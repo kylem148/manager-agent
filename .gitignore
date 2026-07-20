@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+*.tsbuildinfo
+
+# secrets — never commit
+.env
+.env.*
+!.env.example
+
+# co-manager runtime data (normally lives in ~/co-managers; guard against CO_HOME pointing in-tree)
+co-managers/
+instances/
+.memory/
+
+# logs and local caches
+*.log
+npm-debug.log*
+.cache/
+.npm/
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+.idea/
+*.swp
