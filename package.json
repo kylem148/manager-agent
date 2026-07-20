@@ -1,0 +1,35 @@
+{
+  "name": "comanager",
+  "version": "1.0.0",
+  "description": "Terminal-native architectural co-manager for software projects. A persistent, research-capable thinking partner that reasons about architecture, tracks decisions, and generates prompts for coding agents. It is not a coding agent.",
+  "type": "module",
+  "bin": {
+    "co": "./dist/index.js",
+    "comanager": "./dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "postbuild": "chmod +x dist/index.js",
+    "prepare": "tsc && chmod +x dist/index.js",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/bedrock-sdk": "^0.32.0",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  }
+}
