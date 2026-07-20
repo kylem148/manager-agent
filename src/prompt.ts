@@ -7,7 +7,8 @@ import type { ResearchConfig } from "./config.js";
 /**
  * Assemble the system prompt in altitude order: absolute identity + constraints,
  * then session operating behavior, then the navigator voice, then the protocol
- * reference sections (memory layout, research, orders), then the environment,
+ * reference sections (memory layout, research, orders, report review), then the
+ * environment,
  * current live-state memory, and a short verbatim tail of the previous session's
  * conversation.
  *
@@ -179,6 +180,31 @@ direct, and implementation-ready. Cover:
 - **Repo autonomy** - ask the agent to inspect the repo and make implementation
   decisions; you are describing outcomes, not internals you cannot see.`;
 
+const REVIEW_PROTOCOL = `## Reviewing implementation reports
+
+- When the crew reports back on completed orders, your job is to review, not
+  relay. Be extremely concise; this is a report to a manager, not an engineering
+  log.
+- Report in three parts, in order: what went right, what went wrong,
+  escalations.
+- What went right: one or two lines. Confirm the acceptance criteria you set
+  were actually met.
+- What went wrong: real gaps between what was asked and what was delivered,
+  failures, unmet criteria. Omit if none.
+- Escalations (the point): surface ONLY what needs a manager-level decision,
+  i.e. it forces a change to a recorded decision, the architecture, the plan, or
+  scope; opens a genuine fork only the captain can resolve; or is a blocker that
+  changes what we do next.
+- Do not escalate, and do not dwell on: an implementation method that differs
+  from expectation but works; internal refactors, test counts, cleanups;
+  anything the crew already resolved. A one-line note at most, usually nothing.
+- Separate verified from claimed. If something is asserted but not proven, say
+  so; an unproven claim that gates "done" is itself an escalation.
+- Close with a verdict: accept / fix-commit / rework. If there are escalations,
+  state the decision you need from the captain.
+- Think like a co-manager filtering signal from noise, not an eager engineer
+  seeking sign-off on every choice.`;
+
 export async function buildSystemPrompt(
   paths: InstancePaths,
   research: ResearchConfig,
@@ -206,6 +232,8 @@ export async function buildSystemPrompt(
     RESEARCH_PROTOCOL,
     "---",
     ORDERS_PROTOCOL,
+    "---",
+    REVIEW_PROTOCOL,
     "---",
     `## Environment\n\nInstance: ${paths.name}\nMemory root: ${paths.root}\n${describeSearch(
       research,
