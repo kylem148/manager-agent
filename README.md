@@ -280,7 +280,17 @@ The session is a scrollable terminal UI, not a plain read-out:
   whole transcript itself and scrolls it in place — new output auto-follows the
   bottom until you scroll up.
 - **`↑` / `↓` recall your own previous input** (like a shell), separate from
-  transcript scrolling. Left/right, Home/End, Ctrl-A/E/U/K edit the input line.
+  transcript scrolling. Left/right, Home/End, Ctrl-A/E/U/K edit the input line;
+  in a multi-line message they act on the line you're on, and `↑`/`↓` move
+  between its lines before falling through to history.
+- **Multi-line messages**: `Shift+Enter` inserts a newline instead of sending,
+  and `Enter` still sends. Shift+Enter needs a terminal that can report it —
+  the app asks for the Kitty keyboard protocol on startup (Kitty, Ghostty,
+  WezTerm, foot, recent iTerm2), and pops that request on every exit path.
+  Where the terminal can't report it (macOS Terminal.app, most others),
+  **`Ctrl-J`** inserts a newline and works everywhere; `Alt/Option+Enter` also
+  works if your terminal sends Option as Meta. Set `CO_KEYS=off` to skip the
+  protocol request entirely — you lose Shift+Enter, `Ctrl-J` still composes.
 - **Word wrap** breaks long lines at word boundaries and is ANSI-aware, so
   colored text never gets split mid-escape or mid-word at the column edge.
 - **Selecting text** while the app captures the mouse: hold your terminal's
@@ -377,6 +387,10 @@ on exit, the stale-activeContext guard keeps live state honest
   (logs excluded).
 - **`src/session.ts`** — the interactive REPL, slash-commands, and the
   end-of-session sync guard.
+- **`src/tui.ts`** / **`src/keys.ts`** / **`src/wrap.ts`** — the full-screen
+  terminal UI: transcript buffer + scrolling, the multi-line line editor, and
+  ANSI-aware wrapping. `keys.ts` is the pure decode table that maps both legacy
+  control bytes and enhanced-protocol CSI-u sequences onto one set of bindings.
 - **`src/doctor.ts`** / **`src/index.ts`** — diagnostics and CLI dispatch.
 
 ### V1 scope and extension points

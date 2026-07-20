@@ -34,6 +34,13 @@ import { wrapText, wrapLine, visibleWidth, sliceVisibleText, highlightRange } fr
 import { c, colorEnabled } from "./ui.js";
 import { classifyToken, completeCommand } from "./commands.js";
 import { MarkdownRenderer, renderTable, type Rendered } from "./markdown.js";
+import {
+  classify,
+  classifyByte,
+  parseCsiU,
+  parseModifyOtherKeys,
+  type Action,
+} from "./keys.js";
 
 const ESC = "\x1b";
 const CSI = "\x1b[";
@@ -61,6 +68,16 @@ function pasteEnabled(): boolean {
   return process.env.CO_PASTE !== "off";
 }
 
+/**
+ * Whether to ask the terminal for the Kitty keyboard protocol. It's how
+ * Shift+Enter becomes visible at all (see keys.ts); CO_KEYS=off opts out for
+ * anyone whose terminal mis-handles the request. Turning it off costs only
+ * Shift+Enter — Ctrl-J still inserts a newline either way.
+ */
+function enhancedKeysEnabled(): boolean {
+  return process.env.CO_KEYS !== "off";
+}
+
 /** Count the lines in text, ignoring a single trailing newline. */
 function countLines(text: string): number {
   const parts = text.split("\n");
@@ -81,29 +98,44 @@ function countLines(text: string): number {
  * rides along on the end of the row (invisible). A word longer than a full row
  * is hard-split at the column edge as a last resort so nothing overflows.
  *
- * The buffer is plain text (tabs/newlines never reach it — Tab is a completion
- * key, Enter submits) and every char counts as one column, matching the width
- * assumptions the rest of the editor already makes.
+ * The buffer may contain literal newlines (Shift+Enter / Ctrl-J compose a
+ * multi-line message), and each one ends its row unconditionally: the row after
+ * it starts at the index just past the "\n", so the newline character itself is
+ * the last character of the row it terminates. Callers slicing a row must strip
+ * that trailing "\n" before painting it — see inputLayout. Tabs never reach the
+ * buffer (Tab is a completion key) and every other char counts as one column,
+ * matching the width assumptions the rest of the editor already makes.
  */
-function inputRowStarts(buf: string, avail: number): number[] {
+export function inputRowStarts(buf: string, avail: number): number[] {
   const width = Math.max(1, avail);
   const starts = [0];
   const n = buf.length;
   let rowStart = 0;
-  while (rowStart < n) {
-    let col = 0;
-    let lastBreak = -1; // buffer index just past the last space seen this row
-    let j = rowStart;
-    for (; j < n && col < width; j++) {
-      col++;
-      if (buf[j] === " ") lastBreak = j + 1;
+  while (rowStart <= n) {
+    // Wrap only up to the next hard break; the newline owns the row end.
+    const nl = buf.indexOf("\n", rowStart);
+    const lineEnd = nl === -1 ? n : nl;
+
+    let cur = rowStart;
+    for (;;) {
+      let col = 0;
+      let lastBreak = -1; // buffer index just past the last space seen this row
+      let j = cur;
+      for (; j < lineEnd && col < width; j++) {
+        col++;
+        if (buf[j] === " ") lastBreak = j + 1;
+      }
+      if (j >= lineEnd) break; // the remainder fits on the current row
+      // Break after the last fitting space so the following word stays whole;
+      // if the row is one unbroken word, hard-split at the column edge (j).
+      const next = lastBreak > cur ? lastBreak : j;
+      starts.push(next);
+      cur = next;
     }
-    if (j >= n) break; // the remainder fits on the current row
-    // Break after the last fitting space so the following word stays whole;
-    // if the row is one unbroken word, hard-split at the column edge (j).
-    const next = lastBreak > rowStart ? lastBreak : j;
-    starts.push(next);
-    rowStart = next;
+
+    if (nl === -1) break;
+    starts.push(nl + 1); // the row after the hard break (possibly empty)
+    rowStart = nl + 1;
   }
   return starts;
 }
@@ -135,6 +167,17 @@ const term = {
   // so we can buffer it whole instead of processing its newlines as Enter.
   pasteOn: `${CSI}?2004h`,
   pasteOff: `${CSI}?2004l`,
+  // Kitty keyboard protocol, progressive-enhancement flag 1 ("disambiguate
+  // escape codes"). PUSHES onto the terminal's per-screen flag stack, so
+  // keysOff pops exactly our entry and leaves whatever the outer program (tmux,
+  // a shell) had pushed untouched. Flag 1 is the mildest level: keys with an
+  // unambiguous legacy encoding (Enter, Tab, Backspace, printable text) keep
+  // sending it, and only the previously-unrepresentable combos — Shift+Enter,
+  // Ctrl+Enter, Ctrl+J — arrive as CSI-u. Terminals that don't implement the
+  // protocol ignore both sequences: they're syntactically valid CSI with a
+  // private-use intermediate, so nothing is echoed as stray input.
+  keysOn: `${CSI}>1u`,
+  keysOff: `${CSI}<u`,
   moveTo: (row: number, col: number): string => `${CSI}${row};${col}H`,
   clearLine: `${CSI}2K`,
 };
@@ -244,6 +287,8 @@ export class Tui implements SessionIO {
   private header?: string;
   private active = false;
   private raw = false;
+  /** True once we've pushed our Kitty keyboard flags, so stop() pops exactly one. */
+  private keysPushed = false;
 
   // Bracketed-paste state. While `pasting`, raw bytes accumulate in `pasteBuf`
   // (across as many data events as the paste spans) until the end marker. A
@@ -332,6 +377,10 @@ export class Tui implements SessionIO {
     this.out.write(term.enterAlt + term.clear + term.hideCursor);
     if (mouseEnabled()) this.out.write(term.mouseOn);
     if (pasteEnabled()) this.out.write(term.pasteOn);
+    if (enhancedKeysEnabled()) {
+      this.out.write(term.keysOn);
+      this.keysPushed = true;
+    }
 
     if (this.header) this.appendBlock(this.header);
 
@@ -355,6 +404,17 @@ export class Tui implements SessionIO {
 
     if (mouseEnabled()) this.out.write(term.mouseOff);
     if (pasteEnabled()) this.out.write(term.pasteOff);
+    // Pop the keyboard flags BEFORE leaving the alternate screen: the Kitty
+    // flag stack is per-screen-buffer, so popping after the switch would pop
+    // the primary screen's stack and strand our entry on the alt screen. stop()
+    // runs on every exit path (normal, SIGTERM/SIGHUP, uncaughtException, and
+    // process 'exit'), so a crash can't leave the terminal in enhanced mode.
+    // Only pop what we pushed: an unmatched pop would discard an entry belonging
+    // to whatever wraps us (tmux, a shell, an outer TUI).
+    if (this.keysPushed) {
+      this.out.write(term.keysOff);
+      this.keysPushed = false;
+    }
     this.out.write(term.showCursor + term.leaveAlt);
     if (this.raw && this.inp.setRawMode) this.inp.setRawMode(false);
     this.inp.pause();
@@ -422,14 +482,23 @@ export class Tui implements SessionIO {
    * than a row is still hard-split so nothing overflows. See inputRowStarts for
    * why contiguous rows keep the cursor index → (row, col) mapping exact.
    */
-  private inputLayout(): { segs: string[]; cursorRow: number; cursorCol: number } {
+  private inputLayout(): {
+    segs: string[];
+    starts: number[];
+    cursorRow: number;
+    cursorCol: number;
+  } {
     const promptW = visibleWidth(this.promptLabel);
     const avail = Math.max(1, this.cols - promptW);
     const starts = inputRowStarts(this.buf, avail);
 
     const segs: string[] = [];
     for (let r = 0; r < starts.length; r++) {
-      segs.push(this.buf.slice(starts[r]!, starts[r + 1] ?? this.buf.length));
+      const raw = this.buf.slice(starts[r]!, starts[r + 1] ?? this.buf.length);
+      // A hard-broken row carries its terminating "\n" as its last character.
+      // Painting that would emit a real line break mid-frame, so drop it here;
+      // the index math above (and the cursor mapping below) still counts it.
+      segs.push(raw.endsWith("\n") ? raw.slice(0, -1) : raw);
     }
 
     // The cursor sits on the last row whose start offset is <= cursor; its
@@ -447,7 +516,30 @@ export class Tui implements SessionIO {
       if (segs.length <= cursorRow) segs.push("");
     }
     if (segs.length === 0) segs.push("");
-    return { segs, cursorRow, cursorCol };
+    return { segs, starts, cursorRow, cursorCol };
+  }
+
+  /**
+   * Move the cursor one visual row up or down, keeping its column where it can.
+   * Returns false when there is no such row — which is how ↑/↓ fall through to
+   * input-history browsing at the top/bottom of a multi-line buffer, matching
+   * what every other editor-with-history does.
+   */
+  private moveCursorRow(delta: 1 | -1): boolean {
+    const { segs, starts, cursorRow, cursorCol } = this.inputLayout();
+    const target = cursorRow + delta;
+    if (target < 0 || target >= segs.length) return false;
+
+    const start = starts[target];
+    if (start === undefined) {
+      // The synthetic row inputLayout appends for a caret parked past the last
+      // column has no start offset of its own: it IS the end of the buffer.
+      this.cursor = this.buf.length;
+    } else {
+      this.cursor = Math.min(start + Math.min(cursorCol, segs[target]!.length), this.buf.length);
+    }
+    this.paint();
+    return true;
   }
 
   private viewportRows(): number {
@@ -851,6 +943,7 @@ export class Tui implements SessionIO {
   private currentGhost(): { name: string; arg?: string } | null {
     if (!this.buf.startsWith("/")) return null;
     if (this.buf.includes(" ")) return null; // past the command word
+    if (this.buf.includes("\n")) return null; // a multi-line message isn't a command
     if (this.cursor !== this.buf.length) return null; // complete only at the end
     const cmd = completeCommand(this.buf.slice(1));
     return cmd ? { name: cmd.name, arg: cmd.arg } : null;
@@ -930,7 +1023,7 @@ export class Tui implements SessionIO {
     // once sent the chat history shows the whole thing the model will see.
     const expanded = this.expandChips(line);
     this.appendBlock("");
-    this.appendBlock(this.promptLabel + expanded);
+    this.appendBlock(this.echoBlock(expanded));
     if (line.trim() !== "") {
       // History keeps the DISPLAY line (chip intact), so ↑ recalls the compact
       // chip; the pastes map persists for the session, so re-submitting still
@@ -945,6 +1038,20 @@ export class Tui implements SessionIO {
     this.pendingResolve = null;
     this.scrollToBottom();
     r?.(expanded);
+  }
+
+  /**
+   * The transcript echo of a submitted turn: the prompt label leads the first
+   * line and every continuation line hangs under it, so a multi-line message
+   * reads as one block instead of having its second line start hard against the
+   * left margin like a new speaker.
+   */
+  private echoBlock(text: string): string {
+    const lines = text.split("\n");
+    const indent = " ".repeat(visibleWidth(this.promptLabel));
+    return lines
+      .map((l, idx) => (idx === 0 ? this.promptLabel + l : indent + l))
+      .join("\n");
   }
 
   /** Clear the input line and reset history browsing (esc-esc). */
@@ -992,50 +1099,86 @@ export class Tui implements SessionIO {
       return PASTE_START.length;
     }
 
+    // Alt+Enter, as sent by terminals that encode Meta as an ESC prefix (and by
+    // macOS terminals with "Option as Meta" on). Checked before the generic
+    // ESC/CSI dispatch, which would otherwise read it as a lone ESC followed by
+    // a bare Enter — i.e. it would SUBMIT, the one thing it must never do.
+    if (ch === ESC && (data[i + 1] === "\r" || data[i + 1] === "\n")) {
+      this.applyAction({ kind: "newline" }, wasEscPending);
+      return 2;
+    }
+
     // --- Escape sequences (CSI) ---
     if (ch === ESC && data[i + 1] === "[") {
-      return this.consumeCsi(data, i);
+      return this.consumeCsi(data, i, wasEscPending);
     }
     // Lone ESC: arm esc-esc; a second consecutive lone ESC clears the input.
     if (ch === ESC) {
-      if (wasEscPending) this.clearInput();
-      else this.escPending = true;
+      this.applyAction({ kind: "escape" }, wasEscPending);
       return 1;
     }
 
-    const code = ch.charCodeAt(0);
+    this.applyAction(classifyByte(ch), wasEscPending);
+    return 1;
+  }
 
-    // Ctrl-C: first press hints, second within the same idle exits.
-    if (code === 3) {
-      this.sigintCount++;
-      if (this.sigintCount >= 2) {
-        this.stop();
-        process.exit(130);
+  /**
+   * Apply a decoded key action to the editor. Every encoding — legacy control
+   * bytes, Kitty CSI-u, xterm modifyOtherKeys — lands here, so a binding is
+   * defined exactly once no matter how the terminal spelled it.
+   *
+   * `wasEscPending` is the esc-esc arming state captured by the caller before
+   * it was cleared: only another escape consumes it, every other key disarms.
+   */
+  private applyAction(action: Action, wasEscPending: boolean): void {
+    // Ctrl-C's "press again to quit" only counts consecutive presses.
+    if (action.kind !== "interrupt") this.sigintCount = 0;
+
+    switch (action.kind) {
+      case "insert":
+        this.insertText(action.text);
+        this.paint();
+        return;
+
+      case "newline":
+        // Compose, don't send: a literal newline in the buffer. The wrapping
+        // and cursor math handle it (see inputRowStarts) and submit() ships the
+        // buffer with the newlines intact.
+        this.insertText("\n");
+        this.scrollToBottom(); // the taller input box must not hide the tail
+        return;
+
+      case "submit":
+        if (this.pendingResolve) this.submit();
+        return;
+
+      case "escape":
+        if (wasEscPending) this.clearInput();
+        else this.escPending = true;
+        return;
+
+      case "interrupt": {
+        // First press hints, second within the same idle exits.
+        this.sigintCount++;
+        if (this.sigintCount >= 2) {
+          this.stop();
+          process.exit(130);
+        }
+        this.print(c.dim("(press Ctrl-C again to quit, or type /exit)"));
+        return;
       }
-      this.print(c.dim("(press Ctrl-C again to quit, or type /exit)"));
-      return 1;
-    }
-    this.sigintCount = 0;
 
-    // Ctrl-D on empty line: EOF → resolve null (clean exit).
-    if (code === 4) {
-      if (this.buf === "") {
+      case "eof": {
+        // Ctrl-D on an empty buffer: EOF → resolve null (clean exit).
+        if (this.buf !== "") return;
         const r = this.pendingResolve;
         this.pendingResolve = null;
         r?.(null);
+        return;
       }
-      return 1;
-    }
 
-    // Enter (CR or LF).
-    if (code === 13 || code === 10) {
-      if (this.pendingResolve) this.submit();
-      return 1;
-    }
-
-    // Backspace (DEL 127 or BS 8).
-    if (code === 127 || code === 8) {
-      if (this.cursor > 0) {
+      case "backspace": {
+        if (this.cursor === 0) return;
         // A chip is atomic: if the cursor sits just past (or within) one, remove
         // the whole chip rather than nibbling its closing bracket.
         const chip = this.chipSpanAt(this.cursor);
@@ -1047,29 +1190,57 @@ export class Tui implements SessionIO {
           this.cursor--;
         }
         this.paint();
+        return;
       }
-      return 1;
+
+      // Ctrl-A/E/U/K operate on the LOGICAL line around the cursor, not the
+      // whole buffer: in a multi-line message "start of line" means what it
+      // does in any editor, and Ctrl-U can no longer wipe three lines of
+      // composition when the user meant to clear one.
+      case "home":
+        this.cursor = this.lineStart();
+        this.paint();
+        return;
+      case "end":
+        this.cursor = this.lineEnd();
+        this.paint();
+        return;
+      case "kill-to-start": {
+        const start = this.lineStart();
+        this.buf = this.buf.slice(0, start) + this.buf.slice(this.cursor);
+        this.cursor = start;
+        this.paint();
+        return;
+      }
+      case "kill-to-end":
+        this.buf = this.buf.slice(0, this.cursor) + this.buf.slice(this.lineEnd());
+        this.paint();
+        return;
+
+      case "tab":
+        // Accept the ghost command completion when one is showing; else ignore
+        // (we never insert literal tabs into the buffer).
+        this.acceptGhost();
+        return;
+
+      case "none":
+        return;
     }
+  }
 
-    // Ctrl-A / Ctrl-E: line start / end.
-    if (code === 1) { this.cursor = 0; this.paint(); return 1; }
-    if (code === 5) { this.cursor = this.buf.length; this.paint(); return 1; }
-    // Ctrl-U: kill to line start.
-    if (code === 21) { this.buf = this.buf.slice(this.cursor); this.cursor = 0; this.paint(); return 1; }
-    // Ctrl-K: kill to line end.
-    if (code === 11) { this.buf = this.buf.slice(0, this.cursor); this.paint(); return 1; }
+  /** Offset of the start of the logical line the cursor is on. */
+  private lineStart(): number {
+    // lastIndexOf clamps a negative fromIndex to 0 rather than searching
+    // nothing, so a cursor at 0 must short-circuit or a leading "\n" would
+    // report a line start of 1 — past the cursor.
+    if (this.cursor === 0) return 0;
+    return this.buf.lastIndexOf("\n", this.cursor - 1) + 1;
+  }
 
-    // Tab: accept the ghost command completion when one is showing; else ignore
-    // (we don't insert literal tabs into the single-line editor).
-    if (code === 9) { this.acceptGhost(); return 1; }
-
-    // Printable (incl. UTF-8 multibyte, which arrives as JS chars here).
-    if (code >= 32) {
-      this.insertText(ch);
-      this.paint();
-      return 1;
-    }
-    return 1; // swallow other control bytes
+  /** Offset of the end of the logical line the cursor is on (before its "\n"). */
+  private lineEnd(): number {
+    const nl = this.buf.indexOf("\n", this.cursor);
+    return nl === -1 ? this.buf.length : nl;
   }
 
   /** Insert text at the cursor and advance it. Does not repaint. */
@@ -1160,7 +1331,7 @@ export class Tui implements SessionIO {
   }
 
   /** Handle a CSI sequence (arrows, nav keys, mouse). Returns bytes consumed. */
-  private consumeCsi(data: string, i: number): number {
+  private consumeCsi(data: string, i: number, wasEscPending = false): number {
     // Mouse (SGR 1006): ESC [ < b ; x ; y (M|m). The final byte is M for a
     // press/motion and m for a release; we need it to tell drag-end from drag.
     if (data[i + 2] === "<") {
@@ -1180,11 +1351,20 @@ export class Tui implements SessionIO {
     const consumed = j - i + 1;
 
     switch (final) {
-      case "A": // Up → previous history
-        this.historyPrev();
+      case "u": {
+        // Kitty keyboard protocol, CSI-u form: this is where Shift+Enter (and
+        // Ctrl+Enter, and Ctrl+J once the protocol is on) actually arrives.
+        // A reply to a flag query (`CSI ? <flags> u`) parses as null and is
+        // swallowed, so it never leaks into the buffer as text.
+        const ev = parseCsiU(params);
+        if (ev) this.applyAction(classify(ev), wasEscPending);
         return consumed;
-      case "B": // Down → next history
-        this.historyNext();
+      }
+      case "A": // Up → previous input row, else previous history
+        if (!this.moveCursorRow(-1)) this.historyPrev();
+        return consumed;
+      case "B": // Down → next input row, else next history
+        if (!this.moveCursorRow(1)) this.historyNext();
         return consumed;
       case "C": // Right — move cursor, or accept a ghost completion at line end
         if (this.cursor < this.buf.length) { this.cursor++; this.paint(); }
@@ -1193,13 +1373,22 @@ export class Tui implements SessionIO {
       case "D": // Left
         if (this.cursor > 0) { this.cursor--; this.paint(); }
         return consumed;
-      case "H": // Home
-        this.cursor = 0; this.paint();
+      case "H": // Home → start of the current logical line
+        this.applyAction({ kind: "home" }, wasEscPending);
         return consumed;
-      case "F": // End
-        this.cursor = this.buf.length; this.paint();
+      case "F": // End → end of the current logical line
+        this.applyAction({ kind: "end" }, wasEscPending);
         return consumed;
       case "~": {
+        // xterm's modifyOtherKeys form, `CSI 27 ; mods ; code ~` — the other way
+        // a terminal can report Shift+Enter. We don't turn modifyOtherKeys on
+        // ourselves, but iTerm2 and xterm users may already have it enabled, and
+        // decoding it costs one branch.
+        const other = parseModifyOtherKeys(params);
+        if (other) {
+          this.applyAction(classify(other), wasEscPending);
+          return consumed;
+        }
         // PgUp=5, PgDn=6, Home=1/7, End=4/8, Del=3
         const n = Number.parseInt(params, 10);
         if (n === 5) this.scrollBy(-Math.max(1, this.viewportRows() - 1));
