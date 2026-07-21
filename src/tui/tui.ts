@@ -248,6 +248,13 @@ export interface SessionIO {
 const BUSY_FRAMES = ["·", "✢", "✳", "∗", "✻", "✽", "✻", "∗", "✳", "✢"];
 const BUSY_TICK_MS = 120;
 
+/**
+ * Frame budget for coalesced repaints (~60fps). Long enough to collapse a burst
+ * of streamed token deltas into one write, short enough that typing still feels
+ * instant.
+ */
+const PAINT_INTERVAL_MS = 16;
+
 export class Tui implements SessionIO {
   private out: OutStream;
   private inp: InStream;
@@ -287,6 +294,8 @@ export class Tui implements SessionIO {
   private header?: string;
   private active = false;
   private raw = false;
+  /** Pending coalesced frame, if one is scheduled. See paint(). */
+  private paintTimer: ReturnType<typeof setTimeout> | null = null;
   /** True once we've pushed our Kitty keyboard flags, so stop() pops exactly one. */
   private keysPushed = false;
 
@@ -400,6 +409,9 @@ export class Tui implements SessionIO {
     this.inp.removeListener("data", this.handleData);
     if (this.statusTimer) { clearTimeout(this.statusTimer); this.statusTimer = null; }
     if (this.busyTimer) { clearInterval(this.busyTimer); this.busyTimer = null; }
+    // Drop any queued frame: we're about to leave the alt screen, so painting
+    // it would write into a buffer that's being torn down.
+    if (this.paintTimer) { clearTimeout(this.paintTimer); this.paintTimer = null; }
     this.busy = null;
 
     if (mouseEnabled()) this.out.write(term.mouseOff);
@@ -660,7 +672,8 @@ export class Tui implements SessionIO {
   /** After the transcript grows: keep the bottom pinned if we were following. */
   private afterGrow(): void {
     if (this.atBottom) this.scroll = this.maxScroll();
-    if (this.active) this.paint();
+    // Coalesced: this is the per-token streaming path. See paintSoon().
+    if (this.active) this.paintSoon();
   }
 
   /**
@@ -692,8 +705,37 @@ export class Tui implements SessionIO {
 
   // --- rendering -------------------------------------------------------------
 
+  /**
+   * Request a frame within PAINT_INTERVAL_MS, collapsing a burst into one write.
+   *
+   * Used only on the transcript-growth path (see afterGrow). That path runs once
+   * per streamed text delta, so a single reply used to write hundreds of full
+   * frames, each clearing and rewriting every visible row. On a fast local
+   * terminal that reads as stuttering; over SSH or in a slow emulator the writes
+   * throttle the stream itself, so the model looks slower than it is.
+   *
+   * Everything else — keystrokes, scrolling, selection, the busy spinner — still
+   * paints synchronously. Those arrive at human or fixed-tick rates, so
+   * coalescing them would trade real input latency for no gain.
+   */
+  private paintSoon(): void {
+    if (!this.active) return;
+    if (this.paintTimer) return; // a frame is already queued; it will pick this up
+    this.paintTimer = setTimeout(() => {
+      this.paintTimer = null;
+      this.paint();
+    }, PAINT_INTERVAL_MS);
+    // Deliberately not unref'd: this is a one-shot a few milliseconds out, and
+    // letting it hold the loop open that long guarantees the final frame of a
+    // turn actually lands. (The busy spinner's timer does unref — it repeats
+    // forever and would otherwise keep the process alive.)
+  }
+
   private paint(): void {
     if (!this.active) return;
+    // A synchronous paint satisfies any queued one; leaving the timer armed
+    // would just write an identical frame a few milliseconds later.
+    if (this.paintTimer) { clearTimeout(this.paintTimer); this.paintTimer = null; }
     // The input region height is dynamic (it grows as the buffer wraps), so the
     // transcript viewport height changes as the user types. Re-pin to the bottom
     // when following, so a growing input never leaves the transcript showing
