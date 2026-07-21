@@ -8,8 +8,8 @@ import type { ResearchConfig } from "../config.js";
 /**
  * Assemble the system prompt in altitude order: absolute identity + constraints,
  * then session operating behavior, then the navigator voice, then the protocol
- * reference sections (memory layout, documents, research, orders, report
- * review), then the environment,
+ * reference sections (memory layout, documents, research, orders, report review,
+ * task table), then the environment,
  * current live-state memory, and a short verbatim tail of the previous session's
  * conversation.
  *
@@ -263,6 +263,23 @@ const REVIEW_PROTOCOL = `## Reviewing implementation reports
 - Think like a co-manager filtering signal from noise, not an eager engineer
   seeking sign-off on every choice.`;
 
+const TASK_TABLE_PROTOCOL = `## Task table
+
+- Keep a running task table in live state (\`activeContext.md\`) as the single
+  source of truth for open work: each item, its type, its status. Update it
+  whenever next steps surface, work is completed or reviewed, or the captain
+  raises new work. It lives in memory, so it survives restarts.
+- Render it at these moments, not every turn:
+  - at session start, alongside the "where we left off" greeting;
+  - after reviewing a crew implementation report, reflecting any status change;
+  - when the captain asks about status or next steps, or raises new work;
+  - whenever the table materially changes.
+- Default columns: Task | Type | Status. Keep cells terse, per the table rule in
+  "How you operate" above. A one-line "Done" summary of recently finished items
+  may follow the table; keep it short and let old entries fall off.
+- This is a light habit, not licence to reprint the table every turn. When
+  nothing has changed and the moment does not call for it, leave it be.`;
+
 export async function buildSystemPrompt(
   paths: InstancePaths,
   research: ResearchConfig,
@@ -302,6 +319,8 @@ export async function buildSystemPrompt(
     ORDERS_PROTOCOL,
     "---",
     REVIEW_PROTOCOL,
+    "---",
+    TASK_TABLE_PROTOCOL,
     "---",
     `## Environment\n\nInstance: ${paths.name}\nMemory root: ${paths.root}\n${describeSearch(
       research,
