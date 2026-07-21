@@ -7,8 +7,8 @@ import path from "node:path";
  *
  *   <home>/
  *     instances/<name>/
- *       docs/                        user-facing documents (flat)
- *         architecture.md            (+ plan.md and others, born with their workflow)
+ *       docs/                        user-facing documents (flat, starts empty)
+ *         architecture.md, plan.md, ...  born with their workflow, via the doc tool
  *       .memory/                     hidden substrate the co-manager manages
  *         projectbrief.md            rewritten-in-full orientation
  *         activeContext.md           rewritten-in-full orientation
@@ -28,7 +28,13 @@ import path from "node:path";
 export const DOCS_DIR = "docs";
 export const MEMORY_DIR = ".memory";
 
-export const LIVE_FILES = ["projectbrief.md", "activeContext.md", "architecture.md"] as const;
+/**
+ * Substrate orientation files: rewritten in full, read at every cold start, and
+ * owned by the co-manager rather than the user. User-facing documents are NOT in
+ * here — they live flat in docs/ and are addressed by name through the doc tool
+ * (see memory/docs.ts).
+ */
+export const LIVE_FILES = ["projectbrief.md", "activeContext.md"] as const;
 export type LiveFile = (typeof LIVE_FILES)[number];
 
 export const LOG_FILES = ["decisions.md", "progress.md", "research.md"] as const;
@@ -36,13 +42,6 @@ export type LogName = "decisions" | "progress" | "research";
 
 /** Log names without the .md, the single source for iterating over logs. */
 export const LOG_NAMES = LOG_FILES.map((f) => f.replace(".md", "")) as LogName[];
-
-/**
- * User-facing document files: these live flat in docs/. Everything else the
- * co-manager keeps is hidden substrate under .memory/. architecture.md is the
- * one live-state file that is a user document; plan.md joins it once authored.
- */
-export const DOC_FILES = new Set<string>(["architecture.md", "plan.md"]);
 
 export function logFileName(name: LogName): string {
   return `${name}.md`;
@@ -59,7 +58,7 @@ export interface InstancePaths {
   archive: string;
   /** Per-session transcripts, under .memory/. */
   sessions: string;
-  /** Resolve a live-state file to its tier: docs/ for documents, else .memory/. */
+  /** Resolve a substrate orientation file under .memory/. */
   liveFile: (f: LiveFile) => string;
   logFile: (name: LogName) => string;
   archiveDir: (name: LogName) => string;
@@ -77,7 +76,6 @@ export function instancePaths(home: string, name: string): InstancePaths {
   const memory = path.join(root, MEMORY_DIR);
   const archive = path.join(memory, "archive");
   const sessions = path.join(memory, "sessions");
-  const dirForFile = (f: string): string => (DOC_FILES.has(f) ? docs : memory);
   return {
     name,
     root,
@@ -85,7 +83,7 @@ export function instancePaths(home: string, name: string): InstancePaths {
     memory,
     archive,
     sessions,
-    liveFile: (f) => path.join(dirForFile(f), f),
+    liveFile: (f) => path.join(memory, f),
     logFile: (n) => path.join(memory, logFileName(n)),
     archiveDir: (n) => path.join(archive, n),
     docFile: (n) => path.join(docs, n),

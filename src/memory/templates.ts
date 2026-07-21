@@ -62,30 +62,6 @@ the logs. This is what lets the next session pick up naturally.)
 `;
 }
 
-export function architectureTemplate(name: string, dateISO: string): string {
-  return `# Architecture: ${name}
-
-_Last updated ${dateISO}. The current architectural picture - rewritten in
-place as it changes._
-
-## Overview
-(one paragraph)
-
-## Components
--
-
-## Data flow
-(describe how data moves through the system)
-
-## Key technology choices
-| Area | Choice | Why |
-| ---- | ------ | --- |
-
-## Open architectural questions
--
-`;
-}
-
 export function logHeader(title: string): string {
   return `# ${title}
 

@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { InstancePaths, LiveFile } from "../paths.js";
 import { readLiveMemory, readTranscriptTail, type TranscriptTurn } from "../memory/memory.js";
+import { readSurfacedDocs } from "../memory/docs.js";
 import { describeSearch } from "../research.js";
 import type { ResearchConfig } from "../config.js";
 
@@ -249,13 +250,21 @@ export async function buildSystemPrompt(
 ): Promise<string> {
   const live = await readLiveMemory(paths);
   const tail = await readTranscriptTail(paths, { excludeFile: opts.excludeTranscript });
+  // architecture.md and plan.md keep their privileged cold-start read even
+  // though they are ordinary documents to write (through the doc tool). Absent
+  // ones are simply skipped: docs/ starts empty.
+  const docs = await readSurfacedDocs(paths);
 
-  const liveBlock = (Object.keys(live) as LiveFile[])
-    .map((f) => {
+  const liveBlock = [
+    ...(Object.keys(live) as LiveFile[]).map((f) => {
       const rel = path.relative(paths.root, paths.liveFile(f));
       return `### ${rel}\n\n${live[f].trim() || "(empty)"}`;
-    })
-    .join("\n\n");
+    }),
+    ...docs.map((d) => {
+      const rel = path.relative(paths.root, paths.docFile(d.name));
+      return `### ${rel}\n\n${d.content.trim()}`;
+    }),
+  ].join("\n\n");
 
   return [
     IDENTITY,

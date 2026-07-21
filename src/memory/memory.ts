@@ -447,13 +447,17 @@ export async function migrateInstanceLayout(p: InstancePaths): Promise<LayoutMig
   await ensureDir(p.memory);
   await ensureDir(p.docs);
 
-  // Live-state files: p.liveFile resolves architecture.md to docs/ and the rest
-  // to .memory/, so this one loop places each in its correct tier. These are
-  // full-rewrite snapshots — a conflict can't be auto-merged, so the loser is
-  // parked beside the winner instead of being abandoned at the old path.
-  for (const f of LIVE_FILES) {
-    const src = path.join(oldLive, f);
-    const dest = p.liveFile(f);
+  // Snapshot files out of the old live/ dir, each to its new tier: the
+  // orientation files to .memory/, architecture.md to docs/ (it is a user
+  // document now, authored through the doc tool). A conflict can't be
+  // auto-merged for a full-rewrite file, so the loser is parked beside the
+  // winner instead of being abandoned at the old path.
+  const snapshots: { name: string; dest: string }[] = [
+    ...LIVE_FILES.map((f) => ({ name: f as string, dest: p.liveFile(f) })),
+    { name: "architecture.md", dest: p.docFile("architecture.md") },
+  ];
+  for (const { name, dest } of snapshots) {
+    const src = path.join(oldLive, name);
     const r = await moveNoClobber(src, dest);
     if (r === "conflict") parked.push(await parkConflict(src, dest));
     else tally(r);
@@ -496,7 +500,7 @@ export async function migrateInstanceLayout(p: InstancePaths): Promise<LayoutMig
   };
 }
 
-/** Read the three live-state files. Missing files come back as empty strings. */
+/** Read the substrate orientation files. Missing files come back as empty strings. */
 export async function readLiveMemory(
   p: InstancePaths,
 ): Promise<Record<LiveFile, string>> {

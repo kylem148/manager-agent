@@ -316,8 +316,8 @@ flat over time — small rewritten orientation files plus large append-only logs
 ~/co-managers/
 └── instances/
     └── my-saas/
-        ├── docs/               user-facing documents (flat)
-        │   └── architecture.md    ← authored via its workflow; plan.md joins it
+        ├── docs/               user-facing documents (flat, starts empty)
+        │   └── architecture.md    ← plan.md and any other doc join it, via the doc tool
         └── .memory/            hidden substrate the co-manager manages
             ├── projectbrief.md    rewritten-in-full orientation
             ├── activeContext.md   ← the orientation file, read first each start
@@ -330,13 +330,19 @@ flat over time — small rewritten orientation files plus large append-only logs
 ```
 
 - **Cold start reads only the orientation files** (`projectbrief`,
-  `activeContext`, `architecture`). Full logs are never loaded into context; the
-  model searches them or reads a line range on demand via tools.
+  `activeContext`) plus `docs/architecture.md` and `docs/plan.md` when they
+  exist. Full logs are never loaded into context; the model searches them or
+  reads a line range on demand via tools.
 - **`activeContext.md` is the most important file** — current focus, what's
   being decided, recent decisions (compressed), pointers into logs, what's in
   flight, known risks, open questions, next likely actions.
 - **`docs/` starts empty.** User-facing documents are born when their workflow
-  begins, not seeded as blank skeletons at create time.
+  begins, not seeded as blank skeletons at create time. The co-manager creates
+  and edits them through one generic `doc` tool (create / read / str_replace /
+  overwrite / delete / list), which can only address flat `.md` files inside that
+  instance's `docs/` — never the `.memory/` substrate, `.env`, or anything else.
+  `architecture.md` and `plan.md` are ordinary documents that happen to get a
+  privileged read at cold start.
 - **Archiving** (`/archive <log>`) snapshots a log into `.memory/archive/<log>/`
   verbatim and resets the live log to its header, keeping history recoverable but
   off the default read path.
@@ -379,7 +385,7 @@ src/
   cli/       auth.ts doctor.ts modelsdoctor.ts
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
   session/   session.ts prompt.ts tools.ts
-  memory/    memory.ts templates.ts
+  memory/    memory.ts docs.ts templates.ts
 ```
 
 Tests live next to the code they cover (`src/tui/keys.test.ts`, etc.).
@@ -398,8 +404,10 @@ Tests live next to the code they cover (`src/tui/keys.test.ts`, etc.).
 
 **`src/memory/`** — `memory.ts` holds instance scaffolding, live-state
 read/rewrite, append-only logs with decision-id minting, log search / range
-read, archive, and mtime staleness detection. `templates.ts` is the seed
-content for a fresh instance.
+read, archive, and mtime staleness detection. `docs.ts` is the user-facing `docs/`
+tier: the six doc operations, the name/realpath sandbox that keeps them inside
+`docs/`, and the cold-start read of `architecture.md` / `plan.md`. `templates.ts`
+is the seed content for a fresh instance.
 
 **`src/session/`** — `session.ts` is the interactive REPL, slash-commands, and
 the end-of-session sync guard. `prompt.ts` assembles the system prompt in

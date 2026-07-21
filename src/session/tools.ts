@@ -8,6 +8,15 @@ import {
   readLogRange,
   readLiveMemory,
 } from "../memory/memory.js";
+import {
+  DocError,
+  createDoc,
+  deleteDoc,
+  listDocs,
+  overwriteDoc,
+  readDoc,
+  strReplaceDoc,
+} from "../memory/docs.js";
 import { searchWeb, fetchUrl } from "../research.js";
 import type { SearchOptions } from "../research.js";
 
@@ -24,8 +33,17 @@ import type { SearchOptions } from "../research.js";
  * only external work (web search, fetch) surfaces as activity.
  */
 
-export const LIVE_FILE_ENUM: LiveFile[] = ["projectbrief.md", "activeContext.md", "architecture.md"];
 export const LOG_ENUM: LogName[] = LOG_NAMES;
+
+export const DOC_COMMANDS = [
+  "create",
+  "read",
+  "str_replace",
+  "overwrite",
+  "delete",
+  "list",
+] as const;
+export type DocCommand = (typeof DOC_COMMANDS)[number];
 
 /**
  * Tool activity the REPL may surface to the user: external work only. Memory
@@ -39,7 +57,7 @@ export function toolDefinitions(): Tool[] {
     {
       name: "read_live_memory",
       description:
-        "Re-read the three live-state files (projectbrief, activeContext, architecture). They are already provided at session start; call this only to refresh after a rewrite.",
+        "Re-read the live-state files (projectbrief, activeContext). They are already provided at session start; call this only to refresh after a rewrite. For documents under docs/, use the doc tool instead.",
       input_schema: { type: "object", properties: {}, additionalProperties: false },
     },
     {
@@ -121,12 +139,37 @@ export function toolDefinitions(): Tool[] {
       },
     },
     {
-      name: "rewrite_architecture",
-      description: "Rewrite architecture.md in full with the current architectural picture.",
+      name: "doc",
+      description:
+        "Manage the user-facing markdown documents under docs/ (architecture.md, plan.md, and any other doc a workflow calls for). One tool, dispatching on `command`.\n\n" +
+        "Commands:\n" +
+        "- list — every doc in docs/. Takes no other parameter.\n" +
+        "- read — return one doc's full text. Read before editing.\n" +
+        "- create — write a new doc. Fails if it already exists.\n" +
+        "- str_replace — replace `old_str` with `new_str`. `old_str` must match EXACTLY ONCE, whitespace included; if it is ambiguous or absent you get an error rather than a guess, so include enough surrounding context to make it unique. Prefer this for targeted edits: only the diff is generated.\n" +
+        "- overwrite — replace a doc's entire content. Use for full rewrites and restructures, not for small edits.\n" +
+        "- delete — remove an existing doc.\n\n" +
+        "Scope: flat .md files inside THIS instance's docs/ only. It does NOT touch the .memory/ substrate (projectbrief, activeContext, the logs — those have their own tools), .env, or anything outside docs/. No subdirectories.",
       input_schema: {
         type: "object",
-        properties: { content: { type: "string" } },
-        required: ["content"],
+        properties: {
+          command: { type: "string", enum: [...DOC_COMMANDS] },
+          name: {
+            type: "string",
+            description:
+              "The doc filename, e.g. \"plan.md\". Bare markdown filename, no directories. Omit for list.",
+          },
+          content: { type: "string", description: "Full document text, for create and overwrite." },
+          old_str: {
+            type: "string",
+            description: "For str_replace: the exact text to replace. Must appear exactly once.",
+          },
+          new_str: {
+            type: "string",
+            description: "For str_replace: the replacement text. Omit or pass \"\" to delete the matched text.",
+          },
+        },
+        required: ["command"],
         additionalProperties: false,
       },
     },
@@ -260,10 +303,46 @@ export function makeExecutor(ctx: ExecutorContext) {
           effects.liveRewritten.add("activeContext.md");
           return ok(id, { rewritten: "activeContext.md" });
         }
-        case "rewrite_architecture": {
-          await rewriteLive(paths, "architecture.md", String(input.content ?? ""));
-          effects.liveRewritten.add("architecture.md");
-          return ok(id, { rewritten: "architecture.md" });
+        case "doc": {
+          const command = String(input.command ?? "") as DocCommand;
+          const name = input.name === undefined ? "" : String(input.name);
+          try {
+            switch (command) {
+              case "list":
+                return ok(id, { docs: await listDocs(paths) });
+              case "read":
+                return ok(id, { name, content: await readDoc(paths, name) });
+              case "create":
+                return ok(id, await createDoc(paths, name, String(input.content ?? "")));
+              case "overwrite":
+                return ok(id, await overwriteDoc(paths, name, String(input.content ?? "")));
+              case "str_replace":
+                return ok(
+                  id,
+                  await strReplaceDoc(
+                    paths,
+                    name,
+                    String(input.old_str ?? ""),
+                    String(input.new_str ?? ""),
+                  ),
+                );
+              case "delete":
+                return ok(id, await deleteDoc(paths, name));
+              default:
+                return err(
+                  id,
+                  JSON.stringify({
+                    error: "UNKNOWN_COMMAND",
+                    message: `Unknown doc command "${command}". Use one of: ${DOC_COMMANDS.join(", ")}.`,
+                  }),
+                );
+            }
+          } catch (e) {
+            if (e instanceof DocError) {
+              return err(id, JSON.stringify({ error: e.code, message: e.message }));
+            }
+            throw e;
+          }
         }
         case "rewrite_projectbrief": {
           await rewriteLive(paths, "projectbrief.md", String(input.content ?? ""));
