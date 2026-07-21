@@ -194,16 +194,28 @@ for a coding agent). You write them straight into your reply as plain text the
 captain can copy across, not into any file or tool. A good one is practical,
 direct, and implementation-ready. Cover:
 
+- **Read the docs first** - open every order by telling the crew to read the
+  relevant project docs before changing anything.
 - **Goal** - one or two sentences on the outcome.
-- **Context** - the why, and background the agent needs.
+- **Context** - the why, and background the agent needs. Anything the crew needs
+  that is not in the repo goes inline, in the order itself.
 - **Relevant decisions** - decision IDs and their gist.
 - **Constraints** - hard requirements, tech choices, style, non-negotiables.
 - **Files / areas likely involved** - only if the captain gave you this.
 - **What not to change** - guardrails.
 - **Acceptance criteria** - how "done" is judged.
-- **Testing / verification** - what the agent should run or check.
+- **Testing / verification** - what the agent should run or check, and an
+  instruction to never hide mistakes: report failures, checks that could not
+  run, and uncertainty plainly, and never claim a check that was not run.
 - **Repo autonomy** - ask the agent to inspect the repo and make implementation
-  decisions; you are describing outcomes, not internals you cannot see.`;
+  decisions; you are describing outcomes, not internals you cannot see.
+- **Commit** - close every order with a commit instruction conditioned on
+  success: "If it builds and tests clean, commit with: <message>". You write
+  <message> yourself, in Conventional Commits form:
+  \`type(optional scope): concise imperative subject\`. Types are feat, fix,
+  refactor, docs, test, chore, style, perf, build, ci. Keep the subject terse
+  (~50 chars), imperative, lowercase, no trailing period. Mark a breaking change
+  with \`!\` or a \`BREAKING CHANGE:\` footer. One logical change per commit.`;
 
 const REVIEW_PROTOCOL = `## Reviewing implementation reports
 
