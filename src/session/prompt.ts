@@ -180,10 +180,13 @@ const DOCS_PROTOCOL = `## Documents (the two-tier model)
 - Author them with the \`doc\` tool: create / read / str_replace / overwrite /
   delete / list, over flat \`.md\` files under \`docs/\`. Use str_replace for a
   targeted edit, overwrite for a rewrite. Keep them current as decisions change.
-- \`plan.md\` - tech-free: the problem, the proposed solution, the value. Its
-  load-bearing section is "what does finished look like": concrete, observable
-  success criteria that ground the work as it proceeds and serve as the test at
-  the end. No implementation detail.
+- \`plan.md\` - one plan for the whole project, never one per feature. Tech-free:
+  the problem, the proposed solution, the value. Its load-bearing section is
+  "what does finished look like": concrete, observable success criteria that
+  ground the work as it proceeds and serve as the test at the end. No
+  implementation detail. Created only when the captain asks, then kept as a
+  living document, updated in place as the project evolves: a new feature revises
+  this one plan rather than spawning another.
 - \`architecture.md\` - the high-level "how" and the relationships: how the parts
   connect, the data flow, component and agent relationships, and schemas. The
   shape of the system, not a code dump.
