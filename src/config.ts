@@ -70,6 +70,13 @@ export interface ModelConfig {
   maxTokens: number;
   thinking: "adaptive" | "off";
   effort?: Effort;
+  /**
+   * CO_DEBUG_TIMING: print per-round latency and token/cache counters into the
+   * transcript. Off by default. This is the only way to tell whether prompt
+   * caching is actually engaging on the Bedrock runtime path, which Anthropic
+   * does not document as having full feature parity — see model.ts.
+   */
+  debugTiming: boolean;
 }
 
 export type SearchProviderName = "auto" | "exa" | "brave" | "tavily" | "searxng" | "none";
@@ -135,6 +142,7 @@ export function loadConfig(): Config {
       maxTokens: parseIntOr("CO_MAX_TOKENS", 32000),
       thinking,
       effort,
+      debugTiming: (env("CO_DEBUG_TIMING") ?? "").toLowerCase() === "true",
     },
     research: {
       searchProvider,

@@ -30,6 +30,108 @@ export interface StreamHandlers {
   onText?: (delta: string) => void;
   /** Called when the model starts a tool call (after args are known). */
   onToolUse?: (name: string, input: unknown) => void;
+  /**
+   * Per-round timing/usage line, emitted only when CO_DEBUG_TIMING is set.
+   * Routed through a callback rather than written straight to stdout/stderr
+   * because the TUI owns the terminal in alt-screen mode — a stray write would
+   * corrupt the frame.
+   */
+  onTiming?: (line: string) => void;
+}
+
+/**
+ * Cache breakpoints. Bedrock allows at most 4 per request, and (unlike the
+ * first-party API) has no automatic caching, so every breakpoint is placed by
+ * hand. Budget:
+ *   1. the last tool definition — tools are static for the life of the binary,
+ *      so this prefix survives across sessions, not just across turns;
+ *   2. the end of the system prompt — stable for a whole session, since
+ *      buildSystemPrompt runs once at startup and mid-session memory writes
+ *      never rebuild it;
+ *   3-4. two rolling anchors in the message history (see pickMessageBreakpoints).
+ *
+ * Verified working on the legacy bedrock-runtime path with a Bedrock bearer
+ * token on 2026-07-20: a 3.7k-token prefix dropped input_tokens from 3832 to 79
+ * with cache_read_input_tokens=3753 on the second and third calls. Anthropic's
+ * docs steer Opus 4.7+ callers to the Mantle endpoint "for full feature parity"
+ * and do not promise this path caches — so the CO_DEBUG_TIMING counters below
+ * are the standing check, not a nicety. If cache_read_input_tokens goes to zero
+ * and stays there, something upstream of the breakpoints started changing.
+ */
+const CACHE_CONTROL = { type: "ephemeral" as const };
+
+/**
+ * How many content blocks back the lagging message breakpoint sits. Each
+ * breakpoint can only look back ~20 blocks to find an entry an earlier request
+ * already wrote; a research turn stacking several tool_use/tool_result pairs
+ * can blow past that in one round, at which point the newest breakpoint finds
+ * nothing to read and every turn silently pays full price. The lagging anchor
+ * keeps a written entry inside the window.
+ */
+const LOOKBACK_BLOCK_BUDGET = 15;
+
+function blockCount(m: MessageParam): number {
+  return typeof m.content === "string" ? 1 : m.content.length;
+}
+
+/**
+ * Indices of the messages whose final content block should carry a breakpoint:
+ * the newest message, plus one far enough back to stay inside the lookback
+ * window. Returns at most two.
+ */
+function pickMessageBreakpoints(messages: MessageParam[]): Set<number> {
+  const marks = new Set<number>();
+  if (messages.length === 0) return marks;
+
+  const newest = messages.length - 1;
+  marks.add(newest);
+
+  let blocks = 0;
+  for (let i = newest; i >= 0; i--) {
+    blocks += blockCount(messages[i]!);
+    if (blocks >= LOOKBACK_BLOCK_BUDGET && i > 0) {
+      marks.add(i - 1);
+      break;
+    }
+  }
+  return marks;
+}
+
+/** A copy of `m` whose last content block carries a cache breakpoint. */
+function markMessage(m: MessageParam): MessageParam {
+  // A string body has to become a block before it can carry cache_control.
+  // Semantically identical to the API.
+  if (typeof m.content === "string") {
+    return { ...m, content: [{ type: "text", text: m.content, cache_control: CACHE_CONTROL }] };
+  }
+  if (m.content.length === 0) return m;
+  const content = m.content.map((b, i) =>
+    i === m.content.length - 1 ? ({ ...b, cache_control: CACHE_CONTROL } as ContentBlockParam) : b,
+  );
+  return { ...m, content };
+}
+
+/**
+ * Apply the rolling message breakpoints, without touching the caller's array.
+ * The session's own history stays free of cache_control so markers can't
+ * accumulate past the 4-per-request ceiling as the conversation grows.
+ */
+function withMessageBreakpoints(messages: MessageParam[]): MessageParam[] {
+  const marks = pickMessageBreakpoints(messages);
+  if (marks.size === 0) return messages;
+  return messages.map((m, i) => (marks.has(i) ? markMessage(m) : m));
+}
+
+/** Tool definitions with a breakpoint on the last one, closing the tools prefix. */
+function withToolBreakpoint(tools: Tool[]): Tool[] {
+  if (tools.length === 0) return tools;
+  return tools.map((t, i) =>
+    i === tools.length - 1 ? ({ ...t, cache_control: CACHE_CONTROL } as Tool) : t,
+  );
+}
+
+function fmtMs(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 }
 
 export class ModelProvider {
@@ -54,6 +156,18 @@ export class ModelProvider {
     // Claude Code's own working setup (CLAUDE_CODE_USE_BEDROCK=1, Mantle off).
     // Verified end-to-end against the live key on 2026-07-16. Don't switch to
     // Mantle without re-confirming entitlement, or Opus 4.8 will break.
+    //
+    // Re-confirmed 2026-07-20, this time including the id form Anthropic's docs
+    // actually publish for Mantle (bare `anthropic.claude-opus-4-8`, no geo
+    // prefix). All three forms — bare, `us.`-prefixed, and `claude-opus-4-8` —
+    // 404 on Mantle. On runtime only the `us.`-prefixed form works: the bare id
+    // is rejected with "on-demand throughput isn't supported, retry with an
+    // inference profile", which is why the prefix is load-bearing rather than
+    // decorative. Note `us.anthropic.claude-opus-4-8` is undocumented (the geo
+    // prefix table stops at Opus 4.6) and Anthropic steers 4.7+ callers to
+    // Mantle "for full feature parity" without enumerating what legacy lacks —
+    // so treat feature support here as empirical, not promised. Prompt caching
+    // was measured working on this path the same day (see CACHE_CONTROL below).
     this.client = new AnthropicBedrock({
       awsRegion: cfg.region,
       ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
@@ -108,15 +222,26 @@ export class ModelProvider {
     const messages = [...args.messages];
     const maxRounds = args.maxToolRounds ?? 12;
     const base = this.baseParams();
+    const timing = this.cfg.debugTiming ? handlers?.onTiming : undefined;
+    // Built once per turn: neither the tool list nor the system prompt changes
+    // between rounds, and rebuilding them would churn the cached prefix.
+    const cachedTools = withToolBreakpoint(tools);
+    const cachedSystem: Anthropic.TextBlockParam[] = [
+      { type: "text", text: system, cache_control: CACHE_CONTROL },
+    ];
+    const turnStart = Date.now();
     let finalText = "";
 
     for (let round = 0; round < maxRounds; round++) {
+      const roundStart = Date.now();
+      let firstTokenAt: number | null = null;
+
       const stream = this.client.messages.stream({
         model: this.cfg.modelId,
         max_tokens: this.cfg.maxTokens,
-        system,
-        messages,
-        ...(tools.length ? { tools } : {}),
+        system: cachedSystem,
+        messages: withMessageBreakpoints(messages),
+        ...(cachedTools.length ? { tools: cachedTools } : {}),
         ...base,
       });
 
@@ -126,12 +251,27 @@ export class ModelProvider {
         // (see baseParams) and thinking blocks are still preserved verbatim in
         // the message history below — we just don't render them to the user.
         if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+          firstTokenAt ??= Date.now();
           finalText += event.delta.text;
           handlers?.onText?.(event.delta.text);
         }
       }
 
       const message = await stream.finalMessage();
+
+      if (timing) {
+        const u = message.usage;
+        const ttft = firstTokenAt ? fmtMs(firstTokenAt - roundStart) : "—";
+        // input_tokens counts only what followed the last breakpoint, so a small
+        // number here means the cache worked, not that the prompt was small.
+        timing(
+          `round ${round + 1}: ${fmtMs(Date.now() - roundStart)} (first token ${ttft}) · ` +
+            `in ${u.input_tokens} cache+${u.cache_creation_input_tokens ?? 0}/` +
+            `read ${u.cache_read_input_tokens ?? 0} · out ${u.output_tokens} · ` +
+            `stop ${message.stop_reason}`,
+        );
+      }
+
       // Persist the assistant turn verbatim (preserves tool_use + thinking blocks).
       messages.push({ role: "assistant", content: message.content });
 
@@ -142,6 +282,7 @@ export class ModelProvider {
       if (message.stop_reason !== "tool_use" || toolUses.length === 0) {
         // Natural end of turn.
         finalText = collectText(message);
+        timing?.(`turn: ${fmtMs(Date.now() - turnStart)} over ${round + 1} round(s)`);
         return { messages, finalText };
       }
 
@@ -163,6 +304,7 @@ export class ModelProvider {
     }
 
     // Ran out of tool rounds; return whatever text we have.
+    timing?.(`turn: ${fmtMs(Date.now() - turnStart)} — hit the ${maxRounds}-round cap`);
     return { messages, finalText };
   }
 

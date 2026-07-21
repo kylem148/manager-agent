@@ -143,6 +143,7 @@ AWS_BEARER_TOKEN_BEDROCK=
 CO_MAX_TOKENS=8192
 CO_THINKING=off                    # or `adaptive` for extended thinking
 # CO_EFFORT=xhigh                  # low | medium | high | xhigh | max (default xhigh)
+# CO_DEBUG_TIMING=true             # per-round latency + cache counters
 ```
 
 Thinking is never displayed, even when it's on. The co reasons before it speaks,
@@ -372,6 +373,36 @@ it responds and updates memory appropriately
       ↓
 on exit, the stale-activeContext guard keeps live state honest
 ```
+
+## What makes a turn slow
+
+A turn is one or more round trips to Bedrock. The dominant cost is how much of
+the prompt has to be reprocessed on each one.
+
+**Prompt caching.** The system prompt, tool definitions, live state, and the
+conversation so far are re-sent on every round trip. Without caching that whole
+prefix is reprocessed cold each time and the cost grows all session. Four cache
+breakpoints — one closing the tool definitions, one closing the system prompt,
+and two rolling anchors in the message history — mean a warm turn reprocesses
+almost nothing. Measured on a real session: a cold first turn took 4.7s, and the
+next turn read 8,394 tokens from cache and answered in 1.2s.
+
+Caching is placed by hand because Amazon Bedrock has no automatic caching, and
+it is verified at runtime rather than assumed: Anthropic documents the legacy
+`bedrock-runtime` path this app is pinned to (see `model.ts`) as not having full
+feature parity, and a breakpoint that stops matching fails silently — the only
+symptom is a session that gets slower. `CO_DEBUG_TIMING=true` prints the
+counters that tell you:
+
+```
+⏱ round 1: 1.2s (first token 1.2s) · in 2 cache+199/read 8394 · out 7 · stop end_turn
+⏱ turn: 1.2s over 1 round(s)
+```
+
+`read` is prompt tokens served from cache. If it stays at 0 across turns of a
+single session, caching has broken and every turn is paying full price. `in` is
+only the tokens after the last breakpoint, so a small number there is the good
+outcome, not a small prompt.
 
 ## Architecture notes
 

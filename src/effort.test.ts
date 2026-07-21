@@ -17,6 +17,7 @@ const CFG: ModelConfig = {
   maxTokens: 100,
   thinking: "adaptive",
   effort: "xhigh",
+  debugTiming: false,
 };
 
 /** Replace the provider's client with one that records params and ends the turn. */

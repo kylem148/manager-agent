@@ -326,6 +326,9 @@ async function drive(state: SessionState): Promise<void> {
       tools: toolDefinitions(),
       executor,
       handlers: {
+        // Only fires under CO_DEBUG_TIMING. Rendered through io so it lands in
+        // the TUI frame rather than corrupting the alt screen.
+        onTiming: (l) => io.appendBlock(c.dim(`  ⏱ ${l}`)),
         onText: (d) => {
           io.setBusy(null);
           if (mode !== "text") {
