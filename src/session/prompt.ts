@@ -8,8 +8,8 @@ import type { ResearchConfig } from "../config.js";
 /**
  * Assemble the system prompt in altitude order: absolute identity + constraints,
  * then session operating behavior, then the navigator voice, then the protocol
- * reference sections (memory layout, research, orders, report review), then the
- * environment,
+ * reference sections (memory layout, documents, research, orders, report
+ * review), then the environment,
  * current live-state memory, and a short verbatim tail of the previous session's
  * conversation.
  *
@@ -94,6 +94,9 @@ const OPERATING_NOTES = `## How you operate
   X", "show me that research note"). Then surface it: summarise from memory by
   default, and offer the raw file if they want the full text. Absent a request,
   never mention memory, the files, or the fact that you keep them.
+- That silence covers your own substrate only. User-facing documents under
+  \`docs/\` are the captain's, not yours: you propose them out loud and write them
+  only when asked. See the documents section below.
 - Research when real uncertainty or the stakes of a choice justify it, on the
   silent per-turn gate in the research protocol below. When you already know the
   answer, just answer. Don't reflexively search.
@@ -127,17 +130,10 @@ above holds: when seasoning and substance pull apart, the seasoning goes.`;
 
 const MEMORY_PROTOCOL = `## Memory protocol
 
-Reference for the memory layout. The behavioural rules - what you record, when to
-refresh, what survives a restart - are in "How you operate" above; this just says
-what each file is for. The workspace splits by audience: user-facing documents
-flat in \`docs/\`, and your own hidden self-managed substrate in \`.memory/\`.
-
-**\`docs/\`** - user-facing documents:
-- \`architecture.md\` - the current architectural picture: components, data flow,
-  key technology choices, and why. Also surfaced in your live-state block at
-  session start.
-- further documents (e.g. \`plan.md\`) are authored when their workflow begins;
-  \`docs/\` is empty until then.
+Reference for your own substrate, \`.memory/\`. The behavioural rules - what you
+record, when to refresh, what survives a restart - are in "How you operate"
+above; this just says what each file is for. The other tier, the user-facing
+documents in \`docs/\`, has its own section below.
 
 **\`.memory/\`** - your hidden substrate:
 - \`projectbrief.md\` - what this project is, its goals and hard constraints.
@@ -156,6 +152,30 @@ flat in \`docs/\`, and your own hidden self-managed substrate in \`.memory/\`.
 
 Orders to the crew (coding-agent prompts) are not a file at all: you write them
 straight into your reply, and the session transcript is their record.`;
+
+const DOCS_PROTOCOL = `## Documents (the two-tier model)
+
+- Two tiers, two audiences. \`docs/\` is user-facing: flat markdown the captain
+  reads, created only when a workflow calls for it, empty until then. \`.memory/\`
+  is your own substrate, managed silently and never surfaced unless asked. A
+  user-facing artifact does not go in \`.memory/\`; your private bookkeeping does
+  not go in \`docs/\`.
+- Docs are optional and created on request. Propose one when it is genuinely
+  warranted - a plan, an architectural picture - but create it only when the
+  captain says so. Never spawn a user-facing doc unprompted.
+- Author them with the \`doc\` tool: create / read / str_replace / overwrite /
+  delete / list, over flat \`.md\` files under \`docs/\`. Use str_replace for a
+  targeted edit, overwrite for a rewrite. Keep them current as decisions change.
+- \`plan.md\` - tech-free: the problem, the proposed solution, the value. Its
+  load-bearing section is "what does finished look like": concrete, observable
+  success criteria that ground the work as it proceeds and serve as the test at
+  the end. No implementation detail.
+- \`architecture.md\` - the high-level "how" and the relationships: how the parts
+  connect, the data flow, component and agent relationships, and schemas. The
+  shape of the system, not a code dump.
+- Both are surfaced in your live-state block at session start when they exist, so
+  keep them accurate. A stale plan or architecture doc misleads every future
+  session.`;
 
 const RESEARCH_PROTOCOL = `## Research protocol
 
@@ -274,6 +294,8 @@ export async function buildSystemPrompt(
     PERSONA,
     "---",
     MEMORY_PROTOCOL,
+    "---",
+    DOCS_PROTOCOL,
     "---",
     RESEARCH_PROTOCOL,
     "---",

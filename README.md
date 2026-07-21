@@ -353,8 +353,8 @@ flat over time — small rewritten orientation files plus large append-only logs
 The files are plain markdown — edit them in your editor any time. Templates only
 fill gaps; they never overwrite your content. An instance folder contains no
 `package.json`, no `node_modules`, no build output — it is memory, not an app.
-The protocol reference the model reads (memory layout, research, orders, report
-review) is not a file on disk: it's part of the system prompt, assembled from the
+The protocol reference the model reads (memory layout, documents, research,
+orders, report review) is not a file on disk: it's part of the system prompt, assembled from the
 runtime code, so it always matches the installed version.
 
 ## How a session flows
@@ -412,7 +412,8 @@ is the seed content for a fresh instance.
 **`src/session/`** — `session.ts` is the interactive REPL, slash-commands, and
 the end-of-session sync guard. `prompt.ts` assembles the system prompt in
 altitude order: identity + constraints, operating notes, navigator voice, the
-protocol reference sections (memory / research / orders / report review), then
+protocol reference sections (memory / documents / research / orders / report
+review), then
 live state and the recent-conversation tail (logs excluded). `tools.ts` is the
 internal tool surface exposed to the model plus the executor that binds tools
 to memory + research; it holds the decision gate.
