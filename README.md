@@ -142,7 +142,7 @@ AWS_BEARER_TOKEN_BEDROCK=
 
 CO_MAX_TOKENS=8192
 CO_THINKING=off                    # or `adaptive` for extended thinking
-# CO_EFFORT=xhigh                  # low | medium | high | xhigh | max (default xhigh)
+# CO_EFFORT=high                   # low | medium | high | xhigh | max (default high)
 # CO_DEBUG_TIMING=true             # per-round latency + cache counters
 ```
 
@@ -376,8 +376,17 @@ on exit, the stale-activeContext guard keeps live state honest
 
 ## What makes a turn slow
 
-A turn is one or more round trips to Bedrock. The dominant cost is how much of
-the prompt has to be reprocessed on each one.
+A turn is one or more round trips to Bedrock. Latency is dominated by three
+things, in this order:
+
+**Round trips, not thinking.** A turn that calls a tool costs at least two round
+trips: one to decide and call, one to answer. Memory writes are silent, so a turn
+that looked simple can quietly have been two model calls. The system prompt tells
+the co to answer first and record second, so the visible reply lands in the first
+round instead of after the bookkeeping, and to leave `activeContext.md` alone
+unless orientation genuinely moved — every rewrite of that file is a whole-file
+regeneration and its own round trip. The end-of-session distill still runs
+unconditionally, so nothing is lost by not refreshing mid-conversation.
 
 **Prompt caching.** The system prompt, tool definitions, live state, and the
 conversation so far are re-sent on every round trip. Without caching that whole
@@ -403,6 +412,11 @@ counters that tell you:
 single session, caching has broken and every turn is paying full price. `in` is
 only the tokens after the last breakpoint, so a small number there is the good
 outcome, not a small prompt.
+
+**Effort.** `CO_EFFORT` governs all output tokens, not just thinking, so it also
+sets how many tool calls the co makes — and each of those is another round trip.
+Default `high`. The cold-start greeting deliberately runs at `low`: it blocks the
+first prompt, and it is only summarising state already in its context.
 
 Tool calls within one round run concurrently, so a research turn fetching three
 sources pays one fetch timeout rather than three. Memory writes are serialized

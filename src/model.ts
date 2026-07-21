@@ -188,7 +188,18 @@ export class ModelProvider {
     this.cfg.effort = effort;
   }
 
-  private baseParams(): {
+  /**
+   * Per-request thinking/effort. `effortOverride` lets a caller run one turn
+   * cheaper than the session default (the cold-start greeting does this) without
+   * disturbing cfg.
+   *
+   * Caveat worth knowing: changing effort mid-session may drop the message-tier
+   * cache. Anthropic documents `speed`, `tool_choice`, and thinking parameters
+   * as invalidators but says nothing either way about output_config.effort, so
+   * assume it invalidates. That is fine for the greeting (it is the first call,
+   * nothing is cached yet) and it is the accepted cost of /effort.
+   */
+  private baseParams(effortOverride?: Effort): {
     thinking?: Anthropic.ThinkingConfigParam;
     output_config?: { effort: Effort };
   } {
@@ -199,8 +210,9 @@ export class ModelProvider {
     if (this.cfg.thinking === "adaptive") {
       params.thinking = { type: "adaptive", display: "summarized" };
     }
-    if (this.cfg.effort) {
-      params.output_config = { effort: this.cfg.effort };
+    const effort = effortOverride ?? this.cfg.effort;
+    if (effort) {
+      params.output_config = { effort };
     }
     return params;
   }
@@ -217,11 +229,13 @@ export class ModelProvider {
     executor: ToolExecutor;
     handlers?: StreamHandlers;
     maxToolRounds?: number;
+    /** Run this turn at a different effort than the session default. */
+    effort?: Effort;
   }): Promise<{ messages: MessageParam[]; finalText: string }> {
     const { system, tools, executor, handlers } = args;
     const messages = [...args.messages];
     const maxRounds = args.maxToolRounds ?? 12;
-    const base = this.baseParams();
+    const base = this.baseParams(args.effort);
     const timing = this.cfg.debugTiming ? handlers?.onTiming : undefined;
     // Built once per turn: neither the tool list nor the system prompt changes
     // between rounds, and rebuilding them would churn the cached prefix.

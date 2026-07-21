@@ -67,8 +67,9 @@ test("a piped session runs every command, not just the first", async () => {
       ["t"],
       "/effort low\n/effort high\n/effort max\n/exit\n",
     );
-    // Each command must have produced its own transition line, in order.
-    assert.match(out, /effort: xhigh → low/);
+    // Each command must have produced its own transition line, in order. The
+    // first transition starts from the configured default (see loadConfig).
+    assert.match(out, /effort: high → low/);
     assert.match(out, /effort: low → high/);
     assert.match(out, /effort: high → max/);
   });
@@ -77,7 +78,7 @@ test("a piped session runs every command, not just the first", async () => {
 test("a piped session ends cleanly at EOF with no trailing /exit", async () => {
   await withInstance(async (coHome) => {
     const out = await runCli(coHome, ["t"], "/effort low\n/effort\n");
-    assert.match(out, /effort: xhigh → low/);
+    assert.match(out, /effort: high → low/);
     assert.match(out, /effort: low {2}\(levels:/);
     assert.match(out, /bye\./);
   });

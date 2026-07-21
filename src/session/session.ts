@@ -1,6 +1,6 @@
 import * as readline from "node:readline";
 import path from "node:path";
-import { EFFORT_LEVELS, parseEffort, type Config } from "../config.js";
+import { EFFORT_LEVELS, parseEffort, type Config, type Effort } from "../config.js";
 import type { InstancePaths } from "../paths.js";
 import { ModelProvider, type MessageParam } from "../model.js";
 import { buildSystemPrompt } from "./prompt.js";
@@ -283,11 +283,22 @@ async function runOpeningGreeting(state: SessionState): Promise<void> {
       " say so plainly and ask what we're charting, rather than inventing history." +
       " Do not call any tools; do not list open questions exhaustively. Keep it tight.",
   });
-  await drive(state);
+  // Deliberately low effort. This turn blocks the first prompt, so its latency is
+  // the most visible in the whole session — and it is the least demanding work
+  // the co does: summarise state that is already sitting in the system prompt,
+  // no tools, no reasoning. Spending session-default effort here bought nothing
+  // but a longer wait before the captain could type.
+  await drive(state, "low");
 }
 
-/** Run the model to completion for the current message history. */
-async function drive(state: SessionState): Promise<void> {
+/**
+ * Run the model to completion for the current message history.
+ *
+ * `effort` runs this one turn at a different depth than the session default —
+ * used by the cold-start greeting, which is pure summarisation of context the
+ * model already has and does not need the session's reasoning depth.
+ */
+async function drive(state: SessionState, effort?: Effort): Promise<void> {
   const { io } = state;
   const executor = makeExecutor({
     paths: state.paths,
@@ -325,6 +336,7 @@ async function drive(state: SessionState): Promise<void> {
       messages: state.messages,
       tools: toolDefinitions(),
       executor,
+      ...(effort ? { effort } : {}),
       handlers: {
         // Only fires under CO_DEBUG_TIMING. Rendered through io so it lands in
         // the TUI frame rather than corrupting the alt screen.

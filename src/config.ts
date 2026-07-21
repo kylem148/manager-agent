@@ -115,12 +115,18 @@ export function loadConfig(): Config {
   const thinkingRaw = (env("CO_THINKING") ?? "adaptive").toLowerCase();
   const thinking = thinkingRaw === "off" ? "off" : "adaptive";
 
-  // Effort controls thinking depth and overall token spend. Default xhigh: it is
-  // the strongest agentic setting on Opus 4.8, and higher effort is what pulls it
-  // away from over-literal, scoped-to-the-letter answers toward surfacing better
-  // approaches. Lower it (CO_EFFORT=high/medium/low) to trade rigor for latency.
-  // /effort overrides this per-session at runtime.
-  const effort: Effort = parseEffort(env("CO_EFFORT")) ?? "xhigh";
+  // Effort controls thinking depth and overall token spend. Default high, which
+  // is what Anthropic recommends for Opus 4.8 on "intelligence-sensitive
+  // workloads" — they reserve xhigh for coding and agentic use, and a co-manager
+  // is explicitly neither: it reasons and writes prose, it never touches a repo.
+  // This used to default to xhigh on the theory that more effort pulls the model
+  // away from over-literal answers. It does, but it also buys thinking depth we
+  // mostly don't spend, on every turn, including "what did we decide about X".
+  // Effort governs ALL output tokens, not just thinking, so high also means
+  // fewer and more consolidated tool calls — which is the second-order win here,
+  // since every extra tool call is another full round trip.
+  // Raise it per-session with /effort, or set CO_EFFORT to make a change stick.
+  const effort: Effort = parseEffort(env("CO_EFFORT")) ?? "high";
 
   const searchRaw = (env("CO_SEARCH_PROVIDER") ?? "auto").toLowerCase();
   const searchProvider: SearchProviderName = (
