@@ -404,6 +404,11 @@ single session, caching has broken and every turn is paying full price. `in` is
 only the tokens after the last breakpoint, so a small number there is the good
 outcome, not a small prompt.
 
+Tool calls within one round run concurrently, so a research turn fetching three
+sources pays one fetch timeout rather than three. Memory writes are serialized
+behind a single queue (`memory/writequeue.ts`) so that concurrency can't
+interleave a read-modify-write.
+
 ## Architecture notes
 
 `src/` is one level deep: shared primitives and the bin entry sit at the root,
@@ -416,7 +421,7 @@ src/
   cli/       auth.ts doctor.ts modelsdoctor.ts
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
   session/   session.ts prompt.ts tools.ts
-  memory/    memory.ts docs.ts templates.ts
+  memory/    memory.ts docs.ts templates.ts writequeue.ts
 ```
 
 Tests live next to the code they cover (`src/tui/keys.test.ts`, etc.).
@@ -438,7 +443,10 @@ read/rewrite, append-only logs with decision-id minting, log search / range
 read, archive, and mtime staleness detection. `docs.ts` is the user-facing `docs/`
 tier: the six doc operations, the name/realpath sandbox that keeps them inside
 `docs/`, and the cold-start read of `architecture.md` / `plan.md`. `templates.ts`
-is the seed content for a fresh instance.
+is the seed content for a fresh instance. `writequeue.ts` is the single lane every
+mutating memory/doc operation runs through, so the concurrent tool calls in one
+model round can't interleave a read-modify-write (duplicate decision ids, a lost
+doc edit).
 
 **`src/session/`** — `session.ts` is the interactive REPL, slash-commands, and
 the end-of-session sync guard. `prompt.ts` assembles the system prompt in

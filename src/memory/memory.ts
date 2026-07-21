@@ -17,6 +17,7 @@ import {
   activeContextTemplate,
   logHeader,
 } from "./templates.js";
+import { serializeWrite } from "./writequeue.js";
 
 const LOG_TITLES: Record<LogName, string> = {
   decisions: "Decisions",
@@ -529,21 +530,25 @@ export async function appendLog(
   log: LogName,
   entry: string,
 ): Promise<AppendResult> {
-  const file = p.logFile(log);
-  await ensureDir(path.dirname(file));
+  // Serialized: minting a decision id is a read-then-write, so two concurrent
+  // append_decision calls in one tool round would otherwise mint the same id.
+  return serializeWrite(async () => {
+    const file = p.logFile(log);
+    await ensureDir(path.dirname(file));
 
-  let id: string | undefined;
-  let header: string;
-  if (log === "decisions") {
-    id = await mintDecisionId(file);
-    header = `\n## ${id} — ${nowStamp()}\n\n`;
-  } else {
-    header = `\n## ${nowStamp()}\n\n`;
-  }
+    let id: string | undefined;
+    let header: string;
+    if (log === "decisions") {
+      id = await mintDecisionId(file);
+      header = `\n## ${id} — ${nowStamp()}\n\n`;
+    } else {
+      header = `\n## ${nowStamp()}\n\n`;
+    }
 
-  const block = `${header}${entry.trim()}\n`;
-  await fsp.appendFile(file, block, "utf8");
-  return { file, id };
+    const block = `${header}${entry.trim()}\n`;
+    await fsp.appendFile(file, block, "utf8");
+    return { file, id };
+  });
 }
 
 async function mintDecisionId(file: string): Promise<string> {
@@ -565,10 +570,12 @@ async function mintDecisionId(file: string): Promise<string> {
 
 /** Rewrite a live-state file in place. */
 export async function rewriteLive(p: InstancePaths, file: LiveFile, content: string): Promise<void> {
-  const dest = p.liveFile(file);
-  await ensureDir(path.dirname(dest));
-  const trimmed = content.endsWith("\n") ? content : content + "\n";
-  await fsp.writeFile(dest, trimmed, "utf8");
+  await serializeWrite(async () => {
+    const dest = p.liveFile(file);
+    await ensureDir(path.dirname(dest));
+    const trimmed = content.endsWith("\n") ? content : content + "\n";
+    await fsp.writeFile(dest, trimmed, "utf8");
+  });
 }
 
 /**

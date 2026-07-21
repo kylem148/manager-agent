@@ -4,7 +4,7 @@ import type { ModelConfig } from "./config.js";
 import { ModelProvider, type MessageParam, type Tool } from "./model.js";
 
 /**
- * Tests for prompt-cache breakpoint placement.
+ * Tests for prompt-cache breakpoint placement and the parallel tool round.
  *
  * The cache invariants are worth pinning down because breaking them fails
  * silently: too many breakpoints is a hard 400, but a breakpoint in the wrong
@@ -129,6 +129,44 @@ test("breakpoints never leak into the caller's message history", async () => {
   await provider.runTurn(turn(messages));
 
   assert.deepEqual(messages, before);
+});
+
+test("a tool round runs its calls concurrently and returns results in order", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  const toolRound = {
+    content: [
+      { type: "tool_use", id: "t1", name: "a", input: {} },
+      { type: "tool_use", id: "t2", name: "b", input: {} },
+    ],
+    stop_reason: "tool_use",
+    usage: {},
+  };
+  const sent = stubClient(provider, [toolRound, endTurn]);
+
+  let running = 0;
+  let peak = 0;
+  const executor = async (b: any) => {
+    running++;
+    peak = Math.max(peak, running);
+    await new Promise((r) => setTimeout(r, 10));
+    running--;
+    return { tool_use_id: b.id, content: `r-${b.id}` };
+  };
+
+  const result = await provider.runTurn({
+    ...turn([{ role: "user", content: "hi" }]),
+    executor,
+  });
+
+  assert.equal(peak, 2, "both tool calls should have been in flight at once");
+
+  // Results must come back as one user message, in the order the model asked.
+  const toolResults = sent[1]!.messages.at(-1)!.content as Array<Record<string, unknown>>;
+  assert.deepEqual(
+    toolResults.map((r) => r.tool_use_id),
+    ["t1", "t2"],
+  );
+  assert.equal(result.finalText, "ok");
 });
 
 test("a tool round still respects the breakpoint ceiling", async () => {

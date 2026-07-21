@@ -245,7 +245,6 @@ export class ModelProvider {
         ...base,
       });
 
-      let sawToolInThisRound = false;
       for await (const event of stream) {
         // Thinking deltas are deliberately not surfaced: the model still thinks
         // (see baseParams) and thinking blocks are still preserved verbatim in
@@ -286,21 +285,24 @@ export class ModelProvider {
         return { messages, finalText };
       }
 
-      sawToolInThisRound = true;
-      const results: ContentBlockParam[] = [];
-      for (const tu of toolUses) {
-        handlers?.onToolUse?.(tu.name, tu.input);
-        const r = await executor(tu);
-        results.push({
-          type: "tool_result",
-          tool_use_id: r.tool_use_id,
-          content: r.content,
-          ...(r.is_error ? { is_error: true } : {}),
-        });
-      }
-      messages.push({ role: "user", content: results });
+      // Announce every call before any of them run, so the UI reflects the whole
+      // batch rather than revealing it one at a time.
+      for (const tu of toolUses) handlers?.onToolUse?.(tu.name, tu.input);
 
-      if (!sawToolInThisRound) break;
+      // Execute concurrently. A round asking for three sources serially costs up
+      // to 3x the fetch timeout; in parallel it costs one. Promise.all preserves
+      // input order, so results still line up with toolUses, and the API requires
+      // all results for a round to come back in a single user message — which is
+      // what we push below. Memory writes are serialized inside the executor
+      // (see memory.ts), so concurrency here can't interleave them.
+      const executed = await Promise.all(toolUses.map((tu) => executor(tu)));
+      const results: ContentBlockParam[] = executed.map((r) => ({
+        type: "tool_result",
+        tool_use_id: r.tool_use_id,
+        content: r.content,
+        ...(r.is_error ? { is_error: true } : {}),
+      }));
+      messages.push({ role: "user", content: results });
     }
 
     // Ran out of tool rounds; return whatever text we have.

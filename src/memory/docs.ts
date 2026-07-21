@@ -1,6 +1,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { InstancePaths } from "../paths.js";
+import { serializeWrite } from "./writequeue.js";
 
 /**
  * The user-facing document tier: flat markdown under an instance's `docs/`.
@@ -135,20 +136,22 @@ export async function createDoc(
   name: string,
   content: string,
 ): Promise<{ name: string; bytes: number }> {
-  const file = await resolveDocPath(paths, name);
-  const body = content.endsWith("\n") ? content : content + "\n";
-  try {
-    await fsp.writeFile(file, body, { encoding: "utf8", flag: "wx" });
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new DocError(
-        "DOC_EXISTS",
-        `"${name}" already exists. Use the overwrite command to replace it, or str_replace to edit part of it.`,
-      );
+  return serializeWrite(async () => {
+    const file = await resolveDocPath(paths, name);
+    const body = content.endsWith("\n") ? content : content + "\n";
+    try {
+      await fsp.writeFile(file, body, { encoding: "utf8", flag: "wx" });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new DocError(
+          "DOC_EXISTS",
+          `"${name}" already exists. Use the overwrite command to replace it, or str_replace to edit part of it.`,
+        );
+      }
+      throw e;
     }
-    throw e;
-  }
-  return { name, bytes: Buffer.byteLength(body) };
+    return { name, bytes: Buffer.byteLength(body) };
+  });
 }
 
 export async function readDoc(paths: InstancePaths, name: string): Promise<string> {
@@ -170,32 +173,36 @@ export async function strReplaceDoc(
   oldStr: string,
   newStr: string,
 ): Promise<{ name: string; replacedAtLine: number }> {
-  const file = await resolveDocPath(paths, name);
-  const content = await readIfExists(file);
-  if (content === null) throw notFound(name);
+  // Serialized: read-modify-write, so a concurrent write to the same doc within
+  // one tool round would be silently lost. See writequeue.ts.
+  return serializeWrite(async () => {
+    const file = await resolveDocPath(paths, name);
+    const content = await readIfExists(file);
+    if (content === null) throw notFound(name);
 
-  if (oldStr === "") {
-    throw new DocError(
-      "NO_MATCH",
-      `old_str is empty. Give the exact text to replace, or use overwrite to rewrite "${name}" in full.`,
-    );
-  }
-  const first = content.indexOf(oldStr);
-  if (first === -1) {
-    throw new DocError(
-      "NO_MATCH",
-      `old_str was not found in "${name}". Read the doc and copy the target text exactly, whitespace included.`,
-    );
-  }
-  if (content.indexOf(oldStr, first + 1) !== -1) {
-    throw new DocError(
-      "MULTIPLE_MATCHES",
-      `old_str appears more than once in "${name}". Include more surrounding context to make it unique.`,
-    );
-  }
-  const updated = content.slice(0, first) + newStr + content.slice(first + oldStr.length);
-  await fsp.writeFile(file, updated, "utf8");
-  return { name, replacedAtLine: content.slice(0, first).split("\n").length };
+    if (oldStr === "") {
+      throw new DocError(
+        "NO_MATCH",
+        `old_str is empty. Give the exact text to replace, or use overwrite to rewrite "${name}" in full.`,
+      );
+    }
+    const first = content.indexOf(oldStr);
+    if (first === -1) {
+      throw new DocError(
+        "NO_MATCH",
+        `old_str was not found in "${name}". Read the doc and copy the target text exactly, whitespace included.`,
+      );
+    }
+    if (content.indexOf(oldStr, first + 1) !== -1) {
+      throw new DocError(
+        "MULTIPLE_MATCHES",
+        `old_str appears more than once in "${name}". Include more surrounding context to make it unique.`,
+      );
+    }
+    const updated = content.slice(0, first) + newStr + content.slice(first + oldStr.length);
+    await fsp.writeFile(file, updated, "utf8");
+    return { name, replacedAtLine: content.slice(0, first).split("\n").length };
+  });
 }
 
 /** Replace a doc's whole content. Creates it if it does not exist yet. */
@@ -204,27 +211,31 @@ export async function overwriteDoc(
   name: string,
   content: string,
 ): Promise<{ name: string; bytes: number; created: boolean }> {
-  const file = await resolveDocPath(paths, name);
-  const existed = (await readIfExists(file)) !== null;
-  const body = content.endsWith("\n") ? content : content + "\n";
-  await fsp.writeFile(file, body, "utf8");
-  return { name, bytes: Buffer.byteLength(body), created: !existed };
+  return serializeWrite(async () => {
+    const file = await resolveDocPath(paths, name);
+    const existed = (await readIfExists(file)) !== null;
+    const body = content.endsWith("\n") ? content : content + "\n";
+    await fsp.writeFile(file, body, "utf8");
+    return { name, bytes: Buffer.byteLength(body), created: !existed };
+  });
 }
 
 /** Delete an existing doc. Refuses anything that is not an existing plain file. */
 export async function deleteDoc(paths: InstancePaths, name: string): Promise<{ name: string }> {
-  const file = await resolveDocPath(paths, name);
-  let stat;
-  try {
-    stat = await fsp.lstat(file);
-  } catch {
-    throw notFound(name);
-  }
-  if (!stat.isFile()) {
-    throw new DocError("DOC_NOT_A_FILE", `"${name}" is not a regular file; refusing to delete it.`);
-  }
-  await fsp.rm(file);
-  return { name };
+  return serializeWrite(async () => {
+    const file = await resolveDocPath(paths, name);
+    let stat;
+    try {
+      stat = await fsp.lstat(file);
+    } catch {
+      throw notFound(name);
+    }
+    if (!stat.isFile()) {
+      throw new DocError("DOC_NOT_A_FILE", `"${name}" is not a regular file; refusing to delete it.`);
+    }
+    await fsp.rm(file);
+    return { name };
+  });
 }
 
 /**
