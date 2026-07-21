@@ -347,9 +347,9 @@ flat over time — small rewritten orientation files plus large append-only logs
 The files are plain markdown — edit them in your editor any time. Templates only
 fill gaps; they never overwrite your content. An instance folder contains no
 `package.json`, no `node_modules`, no build output — it is memory, not an app.
-The protocol reference the model reads (memory layout, research, orders) is not a
-file on disk: it's part of the system prompt, assembled from the runtime code, so
-it always matches the installed version.
+The protocol reference the model reads (memory layout, research, orders, report
+review) is not a file on disk: it's part of the system prompt, assembled from the
+runtime code, so it always matches the installed version.
 
 ## How a session flows
 
@@ -383,8 +383,8 @@ on exit, the stale-activeContext guard keeps live state honest
   executor that binds tools to memory + research. Holds the decision gate.
 - **`src/prompt.ts`** — system-prompt assembly in altitude order: identity +
   constraints, operating notes, navigator voice, the protocol reference sections
-  (memory / research / orders), then live state and the recent-conversation tail
-  (logs excluded).
+  (memory / research / orders / report review), then live state and the
+  recent-conversation tail (logs excluded).
 - **`src/session.ts`** — the interactive REPL, slash-commands, and the
   end-of-session sync guard.
 - **`src/tui.ts`** / **`src/keys.ts`** / **`src/wrap.ts`** — the full-screen
