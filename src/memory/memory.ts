@@ -11,7 +11,7 @@ import {
   type InstancePaths,
   type LiveFile,
   type LogName,
-} from "./paths.js";
+} from "../paths.js";
 import {
   projectbriefTemplate,
   activeContextTemplate,

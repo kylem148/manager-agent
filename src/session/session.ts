@@ -1,8 +1,8 @@
 import * as readline from "node:readline";
 import path from "node:path";
-import { EFFORT_LEVELS, parseEffort, type Config } from "./config.js";
-import type { InstancePaths } from "./paths.js";
-import { ModelProvider, type MessageParam } from "./model.js";
+import { EFFORT_LEVELS, parseEffort, type Config } from "../config.js";
+import type { InstancePaths } from "../paths.js";
+import { ModelProvider, type MessageParam } from "../model.js";
 import { buildSystemPrompt } from "./prompt.js";
 import {
   toolDefinitions,
@@ -20,12 +20,12 @@ import {
   startTranscript,
   appendTranscript,
   type TranscriptHandle,
-} from "./memory.js";
-import { c, line, write } from "./ui.js";
-import { Tui, type SessionIO } from "./tui.js";
-import { SLASH_COMMANDS } from "./commands.js";
-import { pirateBanner } from "./banner.js";
-import { LOG_NAMES, type LogName } from "./paths.js";
+} from "../memory/memory.js";
+import { c, line, write } from "../ui.js";
+import { Tui, type SessionIO } from "../tui/tui.js";
+import { SLASH_COMMANDS } from "../tui/commands.js";
+import { pirateBanner } from "../tui/banner.js";
+import { LOG_NAMES, type LogName } from "../paths.js";
 
 /**
  * Interactive terminal session for one co-manager instance.

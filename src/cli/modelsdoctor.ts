@@ -1,8 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { AnthropicBedrock, AnthropicBedrockMantle } from "@anthropic-ai/bedrock-sdk";
-import type { Config } from "./config.js";
-import { authModeLabel, bearerMismatchWarning, readClaudeCodeSettings } from "./config.js";
-import { c, line } from "./ui.js";
+import type { Config } from "../config.js";
+import { authModeLabel, bearerMismatchWarning, readClaudeCodeSettings } from "../config.js";
+import { c, line } from "../ui.js";
 
 /**
  * `co doctor --models` — empirically determine which Claude models actually

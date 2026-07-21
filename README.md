@@ -369,29 +369,56 @@ on exit, the stale-activeContext guard keeps live state honest
 
 ## Architecture notes
 
+`src/` is one level deep: shared primitives and the bin entry sit at the root,
+and everything else groups by feature. No barrel files — imports name the file
+they want, so a cold start only loads what it uses.
+
+```
+src/
+  index.ts config.ts paths.ts ui.ts model.ts research.ts
+  cli/       auth.ts doctor.ts modelsdoctor.ts
+  tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
+  session/   session.ts prompt.ts tools.ts
+  memory/    memory.ts templates.ts
+```
+
+Tests live next to the code they cover (`src/tui/keys.test.ts`, etc.).
+
+**Root — shared and entry:**
+
+- **`src/index.ts`** — CLI dispatch and the `dist/index.js` bin entry.
 - **`src/config.ts`** — env/`.env` loading; Bedrock + research config. No
   hardcoded secrets.
 - **`src/paths.ts`** — the two-tier folder layout and instance path resolution.
-- **`src/memory.ts`** — instance scaffolding, live-state read/rewrite,
-  append-only logs with decision-id minting, log search / range read, archive,
-  and mtime staleness detection.
+- **`src/ui.ts`** — colour and line-output primitives used by everything.
 - **`src/model.ts`** — `AnthropicBedrock` wrapper: streaming turns, the tool-use
   loop, thinking/effort config. Bedrock is the only backend (V1).
 - **`src/research.ts`** — `SearchProvider` (Brave/Tavily/SearXNG) and `Fetcher`
   (Jina/HTTP) behind small interfaces; everything optional.
-- **`src/tools.ts`** — the internal tool surface exposed to the model, and the
-  executor that binds tools to memory + research. Holds the decision gate.
-- **`src/prompt.ts`** — system-prompt assembly in altitude order: identity +
-  constraints, operating notes, navigator voice, the protocol reference sections
-  (memory / research / orders / report review), then live state and the
-  recent-conversation tail (logs excluded).
-- **`src/session.ts`** — the interactive REPL, slash-commands, and the
-  end-of-session sync guard.
-- **`src/tui.ts`** / **`src/keys.ts`** / **`src/wrap.ts`** — the full-screen
-  terminal UI: transcript buffer + scrolling, the multi-line line editor, and
-  ANSI-aware wrapping. `keys.ts` is the pure decode table that maps both legacy
-  control bytes and enhanced-protocol CSI-u sequences onto one set of bindings.
-- **`src/doctor.ts`** / **`src/index.ts`** — diagnostics and CLI dispatch.
+
+**`src/memory/`** — `memory.ts` holds instance scaffolding, live-state
+read/rewrite, append-only logs with decision-id minting, log search / range
+read, archive, and mtime staleness detection. `templates.ts` is the seed
+content for a fresh instance.
+
+**`src/session/`** — `session.ts` is the interactive REPL, slash-commands, and
+the end-of-session sync guard. `prompt.ts` assembles the system prompt in
+altitude order: identity + constraints, operating notes, navigator voice, the
+protocol reference sections (memory / research / orders / report review), then
+live state and the recent-conversation tail (logs excluded). `tools.ts` is the
+internal tool surface exposed to the model plus the executor that binds tools
+to memory + research; it holds the decision gate.
+
+**`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
+the multi-line line editor, markdown → ANSI rendering, and ANSI-aware wrapping.
+`keys.ts` is the pure decode table that maps both legacy control bytes and
+enhanced-protocol CSI-u sequences onto one set of bindings. `tui.ts` is
+deliberately one large file: the render loop, input handling, and scroll state
+share mutable state, and splitting them across modules would mean exporting
+that state rather than encapsulating it.
+
+**`src/cli/`** — `doctor.ts` and `modelsdoctor.ts` diagnostics, and `auth.ts`
+for writing the Bedrock token.
 
 ### V1 scope and extension points
 

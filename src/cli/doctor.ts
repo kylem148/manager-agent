@@ -3,13 +3,13 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import type { Config } from "./config.js";
-import { authModeLabel, bearerMismatchWarning } from "./config.js";
-import { describeSearch } from "./research.js";
-import { ModelProvider } from "./model.js";
-import { instancesDir, instancePaths } from "./paths.js";
-import { listInstances } from "./memory.js";
-import { c, line } from "./ui.js";
+import type { Config } from "../config.js";
+import { authModeLabel, bearerMismatchWarning } from "../config.js";
+import { describeSearch } from "../research.js";
+import { ModelProvider } from "../model.js";
+import { instancesDir, instancePaths } from "../paths.js";
+import { listInstances } from "../memory/memory.js";
+import { c, line } from "../ui.js";
 
 type Status = "ok" | "warn" | "fail";
 
@@ -27,12 +27,13 @@ function mark(s: Status): string {
 
 /** Resolve the installed runtime path + version from this module's location. */
 function runtimeInfo(): { entry: string; version: string } {
-  const here = fileURLToPath(import.meta.url); // <pkg>/dist/doctor.js
-  const entry = path.join(path.dirname(here), "index.js");
+  const here = fileURLToPath(import.meta.url); // <pkg>/dist/cli/doctor.js
+  const distRoot = path.dirname(path.dirname(here)); // <pkg>/dist
+  const entry = path.join(distRoot, "index.js");
   let version = "unknown";
   try {
     const pkg = JSON.parse(
-      fs.readFileSync(path.join(path.dirname(here), "..", "package.json"), "utf8"),
+      fs.readFileSync(path.join(distRoot, "..", "package.json"), "utf8"),
     ) as { version?: string };
     if (pkg.version) version = pkg.version;
   } catch {

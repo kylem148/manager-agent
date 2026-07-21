@@ -1,8 +1,8 @@
 import path from "node:path";
-import type { InstancePaths, LiveFile } from "./paths.js";
-import { readLiveMemory, readTranscriptTail, type TranscriptTurn } from "./memory.js";
-import { describeSearch } from "./research.js";
-import type { ResearchConfig } from "./config.js";
+import type { InstancePaths, LiveFile } from "../paths.js";
+import { readLiveMemory, readTranscriptTail, type TranscriptTurn } from "../memory/memory.js";
+import { describeSearch } from "../research.js";
+import type { ResearchConfig } from "../config.js";
 
 /**
  * Assemble the system prompt in altitude order: absolute identity + constraints,

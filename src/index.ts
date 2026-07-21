@@ -10,14 +10,14 @@ import {
   instanceExists,
   instanceStats,
   listInstances,
-} from "./memory.js";
+} from "./memory/memory.js";
 import { instancePaths, isValidInstanceName } from "./paths.js";
-import { runSession } from "./session.js";
-import { runDoctor } from "./doctor.js";
-import { runModelsDoctor } from "./modelsdoctor.js";
-import { runAuthBedrock } from "./auth.js";
+import { runSession } from "./session/session.js";
+import { runDoctor } from "./cli/doctor.js";
+import { runModelsDoctor } from "./cli/modelsdoctor.js";
+import { runAuthBedrock } from "./cli/auth.js";
 import { c, line } from "./ui.js";
-import { restoreTerminal } from "./tui.js";
+import { restoreTerminal } from "./tui/tui.js";
 
 /**
  * CLI entry. Usage:

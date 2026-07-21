@@ -31,7 +31,7 @@
  */
 
 import { wrapText, wrapLine, visibleWidth, sliceVisibleText, highlightRange } from "./wrap.js";
-import { c, colorEnabled } from "./ui.js";
+import { c, colorEnabled } from "../ui.js";
 import { classifyToken, completeCommand } from "./commands.js";
 import { MarkdownRenderer, renderTable, type Rendered } from "./markdown.js";
 import {

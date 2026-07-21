@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
  * Bedrock credentials.
  */
 
-const SRC = path.dirname(fileURLToPath(import.meta.url));
+const SRC = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const ROOT = path.dirname(SRC);
 const TSX = path.join(ROOT, "node_modules", ".bin", "tsx");
 const ENTRY = path.join(SRC, "index.ts");

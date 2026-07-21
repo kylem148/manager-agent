@@ -1,15 +1,15 @@
-import type { Tool, ToolUseBlock, ToolResult } from "./model.js";
-import { LOG_NAMES, type InstancePaths, type LiveFile, type LogName } from "./paths.js";
-import type { ResearchConfig } from "./config.js";
+import type { Tool, ToolUseBlock, ToolResult } from "../model.js";
+import { LOG_NAMES, type InstancePaths, type LiveFile, type LogName } from "../paths.js";
+import type { ResearchConfig } from "../config.js";
 import {
   appendLog,
   rewriteLive,
   searchLog,
   readLogRange,
   readLiveMemory,
-} from "./memory.js";
-import { searchWeb, fetchUrl } from "./research.js";
-import type { SearchOptions } from "./research.js";
+} from "../memory/memory.js";
+import { searchWeb, fetchUrl } from "../research.js";
+import type { SearchOptions } from "../research.js";
 
 /**
  * The co-manager's internal capability surface, exposed to the model as tools.

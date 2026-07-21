@@ -35,7 +35,7 @@
  *    falls through to its own raw text.
  */
 
-import { colorEnabled } from "./ui.js";
+import { colorEnabled } from "../ui.js";
 import { visibleWidth, wrapLine } from "./wrap.js";
 
 const ESC = "\x1b";

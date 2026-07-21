@@ -22,7 +22,7 @@
  */
 
 import { visibleWidth } from "./wrap.js";
-import { c } from "./ui.js";
+import { c } from "../ui.js";
 
 /** Frame chrome per row: "│ " on the left + " │" on the right = 4 columns. */
 const CHROME = 4;

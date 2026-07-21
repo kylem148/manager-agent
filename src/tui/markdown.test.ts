@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MarkdownRenderer, renderTable, highlightCode, type Rendered } from "./markdown.js";
 import { stripAnsi, visibleWidth } from "./wrap.js";
-import { colorEnabled } from "./ui.js";
+import { colorEnabled } from "../ui.js";
 
 /**
  * Tests for markdown → ANSI rendering, with tables as the main event.

@@ -4,7 +4,7 @@ import { mkdtemp, rm, mkdir, writeFile, readFile, readdir } from "node:fs/promis
 import os from "node:os";
 import path from "node:path";
 import { migrateInstanceLayout } from "./memory.js";
-import { instancePaths } from "./paths.js";
+import { instancePaths } from "../paths.js";
 
 /**
  * Migration from the pre-reorg layout (live/ + logs/) to docs/ + .memory/.

@@ -2,9 +2,9 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import * as readline from "node:readline";
-import type { Config } from "./config.js";
-import { redactSecret } from "./config.js";
-import { c, line } from "./ui.js";
+import type { Config } from "../config.js";
+import { redactSecret } from "../config.js";
+import { c, line } from "../ui.js";
 
 /**
  * `co auth bedrock` — set up the Bedrock bearer token for comanager.
