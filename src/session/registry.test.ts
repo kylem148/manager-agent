@@ -54,7 +54,8 @@ test("fallback dispatch runs a fake agent and fires a done review with the captu
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
-    config.commandTemplate = `sh -c 'echo HELLO-FROM-AGENT'`;
+    config.agents = [{ name: "fake", command: `sh -c 'echo HELLO-FROM-AGENT'` }];
+    config.defaultAgent = "fake";
     const done = onCompleteOnce();
     await withRegistry(
       { paths, config, onComplete: done.handler, transportOverride: "fallback", pollIntervalMs: 25 },
@@ -80,7 +81,8 @@ test("a nonzero agent exit is reported as a failed job", async () => {
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
-    config.commandTemplate = `sh -c 'echo nope; exit 7'`;
+    config.agents = [{ name: "fake", command: `sh -c 'echo nope; exit 7'` }];
+    config.defaultAgent = "fake";
     const done = onCompleteOnce();
     await withRegistry(
       { paths, config, onComplete: done.handler, transportOverride: "fallback", pollIntervalMs: 25 },
@@ -96,12 +98,41 @@ test("a nonzero agent exit is reported as a failed job", async () => {
   }
 });
 
+test("a confirm-time agent override selects that agent's command for the run", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    // Two agents that print distinct markers; default is cc, we override to ccw.
+    config.agents = [
+      { name: "cc", command: `sh -c 'echo RAN-CC'` },
+      { name: "ccw", command: `sh -c 'echo RAN-CCW'` },
+    ];
+    config.defaultAgent = "cc";
+    const done = onCompleteOnce();
+    await withRegistry(
+      { paths, config, onComplete: done.handler, transportOverride: "fallback", pollIntervalMs: 25 },
+      async (reg) => {
+        const job = await reg.dispatch("do it", "ccw");
+        assert.equal(job.agentName, "ccw", "the override is recorded on the job");
+        const finished = await done.promise;
+        const captured = await fsp.readFile(finished.captureFile, "utf8");
+        assert.ok(captured.includes("RAN-CCW"), "the overridden agent ran");
+        assert.ok(!captured.includes("RAN-CC\n"), "the default agent did not run");
+      },
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
 test("a hung agent is killed and failed when it exceeds the wall-clock timeout", async () => {
   const { paths, cleanup } = await tmpInstance();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
-    config.commandTemplate = `sh -c 'sleep 30'`;
+    config.agents = [{ name: "fake", command: `sh -c 'sleep 30'` }];
+    config.defaultAgent = "fake";
     config.caps = { timeoutSec: 1 };
     const done = onCompleteOnce();
     await withRegistry(

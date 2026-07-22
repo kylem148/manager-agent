@@ -29,7 +29,13 @@ import { Tui, WAKE_SENTINEL, type SessionIO, type DocSource } from "../tui/tui.j
 import { SLASH_COMMANDS } from "../tui/commands.js";
 import { pirateBanner } from "../tui/banner.js";
 import { LOG_NAMES, type LogName } from "../paths.js";
-import { readDispatchConfig, displayCommand, type DispatchConfig } from "./dispatchconfig.js";
+import {
+  readDispatchConfig,
+  displayCommand,
+  resolveAgent,
+  resolveAgentCommand,
+  type DispatchConfig,
+} from "./dispatchconfig.js";
 import { DispatchRegistry, type Job } from "./registry.js";
 
 /**
@@ -209,7 +215,16 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
 
   const system = await buildSystemPrompt(paths, cfg.research, {
     excludeTranscript: transcript.file,
-    dispatch: dispatch ? { repoPath: dispatch.repoPath, transport: dispatch.anchor ? "visible pane (Ghostty) with background fallback" : "background (no crew pane designated yet)" } : null,
+    dispatch: dispatch
+      ? {
+          repoPath: dispatch.repoPath,
+          transport: dispatch.anchor
+            ? "visible pane (Ghostty) with background fallback"
+            : "background (no crew pane designated yet)",
+          agents: dispatch.agents.map((a) => a.name),
+          defaultAgent: dispatch.defaultAgent,
+        }
+      : null,
   });
 
   // The scroll/selection hint only applies to the interactive TUI; it would be
@@ -288,18 +303,35 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
       if (raw === "") continue;
 
       // Confirm interlock: while a dispatch is armed, ONLY a typed `confirm`
-      // (case-insensitive) fires it. Anything else cancels the armed dispatch and
-      // is then handled as ordinary input. There is no other path to launch a
-      // dispatch, so nothing runs without this explicit confirmation.
+      // (case-insensitive) fires it. A bare `confirm` uses the default crew
+      // agent; `confirm <name>` targets a specific one for this dispatch only.
+      // Anything that isn't a confirm cancels the armed dispatch and is then
+      // handled as ordinary input. There is no other path to launch a dispatch,
+      // so nothing runs without this explicit confirmation.
       if (state.armed) {
-        const armed = state.armed;
-        state.armed = null;
-        io.setConfirmBanner(null);
-        if (raw.toLowerCase() === "confirm") {
+        const confirm = parseConfirm(raw);
+        if (confirm.isConfirm) {
+          const config = state.dispatch;
+          // An explicit agent name must resolve; if it doesn't, keep the order
+          // armed (don't make the captain re-draft) and show the valid names.
+          if (confirm.agent && config && !resolveAgent(config, confirm.agent)) {
+            const names = config.agents.map((a) => a.name).join(", ");
+            io.appendBlock(
+              c.yellow(
+                `  · unknown crew agent "${confirm.agent}". Available: ${names}. Type \`confirm <name>\` or plain \`confirm\` for the default (${config.defaultAgent}).`,
+              ),
+            );
+            continue; // stays armed
+          }
+          const armed = state.armed;
+          state.armed = null;
+          io.setConfirmBanner(null);
           await appendTranscript(state.transcript, "you", raw);
-          await fireDispatch(state, armed.order);
+          await fireDispatch(state, armed.order, confirm.agent);
           continue;
         }
+        state.armed = null;
+        io.setConfirmBanner(null);
         io.appendBlock(c.dim("  · dispatch cancelled."));
         // Fall through: treat the typed line as normal conversation/command.
       }
@@ -525,19 +557,29 @@ function armDispatch(
   if (!config.repoPath) {
     return { armed: false, reason: "No repo path is registered. Re-run `co link` to set one." };
   }
+  if (config.agents.length === 0) {
+    return { armed: false, reason: "No crew agent is registered. Re-run `co link` to set one." };
+  }
   state.armed = { order };
 
-  const cmd = displayCommand(config.commandTemplate, config.repoPath);
+  const cmd = displayCommand(resolveAgentCommand(config), config.repoPath);
   const transport =
     state.registry?.activeTransport === "ghostty" ? "visible Ghostty pane" : "background run";
+  // Offer the named alternatives only when there's a real choice to make.
+  const others = config.agents.map((a) => a.name).filter((n) => n !== config.defaultAgent);
+  const overrideHint =
+    others.length > 0 ? `  or \`confirm <${others.join("|")}>\` to pick another agent` : "";
   state.io.setConfirmBanner([
     c.yellow(c.bold("  ⚑ dispatch armed — type `confirm` to launch, anything else cancels")),
-    c.dim(`  transport: ${transport}   command: ${cmd}`),
+    c.dim(`  transport: ${transport}   agent: ${config.defaultAgent}   command: ${cmd}`),
+    ...(overrideHint ? [c.dim(overrideHint)] : []),
     c.dim(`  order: ${firstLineOf(order)}`),
   ]);
   return {
     armed: true,
-    summary: `It will run via ${transport} as: ${cmd}`,
+    summary:
+      `It will run via ${transport} as: ${cmd} (agent ${config.defaultAgent}).` +
+      (others.length > 0 ? ` The captain can type \`confirm <${others.join("|")}>\` to pick another.` : ""),
   };
 }
 
@@ -547,25 +589,26 @@ function armDispatch(
  * which transport was used and return immediately; the review lands later via the
  * completion callback. Never throws into the loop.
  */
-async function fireDispatch(state: SessionState, order: string): Promise<void> {
+async function fireDispatch(state: SessionState, order: string, agentName?: string): Promise<void> {
   const { io, registry } = state;
   if (!registry) {
     io.appendBlock(c.yellow("  · dispatch unavailable (not linked)."));
     return;
   }
   try {
-    const job = await registry.dispatch(order);
+    const job = await registry.dispatch(order, agentName);
     if (job.status === "failed") {
       io.appendBlock(c.red(`  · dispatch failed to launch: ${job.error ?? "unknown error"}`));
       return;
     }
+    const agentNote = job.agentName ? ` [${job.agentName}]` : "";
     const where =
       job.transport === "ghostty"
         ? job.status === "queued"
           ? "queued for a free crew pane"
           : `running in a Ghostty pane (${job.paneId ?? "?"})`
         : "running in the background";
-    io.appendBlock(c.green(`  · dispatched ${job.id}: ${where}. I'll review it when it finishes.`));
+    io.appendBlock(c.green(`  · dispatched ${job.id}${agentNote}: ${where}. I'll review it when it finishes.`));
   } catch (e) {
     io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));
   }
@@ -615,6 +658,25 @@ async function readCapture(_state: SessionState, file: string): Promise<string> 
 function firstLineOf(order: string): string {
   const l = order.split("\n").find((x) => x.trim() !== "")?.trim() ?? "";
   return l.length > 80 ? l.slice(0, 77) + "…" : l;
+}
+
+/**
+ * Parse a typed line against the confirm interlock. Pure so the interlock's
+ * two decisions — is this a confirm, and does it name a crew agent — can be
+ * unit-tested without arming a real dispatch (which needs a model call).
+ *
+ *   "confirm"        → { isConfirm: true }                 (use the default agent)
+ *   "confirm ccw"    → { isConfirm: true, agent: "ccw" }   (override for this run)
+ *   "CONFIRM"        → { isConfirm: true }                 (case-insensitive verb)
+ *   anything else    → { isConfirm: false }                (cancels the dispatch)
+ *
+ * Only the verb and the first token after it matter; trailing words are ignored
+ * so a fat-fingered "confirm cc please" still selects cc rather than cancelling.
+ */
+export function parseConfirm(raw: string): { isConfirm: boolean; agent?: string } {
+  const [verb, agentToken] = raw.trim().split(/\s+/, 2);
+  if (verb?.toLowerCase() !== "confirm") return { isConfirm: false };
+  return agentToken ? { isConfirm: true, agent: agentToken } : { isConfirm: true };
 }
 
 type CommandResult = "ok" | "exit";

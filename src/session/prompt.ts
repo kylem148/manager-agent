@@ -317,13 +317,27 @@ const TASK_TABLE_PROTOCOL = `## Task table
  * ORDERS_PROTOCOL above). When present, the co-manager may also hand an order
  * straight to the crew through the confirm-gated dispatch_order tool.
  */
-function dispatchProtocol(d: { repoPath: string; transport: string }): string {
+function dispatchProtocol(d: {
+  repoPath: string;
+  transport: string;
+  agents: string[];
+  defaultAgent: string;
+}): string {
+  const other = d.agents.find((a) => a !== d.defaultAgent) ?? d.defaultAgent;
+  const agentLine =
+    d.agents.length > 1
+      ? `The crew has ${d.agents.length} registered agents: ${d.agents.join(", ")}. A bare` +
+        ` \`confirm\` uses the default (${d.defaultAgent}); the captain can type \`confirm <name>\`` +
+        ` (e.g. \`confirm ${other}\`) to run a specific one for that dispatch only. You do not pick` +
+        ` the agent; the captain does at confirm time.`
+      : `The crew runs as agent "${d.defaultAgent}"; a bare \`confirm\` launches it.`;
   return `## Dispatch protocol (this instance is linked)
 
 This instance is linked to a repo, so you can deliver an order two ways: as
 plain text the captain copies (the orders protocol above), or by dispatching it
 straight to the crew with the \`dispatch_order\` tool. You still never touch the
-repo yourself; a separate coding agent does all the work, in ${d.repoPath || "the registered repo"}.
+repo yourself; a separate coding agent does all the work, in ${d.repoPath || "the registered repo"},
+run with that repo as its working directory.
 
 - \`dispatch_order\` ARMS a dispatch. It does not run anything. It shows the
   captain the exact order text and the resolved command, then waits. The
@@ -333,6 +347,7 @@ repo yourself; a separate coding agent does all the work, in ${d.repoPath || "th
 - Draft the full order as the tool's \`order\` argument, to the same checklist as
   a written order (read-docs-first, goal, context, decisions, constraints,
   acceptance, verification, commit). Arm at most one order per turn.
+- ${agentLine}
 - Before you arm, always show your work in the chat in this order: first print
   the entire order text verbatim, exactly as it will go to the crew, so the
   captain reads the whole thing; then a short bullet list summarising the main
@@ -355,9 +370,10 @@ export async function buildSystemPrompt(
   research: ResearchConfig,
   opts: {
     excludeTranscript?: string;
-    /** Present when the instance is linked (co link): the registered repo and
-     *  the transport dispatch will use. Null/absent when unlinked. */
-    dispatch?: { repoPath: string; transport: string } | null;
+    /** Present when the instance is linked (co link): the registered repo, the
+     *  transport dispatch will use, and the crew agents + default. Null/absent
+     *  when unlinked. */
+    dispatch?: { repoPath: string; transport: string; agents: string[]; defaultAgent: string } | null;
   } = {},
 ): Promise<string> {
   const live = await readLiveMemory(paths);

@@ -5,12 +5,14 @@ import type { Config } from "../config.js";
 import { instancePaths, isValidInstanceName } from "../paths.js";
 import { instanceExists } from "../memory/memory.js";
 import {
-  EXAMPLE_TEMPLATES,
+  EXAMPLE_AGENTS,
   defaultDispatchConfig,
   readDispatchConfig,
   writeDispatchConfig,
   setAnchor,
   displayCommand,
+  resolveAgentCommand,
+  type CrewAgent,
   type DispatchConfig,
 } from "../session/dispatchconfig.js";
 import { crewPaneTitle } from "../session/crewpanes.js";
@@ -20,9 +22,11 @@ import { c, line, write } from "../ui.js";
  * `co link <name>` — register how this co-manager dispatches orders to the crew.
  *
  * Records, per instance (under .dispatch/config.json, NOT .env — none of this is
- * secret): the target repo path, the agent command template with {prompt}/{repo}
- * placeholders, optional safety caps, and the pane layout. Re-runnable: it seeds
- * from any existing config so a second run just updates what changed.
+ * secret): the target repo path, the named crew agents (each a launch command
+ * with a {prompt} placeholder) and which one is the default, optional safety
+ * caps, and the pane layout. Re-runnable: it seeds from any existing config so a
+ * second run just updates what changed. The crew process runs with cwd = repo
+ * path, so an agent command needs no --dir flag to target the repo.
  *
  * `co pane <name>` — the one-time anchor designation: tag the crew pane the
  * dispatcher splits from. See runPaneAnchor below.
@@ -72,13 +76,44 @@ export async function runLink(cfg: Config, name: string | undefined): Promise<nu
     line(c.yellow(`note: ${resolvedRepo} does not exist yet. Saved anyway; create it before dispatching.`));
   }
 
-  // 2. Agent command template.
+  // 2. Crew agents. Each is a named launch command with a {prompt} placeholder.
+  //    The crew process runs with cwd = repo path, so no --dir flag is needed.
+  //    The captain types `confirm <name>` at dispatch time to pick one; a bare
+  //    `confirm` uses the default set below.
   line();
-  line(c.dim("Agent command template. Use {prompt} for the order and {repo} for the path."));
-  EXAMPLE_TEMPLATES.forEach((t, i) => line(c.dim(`  ${i + 1}. ${t.label}: ${t.template}`)));
-  line(c.dim("  Enter a number to pick an example, or type your own template."));
-  const templateRaw = await promptWithDefault("Command template: ", existing.commandTemplate);
-  const commandTemplate = resolveTemplateChoice(templateRaw, existing.commandTemplate);
+  line(c.dim("Crew agents. Each name maps to a launch command; {prompt} is the order text."));
+  line(c.dim("The agent runs with the repo as its working directory, so no directory flag is needed."));
+  line(c.dim(`  examples: ${EXAMPLE_AGENTS.map((a) => `${a.name} → ${a.command}`).join("   ")}`));
+  const defaultNames = existing.agents.map((a) => a.name).join(" ");
+  const namesRaw = await promptWithDefault(
+    "Agent names (space-separated, e.g. cc ccw): ",
+    defaultNames,
+  );
+  const names = parseAgentNames(namesRaw, existing.agents);
+  const agents: CrewAgent[] = [];
+  for (const nm of names) {
+    const prior = existing.agents.find((a) => a.name === nm);
+    const cmd = await promptWithDefault(`  command for ${nm}: `, prior?.command ?? `${nm} {prompt}`);
+    if (cmd.trim()) agents.push({ name: nm, command: cmd.trim() });
+  }
+  if (agents.length === 0) {
+    line(c.yellow("no crew agents entered — nothing changed."));
+    return 1;
+  }
+
+  // Which agent a bare `confirm` uses. Default to the prior default when it
+  // still exists, else the first agent.
+  const defaultFallback = agents.some((a) => a.name === existing.defaultAgent)
+    ? existing.defaultAgent
+    : agents[0]!.name;
+  let defaultAgent = defaultFallback;
+  if (agents.length > 1) {
+    const pick = await promptWithDefault(
+      `Default agent (bare \`confirm\` uses this) [${agents.map((a) => a.name).join(", ")}]: `,
+      defaultFallback,
+    );
+    defaultAgent = agents.some((a) => a.name === pick) ? pick : defaultFallback;
+  }
 
   // 3. Safety caps (all optional).
   line();
@@ -103,7 +138,8 @@ export async function runLink(cfg: Config, name: string | undefined): Promise<nu
 
   const config: DispatchConfig = {
     repoPath: resolvedRepo,
-    commandTemplate,
+    agents,
+    defaultAgent,
     caps,
     pane: existing.pane, // retune via config.json; not prompted (has sane defaults)
     anchor: existing.anchor,
@@ -113,7 +149,8 @@ export async function runLink(cfg: Config, name: string | undefined): Promise<nu
   line();
   line(c.green(`linked "${name}".`));
   line(c.dim(`  repo:    ${config.repoPath}`));
-  line(c.dim(`  command: ${displayCommand(config.commandTemplate, config.repoPath)}`));
+  line(c.dim(`  agents:  ${config.agents.map((a) => a.name).join(", ")}  (default: ${config.defaultAgent})`));
+  line(c.dim(`  command: ${displayCommand(resolveAgentCommand(config), config.repoPath)}`));
   if (config.caps.timeoutSec) line(c.dim(`  timeout: ${config.caps.timeoutSec}s`));
   line(c.dim(`  panes:   ${config.pane.directionSequence.join("/")} split, cap ${config.pane.cap}`));
   line();
@@ -210,16 +247,28 @@ function untilde(p: string): string {
   return p;
 }
 
-/** Map a numeric choice to an example template; otherwise take the typed text,
- *  falling back to the prior value when the user just pressed Enter. */
-function resolveTemplateChoice(raw: string, fallback: string): string {
+/**
+ * Parse the space-separated agent-names line into a deduped, ordered list.
+ * Pressing Enter (empty input) keeps the prior set of names; a fresh instance
+ * with no prior agents falls back to the shipped examples so `co link` always
+ * ends with at least one agent to prompt a command for.
+ */
+function parseAgentNames(raw: string, priorAgents: CrewAgent[]): string[] {
   const trimmed = raw.trim();
-  if (!trimmed) return fallback;
-  const n = Number.parseInt(trimmed, 10);
-  if (String(n) === trimmed && n >= 1 && n <= EXAMPLE_TEMPLATES.length) {
-    return EXAMPLE_TEMPLATES[n - 1]!.template;
+  if (!trimmed) {
+    return priorAgents.length > 0
+      ? priorAgents.map((a) => a.name)
+      : EXAMPLE_AGENTS.map((a) => a.name);
   }
-  return trimmed;
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const tok of trimmed.split(/\s+/)) {
+    if (tok && !seen.has(tok)) {
+      seen.add(tok);
+      names.push(tok);
+    }
+  }
+  return names;
 }
 
 /**

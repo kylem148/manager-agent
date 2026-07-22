@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseConfirm } from "./session.js";
 
 /**
  * End-to-end tests for the piped / non-TTY read loop (PlainIO).
@@ -96,4 +97,20 @@ test("a final line with no trailing newline is still read", async () => {
     const out = await runCli(coHome, ["t"], "/effort low\n/effort high");
     assert.match(out, /effort: low → high/);
   });
+});
+
+test("parseConfirm reads the interlock verb and an optional agent override", () => {
+  // Bare confirm → fire with the default agent (no override).
+  assert.deepEqual(parseConfirm("confirm"), { isConfirm: true });
+  // The verb is case-insensitive and tolerant of surrounding whitespace.
+  assert.deepEqual(parseConfirm("  CONFIRM  "), { isConfirm: true });
+  // `confirm <name>` selects that agent for this dispatch only.
+  assert.deepEqual(parseConfirm("confirm ccw"), { isConfirm: true, agent: "ccw" });
+  assert.deepEqual(parseConfirm("confirm cc"), { isConfirm: true, agent: "cc" });
+  // Only the first token after the verb is the agent; trailing words are ignored.
+  assert.deepEqual(parseConfirm("confirm cc please"), { isConfirm: true, agent: "cc" });
+  // Anything that isn't the confirm verb cancels — never a partial confirm.
+  assert.deepEqual(parseConfirm("cancel"), { isConfirm: false });
+  assert.deepEqual(parseConfirm("confirmation"), { isConfirm: false });
+  assert.deepEqual(parseConfirm(""), { isConfirm: false });
 });

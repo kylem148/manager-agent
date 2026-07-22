@@ -395,20 +395,25 @@ agent yourself. If you'd rather have it run the order for you, link the instance
 to a repo:
 
 ```bash
-co link my-saas          # register the target repo + the agent command template
+co link my-saas          # register the target repo + the named crew agents
 ```
 
 `co link` records, per instance (in `.dispatch/config.json` under the instance
-folder, not `.env` — none of it is secret): the repo path; an **agent-agnostic
-command template** with `{prompt}` and `{repo}` placeholders (it ships examples
-for Claude Code and OpenCode, and you can type your own); optional safety caps
-(wall-clock timeout, turn limit); and the crew-pane layout. It's re-runnable —
-run it again to change any of it.
+folder, not `.env` — none of it is secret): the repo path; one or more **named
+crew agents**, each an agent-agnostic launch command with a `{prompt}`
+placeholder (it ships `cc`/`ccw` for the two Claude Code wrappers and `opencode`,
+and you can name your own); which agent a bare `confirm` uses by default; optional
+safety caps (wall-clock timeout, turn limit); and the crew-pane layout. It's
+re-runnable — run it again to change any of it. The crew process runs with the
+repo as its working directory, so a command needs **no** `--dir` flag to target
+the repo (Claude Code has none).
 
 Once linked, the co-manager can **arm** a dispatch instead of only writing text.
 Arming shows you the exact order and the resolved command and waits. Nothing runs
-until you type `confirm`; any other input cancels it. This typed confirm is a hard
-interlock, not a nicety — there is no code path that dispatches without it.
+until you type `confirm`; any other input cancels it. A bare `confirm` runs the
+default agent; `confirm <name>` (e.g. `confirm ccw`) picks a specific agent for
+that one dispatch. This typed confirm is a hard interlock, not a nicety — there is
+no code path that dispatches without it.
 
 **On macOS with Ghostty**, a confirmed dispatch opens a visible split pane in your
 current tab and runs the agent there interactively, so you can watch it and answer
@@ -536,7 +541,8 @@ the arm-only `dispatch_order` tool.
 The dispatch layer is four focused modules. `crewpanes.ts` is the pure pane-
 placement planner (anchor takeover, alternating splits of the newest pane, cap +
 reuse-oldest, all configurable) with no I/O. `dispatchconfig.ts` reads/writes the
-per-instance `.dispatch/config.json` and resolves the agent command template
+per-instance `.dispatch/config.json`, resolves which named crew agent a dispatch
+uses (default or `confirm <name>` override), and turns its command into argv
 (placeholder substitution, argv tokenizing, shell quoting). `transport.ts` has
 the two launchers — a Ghostty/AppleScript visible-pane path that consumes the
 planner, and a detached-subprocess fallback — both sharing one capture-file +

@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fsp from "node:fs/promises";
 import fs from "node:fs";
 import path from "node:path";
-import { resolveArgv, shellQuote, type DispatchConfig } from "./dispatchconfig.js";
+import { resolveArgv, resolveAgentCommand, shellQuote, type DispatchConfig } from "./dispatchconfig.js";
 import type { InstancePaths } from "../paths.js";
 import { CrewPaneLayout, type PlacementDecision } from "./crewpanes.js";
 
@@ -122,31 +122,45 @@ export async function anchorExists(id: string): Promise<boolean> {
 }
 
 /**
- * The interactive command run inside a pane or as a detached process. It launches
- * the agent, tees output to the capture file, then appends the sentinel with the
- * captured exit code. Written as a single `sh -c` string so both transports share
- * the same completion contract.
+ * The interactive command run inside a pane or as a detached process. It cd's
+ * into the repo, launches the agent, tees output to the capture file, then
+ * appends the sentinel with the captured exit code. Written as a single `sh -c`
+ * string so both transports share the same completion contract.
+ *
+ * The repo is supplied as the working directory (a leading `cd`), not as a
+ * command-line flag: Claude Code has no --dir, and --add-dir only adds extra
+ * readable dirs rather than setting the working directory. A `cd ... || exit`
+ * makes a bad repo path fail loudly (captured, with a nonzero sentinel) instead
+ * of silently running the agent in the wrong directory. An empty repo path skips
+ * the cd and runs wherever the transport's own cwd points.
  *
  * The agent argv is shell-quoted token by token; the {prompt} token already holds
  * the full order text as one argv element (see resolveArgv), so quoting it once
  * here is correct regardless of newlines or metacharacters in the order.
  */
-export function buildShellCommand(argv: string[], captureFile: string): string {
+export function buildShellCommand(argv: string[], captureFile: string, cwd?: string): string {
   const quotedCmd = argv.map(shellQuote).join(" ");
   const quotedCapture = shellQuote(captureFile);
   // `command; code=$?` captures the agent's real exit status even in a pane; the
   // sentinel is echoed to BOTH the tee'd file and the pane so the user sees the
   // run finish and the watcher sees the marker. `2>&1` folds stderr into capture.
+  const cdPrefix = cwd && cwd.trim() ? `cd ${shellQuote(cwd)} || exit 1; ` : "";
   return (
-    `{ ${quotedCmd}; } 2>&1 | tee ${quotedCapture}; ` +
+    `${cdPrefix}{ ${quotedCmd}; } 2>&1 | tee ${quotedCapture}; ` +
     `code=\${PIPESTATUS[0]:-$?}; ` +
     `echo "${SENTINEL_PREFIX} $code" | tee -a ${quotedCapture}`
   );
 }
 
-/** Build the argv for a job's agent command from the template + config. */
-export function jobArgv(config: DispatchConfig, order: string): string[] {
-  return resolveArgv(config.commandTemplate, { prompt: order, repo: config.repoPath });
+/**
+ * Build the argv for a job's agent command from the config. Picks the crew agent
+ * (the confirm-time override `agentName`, else the config default) and resolves
+ * its command's placeholders. Command assembly is live here, not a frozen string:
+ * a config persisted before agent selection is migrated on read (see coerce).
+ */
+export function jobArgv(config: DispatchConfig, order: string, agentName?: string): string[] {
+  const command = resolveAgentCommand(config, agentName);
+  return resolveArgv(command, { prompt: order, repo: config.repoPath });
 }
 
 // --- AppleScript composition (pure, unit-testable) --------------------------
@@ -245,8 +259,10 @@ export async function launchGhostty(args: {
   layout: CrewPaneLayout;
   jobId: string;
   order: string;
+  /** The confirm-time agent override; omit to use the config default. */
+  agentName?: string;
 }): Promise<LaunchResult> {
-  const { paths, config, layout, jobId, order } = args;
+  const { paths, config, layout, jobId, order, agentName } = args;
   await ensureCaptureDir(paths);
   const captureFile = paths.captureFile(jobId);
   await fsp.writeFile(captureFile, "", "utf8"); // fresh capture
@@ -257,8 +273,10 @@ export async function launchGhostty(args: {
     return { transport: "ghostty", placement: decision };
   }
 
-  const argv = jobArgv(config, order);
-  const shellCommand = buildShellCommand(argv, captureFile);
+  const argv = jobArgv(config, order, agentName);
+  // The pane is a plain shell with no spawn cwd of its own, so the repo working
+  // directory is set by the `cd` inside the shell command.
+  const shellCommand = buildShellCommand(argv, captureFile, config.repoPath);
   const script = composeSplitScript({ decision, shellCommand });
 
   try {
@@ -284,19 +302,28 @@ export async function launchFallback(args: {
   config: DispatchConfig;
   jobId: string;
   order: string;
+  /** The confirm-time agent override; omit to use the config default. */
+  agentName?: string;
 }): Promise<LaunchResult> {
-  const { paths, config, jobId, order } = args;
+  const { paths, config, jobId, order, agentName } = args;
   await ensureCaptureDir(paths);
   const captureFile = paths.captureFile(jobId);
-  const argv = jobArgv(config, order);
-  const shellCommand = buildShellCommand(argv, captureFile);
+  const argv = jobArgv(config, order, agentName);
+  // Set the repo cwd two ways that agree: the spawn cwd below (the real working
+  // directory of the detached process) and, when the repo exists, the `cd` baked
+  // into the shell command so the assembled command is self-describing and
+  // matches the pane path exactly. Only pass the cd when the path exists, so a
+  // missing repo degrades to the spawn cwd (undefined → inherit) rather than a
+  // hard `cd ... || exit` failure the moment a repo hasn't been created yet.
+  const repoExists = Boolean(config.repoPath) && fs.existsSync(config.repoPath);
+  const shellCommand = buildShellCommand(argv, captureFile, repoExists ? config.repoPath : undefined);
 
   // We run through `sh -c` so the tee + sentinel contract matches the pane path.
   // detached:true puts the child in its own process group; unref() lets the
   // parent event loop exit independently. stdio is ignored because all output is
   // already tee'd to the capture file by the shell command itself.
   const child = spawn("sh", ["-c", shellCommand], {
-    cwd: fs.existsSync(config.repoPath) ? config.repoPath : undefined,
+    cwd: repoExists ? config.repoPath : undefined,
     detached: true,
     stdio: "ignore",
   });

@@ -34,6 +34,10 @@ export interface Job {
   order: string;
   /** A short human label for notices (first line of the order, trimmed). */
   label: string;
+  /** The crew agent this job launched with (the confirm-time override or the
+   *  config default). Undefined means the config default was used. Kept so a
+   *  queued job relaunches with the same agent and reviews can name it. */
+  agentName?: string;
   transport: TransportKind;
   status: JobStatus;
   paneId?: string;
@@ -147,7 +151,7 @@ export class DispatchRegistry {
    * throws into the caller: a launch failure marks the job failed and notifies,
    * so a bad dispatch can't crash the session. Starts the poller if idle.
    */
-  async dispatch(order: string): Promise<Job> {
+  async dispatch(order: string, agentName?: string): Promise<Job> {
     const id = this.nextJobId();
     const label = firstLine(order);
     const captureFile = this.paths.captureFile(id);
@@ -155,6 +159,7 @@ export class DispatchRegistry {
       id,
       order,
       label,
+      ...(agentName ? { agentName } : {}),
       transport: this.activeTransport,
       status: "running",
       captureFile,
@@ -186,7 +191,13 @@ export class DispatchRegistry {
           this.queue.push(job.id);
         }
       } else {
-        const res = await launchFallback({ paths: this.paths, config: this.config, jobId: id, order });
+        const res = await launchFallback({
+          paths: this.paths,
+          config: this.config,
+          jobId: id,
+          order,
+          agentName,
+        });
         job.pid = res.pid;
       }
     } catch (e) {
@@ -214,6 +225,7 @@ export class DispatchRegistry {
       layout: this.layout!,
       jobId: job.id,
       order: job.order,
+      ...(job.agentName ? { agentName: job.agentName } : {}),
     });
     if (res.placement && res.placement.kind === "queue") return false;
     job.paneId = res.paneId;

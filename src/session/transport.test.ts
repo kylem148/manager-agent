@@ -64,6 +64,21 @@ test("buildShellCommand tees to capture and appends the sentinel", () => {
   assert.ok(cmd.includes("'echo' 'hi there'"), "agent argv is shell-quoted");
   assert.ok(cmd.includes("tee '/tmp/cap.log'"), "output tees to the capture file");
   assert.ok(cmd.includes(SENTINEL_PREFIX), "sentinel is echoed on completion");
+  // No cwd given: no cd prefix.
+  assert.ok(!cmd.includes("cd "), "no cd when no cwd is supplied");
+});
+
+test("buildShellCommand cd's into the repo cwd when given one", () => {
+  const cmd = buildShellCommand(["cc", "order"], "/tmp/cap.log", "/my/repo");
+  assert.ok(
+    cmd.startsWith("cd '/my/repo' || exit 1; "),
+    `command must cd into the repo first, got: ${cmd}`,
+  );
+  // A bad path fails loudly (nonzero) rather than running in the wrong dir.
+  assert.ok(cmd.includes("|| exit 1"), "a failed cd aborts the run");
+  assert.ok(cmd.includes(SENTINEL_PREFIX), "sentinel still emitted");
+  // Still no --dir anywhere.
+  assert.ok(!cmd.includes("--dir"), "cwd replaces --dir entirely");
 });
 
 test("osaEscape escapes backslashes and quotes for an AppleScript literal", () => {
@@ -99,11 +114,28 @@ test("composeSplitScript for a takeover targets the anchor by id, no split", () 
   assert.ok(script.includes('send key "enter" to target'));
 });
 
-test("jobArgv resolves the template with the order and repo", () => {
+test("jobArgv resolves the default agent's command with no --dir", () => {
   const config = defaultDispatchConfig();
   config.repoPath = "/repo";
-  config.commandTemplate = "claude --dir {repo} {prompt}";
-  assert.deepEqual(jobArgv(config, "build X"), ["claude", "--dir", "/repo", "build X"]);
+  config.agents = [
+    { name: "cc", command: "cc {prompt}" },
+    { name: "ccw", command: "ccw {prompt}" },
+  ];
+  config.defaultAgent = "cc";
+  // Bare (no override) → the default agent, and NO --dir flag.
+  assert.deepEqual(jobArgv(config, "build X"), ["cc", "build X"]);
+});
+
+test("jobArgv honors a named-agent override", () => {
+  const config = defaultDispatchConfig();
+  config.repoPath = "/repo";
+  config.agents = [
+    { name: "cc", command: "cc {prompt}" },
+    { name: "ccw", command: "ccw {prompt}" },
+  ];
+  config.defaultAgent = "cc";
+  // `confirm ccw` selects the work wrapper for this dispatch.
+  assert.deepEqual(jobArgv(config, "build X", "ccw"), ["ccw", "build X"]);
 });
 
 test("fallback launch runs a fake echo agent and produces a captured sentinel", async () => {
@@ -112,7 +144,8 @@ test("fallback launch runs a fake echo agent and produces a captured sentinel", 
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
     // Fake agent: print a marker and the order, then exit 0. No tokens, no network.
-    config.commandTemplate = `sh -c 'echo AGENT-RAN; echo "order={prompt}"'`;
+    config.agents = [{ name: "fake", command: `sh -c 'echo AGENT-RAN; echo "order={prompt}"'` }];
+    config.defaultAgent = "fake";
     const res = await launchFallback({ paths, config, jobId: "job-001", order: "hello crew" });
     assert.equal(res.transport, "fallback");
 
@@ -125,12 +158,35 @@ test("fallback launch runs a fake echo agent and produces a captured sentinel", 
   }
 });
 
+test("fallback runs the crew process with cwd = repo path (no --dir)", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    // The repo IS the instance root here; the agent prints its own working dir.
+    config.repoPath = paths.root;
+    config.agents = [{ name: "fake", command: `sh -c 'pwd'` }];
+    config.defaultAgent = "fake";
+    await launchFallback({ paths, config, jobId: "job-cwd", order: "x" });
+    const captured = await waitForSentinel(paths.captureFile("job-cwd"));
+    // macOS resolves /var → /private/var etc., so compare the real paths.
+    const realRepo = await fsp.realpath(paths.root);
+    const printed = captured.split("\n").map((l) => l.trim());
+    assert.ok(
+      printed.includes(realRepo) || printed.includes(paths.root),
+      `crew cwd should be the repo path.\n  want: ${realRepo}\n  got:\n${captured}`,
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
 test("fallback captures a nonzero exit code in the sentinel", async () => {
   const { paths, cleanup } = await tmpInstance();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
-    config.commandTemplate = `sh -c 'echo boom; exit 3'`;
+    config.agents = [{ name: "fake", command: `sh -c 'echo boom; exit 3'` }];
+    config.defaultAgent = "fake";
     await launchFallback({ paths, config, jobId: "job-002", order: "x" });
     const captured = await waitForSentinel(paths.captureFile("job-002"));
     assert.deepEqual(parseSentinel(captured), { exitCode: 3 });
