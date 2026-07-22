@@ -17,6 +17,8 @@ import {
 } from "./docs.js";
 import { makeExecutor, newSideEffects, toolDefinitions } from "../session/tools.js";
 import { buildSystemPrompt } from "../session/prompt.js";
+import { onWrite } from "./writequeue.js";
+import { rewriteLive, appendLog } from "./memory.js";
 import type { ResearchConfig } from "../config.js";
 
 /**
@@ -235,6 +237,35 @@ test("the executor dispatches all six commands and reports errors structurally",
     assert.equal(unknown.is_error, true);
     assert.equal(JSON.parse(String(unknown.content)).error, "UNKNOWN_COMMAND");
   } finally {
+    await cleanup();
+  }
+});
+
+test("doc writes emit a write-queue change signal; the .memory/ substrate never does", async () => {
+  const { paths, cleanup } = await makeInstance();
+  const events: string[] = [];
+  const unsubscribe = onWrite((e) => {
+    assert.equal(e.kind, "doc");
+    events.push(e.name);
+  });
+  try {
+    // Every mutating doc command fires exactly one signal, carrying the bare
+    // filename the viewer needs to decide "is this the doc I'm showing?".
+    await createDoc(paths, "plan.md", "# Plan\n");
+    await strReplaceDoc(paths, "plan.md", "# Plan", "# Plan v2");
+    await overwriteDoc(paths, "plan.md", "# Plan v3\n");
+    await deleteDoc(paths, "plan.md");
+    assert.deepEqual(events, ["plan.md", "plan.md", "plan.md", "plan.md"]);
+
+    // Writes to the hidden substrate go through the SAME serialized queue but
+    // must never surface on this channel: the doc viewer can only ever learn
+    // about docs/, never about .memory/.
+    events.length = 0;
+    await rewriteLive(paths, "activeContext.md", "fresh orientation\n");
+    await appendLog(paths, "decisions", "a decision");
+    assert.deepEqual(events, [], "no substrate write leaks to the doc-change channel");
+  } finally {
+    unsubscribe();
     await cleanup();
   }
 });

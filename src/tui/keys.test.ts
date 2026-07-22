@@ -101,6 +101,20 @@ test("the same bindings survive the protocol's CSI-u spelling", () => {
   assert.deepEqual(classify(parseCsiU("127")!), { kind: "backspace" });
 });
 
+test("Ctrl-O opens the doc viewer in both encodings, and doesn't collide", () => {
+  // Legacy control byte 0x0F is Ctrl-O.
+  assert.deepEqual(classifyByte("\x0f"), { kind: "open-docs" });
+  // Under the Kitty protocol the same key arrives as CSI 111;5u.
+  assert.deepEqual(classify(parseCsiU("111;5")!), { kind: "open-docs" });
+  // A bare "o" is still ordinary text, not the overlay chord.
+  assert.deepEqual(classifyByte("o"), { kind: "insert", text: "o" });
+  // The existing ctrl-letter editing bindings are untouched by the new one.
+  assert.deepEqual(classifyByte("\x01"), { kind: "home" }); // Ctrl-A
+  assert.deepEqual(classifyByte("\x05"), { kind: "end" }); // Ctrl-E
+  assert.deepEqual(classifyByte("\x15"), { kind: "kill-to-start" }); // Ctrl-U
+  assert.deepEqual(classifyByte("\x0b"), { kind: "kill-to-end" }); // Ctrl-K
+});
+
 test("printable input is inserted, unknown combos are swallowed", () => {
   assert.deepEqual(classifyByte("a"), { kind: "insert", text: "a" });
   assert.deepEqual(classifyByte(" "), { kind: "insert", text: " " });

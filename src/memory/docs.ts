@@ -1,7 +1,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { InstancePaths } from "../paths.js";
-import { serializeWrite } from "./writequeue.js";
+import { serializeWrite, notifyWrite } from "./writequeue.js";
 
 /**
  * The user-facing document tier: flat markdown under an instance's `docs/`.
@@ -150,6 +150,7 @@ export async function createDoc(
       }
       throw e;
     }
+    notifyWrite({ kind: "doc", name });
     return { name, bytes: Buffer.byteLength(body) };
   });
 }
@@ -201,6 +202,7 @@ export async function strReplaceDoc(
     }
     const updated = content.slice(0, first) + newStr + content.slice(first + oldStr.length);
     await fsp.writeFile(file, updated, "utf8");
+    notifyWrite({ kind: "doc", name });
     return { name, replacedAtLine: content.slice(0, first).split("\n").length };
   });
 }
@@ -216,6 +218,7 @@ export async function overwriteDoc(
     const existed = (await readIfExists(file)) !== null;
     const body = content.endsWith("\n") ? content : content + "\n";
     await fsp.writeFile(file, body, "utf8");
+    notifyWrite({ kind: "doc", name });
     return { name, bytes: Buffer.byteLength(body), created: !existed };
   });
 }
@@ -234,6 +237,7 @@ export async function deleteDoc(paths: InstancePaths, name: string): Promise<{ n
       throw new DocError("DOC_NOT_A_FILE", `"${name}" is not a regular file; refusing to delete it.`);
     }
     await fsp.rm(file);
+    notifyWrite({ kind: "doc", name });
     return { name };
   });
 }

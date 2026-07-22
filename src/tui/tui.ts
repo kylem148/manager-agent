@@ -189,6 +189,46 @@ export interface OutStream {
   rows?: number;
 }
 
+/**
+ * The doc surface the in-session viewer overlay reads through. Injected so the
+ * Tui never touches the filesystem itself: session.ts backs this with the same
+ * sandboxed doc tool the model uses (listDocs/readDoc over docs/), so the
+ * overlay is structurally incapable of listing or reaching the `.memory/`
+ * substrate — it can only ever name a file the sandbox already vetted.
+ *
+ * `subscribe` wires the overlay to the serialized memory write queue: the
+ * listener fires with the bare doc filename after a completed write, which is
+ * how the view refreshes live when an agent edits the doc on screen.
+ */
+export interface DocSource {
+  /** Every doc in docs/, sorted. Never includes anything under `.memory/`. */
+  list(): Promise<string[]>;
+  /** One doc's full text by bare filename. Throws if it can't be read. */
+  read(name: string): Promise<string>;
+  /** Subscribe to doc-write events; returns an unsubscribe function. */
+  subscribe(listener: (name: string) => void): () => void;
+}
+
+/**
+ * Render a whole markdown document to visual rows through the SAME renderer the
+ * transcript uses, so the overlay looks identical to inline output. Tables are
+ * laid out from their raw form at `width` (never word-wrapped), honoring the
+ * resize re-layout rule; everything else wraps at word boundaries.
+ */
+export function renderMarkdownDoc(content: string, width: number): string[] {
+  const md = new MarkdownRenderer();
+  const out: string[] = [];
+  const push = (e: Rendered): void => {
+    if (e.kind === "table") out.push(...renderTable(e.table, width));
+    else out.push(...(e.text === "" ? [""] : wrapLine(e.text, width)));
+  };
+  for (const l of content.split("\n")) {
+    for (const e of md.feed(l, width)) push(e);
+  }
+  for (const e of md.flushBlock(width)) push(e);
+  return out;
+}
+
 /** The subset of a readable TTY stream the Tui needs. */
 export interface InStream {
   isTTY?: boolean;
@@ -208,6 +248,12 @@ export interface TuiOptions {
   /** Injectable IO for testing; defaults to process stdio. */
   out?: OutStream;
   inp?: InStream;
+  /**
+   * Backs the Ctrl-O doc viewer overlay. Omit to disable the feature (the
+   * keybinding then flashes a hint instead of opening). session.ts always
+   * supplies one bound to the instance's docs/.
+   */
+  docs?: DocSource;
 }
 
 /**
@@ -236,7 +282,28 @@ export interface SessionIO {
   setBusy(label: string | null): void;
   /** Read one line; resolves null on EOF (clean exit). */
   question(): Promise<string | null>;
+  /**
+   * Resolve a pending question() with a private sentinel WITHOUT losing the
+   * user's half-typed input. Used to hand control back to the session loop when
+   * an out-of-band event needs a turn (a finished dispatch wanting a review).
+   * No-op if nothing is waiting on input. Returns true if a waiter was woken.
+   */
+  wake(reason: string): boolean;
+  /**
+   * Show or clear the armed-dispatch confirm banner (order preview + resolved
+   * command + confirm hint) just above the input bar. Null clears it. On the
+   * plain non-TTY path this is a no-op — the banner is printed inline instead.
+   */
+  setConfirmBanner(lines: string[] | null): void;
 }
+
+/**
+ * The sentinel question() resolves with when wake() is called. The session loop
+ * recognizes it, runs any pending out-of-band work, then re-prompts — the user's
+ * draft input is preserved by the TUI across the wake, so they never lose a
+ * half-typed line to a background completion.
+ */
+export const WAKE_SENTINEL = " co-wake ";
 
 /**
  * Spinner frames for the busy indicator: Claude Code's pulsing asterisk. The
@@ -254,6 +321,45 @@ const BUSY_TICK_MS = 120;
  * instant.
  */
 const PAINT_INTERVAL_MS = 16;
+
+/**
+ * Single-key selectors for the doc list, in press order: digits first (the
+ * obvious "press 3"), then letters for a longer list. No arrow key is ever
+ * required — pressing the label beside a doc opens it. Doc-mode paging commands
+ * (f/b/d/u/j/k/g/G) don't appear as list labels, so nothing collides.
+ */
+const OVERLAY_LABELS = "123456789abcdefghijklmnopqrstuvwxyz";
+
+/**
+ * The doc viewer overlay's state. `list` offers the docs/ files for selection;
+ * `doc` shows one rendered document with its own scroll offset. `content` is
+ * kept raw alongside the rendered `rows` so a resize can re-lay the doc out
+ * (tables included) without word-wrapping already-drawn output.
+ */
+type Overlay =
+  | { mode: "list"; docs: string[]; loading: boolean; error: string | null }
+  | { mode: "doc"; name: string; content: string; rows: string[]; scroll: number; error: string | null };
+
+/**
+ * A decoded overlay keystroke: either a printable char (a doc-list selector or
+ * a paging letter) or a named navigation intent. Kept separate from the editor's
+ * `Action` so the two input modes never share a binding by accident.
+ */
+type OverlayInput =
+  | { ch: string }
+  | {
+      nav:
+        | "escape"
+        | "back"
+        | "up"
+        | "down"
+        | "pageup"
+        | "pagedown"
+        | "halfup"
+        | "halfdown"
+        | "top"
+        | "bottom";
+    };
 
 export class Tui implements SessionIO {
   private out: OutStream;
@@ -342,13 +448,29 @@ export class Tui implements SessionIO {
   // Pending single-line resolver when awaiting input.
   private pendingResolve: ((line: string | null) => void) | null = null;
   private sigintCount = 0;
+  // A pending-confirm banner shown above the input bar while a dispatch is armed
+  // and awaiting the captain's typed `confirm`. Purely presentational: the
+  // interlock itself lives in the session loop, which decides what to do with
+  // the typed line. Null when nothing is armed.
+  private confirmBanner: string[] | null = null;
   // Armed by a lone ESC; a second consecutive lone ESC clears the input line
   // (matches Claude Code's esc-esc). Any other key disarms it.
   private escPending = false;
 
+  // The doc viewer overlay (Ctrl-O). While `overlay` is non-null it is modal:
+  // every keystroke drives the viewer, not the prompt, and paint() draws the
+  // overlay over the whole screen instead of the transcript+editor. The model
+  // keeps streaming into the transcript underneath (committed/open are still
+  // updated); closing the overlay repaints it intact. `docs` is the injected
+  // sandboxed source; `unsubscribeDocs` tears down the live-refresh listener.
+  private readonly docs?: DocSource;
+  private overlay: Overlay | null = null;
+  private unsubscribeDocs: (() => void) | null = null;
+
   private onResize = (): void => {
     this.measure();
     this.rewrap();
+    this.reflowOverlay();
     this.paint();
   };
 
@@ -357,6 +479,7 @@ export class Tui implements SessionIO {
     this.header = opts.header;
     this.out = opts.out ?? process.stdout;
     this.inp = opts.inp ?? process.stdin;
+    this.docs = opts.docs;
   }
 
   // --- lifecycle -------------------------------------------------------------
@@ -407,6 +530,10 @@ export class Tui implements SessionIO {
 
     process.removeListener("SIGWINCH", this.onResize);
     this.inp.removeListener("data", this.handleData);
+    // Drop the doc-viewer live-refresh subscription so the write queue doesn't
+    // keep calling into a torn-down Tui.
+    if (this.unsubscribeDocs) { this.unsubscribeDocs(); this.unsubscribeDocs = null; }
+    this.overlay = null;
     if (this.statusTimer) { clearTimeout(this.statusTimer); this.statusTimer = null; }
     if (this.busyTimer) { clearInterval(this.busyTimer); this.busyTimer = null; }
     // Drop any queued frame: we're about to leave the alt screen, so painting
@@ -460,8 +587,14 @@ export class Tui implements SessionIO {
 
   /** Number of screen rows reserved for the input editor + separator. */
   private inputRows(): number {
-    // busy line (when working) + separator + wrapped input text rows
-    return this.busyRows() + 1 + this.inputTextRows();
+    // confirm banner (when armed) + busy line (when working) + separator +
+    // wrapped input text rows
+    return this.confirmRows() + this.busyRows() + 1 + this.inputTextRows();
+  }
+
+  /** Rows the armed-dispatch confirm banner occupies (0 when nothing armed). */
+  private confirmRows(): number {
+    return this.confirmBanner ? this.confirmBanner.length : 0;
   }
 
   /**
@@ -736,6 +869,10 @@ export class Tui implements SessionIO {
     // A synchronous paint satisfies any queued one; leaving the timer armed
     // would just write an identical frame a few milliseconds later.
     if (this.paintTimer) { clearTimeout(this.paintTimer); this.paintTimer = null; }
+    // The doc viewer is modal: when it's open it owns the whole screen. The
+    // transcript underneath keeps updating (streamed output still lands in the
+    // model); closing the overlay repaints it.
+    if (this.overlay) { this.paintOverlay(); return; }
     // The input region height is dynamic (it grows as the buffer wraps), so the
     // transcript viewport height changes as the user types. Re-pin to the bottom
     // when following, so a growing input never leaves the transcript showing
@@ -753,12 +890,26 @@ export class Tui implements SessionIO {
       frame.push(term.clearLine + this.clip(line, this.cols) + "\n");
     }
 
+    // Armed-dispatch confirm banner: sits directly above the busy line/rule when
+    // a dispatch is staged and awaiting a typed `confirm`. Painted before the
+    // busy line so it reads as a distinct region, not part of the spinner row.
+    const confirmRows = this.confirmRows();
+    if (this.confirmBanner) {
+      for (let cr = 0; cr < this.confirmBanner.length; cr++) {
+        frame.push(
+          term.moveTo(vp + 1 + cr, 1) + term.clearLine + this.clip(this.confirmBanner[cr]!, this.cols),
+        );
+      }
+    }
+
     // Busy line: the spinner + chore, hard against the left margin on its own
     // row directly above the rule. Only painted while working.
     const busyRows = this.busyRows();
     if (busyRows) {
       frame.push(
-        term.moveTo(vp + 1, 1) + term.clearLine + c.cyan(this.clip(this.busyText(), this.cols)),
+        term.moveTo(vp + confirmRows + 1, 1) +
+          term.clearLine +
+          c.cyan(this.clip(this.busyText(), this.cols)),
       );
     }
 
@@ -768,7 +919,7 @@ export class Tui implements SessionIO {
     const below = rowsAll.length - (start + vp);
     const scrollHint =
       this.atBottom || below <= 0 ? "" : `more below · ${below} line(s)`;
-    const sepRow = vp + busyRows + 1;
+    const sepRow = vp + confirmRows + busyRows + 1;
     frame.push(term.moveTo(sepRow, 1) + term.clearLine + this.renderSeparator(scrollHint));
 
     // Input region: one or more wrapped rows below the separator. The prompt
@@ -1049,6 +1200,32 @@ export class Tui implements SessionIO {
     });
   }
 
+  /**
+   * Resolve a waiting question() with the wake sentinel, so the session loop can
+   * run out-of-band work (a finished dispatch review) and re-prompt. The user's
+   * in-progress `buf`/`cursor` are deliberately left untouched — the next
+   * question() repaints with their draft intact, so a background completion never
+   * eats a half-typed line. No-op (returns false) when nothing is waiting; the
+   * caller then holds the event until the next idle prompt.
+   */
+  wake(_reason: string): boolean {
+    const r = this.pendingResolve;
+    if (!r) return false;
+    this.pendingResolve = null;
+    r(WAKE_SENTINEL);
+    return true;
+  }
+
+  /**
+   * Show or clear the armed-dispatch confirm banner above the input bar. Pass the
+   * lines to show (order preview + resolved command + the confirm hint), or null
+   * to clear it. Presentational only; the loop owns the interlock logic.
+   */
+  setConfirmBanner(lines: string[] | null): void {
+    this.confirmBanner = lines && lines.length ? lines : null;
+    this.paint();
+  }
+
   /** Print a system line into the transcript (e.g. a notice). */
   print(text: string): void {
     this.appendBlock(text);
@@ -1118,6 +1295,12 @@ export class Tui implements SessionIO {
 
   /** Parse one key/sequence starting at `data[i]`. Returns bytes consumed. */
   private consume(data: string, i: number): number {
+    // The doc viewer is modal: while it's open every key drives the viewer, not
+    // the prompt. Delegate before any editor parsing so a keystroke can't leak
+    // into the buffer underneath. (The model keeps streaming into the transcript
+    // beneath the overlay; closing it repaints that intact — see closeOverlay.)
+    if (this.overlay) return this.consumeOverlay(data, i);
+
     // Inside a bracketed paste, bytes are opaque content: accumulate them until
     // the end marker and never parse CSI/keys within (a paste can contain
     // anything, including escape sequences and newlines).
@@ -1263,6 +1446,10 @@ export class Tui implements SessionIO {
         // Accept the ghost command completion when one is showing; else ignore
         // (we never insert literal tabs into the buffer).
         this.acceptGhost();
+        return;
+
+      case "open-docs":
+        this.openOverlay();
         return;
 
       case "none":
@@ -1559,6 +1746,381 @@ export class Tui implements SessionIO {
     this.copyToClipboard(text);
     const n = countLines(text);
     this.setStatus(`copied ${n} line${n === 1 ? "" : "s"}`);
+  }
+
+  // --- doc viewer overlay -----------------------------------------------------
+  //
+  // A modal, in-process viewer for the instance's user-facing docs (Ctrl-O). It
+  // lists docs/, renders a selected doc through the SAME markdown renderer the
+  // transcript uses, and refreshes live when an agent writes the doc on screen.
+  // It reads only through the injected DocSource, which is the sandboxed doc
+  // tool — so the `.memory/` substrate is never listed or reachable here. No
+  // step requires an arrow key: selection is a letter/number, paging is
+  // less-style (space/b, j/k, d/u, g/G).
+
+  /** Visible content rows in the overlay: full screen minus header + footer. */
+  private overlayViewport(): number {
+    return Math.max(1, this.rows - 2);
+  }
+
+  /** A page step for space/b/PgUp/PgDn: a screenful less one line of overlap. */
+  private overlayPage(): number {
+    return Math.max(1, this.overlayViewport() - 1);
+  }
+
+  /**
+   * Open the doc viewer. No-op (with a hint) when no DocSource was wired, so a
+   * PlainIO/degraded session never crashes on the keybind. Subscribes to the
+   * write queue for live refresh; loads the list asynchronously.
+   */
+  private openOverlay(): void {
+    if (!this.docs) {
+      this.setStatus("doc viewer unavailable");
+      return;
+    }
+    if (this.overlay) return;
+    this.clearSelection();
+    this.overlay = { mode: "list", docs: [], loading: true, error: null };
+    this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
+    this.paint();
+    void this.loadList();
+  }
+
+  /** Close the overlay and repaint the transcript+editor beneath it, intact. */
+  private closeOverlay(): void {
+    if (!this.overlay) return;
+    this.overlay = null;
+    if (this.unsubscribeDocs) {
+      this.unsubscribeDocs();
+      this.unsubscribeDocs = null;
+    }
+    // Any model output that streamed in while the overlay was up is already in
+    // the transcript model; this paint reveals it.
+    this.paint();
+  }
+
+  private async loadList(): Promise<void> {
+    if (!this.docs) return;
+    try {
+      const docs = await this.docs.list();
+      if (this.overlay?.mode === "list") {
+        this.overlay = { mode: "list", docs, loading: false, error: null };
+        this.paint();
+      }
+    } catch (e) {
+      if (this.overlay?.mode === "list") {
+        this.overlay = { mode: "list", docs: [], loading: false, error: (e as Error).message };
+        this.paint();
+      }
+    }
+  }
+
+  /** Load a doc and switch the overlay to showing it, scrolled to the top. */
+  private async openDoc(name: string): Promise<void> {
+    if (!this.docs) return;
+    try {
+      const content = await this.docs.read(name);
+      if (!this.overlay) return; // closed while loading
+      this.overlay = {
+        mode: "doc",
+        name,
+        content,
+        rows: renderMarkdownDoc(content, this.cols),
+        scroll: 0,
+        error: null,
+      };
+      this.paint();
+    } catch (e) {
+      if (!this.overlay) return;
+      this.overlay = { mode: "doc", name, content: "", rows: [], scroll: 0, error: (e as Error).message };
+      this.paint();
+    }
+  }
+
+  /** Return from a doc to the (re-loaded) list. */
+  private backToList(): void {
+    if (!this.docs) {
+      this.closeOverlay();
+      return;
+    }
+    this.overlay = { mode: "list", docs: [], loading: true, error: null };
+    this.paint();
+    void this.loadList();
+  }
+
+  /**
+   * A doc write landed (via the write queue). Refresh the view if it concerns
+   * what's on screen: re-read the open doc, or re-list (a create/delete changes
+   * the list). This is the live-refresh path the feature is built around.
+   */
+  private onDocWrite(name: string): void {
+    const ov = this.overlay;
+    if (!ov) return;
+    if (ov.mode === "doc") {
+      if (ov.name === name) void this.refreshDoc();
+    } else {
+      void this.loadList();
+    }
+  }
+
+  /** Re-read the open doc, preserving the scroll position where it still fits. */
+  private async refreshDoc(): Promise<void> {
+    const ov = this.overlay;
+    if (!this.docs || !ov || ov.mode !== "doc") return;
+    const name = ov.name;
+    try {
+      const content = await this.docs.read(name);
+      const cur = this.overlay;
+      if (!cur || cur.mode !== "doc" || cur.name !== name) return; // moved on
+      const rows = renderMarkdownDoc(content, this.cols);
+      const scroll = Math.min(cur.scroll, Math.max(0, rows.length - this.overlayViewport()));
+      this.overlay = { mode: "doc", name, content, rows, scroll, error: null };
+      this.paint();
+    } catch {
+      // Deleted out from under us: drop back to the list rather than show stale.
+      const cur = this.overlay;
+      if (cur && cur.mode === "doc" && cur.name === name) this.backToList();
+    }
+  }
+
+  /** Re-lay the open doc out at the current width (resize). */
+  private reflowOverlay(): void {
+    const ov = this.overlay;
+    if (!ov || ov.mode !== "doc") return;
+    const rows = renderMarkdownDoc(ov.content, this.cols);
+    const scroll = Math.min(ov.scroll, Math.max(0, rows.length - this.overlayViewport()));
+    this.overlay = { ...ov, rows, scroll };
+  }
+
+  private overlayScrollBy(delta: number): void {
+    const ov = this.overlay;
+    if (!ov || ov.mode !== "doc") return;
+    const max = Math.max(0, ov.rows.length - this.overlayViewport());
+    const next = Math.max(0, Math.min(max, ov.scroll + delta));
+    if (next !== ov.scroll) {
+      this.overlay = { ...ov, scroll: next };
+      this.paint();
+    }
+  }
+
+  private overlayScrollTo(pos: number): void {
+    const ov = this.overlay;
+    if (!ov || ov.mode !== "doc") return;
+    const max = Math.max(0, ov.rows.length - this.overlayViewport());
+    const next = Math.max(0, Math.min(max, pos));
+    if (next !== ov.scroll) {
+      this.overlay = { ...ov, scroll: next };
+      this.paint();
+    }
+  }
+
+  /** Parse one key/sequence while the overlay is open. Returns bytes consumed. */
+  private consumeOverlay(data: string, i: number): number {
+    const ch = data[i]!;
+    if (ch === ESC && data[i + 1] === "[") return this.consumeOverlayCsi(data, i);
+    // A lone ESC leaves. (Under the Kitty protocol Escape arrives as CSI 27 u,
+    // handled below; a bare 0x1b really is an Escape press.)
+    if (ch === ESC) {
+      this.dispatchOverlay({ nav: "escape" });
+      return 1;
+    }
+    const input = this.overlayByte(ch);
+    if (input) this.dispatchOverlay(input);
+    return 1;
+  }
+
+  /** Translate a legacy byte into an overlay input, or null to ignore it. */
+  private overlayByte(ch: string): OverlayInput | null {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code >= 32 && code !== 127) return { ch }; // printable
+    switch (code) {
+      case 8:
+      case 127:
+        return { nav: "back" }; // Backspace
+      case 2:
+        return { nav: "pageup" }; // Ctrl-B
+      case 6:
+        return { nav: "pagedown" }; // Ctrl-F
+      case 4:
+        return { nav: "halfdown" }; // Ctrl-D
+      case 21:
+        return { nav: "halfup" }; // Ctrl-U
+    }
+    return null; // Enter, Tab, other control bytes: nothing to do in the viewer
+  }
+
+  private consumeOverlayCsi(data: string, i: number): number {
+    // Mouse: swallow, and let the wheel scroll a doc (a bonus; never required).
+    if (data[i + 2] === "<") {
+      const end = this.findMouseEnd(data, i + 3);
+      if (end === -1) return data.length - i;
+      const b = Number.parseInt(data.slice(i + 3, end).split(";")[0] ?? "", 10);
+      if (b === 64) this.overlayScrollBy(-3);
+      else if (b === 65) this.overlayScrollBy(3);
+      return end - i + 1;
+    }
+
+    let j = i + 2;
+    while (j < data.length && !/[A-Za-z~]/.test(data[j]!)) j++;
+    if (j >= data.length) return data.length - i;
+    const final = data[j]!;
+    const params = data.slice(i + 2, j);
+    const consumed = j - i + 1;
+
+    switch (final) {
+      case "u": {
+        const ev = parseCsiU(params);
+        if (ev) {
+          if (ev.code === 27) this.dispatchOverlay({ nav: "escape" });
+          else {
+            // Fold a Kitty-encoded key back onto the legacy byte its raw form
+            // would have been, so Ctrl-F/B/D/U page identically either way.
+            const raw =
+              ev.mods.ctrl && ev.code >= 97 && ev.code <= 122
+                ? String.fromCharCode(ev.code - 96)
+                : String.fromCodePoint(ev.code);
+            const input = this.overlayByte(raw);
+            if (input) this.dispatchOverlay(input);
+          }
+        }
+        return consumed;
+      }
+      case "A": this.dispatchOverlay({ nav: "up" }); return consumed;
+      case "B": this.dispatchOverlay({ nav: "down" }); return consumed;
+      case "C": return consumed; // Right: nothing to do
+      case "D": return consumed; // Left: nothing to do (Backspace goes back)
+      case "H": this.dispatchOverlay({ nav: "top" }); return consumed;
+      case "F": this.dispatchOverlay({ nav: "bottom" }); return consumed;
+      case "~": {
+        const n = Number.parseInt(params, 10);
+        if (n === 5) this.dispatchOverlay({ nav: "pageup" });
+        else if (n === 6) this.dispatchOverlay({ nav: "pagedown" });
+        else if (n === 1 || n === 7) this.dispatchOverlay({ nav: "top" });
+        else if (n === 4 || n === 8) this.dispatchOverlay({ nav: "bottom" });
+        return consumed;
+      }
+      default:
+        return consumed;
+    }
+  }
+
+  private dispatchOverlay(input: OverlayInput): void {
+    const ov = this.overlay;
+    if (!ov) return;
+    if (ov.mode === "list") this.overlayListInput(input, ov);
+    else this.overlayDocInput(input);
+  }
+
+  private overlayListInput(input: OverlayInput, ov: Extract<Overlay, { mode: "list" }>): void {
+    if ("nav" in input) {
+      if (input.nav === "escape" || input.nav === "back") this.closeOverlay();
+      return; // a labelled list has no line/page navigation
+    }
+    const ch = input.ch;
+    if (ch === "q" || ch === "Q") {
+      this.closeOverlay();
+      return;
+    }
+    const idx = OVERLAY_LABELS.indexOf(ch.toLowerCase());
+    if (idx >= 0 && idx < ov.docs.length) void this.openDoc(ov.docs[idx]!);
+  }
+
+  private overlayDocInput(input: OverlayInput): void {
+    if ("nav" in input) {
+      switch (input.nav) {
+        case "escape": this.closeOverlay(); return;
+        case "back": this.backToList(); return;
+        case "up": this.overlayScrollBy(-1); return;
+        case "down": this.overlayScrollBy(1); return;
+        case "pageup": this.overlayScrollBy(-this.overlayPage()); return;
+        case "pagedown": this.overlayScrollBy(this.overlayPage()); return;
+        case "halfup": this.overlayScrollBy(-Math.max(1, Math.floor(this.overlayPage() / 2))); return;
+        case "halfdown": this.overlayScrollBy(Math.max(1, Math.floor(this.overlayPage() / 2))); return;
+        case "top": this.overlayScrollTo(0); return;
+        case "bottom": this.overlayScrollTo(Number.MAX_SAFE_INTEGER); return;
+      }
+    }
+    switch (input.ch) {
+      case "q": this.closeOverlay(); return;
+      case " ":
+      case "f": this.overlayScrollBy(this.overlayPage()); return;
+      case "b": this.overlayScrollBy(-this.overlayPage()); return;
+      case "d": this.overlayScrollBy(Math.max(1, Math.floor(this.overlayPage() / 2))); return;
+      case "u": this.overlayScrollBy(-Math.max(1, Math.floor(this.overlayPage() / 2))); return;
+      case "j": this.overlayScrollBy(1); return;
+      case "k": this.overlayScrollBy(-1); return;
+      case "g": this.overlayScrollTo(0); return;
+      case "G": this.overlayScrollTo(Number.MAX_SAFE_INTEGER); return;
+    }
+  }
+
+  /** Paint the full-screen overlay: header bar, content viewport, footer hints. */
+  private paintOverlay(): void {
+    const ov = this.overlay;
+    if (!ov) return;
+    const w = this.cols;
+    const vp = this.overlayViewport();
+    const title = ov.mode === "list" ? "docs" : `docs · ${ov.name}`;
+
+    const body = ov.mode === "list" ? this.overlayListRows() : ov.rows;
+    const start = ov.mode === "doc" ? ov.scroll : 0;
+
+    const frame: string[] = [term.moveTo(1, 1) + term.clearLine + this.overlayHeader(title)];
+    for (let r = 0; r < vp; r++) {
+      const lineText = body[start + r] ?? "";
+      frame.push(term.moveTo(2 + r, 1) + term.clearLine + this.clip(lineText, w));
+    }
+    frame.push(term.moveTo(this.rows, 1) + term.clearLine + this.overlayFooter(ov, body.length, start, vp));
+    // The viewer has no text cursor; hide the hardware caret while it's up.
+    frame.push(term.hideCursor);
+    this.out.write(frame.join(""));
+  }
+
+  private overlayHeader(title: string): string {
+    const w = this.cols;
+    const bar = this.clip(` ${title} `, w).padEnd(w, " ");
+    return colorEnabled ? `${ESC}[7m${bar}${ESC}[27m` : bar;
+  }
+
+  /** The doc list as selectable rows: "a) plan.md". */
+  private overlayListRows(): string[] {
+    const ov = this.overlay;
+    if (!ov || ov.mode !== "list") return [];
+    if (ov.loading) return ["", "  " + c.dim("loading…")];
+    if (ov.error) return ["", "  " + c.yellow(ov.error)];
+    if (ov.docs.length === 0) {
+      return [
+        "",
+        "  " + c.dim("No documents yet."),
+        "  " + c.dim("Docs live in docs/ and show up here once the co writes one."),
+      ];
+    }
+    const rows: string[] = [""];
+    ov.docs.forEach((name, idx) => {
+      const label = OVERLAY_LABELS[idx];
+      if (label === undefined) return; // beyond the label alphabet; noted below
+      rows.push("  " + c.cyan(`${label})`) + " " + name);
+    });
+    if (ov.docs.length > OVERLAY_LABELS.length) {
+      rows.push("", "  " + c.dim(`(${ov.docs.length - OVERLAY_LABELS.length} more not shown)`));
+    }
+    return rows;
+  }
+
+  private overlayFooter(ov: Overlay, total: number, start: number, vp: number): string {
+    const w = this.cols;
+    const hint =
+      ov.mode === "list"
+        ? "1-9/a-z open · Esc close"
+        : "space/b page · j/k line · g/G ends · Backspace list · Esc close";
+    let right = "";
+    if (ov.mode === "doc" && total > vp) {
+      const below = total - (start + vp);
+      right = below > 0 ? `${below} more below ` : "end ";
+    }
+    const left = ` ${hint} `;
+    const fill = Math.max(0, w - visibleWidth(left) - visibleWidth(right));
+    return c.dim(this.clip(left + "─".repeat(fill) + right, w));
   }
 
   // --- input history ---------------------------------------------------------

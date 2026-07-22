@@ -30,3 +30,46 @@ export function serializeWrite<T>(fn: () => Promise<T>): Promise<T> {
   tail = run.catch(() => undefined);
   return run;
 }
+
+/**
+ * Change notification, for surfaces that want to react to a completed write.
+ *
+ * The in-session doc viewer (see tui.ts) subscribes here so an agent write to
+ * the doc it is showing refreshes the view live, without polling or an fs.watch.
+ * The queue is the right emitter because it already sees every mutating memory
+ * and doc operation in one serialized lane: a signal fired here is fired exactly
+ * once per write, after the bytes have landed.
+ *
+ * Only the doc tier emits (docs.ts calls notifyWrite after a successful write);
+ * the `.memory/` substrate deliberately does not, so nothing about the hidden
+ * substrate is ever observable through this channel. The payload is the bare
+ * doc filename — everything a viewer needs to decide "is this the doc I'm on?"
+ * without handing out a path.
+ */
+export type WriteEvent = { kind: "doc"; name: string };
+type WriteListener = (e: WriteEvent) => void;
+
+const listeners = new Set<WriteListener>();
+
+/** Subscribe to write events. Returns an unsubscribe function. */
+export function onWrite(listener: WriteListener): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+/**
+ * Announce a completed write to every subscriber. A listener that throws must
+ * not break the writer that emitted, nor starve the other listeners, so each is
+ * called in isolation and its failure is swallowed.
+ */
+export function notifyWrite(e: WriteEvent): void {
+  for (const listener of listeners) {
+    try {
+      listener(e);
+    } catch {
+      // A cosmetic refresh is never worth failing a write over.
+    }
+  }
+}

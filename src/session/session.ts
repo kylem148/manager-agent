@@ -1,4 +1,5 @@
 import * as readline from "node:readline";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { EFFORT_LEVELS, parseEffort, type Config, type Effort } from "../config.js";
 import type { InstancePaths } from "../paths.js";
@@ -21,11 +22,15 @@ import {
   appendTranscript,
   type TranscriptHandle,
 } from "../memory/memory.js";
+import { listDocs, readDoc } from "../memory/docs.js";
+import { onWrite } from "../memory/writequeue.js";
 import { c, line, write } from "../ui.js";
-import { Tui, type SessionIO } from "../tui/tui.js";
+import { Tui, WAKE_SENTINEL, type SessionIO, type DocSource } from "../tui/tui.js";
 import { SLASH_COMMANDS } from "../tui/commands.js";
 import { pirateBanner } from "../tui/banner.js";
 import { LOG_NAMES, type LogName } from "../paths.js";
+import { readDispatchConfig, displayCommand, type DispatchConfig } from "./dispatchconfig.js";
+import { DispatchRegistry, type Job } from "./registry.js";
 
 /**
  * Interactive terminal session for one co-manager instance.
@@ -58,6 +63,16 @@ interface SessionState {
   /** Count of real user turns (natural-language + steering commands), so the
    *  exit distill can skip a session where nothing was actually said. */
   userTurns: number;
+  /** Dispatch config if the instance is linked (co link), else null. When null,
+   *  the dispatch_order tool is not exposed and no dispatch can be armed. */
+  dispatch: DispatchConfig | null;
+  /** The job registry + capture watcher, created only when linked. */
+  registry: DispatchRegistry | null;
+  /** The order armed and awaiting a typed `confirm`, or null. Set by the arm
+   *  callback; consumed by the confirm interlock in the input loop. */
+  armed: { order: string } | null;
+  /** Completed jobs waiting for a review turn, drained on the next idle prompt. */
+  reviewQueue: Job[];
 }
 
 const PROMPT_LABEL = c.cyan("you › ");
@@ -111,6 +126,24 @@ const BUSY_CHORES = [
   "reading the stars",
   "dousing the lanterns",
 ];
+
+/**
+ * The doc surface the Ctrl-O viewer overlay reads through. This is the SAME
+ * sandboxed doc tool the model uses (listDocs/readDoc resolve inside docs/ and
+ * reject any path that escapes it), so the overlay is structurally incapable of
+ * listing or opening anything under `.memory/` — it can only ever name a `.md`
+ * file the sandbox already vetted. Live refresh rides the serialized memory
+ * write queue: onWrite fires with the doc's bare filename after a completed
+ * write, and only the doc tier emits there, so the hidden substrate stays
+ * invisible to this feature.
+ */
+function docSource(paths: InstancePaths): DocSource {
+  return {
+    list: () => listDocs(paths),
+    read: (name) => readDoc(paths, name),
+    subscribe: (listener) => onWrite((e) => listener(e.name)),
+  };
+}
 
 /** The chore showing right now, so we never pick the same one twice running —
  *  a repeat reads as a stuck spinner, which is the bug this whole thing fixes. */
@@ -168,8 +201,15 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // .memory/ hold the curated memory that cold start reads.
   const transcript = await startTranscript(paths, { model: cfg.model.modelId });
 
+  // Dispatch is available only when the instance has been linked to a repo
+  // (`co link`). When linked, the model gets the dispatch_order tool and the
+  // prompt says so; unlinked, none of the dispatch machinery is created and the
+  // co-manager writes plain-text orders exactly as before.
+  const dispatch = await readDispatchConfig(paths);
+
   const system = await buildSystemPrompt(paths, cfg.research, {
     excludeTranscript: transcript.file,
+    dispatch: dispatch ? { repoPath: dispatch.repoPath, transport: dispatch.anchor ? "visible pane (Ghostty) with background fallback" : "background (no crew pane designated yet)" } : null,
   });
 
   // The scroll/selection hint only applies to the interactive TUI; it would be
@@ -177,7 +217,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   const tui = Tui.capable();
   const header = bannerText(paths.name, cfg, tui);
   const io: SessionIO = tui
-    ? new Tui({ promptLabel: PROMPT_LABEL, header })
+    ? new Tui({ promptLabel: PROMPT_LABEL, header, docs: docSource(paths) })
     : new PlainIO(PROMPT_LABEL, header);
 
   const state: SessionState = {
@@ -190,7 +230,28 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     io,
     transcript,
     userTurns: 0,
+    dispatch,
+    registry: null,
+    armed: null,
+    reviewQueue: [],
   };
+
+  // Wire the job registry when linked. On completion a job is queued for review
+  // and the input loop is woken so the co reviews it on the next idle prompt,
+  // without the captain pasting anything. The wake preserves any half-typed line.
+  if (dispatch) {
+    state.registry = new DispatchRegistry({
+      paths,
+      config: dispatch,
+      onComplete: (job) => {
+        state.reviewQueue.push(job);
+        io.appendBlock(
+          c.dim(`  · crew job ${job.id} ${job.status === "done" ? "finished" : "failed"}: ${job.label}`),
+        );
+        io.wake("dispatch-complete");
+      },
+    });
+  }
 
   io.start();
 
@@ -207,8 +268,34 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     while (true) {
       const input = await io.question();
       if (input === null) break; // EOF → clean exit, run the guard below
+
+      // Wake sentinel: a background dispatch finished (or another out-of-band
+      // event) and asked for a turn. Drain any pending reviews, then re-prompt.
+      // The captain's half-typed line is preserved by the TUI across the wake.
+      if (input === WAKE_SENTINEL) {
+        await drainReviews(state);
+        continue;
+      }
+
       const raw = input.trim();
       if (raw === "") continue;
+
+      // Confirm interlock: while a dispatch is armed, ONLY a typed `confirm`
+      // (case-insensitive) fires it. Anything else cancels the armed dispatch and
+      // is then handled as ordinary input. There is no other path to launch a
+      // dispatch, so nothing runs without this explicit confirmation.
+      if (state.armed) {
+        const armed = state.armed;
+        state.armed = null;
+        io.setConfirmBanner(null);
+        if (raw.toLowerCase() === "confirm") {
+          await appendTranscript(state.transcript, "you", raw);
+          await fireDispatch(state, armed.order);
+          continue;
+        }
+        io.appendBlock(c.dim("  · dispatch cancelled."));
+        // Fall through: treat the typed line as normal conversation/command.
+      }
 
       // Record what the captain actually typed, verbatim, before dispatching.
       // Hidden instruction injections (greeting, /decide, /sync) are internal
@@ -225,8 +312,13 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
       // conversational substance worth preserving, even if no tool ran.
       state.userTurns++;
       await runUserTurn(state, raw);
+
+      // A turn may have finished a dispatch while the model was talking; surface
+      // any reviews now rather than waiting for the next idle prompt.
+      await drainReviews(state);
     }
   } finally {
+    state.registry?.stop();
     // The end-of-session guard runs inside the live UI so its prompts render
     // in-session; then we tear the UI down and leave a short, persistent
     // footprint on the user's primary screen.
@@ -311,6 +403,10 @@ async function drive(state: SessionState, effort?: Effort): Promise<void> {
       io.appendBlock(c.dim(`  · ${msg}`));
       void appendTranscript(state.transcript, "note", msg);
     },
+    // Only wired when the instance is linked. Arming shows the confirm banner and
+    // records the order; it never launches — the input loop's `confirm` branch is
+    // the only path that fires a dispatch.
+    ...(state.dispatch ? { onArmDispatch: (order: string) => armDispatch(state, order) } : {}),
   });
 
   // Streaming render state. "mode" tracks whether the open transcript line is
@@ -334,7 +430,7 @@ async function drive(state: SessionState, effort?: Effort): Promise<void> {
     result = await state.model.runTurn({
       system: state.system,
       messages: state.messages,
-      tools: toolDefinitions(),
+      tools: toolDefinitions({ dispatch: Boolean(state.dispatch) }),
       executor,
       ...(effort ? { effort } : {}),
       handlers: {
@@ -383,6 +479,115 @@ async function drive(state: SessionState, effort?: Effort): Promise<void> {
 
   // Persist the co's turn as soon as it lands — the "save along the way" path.
   await appendTranscript(state.transcript, "co", answer);
+}
+
+// --- dispatch (arm → confirm → launch → review) ------------------------------
+
+/**
+ * Arm a dispatch (called by the dispatch_order tool via the executor). Records
+ * the order and shows the confirm banner; it launches NOTHING. Returns a short
+ * summary for the tool result. Re-arming replaces any prior armed order — only
+ * one can be pending, and the last one the model staged this turn wins.
+ */
+function armDispatch(
+  state: SessionState,
+  order: string,
+): { armed: true; summary: string } | { armed: false; reason: string } {
+  const config = state.dispatch;
+  if (!config) return { armed: false, reason: "This instance is not linked; run `co link` first." };
+  if (!config.repoPath) {
+    return { armed: false, reason: "No repo path is registered. Re-run `co link` to set one." };
+  }
+  state.armed = { order };
+
+  const cmd = displayCommand(config.commandTemplate, config.repoPath);
+  const transport =
+    state.registry?.activeTransport === "ghostty" ? "visible Ghostty pane" : "background run";
+  state.io.setConfirmBanner([
+    c.yellow(c.bold("  ⚑ dispatch armed — type `confirm` to launch, anything else cancels")),
+    c.dim(`  transport: ${transport}   command: ${cmd}`),
+    c.dim(`  order: ${firstLineOf(order)}`),
+  ]);
+  return {
+    armed: true,
+    summary: `It will run via ${transport} as: ${cmd}`,
+  };
+}
+
+/**
+ * Fire a confirmed dispatch: hand the order to the registry, which launches it
+ * on the chosen transport and watches for completion. Non-blocking — we report
+ * which transport was used and return immediately; the review lands later via the
+ * completion callback. Never throws into the loop.
+ */
+async function fireDispatch(state: SessionState, order: string): Promise<void> {
+  const { io, registry } = state;
+  if (!registry) {
+    io.appendBlock(c.yellow("  · dispatch unavailable (not linked)."));
+    return;
+  }
+  try {
+    const job = await registry.dispatch(order);
+    if (job.status === "failed") {
+      io.appendBlock(c.red(`  · dispatch failed to launch: ${job.error ?? "unknown error"}`));
+      return;
+    }
+    const where =
+      job.transport === "ghostty"
+        ? job.status === "queued"
+          ? "queued for a free crew pane"
+          : `running in a Ghostty pane (${job.paneId ?? "?"})`
+        : "running in the background";
+    io.appendBlock(c.green(`  · dispatched ${job.id}: ${where}. I'll review it when it finishes.`));
+  } catch (e) {
+    io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));
+  }
+}
+
+/**
+ * Drain completed jobs into review turns. For each finished job the co reads the
+ * capture file itself (the captain pastes nothing) and reports a review using the
+ * standard report-review protocol. Runs on the next idle prompt or right after a
+ * turn. Serial, so multiple completions review in order.
+ */
+async function drainReviews(state: SessionState): Promise<void> {
+  while (state.reviewQueue.length > 0) {
+    const job = state.reviewQueue.shift()!;
+    let captured = "";
+    try {
+      captured = await readCapture(state, job.captureFile);
+    } catch {
+      captured = "(the capture file could not be read)";
+    }
+    state.userTurns++;
+    state.messages.push({
+      role: "user",
+      content:
+        "SYSTEM: A crew dispatch you launched has finished; review it now for the captain. This is" +
+        " not something the captain typed — you triggered it. The agent ran in a separate coding" +
+        " session against the registered repo; below is the captured output of that run. Review it" +
+        " per the report-review protocol (what went right, what went wrong, escalations, then a" +
+        " verdict: accept / fix-commit / rework). Be concise. Do NOT ask the captain to paste" +
+        " anything; you already have the capture. Separate verified from claimed.\n\n" +
+        `Job: ${job.id} (${job.label})\nStatus: ${job.status}` +
+        (job.exitCode !== undefined ? ` (exit ${job.exitCode})` : "") +
+        `\n\n--- captured run output ---\n${captured}`,
+    });
+    await drive(state);
+  }
+}
+
+/** Read a capture file, capping its size so a runaway log can't blow the context
+ *  window. Keeps the tail, where the agent's conclusion and any sentinel live. */
+async function readCapture(_state: SessionState, file: string): Promise<string> {
+  const raw = await fsp.readFile(file, "utf8");
+  const MAX = 16000;
+  return raw.length > MAX ? "…[capture truncated to the last part]\n" + raw.slice(-MAX) : raw;
+}
+
+function firstLineOf(order: string): string {
+  const l = order.split("\n").find((x) => x.trim() !== "")?.trim() ?? "";
+  return l.length > 80 ? l.slice(0, 77) + "…" : l;
 }
 
 type CommandResult = "ok" | "exit";
@@ -603,6 +808,7 @@ function bannerText(name: string, cfg: Config, tui: boolean): string {
   if (tui) {
     lines.push(
       c.dim("scroll: wheel or PgUp/PgDn · ↑/↓ recalls your input · hold Option/Shift to select text"),
+      c.dim("Ctrl-O opens the doc viewer"),
     );
   }
   return lines.join("\n");
@@ -710,4 +916,21 @@ class PlainIO implements SessionIO {
     if (next !== undefined) return Promise.resolve(next);
     return new Promise((resolve) => { this.waiter = resolve; });
   }
+
+  /**
+   * Wake a waiting question() with the sentinel. On the plain path a completed
+   * dispatch review is delivered on the next scripted turn regardless, so this is
+   * only meaningful if something is actually blocked on input; deliver it if so.
+   */
+  wake(_reason: string): boolean {
+    const waiter = this.waiter;
+    if (!waiter) return false;
+    this.waiter = null;
+    waiter(WAKE_SENTINEL);
+    return true;
+  }
+
+  // No banner off the TTY: the armed order + command are printed inline by the
+  // session loop instead, so a pipe/script sees them as ordinary output.
+  setConfirmBanner(_lines: string[] | null): void {}
 }

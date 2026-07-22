@@ -109,6 +109,7 @@ export type Action =
   | { kind: "end" } // Ctrl-E
   | { kind: "kill-to-start" } // Ctrl-U
   | { kind: "kill-to-end" } // Ctrl-K
+  | { kind: "open-docs" } // Ctrl-O — open the in-session doc viewer overlay
   | { kind: "none" };
 
 const NONE: Action = { kind: "none" };
@@ -124,6 +125,7 @@ const CTRL_LETTERS: Record<number, Action> = {
   105: { kind: "tab" }, // i — Ctrl-I *is* Tab
   106: { kind: "newline" }, // j — the universal newline fallback; see below
   109: { kind: "submit" }, // m — Ctrl-M *is* Enter
+  111: { kind: "open-docs" }, // o — open the doc viewer overlay
 };
 
 /**
