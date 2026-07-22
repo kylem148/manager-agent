@@ -340,7 +340,7 @@ flat over time — small rewritten orientation files plus large append-only logs
         │   │   └── decisions/ progress/ research/
         │   └── sessions/          verbatim per-session transcripts (the record)
         └── .dispatch/          crew-dispatch state (only after `co link`)
-            ├── config.json        repo path, agent command, caps, pane layout, anchor
+            ├── config.json        repo path, named agent commands, caps, pane layout, anchor
             └── captures/          per-job captured output the co reviews from
 ```
 
@@ -461,20 +461,24 @@ On the pane path, the job — the `cd` into the repo, the agent command, the
 (possibly multi-line) order text, capture and completion bookkeeping — is written
 to a **per-job script file** next to the capture, and the pane only ever receives
 a launch of that file. A fresh split is created already running it (Ghostty's
-surface `command`), so nothing is typed into a new pane at all; taking over or
-reusing an existing pane pastes a single short `/bin/sh '<script>'` line. The
-order itself never travels through the keystroke stream, so newlines and quotes
-in an order can't be re-interpreted by whatever the pane is doing. If the pane
-doesn't start the job promptly (something else — an editor, another agent — owns
+surface `command`), so nothing is typed into a new pane at all; the script ends
+by exec'ing a login shell, so that freshly-split pane stays open and reusable
+instead of closing when the job exits. Taking over or reusing an existing pane
+pastes a single short `/bin/sh '<script>'` line instead. The order itself never
+travels through the keystroke stream, so newlines and quotes in an order can't
+be re-interpreted by whatever the pane is doing. If the pane doesn't start the
+job within about four seconds (something else — an editor, another agent — owns
 it), the dispatch degrades to the background transport with a note in the
 capture saying why. Inside the script the agent runs under `script(1)`, a pty
 recorder: it keeps a real terminal on both ends — so an interactive agent stays
 interactive and visible in the pane — while everything is recorded to the
-capture file. The background fallback instead pipes output straight to the
-capture (no pty, agents run in their non-interactive mode there), sets the repo
-as the working directory, and skips the `cd` when the repo doesn't exist yet so
-a not-yet-created repo degrades to the inherited directory instead of a hard
-failure.
+capture file. The co-manager's own `PATH` is baked into the script, because a
+command-launched Ghostty surface otherwise inherits only the bare GUI `PATH` and
+wouldn't find a user-installed agent binary. The background fallback instead
+pipes output straight to the capture (no pty, agents run in their non-interactive
+mode there), sets the repo as the working directory, and skips the `cd` when the
+repo doesn't exist yet so a not-yet-created repo degrades to the inherited
+directory instead of a hard failure.
 
 Both transports share one completion contract, so a run reports the same way
 whether it lands in a pane or the background. A bad repo path fails the `cd ||
@@ -592,8 +596,9 @@ The dispatch layer is four focused modules. `crewpanes.ts` is the pure pane-
 placement planner (anchor takeover, alternating splits of the newest pane, cap +
 reuse-oldest, all configurable) with no I/O. `dispatchconfig.ts` reads/writes the
 per-instance `.dispatch/config.json`, resolves which named crew agent a dispatch
-uses (default or `confirm <name>` override), and turns its command into argv
-(placeholder substitution, argv tokenizing, shell quoting). `transport.ts` has
+uses (default or `confirm <name>` override), and resolves that agent's command
+into a runnable shell command line (git-style: the template runs verbatim, only
+the substituted `{prompt}`/`{repo}` values are shell-quoted). `transport.ts` has
 the two launchers — a Ghostty/AppleScript visible-pane path that consumes the
 planner, and a detached-subprocess fallback — both sharing one capture-file +
 completion-sentinel contract. `registry.ts` owns in-flight jobs: it launches on
