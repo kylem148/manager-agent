@@ -6,9 +6,16 @@ architecture, pushes back on weak assumptions, tracks decisions, and writes
 high-quality orders to the crew (separate coding agents).
 
 It is deliberately **not** a coding agent. It never inspects, edits, or runs
-your project's source code. It operates from its own markdown memory workspace
-and writes orders to the crew (Claude Code, OpenCode, etc.) straight into its
-reply, as plain text you copy across.
+your project's source code itself: a separate coding agent does all the repo
+work, and the co-manager is the architect and orchestrator. It operates from its
+own markdown memory workspace, not your repo's files.
+
+It delivers an order to the crew (Claude Code, OpenCode, etc.) one of two ways:
+as plain text you copy across, or by dispatching it directly to the crew when
+you've linked the instance to a repo (`co link`). A direct dispatch is always
+gated by a typed `confirm`, runs the agent in a visible pane you can watch and
+answer, and the co-manager reviews the captured result for you afterward. Even
+when dispatching, it never reads or edits repo files itself.
 
 ```
 Ghostty (or any terminal multiplexer)
@@ -33,11 +40,13 @@ system prompt:
 > research tradeoffs from primary sources, preserve decisions, maintain project
 > memory, and write the orders to the crew: implementation-ready prompts for
 > separate coding agents. You never inspect, edit, or run the user's source code
-> and you do not have the repository; when a task needs repo access, you write
-> the orders to the crew instead of pretending to do it yourself. The orders are
-> simply the text you write back, drafted directly in your reply. These
-> constraints are absolute - everything else in the prompt is guidance on how to
-> carry them out.
+> yourself; a separate coding agent does all the repo work. You deliver an order
+> either as plain text the captain carries across, or by dispatching it directly
+> to the crew when the instance is linked to a repo - always gated by the
+> captain's typed confirm, run in a visible pane, and reviewed from the captured
+> result afterward. Even when dispatching, you never read or edit repo files
+> yourself. These constraints are absolute - everything else in the prompt is
+> guidance on how to carry them out.
 
 ## Two layers: the app and the memory
 
@@ -200,6 +209,8 @@ co create my-saas        # create an instance from the template
 co my-saas               # open an interactive session (creates it if missing)
 co delete my-saas        # permanently delete an instance (type the name to confirm)
 co delete my-saas -y     # skip the prompt (--force / -y) for scripting
+co link my-saas          # register a repo + agent command so it can dispatch to the crew
+co pane my-saas          # designate the crew anchor pane (macOS + Ghostty)
 co auth bedrock          # set the Bedrock bearer token in ~/co-managers/.env (0600)
 co doctor                # check runtime + workspace paths, auth, research
 co doctor --ping         # also make one live model call
@@ -319,15 +330,18 @@ flat over time — small rewritten orientation files plus large append-only logs
     └── my-saas/
         ├── docs/               user-facing documents (flat, starts empty)
         │   └── architecture.md    ← plan.md and any other doc join it, via the doc tool
-        └── .memory/            hidden substrate the co-manager manages
-            ├── projectbrief.md    rewritten-in-full orientation
-            ├── activeContext.md   ← the orientation file, read first each start
-            ├── decisions.md       append-only log
-            ├── progress.md        append-only log
-            ├── research.md        append-only log
-            ├── archive/           cold log history, off the read path
-            │   └── decisions/ progress/ research/
-            └── sessions/          verbatim per-session transcripts (the record)
+        ├── .memory/            hidden substrate the co-manager manages
+        │   ├── projectbrief.md    rewritten-in-full orientation
+        │   ├── activeContext.md   ← the orientation file, read first each start
+        │   ├── decisions.md       append-only log
+        │   ├── progress.md        append-only log
+        │   ├── research.md        append-only log
+        │   ├── archive/           cold log history, off the read path
+        │   │   └── decisions/ progress/ research/
+        │   └── sessions/          verbatim per-session transcripts (the record)
+        └── .dispatch/          crew-dispatch state (only after `co link`)
+            ├── config.json        repo path, agent command, caps, pane layout, anchor
+            └── captures/          per-job captured output the co reviews from
 ```
 
 - **Cold start reads only the orientation files** (`projectbrief`,
@@ -373,6 +387,48 @@ it responds and updates memory appropriately
       ↓
 on exit, the stale-activeContext guard keeps live state honest
 ```
+
+## Dispatching orders to the crew
+
+By default the co-manager hands you an order as text and you carry it to a coding
+agent yourself. If you'd rather have it run the order for you, link the instance
+to a repo:
+
+```bash
+co link my-saas          # register the target repo + the agent command template
+```
+
+`co link` records, per instance (in `.dispatch/config.json` under the instance
+folder, not `.env` — none of it is secret): the repo path; an **agent-agnostic
+command template** with `{prompt}` and `{repo}` placeholders (it ships examples
+for Claude Code and OpenCode, and you can type your own); optional safety caps
+(wall-clock timeout, turn limit); and the crew-pane layout. It's re-runnable —
+run it again to change any of it.
+
+Once linked, the co-manager can **arm** a dispatch instead of only writing text.
+Arming shows you the exact order and the resolved command and waits. Nothing runs
+until you type `confirm`; any other input cancels it. This typed confirm is a hard
+interlock, not a nicety — there is no code path that dispatches without it.
+
+**On macOS with Ghostty**, a confirmed dispatch opens a visible split pane in your
+current tab and runs the agent there interactively, so you can watch it and answer
+its questions live. Placement follows a fixed scheme: designate the crew pane once
+with `co pane my-saas` (focus the pane, and it's tagged so the dispatcher finds it
+every time and across restarts); the first job takes over that anchor pane, and
+each later job splits the newest crew pane, alternating beside/below, up to a cap
+(default 4) after which the oldest finished pane is reused or the job queues. The
+split direction sequence and the cap are config values you can retune.
+
+**Everywhere else** (no Ghostty, or automation unavailable), the same dispatch
+runs as a detached background process instead, with no pane geometry. The
+co-manager tells you which transport it used.
+
+Either way the run's output is captured to a file, and when it finishes the
+co-manager reads that capture and reports a review on its own — you never paste
+anything back. The session stays fully interactive the whole time, including with
+several jobs running at once; a failed or timed-out job never takes the session
+down. This layer is macOS + Ghostty only for the visible pane; the background
+fallback is portable.
 
 ## What makes a turn slow
 
@@ -432,9 +488,10 @@ they want, so a cold start only loads what it uses.
 ```
 src/
   index.ts config.ts paths.ts ui.ts model.ts research.ts
-  cli/       auth.ts doctor.ts modelsdoctor.ts
+  cli/       auth.ts doctor.ts modelsdoctor.ts link.ts
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
   session/   session.ts prompt.ts tools.ts
+             crewpanes.ts dispatchconfig.ts transport.ts registry.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
 ```
 
@@ -462,14 +519,26 @@ mutating memory/doc operation runs through, so the concurrent tool calls in one
 model round can't interleave a read-modify-write (duplicate decision ids, a lost
 doc edit).
 
-**`src/session/`** — `session.ts` is the interactive REPL, slash-commands, and
-the end-of-session sync guard. `prompt.ts` assembles the system prompt in
-altitude order: identity + constraints, operating notes, navigator voice, the
-protocol reference sections (memory / documents / research / orders / report
-review), then
-live state and the recent-conversation tail (logs excluded). `tools.ts` is the
-internal tool surface exposed to the model plus the executor that binds tools
-to memory + research; it holds the decision gate.
+**`src/session/`** — `session.ts` is the interactive REPL, slash-commands, the
+end-of-session sync guard, and the dispatch flow (arm → typed-confirm interlock →
+fire → proactive review). `prompt.ts` assembles the system prompt in altitude
+order: identity + constraints, operating notes, navigator voice, the protocol
+reference sections (memory / documents / research / orders / dispatch when linked
+/ report review), then live state and the recent-conversation tail (logs
+excluded). `tools.ts` is the internal tool surface exposed to the model plus the
+executor that binds tools to memory + research; it holds the decision gate and
+the arm-only `dispatch_order` tool.
+
+The dispatch layer is four focused modules. `crewpanes.ts` is the pure pane-
+placement planner (anchor takeover, alternating splits of the newest pane, cap +
+reuse-oldest, all configurable) with no I/O. `dispatchconfig.ts` reads/writes the
+per-instance `.dispatch/config.json` and resolves the agent command template
+(placeholder substitution, argv tokenizing, shell quoting). `transport.ts` has
+the two launchers — a Ghostty/AppleScript visible-pane path that consumes the
+planner, and a detached-subprocess fallback — both sharing one capture-file +
+completion-sentinel contract. `registry.ts` owns in-flight jobs: it launches on
+the chosen transport, polls captures for the sentinel, enforces timeouts, drains
+the pane queue, and fires a completion callback, all non-blocking.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, and ANSI-aware wrapping.
@@ -479,8 +548,9 @@ deliberately one large file: the render loop, input handling, and scroll state
 share mutable state, and splitting them across modules would mean exporting
 that state rather than encapsulating it.
 
-**`src/cli/`** — `doctor.ts` and `modelsdoctor.ts` diagnostics, and `auth.ts`
-for writing the Bedrock token.
+**`src/cli/`** — `doctor.ts` and `modelsdoctor.ts` diagnostics, `auth.ts` for
+writing the Bedrock token, and `link.ts` for `co link` (register repo + agent
+command) and `co pane` (designate the crew anchor pane).
 
 ### V1 scope and extension points
 
