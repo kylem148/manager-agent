@@ -1,7 +1,7 @@
 import fsp from "node:fs/promises";
 import type { InstancePaths } from "../paths.js";
 import { CrewPaneLayout } from "./crewpanes.js";
-import type { DispatchConfig } from "./dispatchconfig.js";
+import { readDispatchConfig, type DispatchConfig } from "./dispatchconfig.js";
 import {
   anchorExists,
   chooseTransport,
@@ -78,11 +78,18 @@ export interface RegistryOptions {
 
 export class DispatchRegistry {
   private readonly paths: InstancePaths;
-  private readonly config: DispatchConfig;
+  /** The dispatch config. Re-read from disk at each dispatch (see
+   *  refreshConfig) so a `co pane` / `co link` change in another process takes
+   *  effect on the next dispatch without a session restart. Seeded from the
+   *  constructor value, which is also the fallback when the file can't be read. */
+  private config: DispatchConfig;
   private readonly onComplete: JobCompletionListener;
   private readonly clock: RegistryClock;
   private readonly pollIntervalMs: number;
   private readonly transport: TransportKind;
+  /** Whether to skip the live anchor `exists` probe (tests, and the no-anchor
+   *  case). Remembered so a re-read that swaps in a new anchor re-probes it. */
+  private readonly skipAnchorCheck: boolean;
 
   private readonly jobs = new Map<string, Job>();
   /** FIFO of jobs waiting for a crew pane to free (Ghostty path, at cap). */
@@ -104,6 +111,7 @@ export class DispatchRegistry {
     this.clock = opts.clock ?? { now: () => Date.now() };
     this.pollIntervalMs = opts.pollIntervalMs ?? POLL_INTERVAL_MS;
     this.transport = opts.transportOverride ?? chooseTransport();
+    this.skipAnchorCheck = Boolean(opts.skipAnchorCheck);
 
     // The placement planner only exists on the Ghostty path AND only once an
     // anchor has been designated. Off Ghostty, or before `co pane`, there is no
@@ -115,7 +123,7 @@ export class DispatchRegistry {
         : null;
     this.onAnchorLost = opts.onAnchorLost;
     // Tests (and the no-anchor case) skip the live existence probe.
-    this.anchorChecked = Boolean(opts.skipAnchorCheck) || !this.layout;
+    this.anchorChecked = this.skipAnchorCheck || !this.layout;
   }
 
   /** The transport this registry will actually use for new jobs. */
@@ -147,11 +155,48 @@ export class DispatchRegistry {
   }
 
   /**
+   * Re-read the dispatch config from disk and, if the designated anchor changed
+   * (a `co pane` in another process while this session runs), rebuild the layout
+   * on the new anchor so the very next dispatch targets it — no session restart.
+   *
+   * This is the fix for a stale pane id surviving `co pane`: the running session
+   * cached the anchor at construction, so a re-designated pane was invisible. We
+   * do NOT rebuild when the anchor id is unchanged: that would throw away live
+   * pane state (splits, running jobs) on every dispatch. A brand-new anchor is
+   * re-probed for existence on its first pane launch (anchorChecked reset).
+   *
+   * Best-effort: an unreadable/corrupt config keeps the current in-memory config
+   * rather than tearing down a working session. Only runs on the Ghostty path;
+   * off Ghostty there is no pane geometry to refresh.
+   */
+  private async refreshConfig(): Promise<void> {
+    if (this.transport !== "ghostty") return;
+    const fresh = await readDispatchConfig(this.paths);
+    if (!fresh) return; // never linked, or unreadable: keep what we have
+    this.config = fresh;
+
+    const anchor = fresh.anchor;
+    const currentAnchorId = this.layout?.anchorPaneId ?? null;
+    const nextAnchorId = anchor?.id ?? null;
+    if (nextAnchorId === currentAnchorId) return; // unchanged: keep live state
+
+    // The anchor was added, changed, or cleared. Rebuild from the fresh value.
+    this.layout = anchor ? new CrewPaneLayout(anchor, fresh.pane) : null;
+    // A fresh anchor must be re-probed for existence before we trust it (unless
+    // tests opt out); a cleared anchor has no pane to check.
+    this.anchorChecked = this.skipAnchorCheck || !this.layout;
+  }
+
+  /**
    * Launch (or queue) a dispatch for `order`. Returns the created Job. Never
    * throws into the caller: a launch failure marks the job failed and notifies,
    * so a bad dispatch can't crash the session. Starts the poller if idle.
    */
   async dispatch(order: string, agentName?: string): Promise<Job> {
+    // Pick up a `co pane` / `co link` change made since the session started (or
+    // the last dispatch) before deciding transport for this job.
+    await this.refreshConfig();
+
     const id = this.nextJobId();
     const label = firstLine(order);
     const captureFile = this.paths.captureFile(id);

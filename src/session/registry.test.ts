@@ -4,7 +4,11 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { instancePaths } from "../paths.js";
-import { defaultDispatchConfig, type DispatchConfig } from "./dispatchconfig.js";
+import {
+  defaultDispatchConfig,
+  writeDispatchConfig,
+  type DispatchConfig,
+} from "./dispatchconfig.js";
 import { crewPaneTitle } from "./crewpanes.js";
 import { setGhosttyAvailableForTest, setOsaRunnerForTest } from "./transport.js";
 import { DispatchRegistry, type Job, type RegistryOptions } from "./registry.js";
@@ -247,6 +251,51 @@ test("activeTransport degrades to fallback on Ghostty without a designated ancho
     );
   } finally {
     setGhosttyAvailableForTest(null);
+    await cleanup();
+  }
+});
+
+test("dispatch reads the pane id fresh from config, so `co pane` takes effect with no restart", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config: DispatchConfig = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = { id: "anchor-old", title: crewPaneTitle("inst") };
+    await writeDispatchConfig(paths, config);
+
+    setGhosttyAvailableForTest(true);
+    // Echo the targeted id back so we can see which anchor each dispatch used.
+    setOsaRunnerForTest(async (s) => {
+      const m = s.match(/first terminal whose id = "([^"]+)"/);
+      return m ? m[1]! : "unknown";
+    });
+
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: () => {},
+        transportOverride: "ghostty",
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000, // don't let the fake job complete
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one");
+        assert.equal(j1.paneId, "anchor-old", "first dispatch targets the originally-linked anchor");
+
+        // Simulate `co pane` in another process re-designating the anchor while
+        // this session keeps running: it just rewrites the config on disk.
+        const updated = { ...config, anchor: { id: "anchor-new", title: crewPaneTitle("inst") } };
+        await writeDispatchConfig(paths, updated);
+
+        // The very next dispatch must pick up the new id WITHOUT a restart.
+        const j2 = await reg.dispatch("two");
+        assert.equal(j2.paneId, "anchor-new", "the next dispatch uses the freshly-set pane id");
+      },
+    );
+  } finally {
+    setGhosttyAvailableForTest(null);
+    setOsaRunnerForTest(null);
     await cleanup();
   }
 });

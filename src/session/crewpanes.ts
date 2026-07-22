@@ -190,6 +190,13 @@ export class CrewPaneLayout {
     return { directionSequence: [...this.config.directionSequence], cap: this.config.cap };
   }
 
+  /** The anchor pane id this layout was built on. The registry compares it to the
+   *  freshly-read config at dispatch time to detect a `co pane` change and rebuild
+   *  the layout on the new anchor without a session restart. */
+  get anchorPaneId(): string {
+    return this.anchorId;
+  }
+
   /** Panes currently running a job. */
   get runningCount(): number {
     return this.panes.filter((p) => p.status === "running").length;
