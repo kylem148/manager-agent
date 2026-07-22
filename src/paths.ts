@@ -27,6 +27,14 @@ import path from "node:path";
 
 export const DOCS_DIR = "docs";
 export const MEMORY_DIR = ".memory";
+/**
+ * Third tier, alongside docs/ and .memory/: dispatch state. Holds the
+ * per-instance dispatch config (co link) and per-job capture files. It is
+ * neither user-facing prose (docs/) nor the co-manager's silent memory
+ * substrate (.memory/), so it gets its own hidden dir rather than being forced
+ * into either. Not secret (see the order): plain JSON, no 0600.
+ */
+export const DISPATCH_DIR = ".dispatch";
 
 /**
  * Substrate orientation files: rewritten in full, read at every cold start, and
@@ -58,6 +66,14 @@ export interface InstancePaths {
   archive: string;
   /** Per-session transcripts, under .memory/. */
   sessions: string;
+  /** Dispatch state (config + captures), under .dispatch/. */
+  dispatch: string;
+  /** The per-instance dispatch config file (co link). */
+  dispatchConfig: string;
+  /** Directory holding per-job capture files. */
+  captures: string;
+  /** Resolve a per-job capture file under .dispatch/captures/. */
+  captureFile: (jobId: string) => string;
   /** Resolve a substrate orientation file under .memory/. */
   liveFile: (f: LiveFile) => string;
   logFile: (name: LogName) => string;
@@ -76,6 +92,8 @@ export function instancePaths(home: string, name: string): InstancePaths {
   const memory = path.join(root, MEMORY_DIR);
   const archive = path.join(memory, "archive");
   const sessions = path.join(memory, "sessions");
+  const dispatch = path.join(root, DISPATCH_DIR);
+  const captures = path.join(dispatch, "captures");
   return {
     name,
     root,
@@ -83,6 +101,10 @@ export function instancePaths(home: string, name: string): InstancePaths {
     memory,
     archive,
     sessions,
+    dispatch,
+    dispatchConfig: path.join(dispatch, "config.json"),
+    captures,
+    captureFile: (jobId) => path.join(captures, `${jobId}.log`),
     liveFile: (f) => path.join(memory, f),
     logFile: (n) => path.join(memory, logFileName(n)),
     archiveDir: (n) => path.join(archive, n),

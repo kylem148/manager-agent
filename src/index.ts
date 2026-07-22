@@ -16,6 +16,7 @@ import { runSession } from "./session/session.js";
 import { runDoctor } from "./cli/doctor.js";
 import { runModelsDoctor } from "./cli/modelsdoctor.js";
 import { runAuthBedrock } from "./cli/auth.js";
+import { runLink, runPaneAnchor } from "./cli/link.js";
 import { c, line } from "./ui.js";
 import { restoreTerminal } from "./tui/tui.js";
 
@@ -24,6 +25,8 @@ import { restoreTerminal } from "./tui/tui.js";
  *   co <name>            open (create-if-missing) the named co-manager
  *   co list              list instances
  *   co create <name>     create an instance from the template
+ *   co link <name>       register a repo + agent command for crew dispatch
+ *   co pane <name>       designate the crew anchor pane (macOS + Ghostty)
  *   co doctor [--ping]   diagnostics
  *   co refresh           rebuild the CLI from source (npm run build)
  *   co help
@@ -102,6 +105,12 @@ async function main(): Promise<number> {
       line(c.red("usage: co auth bedrock"));
       return 1;
     }
+
+    case "link":
+      return runLink(cfg, argv[1]);
+
+    case "pane":
+      return runPaneAnchor(cfg, argv[1]);
 
     case "doctor": {
       if (argv.includes("--models")) {
@@ -241,6 +250,8 @@ function printUsage(): void {
   line(`  ${c.cyan("co list")}             list co-managers`);
   line(`  ${c.cyan("co create <name>")}    create a co-manager from the template`);
   line(`  ${c.cyan("co delete <name>")}    delete a co-manager (type the name to confirm; -y to force)`);
+  line(`  ${c.cyan("co link <name>")}      register a repo + agent command so it can dispatch to the crew`);
+  line(`  ${c.cyan("co pane <name>")}      designate the crew anchor pane (macOS + Ghostty)`);
   line(`  ${c.cyan("co auth bedrock")}     set the Bedrock bearer token in ~/co-managers/.env`);
   line(`  ${c.cyan("co doctor [--ping]")}  check config, paths, auth (--ping tests the model)`);
   line(`  ${c.cyan("co doctor --models")}  probe which Claude models actually work on this account`);
