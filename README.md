@@ -410,10 +410,13 @@ the repo (Claude Code has none).
 
 Once linked, the co-manager can **arm** a dispatch instead of only writing text.
 Arming shows you the exact order and the resolved command and waits. Nothing runs
-until you type `confirm`; any other input cancels it. A bare `confirm` runs the
-default agent; `confirm <name>` (e.g. `confirm ccw`) picks a specific agent for
-that one dispatch. This typed confirm is a hard interlock, not a nicety — there is
-no code path that dispatches without it.
+until you type `confirm`; anything that isn't a `confirm` cancels the armed order
+and is handled as ordinary input. A bare `confirm` runs the default agent;
+`confirm <name>` (e.g. `confirm ccw`) picks a specific agent for that one dispatch
+and does not change the default. Type an agent name that isn't registered and the
+order stays armed — it lists the valid names and waits for you to retype, so a
+typo never fires the wrong agent or forces a re-draft. This typed confirm is a
+hard interlock, not a nicety — there is no code path that dispatches without it.
 
 **On macOS with Ghostty**, a confirmed dispatch opens a visible split pane in your
 current tab and runs the agent there interactively, so you can watch it and answer
@@ -432,9 +435,10 @@ permission (granted the first time it scripts Ghostty).
 runs as a detached background process instead, with no pane geometry. The
 co-manager tells you which transport it used.
 
-Either way the run's output is captured to a file, and when it finishes the
-co-manager reads that capture and reports a review on its own — you never paste
-anything back. The session stays fully interactive the whole time, including with
+Either way the run's output (stdout and stderr) is captured to a per-job log at
+`.dispatch/captures/job-NNN.log` under the instance folder, and when it finishes
+the co-manager reads that capture and reports a review on its own — you never
+paste anything back. The session stays fully interactive the whole time, including with
 several jobs running at once; a failed or timed-out job never takes the session
 down. This layer is macOS + Ghostty only for the visible pane; the background
 fallback is portable.
