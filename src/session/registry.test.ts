@@ -53,6 +53,18 @@ function onCompleteOnce(): { promise: Promise<Job>; handler: (j: Job) => void } 
   return { promise, handler: (j) => resolve(j) };
 }
 
+/**
+ * Play the launched job's first act for a stubbed pane launch. The transport
+ * probes for the capture file the job script creates the moment it starts (that
+ * is how a busy pane is detected), so a stub that only returns a pane id would
+ * look like a launch that went nowhere and degrade to background. The script
+ * path rides inside the AppleScript as `/bin/sh '<capture>.sh'`.
+ */
+async function touchCaptureFromScript(script: string): Promise<void> {
+  const m = script.match(/\/bin\/sh '([^']+)\.sh'/);
+  if (m) await fsp.writeFile(m[1]!, "", "utf8");
+}
+
 test("fallback dispatch runs a fake agent and fires a done review with the capture", async () => {
   const { paths, cleanup } = await tmpInstance();
   try {
@@ -162,7 +174,10 @@ test("Ghostty path takes over the anchor then splits the newest pane", async () 
 
     let split = 0;
     setGhosttyAvailableForTest(true);
-    setOsaRunnerForTest(async (s) => (s.includes("split ") ? `pane-${++split}` : "anchor-1"));
+    setOsaRunnerForTest(async (s) => {
+      await touchCaptureFromScript(s);
+      return s.includes("split ") ? `pane-${++split}` : "anchor-1";
+    });
 
     await withRegistry(
       {
@@ -199,7 +214,10 @@ test("at the pane cap the next job queues, then reuses a freed pane on completio
 
     let split = 0;
     setGhosttyAvailableForTest(true);
-    setOsaRunnerForTest(async (s) => (s.includes("split ") ? `pane-${++split}` : "anchor-1"));
+    setOsaRunnerForTest(async (s) => {
+      await touchCaptureFromScript(s);
+      return s.includes("split ") ? `pane-${++split}` : "anchor-1";
+    });
 
     await withRegistry(
       {
@@ -320,6 +338,7 @@ test("dispatch reads the pane id fresh from config, so `co pane` takes effect wi
     setGhosttyAvailableForTest(true);
     // Echo the targeted id back so we can see which anchor each dispatch used.
     setOsaRunnerForTest(async (s) => {
+      await touchCaptureFromScript(s);
       const m = s.match(/first terminal whose id = "([^"]+)"/);
       return m ? m[1]! : "unknown";
     });

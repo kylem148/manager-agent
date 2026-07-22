@@ -36,7 +36,8 @@ import {
   resolveAgentCommand,
   type DispatchConfig,
 } from "./dispatchconfig.js";
-import { DispatchRegistry, type Job } from "./registry.js";
+import { DispatchRegistry, readFileTail, type Job } from "./registry.js";
+import { scrubCapture } from "./transport.js";
 
 /**
  * Interactive terminal session for one co-manager instance.
@@ -653,12 +654,16 @@ async function drainReviews(state: SessionState): Promise<void> {
   }
 }
 
-/** Read a capture file, capping its size so a runaway log can't blow the context
- *  window. Keeps the tail, where the agent's conclusion and any sentinel live. */
+/** Read a capture file for review, capping its size so a runaway log can't blow
+ *  the context window. Pane captures are pty recordings (an interactive agent's
+ *  full TUI stream), so this reads only the file tail, scrubs the terminal
+ *  escape noise into readable text, then keeps the last MAX characters — where
+ *  the agent's conclusion and the sentinel live. */
 async function readCapture(_state: SessionState, file: string): Promise<string> {
-  const raw = await fsp.readFile(file, "utf8");
+  const raw = await readFileTail(file, 256 * 1024);
+  const clean = scrubCapture(raw);
   const MAX = 16000;
-  return raw.length > MAX ? "…[capture truncated to the last part]\n" + raw.slice(-MAX) : raw;
+  return clean.length > MAX ? "…[capture truncated to the last part]\n" + clean.slice(-MAX) : clean;
 }
 
 function firstLineOf(order: string): string {

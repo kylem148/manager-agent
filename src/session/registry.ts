@@ -93,6 +93,14 @@ export class DispatchRegistry {
   private readonly skipAnchorCheck: boolean;
 
   private readonly jobs = new Map<string, Job>();
+  /** Per-session tag mixed into capture/script FILE names (job ids stay short
+   *  for display). Job ids restart at 001 every session while the captures dir
+   *  persists, so an untagged job-001.log from a previous session would be
+   *  overwritten — and worse, a stale file still containing a completion
+   *  sentinel would instantly "complete" a new job before its launch had even
+   *  created the real capture. Derived from the injected clock so tests stay
+   *  deterministic. */
+  private readonly runTag: string;
   /** FIFO of jobs waiting for a crew pane to free (Ghostty path, at cap). */
   private readonly queue: string[] = [];
   private layout: CrewPaneLayout | null;
@@ -113,6 +121,7 @@ export class DispatchRegistry {
     this.pollIntervalMs = opts.pollIntervalMs ?? POLL_INTERVAL_MS;
     this.transport = opts.transportOverride ?? chooseTransport();
     this.skipAnchorCheck = Boolean(opts.skipAnchorCheck);
+    this.runTag = this.clock.now().toString(36);
 
     // The placement planner only exists on the Ghostty path AND only once an
     // anchor has been designated. Off Ghostty, or before `co pane`, there is no
@@ -136,7 +145,8 @@ export class DispatchRegistry {
 
   private nextJobId(): string {
     // Stable, sortable, collision-free within a session. Not time-based so tests
-    // are deterministic; the session start already namespaces the capture dir.
+    // are deterministic. Capture FILES additionally carry the runTag, because
+    // the captures dir persists across sessions while these ids restart at 001.
     this.jobSeq += 1;
     return `job-${String(this.jobSeq).padStart(3, "0")}`;
   }
@@ -216,7 +226,10 @@ export class DispatchRegistry {
 
     const id = this.nextJobId();
     const label = firstLine(order);
-    const captureFile = this.paths.captureFile(id);
+    // Tagged with the session's runTag so a job-001 from a previous session
+    // (same persistent captures dir) can never be overwritten or, worse, have
+    // its old completion sentinel read as this job's.
+    const captureFile = this.paths.captureFile(`${id}-${this.runTag}`);
     const job: Job = {
       id,
       order,
@@ -296,6 +309,7 @@ export class DispatchRegistry {
       config: this.config,
       jobId: job.id,
       order,
+      captureFile: job.captureFile,
       ...(agentName ? { agentName } : {}),
       ...(opts.note ? { note: opts.note } : {}),
     });
@@ -314,6 +328,7 @@ export class DispatchRegistry {
       layout: this.layout!,
       jobId: job.id,
       order: job.order,
+      captureFile: job.captureFile,
       ...(job.agentName ? { agentName: job.agentName } : {}),
     });
     if (res.placement && res.placement.kind === "queue") return false;
@@ -363,7 +378,10 @@ export class DispatchRegistry {
 
     let captured: string;
     try {
-      captured = await fsp.readFile(job.captureFile, "utf8");
+      // Tail read: a pane capture is a pty recording of an interactive agent
+      // and can run to megabytes; the sentinel is appended at the very end, so
+      // polling never needs more than the tail.
+      captured = await readFileTail(job.captureFile, 64 * 1024);
     } catch {
       return; // capture file not created yet; try again next tick
     }
@@ -476,4 +494,21 @@ export class DispatchRegistry {
 function firstLine(order: string): string {
   const line = order.split("\n").find((l) => l.trim() !== "")?.trim() ?? "dispatch";
   return line.length > 60 ? line.slice(0, 57) + "…" : line;
+}
+
+/** Read at most the last `maxBytes` of a file (the whole file when smaller).
+ *  Throws like readFile if the file doesn't exist — callers treat that as
+ *  "not created yet". Exported for the session's review reader, which faces the
+ *  same pty-recording sizes. */
+export async function readFileTail(file: string, maxBytes: number): Promise<string> {
+  const stat = await fsp.stat(file);
+  if (stat.size <= maxBytes) return fsp.readFile(file, "utf8");
+  const fh = await fsp.open(file, "r");
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    await fh.read(buf, 0, maxBytes, stat.size - maxBytes);
+    return buf.toString("utf8");
+  } finally {
+    await fh.close();
+  }
 }

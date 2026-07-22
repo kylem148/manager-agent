@@ -12,7 +12,10 @@ import {
   sentinelLine,
   parseSentinel,
   buildShellCommand,
+  buildJobScript,
+  scrubCapture,
   composeSplitScript,
+  composeCloseScript,
   osaEscape,
   jobCommandLine,
   launchFallback,
@@ -154,32 +157,110 @@ test("osaEscape escapes backslashes and quotes for an AppleScript literal", () =
   assert.equal(osaEscape("a\\b"), "a\\\\b");
 });
 
-test("composeSplitScript uses the real 1.3 grammar: split direction, input text, send key", () => {
+test("composeSplitScript launches a split via surface configuration, nothing typed", () => {
   const script = composeSplitScript({
     decision: { kind: "split", target: "term-A", direction: "down" },
-    shellCommand: "echo hi",
+    launchCommand: "/bin/sh '/tmp/job.sh' hold",
   });
-  // Verified against Ghostty.sdef: `split <terminal> direction <dir>`, and
-  // injection via `input text ... to` + `send key "enter" to`.
-  assert.ok(script.includes("split target direction down"));
+  // Verified against Ghostty.sdef (1.3) and live 1.3.1: `split <terminal>
+  // direction <dir> with configuration {command:"..."}` creates the pane
+  // already running the command on a real tty. No keystrokes are involved, so
+  // a fresh split can never deliver the job into the wrong program.
   assert.ok(script.includes('first terminal whose id = "term-A"'));
-  assert.ok(script.includes("input text"));
-  assert.ok(script.includes('send key "enter" to newTerm'));
+  assert.ok(
+    script.includes(`split target direction down with configuration {command:"/bin/sh '/tmp/job.sh' hold"}`),
+    `split must launch the job as the pane's command, got:\n${script}`,
+  );
   assert.ok(script.includes("return (id of newTerm as text)"));
-  // The dead 'write text' / title-tagging grammar must be gone.
-  assert.ok(!script.includes("write text"));
-  assert.ok(!script.includes("set title"));
-  assert.ok(!script.includes("split target with direction"), "old 'with direction' form is gone");
+  assert.ok(!script.includes("input text"), "a split must not paste anything");
+  assert.ok(!script.includes("send key"), "a split must not send keys");
 });
 
-test("composeSplitScript for a takeover targets the anchor by id, no split", () => {
+test("composeSplitScript for a takeover pastes ONLY the one-line launch, no split", () => {
   const script = composeSplitScript({
     decision: { kind: "takeover", paneId: "anchor-1" },
-    shellCommand: "echo hi",
+    launchCommand: "/bin/sh '/tmp/job.sh'",
   });
   assert.ok(!script.includes("split "), "a takeover must not split");
   assert.ok(script.includes('first terminal whose id = "anchor-1"'));
+  assert.ok(
+    script.includes(`input text "/bin/sh '/tmp/job.sh'" to target`),
+    "the pasted text is the short launch line, never the job itself",
+  );
   assert.ok(script.includes('send key "enter" to target'));
+});
+
+test("composeCloseScript targets the terminal by id", () => {
+  const script = composeCloseScript("pane-9");
+  assert.ok(script.includes('close (first terminal whose id = "pane-9")'));
+});
+
+test("buildJobScript pins PATH, isolates the order in the file, holds only when asked", () => {
+  const text = buildJobScript({
+    crewCommand: "claude 'line one\nline two'",
+    captureFile: "/caps/j1.log",
+    scriptPath: "/caps/j1.log.sh",
+    cwd: "/repo",
+    pathEnv: "/usr/bin:/me/.local/bin",
+  });
+  assert.ok(
+    text.includes("PATH='/usr/bin:/me/.local/bin'; export PATH"),
+    "the co process's PATH is baked in (a command-launched surface gets only the bare GUI PATH)",
+  );
+  assert.ok(text.includes("cd '/repo' || exit 1"), "cd fails loudly");
+  assert.ok(text.includes("claude 'line one\nline two'"), "the multi-line order lives in the file verbatim");
+  assert.ok(text.includes("/usr/bin/script -q"), "the crew runs under the pty recorder, absolute path");
+  assert.ok(text.includes(SENTINEL_PREFIX), "sentinel is appended after the run");
+  assert.ok(text.includes(`if [ "$1" = hold ]`), "hold branch exists");
+  assert.ok(text.includes('exec "${SHELL:-/bin/zsh}" -l'), "hold keeps the pane open as a shell");
+});
+
+test("job script end-to-end: real tty for the crew, capture, sentinel, self-cleanup", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    // The crew reports whether it got a REAL tty on both ends — the whole point
+    // of script(1) over `| tee` (a piped stdout knocks Claude Code out of
+    // interactive mode) — then exits nonzero to prove the code survives the pty.
+    config.agents = [
+      {
+        name: "fake",
+        command: `sh -c 'echo "order=$1"; test -t 0 && echo IN-TTY; test -t 1 && echo OUT-TTY; exit 4' _ {prompt}`,
+      },
+    ];
+    config.defaultAgent = "fake";
+    const order = "line one\nit's got an apostrophe\nline two";
+    const crewCommand = jobCommandLine(config, order);
+    const captureFile = paths.captureFile("job-script");
+    const scriptPath = `${captureFile}.sh`;
+    await fsp.writeFile(
+      scriptPath,
+      buildJobScript({ crewCommand, captureFile, scriptPath, cwd: paths.root, pathEnv: process.env.PATH ?? "" }),
+      "utf8",
+    );
+    execFileSync("/bin/sh", [scriptPath], { stdio: "ignore" });
+    const captured = await fsp.readFile(captureFile, "utf8");
+    assert.ok(captured.includes("order=line one"), `order reached the crew, got:\n${captured}`);
+    assert.ok(captured.includes("it's got an apostrophe"), "newlines and apostrophes survive the file path");
+    assert.ok(captured.includes("IN-TTY"), "crew stdin is a real tty under script(1)");
+    assert.ok(captured.includes("OUT-TTY"), "crew stdout is a real tty under script(1)");
+    assert.deepEqual(parseSentinel(captured), { exitCode: 4 }, "sentinel carries the crew's real exit code");
+    const entries = await fsp.readdir(paths.captures);
+    assert.ok(!entries.some((e) => e.endsWith(".exit")), "exit sidecar removed");
+    assert.ok(!entries.some((e) => e.endsWith(".sh")), "the job script removes itself");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("scrubCapture strips terminal noise and resolves overwrites for review", () => {
+  assert.equal(scrubCapture("a \x1b[31mred\x1b[0m z"), "a red z");
+  assert.equal(scrubCapture("progress 1%\rprogress 99%\r\ndone"), "progress 99%\ndone");
+  assert.equal(scrubCapture("\x1b]0;window title\x07body"), "body");
+  assert.equal(scrubCapture("a\n\n\n\n\nb"), "a\n\nb");
+  const sentinel = `${SENTINEL_PREFIX} 3`;
+  assert.ok(scrubCapture(`\x1b[2Jnoise\r\n${sentinel}\n`).includes(sentinel), "the sentinel line survives scrubbing");
 });
 
 test("jobCommandLine resolves the default agent's command with no --dir", () => {
@@ -268,7 +349,7 @@ test("fallback captures a nonzero exit code in the sentinel", async () => {
   }
 });
 
-test("launchGhostty consults the planner and commits the returned pane id", async () => {
+test("launchGhostty consults the planner, probes the launch, and commits the pane id", async () => {
   const { paths, cleanup } = await tmpInstance();
   try {
     const config = defaultDispatchConfig();
@@ -276,22 +357,104 @@ test("launchGhostty consults the planner and commits the returned pane id", asyn
     const layout = new CrewPaneLayout({ id: "anchor-1", title: crewPaneTitle("inst") }, config.pane);
 
     const scripts: string[] = [];
-    // Stub osascript: first (takeover) returns the anchor id; a split returns a
-    // fresh id. We assert the planner state advances correctly off these.
-    setOsaRunnerForTest(async (script) => {
+    // Stub osascript: it also plays the launched job's first act — creating the
+    // capture file — which is what the transport's launch probe waits for.
+    const stubLaunch = (jobId: string) => async (script: string): Promise<string> => {
       scripts.push(script);
+      await fsp.writeFile(paths.captureFile(jobId), "", "utf8");
       return script.includes("split ") ? "pane-new" : "anchor-1";
-    });
+    };
 
+    setOsaRunnerForTest(stubLaunch("j1"));
     const first = await launchGhostty({ paths, config, layout, jobId: "j1", order: "one" });
     assert.equal(first.paneId, "anchor-1");
     assert.equal(first.placement?.kind, "takeover");
     assert.equal(layout.paneCount, 1);
+    // The takeover pasted only the short script launch; the order text (and the
+    // job script path's quoting) never rides the keystroke stream.
+    assert.ok(scripts[0]!.includes("input text \"/bin/sh '"), "takeover pastes the one-line launch");
+    assert.ok(!scripts[0]!.includes("one"), "the order text is not in the AppleScript");
 
+    setOsaRunnerForTest(stubLaunch("j2"));
     const second = await launchGhostty({ paths, config, layout, jobId: "j2", order: "two" });
     assert.equal(second.placement?.kind, "split");
     assert.equal(second.paneId, "pane-new");
     assert.equal(layout.paneCount, 2);
+    assert.ok(
+      scripts[1]!.includes("with configuration {command:"),
+      "a split launches the job script as the new pane's command",
+    );
+    assert.ok(scripts[1]!.includes(" hold\"}"), "a split-born pane holds (execs a shell) after the job");
+  } finally {
+    setOsaRunnerForTest(null);
+    await cleanup();
+  }
+});
+
+test("launchGhostty degrades when a busy pane never starts the job (paste went nowhere)", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    const layout = new CrewPaneLayout({ id: "anchor-1", title: crewPaneTitle("inst") }, config.pane);
+    // The paste "succeeds" (osascript is happy) but whatever owns the pane —
+    // an editor, another agent — swallowed the line: no capture file appears.
+    setOsaRunnerForTest(async () => "anchor-1");
+    const err = await launchGhostty({
+      paths,
+      config,
+      layout,
+      jobId: "busy",
+      order: "x",
+      paneStartTimeoutMs: 300,
+    }).then(
+      () => null,
+      (e) => e,
+    );
+    assert.ok(err instanceof PaneUnavailableError, `expected PaneUnavailableError, got ${err}`);
+    assert.match(err.message, /never started/);
+    assert.equal(layout.paneCount, 0, "the failed plan is aborted");
+    const entries = await fsp.readdir(paths.captures);
+    assert.deepEqual(entries, [], "no capture and no orphaned job script left behind");
+  } finally {
+    setOsaRunnerForTest(null);
+    await cleanup();
+  }
+});
+
+test("launchGhostty reaps a split it created when the job never starts in it", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    const layout = new CrewPaneLayout({ id: "anchor-1", title: crewPaneTitle("inst") }, config.pane);
+    // Seed one committed pane so the next plan() is a split.
+    layout.plan();
+    layout.commit("anchor-1");
+
+    const closes: string[] = [];
+    setOsaRunnerForTest(async (script) => {
+      if (script.includes("close ")) {
+        closes.push(script);
+        return "";
+      }
+      return "pane-new"; // the split is created, but its command never runs
+    });
+    const err = await launchGhostty({
+      paths,
+      config,
+      layout,
+      jobId: "deadsplit",
+      order: "x",
+      paneStartTimeoutMs: 300,
+    }).then(
+      () => null,
+      (e) => e,
+    );
+    assert.ok(err instanceof PaneUnavailableError, `expected PaneUnavailableError, got ${err}`);
+    assert.equal(layout.paneCount, 1, "only the pre-existing pane remains");
+    assert.equal(closes.length, 1, "the stray split pane is closed");
+    assert.ok(closes[0]!.includes('id = "pane-new"'), "closes the pane the split returned");
   } finally {
     setOsaRunnerForTest(null);
     await cleanup();
