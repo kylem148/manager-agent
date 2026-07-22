@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { resolveArgv, shellQuote, type DispatchConfig } from "./dispatchconfig.js";
 import type { InstancePaths } from "../paths.js";
-import { CrewPaneLayout, crewPaneTitle, type PlacementDecision } from "./crewpanes.js";
+import { CrewPaneLayout, type PlacementDecision } from "./crewpanes.js";
 
 /**
  * Two transports for launching a coding agent, chosen automatically:
@@ -59,8 +59,11 @@ export interface LaunchResult {
  * AppleScript. We probe once and cache — the answer can't change within a
  * session, and an `osascript` probe per dispatch would be wasteful.
  *
- * The probe is deliberately cheap and side-effect free: ask System Events
- * whether a process named "Ghostty" exists. If `osascript` is missing, the
+ * The probe is deliberately cheap and side-effect free: ask Ghostty for its own
+ * `version`. Probing Ghostty directly (rather than asking System Events for the
+ * process list) matters for permissions — the visible-pane path already needs
+ * automation access to Ghostty, so this reuses that one grant instead of
+ * requiring a SECOND grant for System Events. If `osascript` is missing, the
  * automation permission is denied, or Ghostty isn't running, this returns false
  * and we fall back — never throwing into the caller.
  */
@@ -80,13 +83,13 @@ export function setGhosttyAvailableForTest(v: boolean | null): void {
 function probeGhostty(): boolean {
   if (process.platform !== "darwin") return false;
   try {
-    const res = spawnSync(
-      "osascript",
-      ["-e", 'tell application "System Events" to (name of processes) contains "Ghostty"'],
-      { encoding: "utf8", timeout: 4000 },
-    );
-    if (res.error || res.status !== 0) return false;
-    return res.stdout.trim() === "true";
+    const res = spawnSync("osascript", ["-e", 'tell application "Ghostty" to get version'], {
+      encoding: "utf8",
+      timeout: 4000,
+    });
+    // A version string on success; anything else (not installed, permission
+    // denied, not scriptable) means fall back.
+    return !res.error && res.status === 0 && res.stdout.trim().length > 0;
   } catch {
     return false;
   }
@@ -95,6 +98,27 @@ function probeGhostty(): boolean {
 /** Pick the transport for this environment. Ghostty when available, else fallback. */
 export function chooseTransport(): TransportKind {
   return isGhosttyAvailable() ? "ghostty" : "fallback";
+}
+
+/**
+ * Whether a terminal with `id` still exists in Ghostty. The designated anchor is
+ * stored by id (the API can't tag panes), and a pane can be closed between
+ * sessions, so before treating the anchor as usable we verify it. Uses the
+ * dictionary's `exists`, which returns false cleanly for a stale id rather than
+ * erroring. Best-effort: any AppleScript failure returns false so we degrade to
+ * the background transport instead of throwing.
+ */
+export async function anchorExists(id: string): Promise<boolean> {
+  const script = [
+    'tell application "Ghostty"',
+    `  return (exists (first terminal whose id = "${osaEscape(id)}"))`,
+    "end tell",
+  ].join("\n");
+  try {
+    return (await osaRunner(script)).trim() === "true";
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -133,46 +157,49 @@ export function osaEscape(s: string): string {
 }
 
 /**
- * Compose the AppleScript that splits a crew pane (or targets the anchor for a
- * takeover/reuse) and injects the shell command. Returns the script text; the
- * caller runs it via `osascript -e`. For a `split`, the script returns the new
- * pane's id on its last line so the caller can commit() it to the planner.
+ * Compose the AppleScript that places a crew job and launches it, returning the
+ * hosting terminal's id on the last line so the caller can commit() it. Runs via
+ * `osascript -e`.
  *
- * Ghostty's scripting model (1.3.0+): `split <pane> with direction <dir>` returns
- * the new pane; `tell <pane> to write text <cmd>` types a command; a return key
- * runs it. We tag every crew pane's title so the anchor and existing panes are
- * findable across dispatches and restarts.
+ * Grammar verified against Ghostty.sdef (1.3.x) and live Ghostty:
+ *  - the scriptable object is a `terminal`, referenced app-wide by its stable id
+ *    with `first terminal whose id = "..."`;
+ *  - `split <terminal> direction <right|down|left|up>` returns the new terminal;
+ *  - a command is run by pasting it with `input text <cmd> to <terminal>` then
+ *    `send key "enter" to <terminal>`.
+ *
+ * Note what the API does NOT allow: a terminal's title is read-only, so panes
+ * cannot be tagged for discovery — the stable `id` is the only handle, which is
+ * what the planner and the persisted anchor use. Every crew pane is a plain
+ * shell (no launch-time `command`), so a finished job returns to its prompt and
+ * the pane stays reusable; that is why we inject rather than launch via a surface
+ * configuration (which would close the pane on command exit).
  */
-export function composeSplitScript(args: {
-  decision: PlacementDecision;
-  title: string;
-  shellCommand: string;
-}): string {
-  const { decision, title, shellCommand } = args;
+export function composeSplitScript(args: { decision: PlacementDecision; shellCommand: string }): string {
+  const { decision, shellCommand } = args;
   const cmd = osaEscape(shellCommand);
-  const t = osaEscape(title);
 
-  // A takeover or reuse targets an existing pane by id; a split creates a new one
-  // from the target pane. `queue` never reaches the transport (the caller holds
-  // it), so it is not represented here.
+  // A takeover or reuse runs in an existing terminal by id; a split makes a new
+  // terminal from the target and runs there. `queue` never reaches the transport
+  // (the caller holds it), so it is not represented here.
   if (decision.kind === "split") {
     return [
       'tell application "Ghostty"',
-      `  set target to (first pane whose id is "${osaEscape(decision.target)}")`,
-      `  set newPane to (split target with direction ${decision.direction})`,
-      `  set title of newPane to "${t}"`,
-      `  tell newPane to write text "${cmd}"`,
-      "  return id of newPane as string",
+      `  set target to (first terminal whose id = "${osaEscape(decision.target)}")`,
+      `  set newTerm to (split target direction ${decision.direction})`,
+      `  input text "${cmd}" to newTerm`,
+      '  send key "enter" to newTerm',
+      "  return (id of newTerm as text)",
       "end tell",
     ].join("\n");
   }
-  // takeover / reuse: run in the existing pane by id.
+  // takeover / reuse: run in the existing terminal by id.
   const paneId = decision.kind === "takeover" || decision.kind === "reuse" ? decision.paneId : "";
   return [
     'tell application "Ghostty"',
-    `  set target to (first pane whose id is "${osaEscape(paneId)}")`,
-    `  set title of target to "${t}"`,
-    `  tell target to write text "${cmd}"`,
+    `  set target to (first terminal whose id = "${osaEscape(paneId)}")`,
+    `  input text "${cmd}" to target`,
+    '  send key "enter" to target',
     `  return "${osaEscape(paneId)}"`,
     "end tell",
   ].join("\n");
@@ -232,11 +259,7 @@ export async function launchGhostty(args: {
 
   const argv = jobArgv(config, order);
   const shellCommand = buildShellCommand(argv, captureFile);
-  const script = composeSplitScript({
-    decision,
-    title: crewPaneTitle(paths.name),
-    shellCommand,
-  });
+  const script = composeSplitScript({ decision, shellCommand });
 
   try {
     const returnedId = await osaRunner(script);

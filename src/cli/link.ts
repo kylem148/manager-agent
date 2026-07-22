@@ -14,7 +14,7 @@ import {
   type DispatchConfig,
 } from "../session/dispatchconfig.js";
 import { crewPaneTitle } from "../session/crewpanes.js";
-import { c, line } from "../ui.js";
+import { c, line, write } from "../ui.js";
 
 /**
  * `co link <name>` — register how this co-manager dispatches orders to the crew.
@@ -54,10 +54,14 @@ export async function runLink(cfg: Config, name: string | undefined): Promise<nu
   line(c.dim(`  Stored in ${paths.dispatchConfig} (plain JSON, not secret).`));
   line();
 
-  // 1. Repo path.
+  // 1. Repo path. Default to the prior value, or (on a first link) the current
+  //    working directory: `co link` is almost always run from inside the repo
+  //    you want to dispatch into, so pre-filling cwd makes the common case a
+  //    single Enter.
+  const repoDefault = existing.repoPath || process.cwd();
   const repoPath = await promptWithDefault(
     "Target repo path (the coding agent runs here): ",
-    existing.repoPath,
+    repoDefault,
   );
   const resolvedRepo = repoPath ? path.resolve(untilde(repoPath)) : "";
   if (!resolvedRepo) {
@@ -121,13 +125,21 @@ export async function runLink(cfg: Config, name: string | undefined): Promise<nu
   return 0;
 }
 
+/** Seconds you get to switch to the crew pane after starting `co pane`. */
+const PANE_COUNTDOWN_SEC = 5;
+
 /**
  * `co pane <name>` — designate the crew anchor pane (one-time, macOS + Ghostty).
  *
- * The user focuses the pane they want crew jobs to grow from (top-left in the
- * captain's layout). We read Ghostty's focused pane id via AppleScript, tag it
- * with a discoverable title (co-crew:<instance>), and persist both so the
- * transport finds the anchor on every dispatch and across restarts.
+ * Flow: run it, then within a few seconds click/focus the Ghostty pane you want
+ * crew jobs to grow from. When the countdown ends it grabs whatever terminal is
+ * focused and stores it as the anchor. A countdown (rather than "press Enter
+ * once focused") is required because focusing another pane steals your
+ * keystrokes — you could never press Enter back here.
+ *
+ * Ghostty's API can't tag a pane (a terminal's title is read-only), so we
+ * persist the terminal's stable id; dispatch verifies it still exists and asks
+ * you to re-run this if the pane was closed.
  */
 export async function runPaneAnchor(cfg: Config, name: string | undefined): Promise<number> {
   if (!name) {
@@ -151,31 +163,41 @@ export async function runPaneAnchor(cfg: Config, name: string | undefined): Prom
 
   line();
   line(c.bold(`co pane ${name}`));
-  line(c.dim("  Focus the Ghostty pane you want crew jobs to grow from (the top-left crew"));
-  line(c.dim("  pane in the standard layout), then come back here."));
+  line(c.dim(`  Click the Ghostty pane you want crew jobs to grow from now — you have`));
+  line(c.dim(`  ${PANE_COUNTDOWN_SEC} seconds. Whatever pane is focused when the countdown ends is tagged.`));
+  line(c.dim("  (Staying in this pane is fine too; it just designates this one.)"));
   line();
-  if (process.stdin.isTTY) {
-    await promptWithDefault("Press Enter once that pane is focused… ", "");
+  for (let s = PANE_COUNTDOWN_SEC; s > 0; s--) {
+    write(`\r  grabbing the focused pane in ${s}… `);
+    await sleep(1000);
   }
+  write("\r  grabbing the focused pane now…   \n");
 
-  const title = crewPaneTitle(name);
   let paneId: string;
   try {
-    paneId = await readFocusedPaneId(title);
+    paneId = await readFocusedTerminalId();
   } catch (e) {
     line(c.red(`could not reach Ghostty via AppleScript: ${(e as Error).message}`));
     line(c.dim("Make sure Ghostty 1.3.0+ is running and grant the automation permission when prompted."));
     return 1;
   }
   if (!paneId) {
-    line(c.red("Ghostty did not report a focused pane. Is a Ghostty window focused?"));
+    line(c.red("Ghostty did not report a focused terminal. Is a Ghostty window focused?"));
     return 1;
   }
 
+  // A descriptive label stored beside the id; NOT applied to the pane (the API
+  // won't let us) — the id is the real handle.
+  const title = crewPaneTitle(name);
   await setAnchor(paths, { id: paneId, title });
-  line(c.green(`crew anchor set: pane ${paneId} tagged "${title}".`));
-  line(c.dim("Dispatches now take over this pane first, then subdivide it as more jobs run."));
+  line();
+  line(c.green(`crew anchor set: pane ${paneId}.`));
+  line(c.dim("The first dispatch takes over this pane; later jobs subdivide it as they run."));
   return 0;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -201,17 +223,16 @@ function resolveTemplateChoice(raw: string, fallback: string): string {
 }
 
 /**
- * Read the id of Ghostty's currently-focused pane and tag it with `title` in one
- * AppleScript round trip, so the anchor is both identified and made discoverable
- * at once. Returns the pane id string.
+ * Read the stable id of Ghostty's currently-focused terminal — the pane this
+ * command is running in. Grammar verified against Ghostty.sdef (1.3.x): a tab's
+ * `focused terminal` is the active surface, and each terminal has a read-only
+ * stable `id`. We do NOT set a title (the API forbids it); the id is the handle.
  */
-async function readFocusedPaneId(title: string): Promise<string> {
-  const t = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+async function readFocusedTerminalId(): Promise<string> {
   const script = [
     'tell application "Ghostty"',
-    "  set p to (front window's selected tab's selected pane)",
-    `  set title of p to "${t}"`,
-    "  return id of p as string",
+    "  set t to focused terminal of selected tab of front window",
+    "  return (id of t as text)",
     "end tell",
   ].join("\n");
   const { spawn } = await import("node:child_process");

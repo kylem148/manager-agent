@@ -3,6 +3,7 @@ import type { InstancePaths } from "../paths.js";
 import { CrewPaneLayout } from "./crewpanes.js";
 import type { DispatchConfig } from "./dispatchconfig.js";
 import {
+  anchorExists,
   chooseTransport,
   launchFallback,
   launchGhostty,
@@ -64,6 +65,11 @@ export interface RegistryOptions {
   transportOverride?: TransportKind;
   clock?: RegistryClock;
   pollIntervalMs?: number;
+  /** Called once if the designated crew anchor pane has been closed since
+   *  `co pane` ran; the registry then falls back to background for the session. */
+  onAnchorLost?: () => void;
+  /** Test seam: skip the live anchor `exists` check (assume it's present). */
+  skipAnchorCheck?: boolean;
 }
 
 export class DispatchRegistry {
@@ -77,10 +83,15 @@ export class DispatchRegistry {
   private readonly jobs = new Map<string, Job>();
   /** FIFO of jobs waiting for a crew pane to free (Ghostty path, at cap). */
   private readonly queue: string[] = [];
-  private readonly layout: CrewPaneLayout | null;
+  private layout: CrewPaneLayout | null;
   private poller: ReturnType<typeof setInterval> | null = null;
   private jobSeq = 0;
   private stopped = false;
+  /** Whether we've confirmed the designated anchor pane still exists this
+   *  session. Checked once, lazily, on the first pane launch: a pane closed
+   *  since `co pane` ran would otherwise fail the dispatch. */
+  private anchorChecked = false;
+  private readonly onAnchorLost?: () => void;
 
   constructor(opts: RegistryOptions) {
     this.paths = opts.paths;
@@ -98,6 +109,9 @@ export class DispatchRegistry {
       this.transport === "ghostty" && this.config.anchor
         ? new CrewPaneLayout(this.config.anchor, this.config.pane)
         : null;
+    this.onAnchorLost = opts.onAnchorLost;
+    // Tests (and the no-anchor case) skip the live existence probe.
+    this.anchorChecked = Boolean(opts.skipAnchorCheck) || !this.layout;
   }
 
   /** The transport this registry will actually use for new jobs. */
@@ -147,6 +161,20 @@ export class DispatchRegistry {
       startedAt: this.clock.now(),
     };
     this.jobs.set(id, job);
+
+    // Lazily confirm the designated anchor pane still exists before the first
+    // pane launch. If it was closed since `co pane` ran, drop to background for
+    // the rest of the session rather than failing every dispatch.
+    if (this.layout && !this.anchorChecked) {
+      this.anchorChecked = true;
+      const present = await anchorExists(this.config.anchor!.id);
+      if (!present) {
+        this.layout = null;
+        this.onAnchorLost?.();
+      }
+    }
+    // activeTransport may have just changed; reflect it on the job.
+    job.transport = this.activeTransport;
 
     try {
       if (this.layout) {
@@ -198,11 +226,13 @@ export class DispatchRegistry {
     this.poller = setInterval(() => {
       void this.tick();
     }, this.pollIntervalMs);
-    // Deliberately NOT unref'd: the poller is the mechanism that detects a job
-    // finishing and drives the proactive review, so while jobs are in flight it
-    // is legitimate work that should hold the event loop open. tick() clears the
-    // timer once no job is active, and stop() clears it on every session-exit
-    // path, so it can never outlive the work it watches.
+    // Deliberately NOT unref'd: while a crew job is in flight, detecting its
+    // completion and firing the review IS the work the process is here to do, so
+    // the poller legitimately holds the loop open (the detached agent child is
+    // unref'd, so nothing else would). tick() clears the timer the moment no job
+    // is active, and stop() clears it on every session-exit path, so it can't
+    // outlive the jobs it watches. Tests always stop() in a finally so a failed
+    // assertion can't leak a live interval.
   }
 
   /** One poll: check each running job for completion or timeout. */
@@ -225,7 +255,7 @@ export class DispatchRegistry {
       const elapsed = (this.clock.now() - job.startedAt) / 1000;
       if (elapsed > timeoutSec) {
         this.killJob(job);
-        this.finalize(job, "failed", { error: `timed out after ${timeoutSec}s` });
+        await this.finalize(job, "failed", { error: `timed out after ${timeoutSec}s` });
         return;
       }
     }
@@ -240,7 +270,7 @@ export class DispatchRegistry {
     if (!sentinel) return;
 
     const status: JobStatus = sentinel.exitCode > 0 ? "failed" : "done";
-    this.finalize(job, status, {
+    await this.finalize(job, status, {
       exitCode: sentinel.exitCode,
       ...(status === "failed" ? { error: `agent exited ${sentinel.exitCode}` } : {}),
     });
@@ -257,15 +287,19 @@ export class DispatchRegistry {
     }
   }
 
-  /** Move a job to a terminal state, free its pane, drain the queue, notify. */
-  private finalize(job: Job, status: "done" | "failed", extra: Partial<Job>): void {
+  /** Move a job to a terminal state, free its pane, drain the queue, notify. The
+   *  queue drain is awaited so a freed pane deterministically relaunches the next
+   *  queued job before the caller (a poll tick) returns. */
+  private async finalize(job: Job, status: "done" | "failed", extra: Partial<Job>): Promise<void> {
     job.status = status;
     Object.assign(job, extra);
+    // Notify first so the review is enqueued before we relaunch anything; the
+    // ordering keeps a completion callback ahead of the next job's launch notices.
+    this.onComplete(job);
     if (job.paneId && this.layout) {
       this.layout.finish(job.paneId);
-      void this.drainQueue();
+      await this.drainQueue();
     }
-    this.onComplete(job);
   }
 
   /**

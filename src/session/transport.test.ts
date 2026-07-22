@@ -16,6 +16,7 @@ import {
   jobArgv,
   launchFallback,
   launchGhostty,
+  anchorExists,
   setOsaRunnerForTest,
 } from "./transport.js";
 
@@ -70,25 +71,32 @@ test("osaEscape escapes backslashes and quotes for an AppleScript literal", () =
   assert.equal(osaEscape("a\\b"), "a\\\\b");
 });
 
-test("composeSplitScript splits in the planned direction and returns the new id", () => {
+test("composeSplitScript uses the real 1.3 grammar: split direction, input text, send key", () => {
   const script = composeSplitScript({
-    decision: { kind: "split", target: "pane-1", direction: "down" },
-    title: "co-crew:inst",
+    decision: { kind: "split", target: "term-A", direction: "down" },
     shellCommand: "echo hi",
   });
-  assert.ok(script.includes("split target with direction down"));
-  assert.ok(script.includes('id is "pane-1"'));
-  assert.ok(script.includes("return id of newPane"));
+  // Verified against Ghostty.sdef: `split <terminal> direction <dir>`, and
+  // injection via `input text ... to` + `send key "enter" to`.
+  assert.ok(script.includes("split target direction down"));
+  assert.ok(script.includes('first terminal whose id = "term-A"'));
+  assert.ok(script.includes("input text"));
+  assert.ok(script.includes('send key "enter" to newTerm'));
+  assert.ok(script.includes("return (id of newTerm as text)"));
+  // The dead 'write text' / title-tagging grammar must be gone.
+  assert.ok(!script.includes("write text"));
+  assert.ok(!script.includes("set title"));
+  assert.ok(!script.includes("split target with direction"), "old 'with direction' form is gone");
 });
 
 test("composeSplitScript for a takeover targets the anchor by id, no split", () => {
   const script = composeSplitScript({
     decision: { kind: "takeover", paneId: "anchor-1" },
-    title: "co-crew:inst",
     shellCommand: "echo hi",
   });
   assert.ok(!script.includes("split "), "a takeover must not split");
-  assert.ok(script.includes('id is "anchor-1"'));
+  assert.ok(script.includes('first terminal whose id = "anchor-1"'));
+  assert.ok(script.includes('send key "enter" to target'));
 });
 
 test("jobArgv resolves the template with the order and repo", () => {
@@ -159,6 +167,20 @@ test("launchGhostty consults the planner and commits the returned pane id", asyn
     setOsaRunnerForTest(null);
     await cleanup();
   }
+});
+
+test("anchorExists reports true/false from the exists probe and false on error", async () => {
+  setOsaRunnerForTest(async (script) => {
+    assert.ok(script.includes("exists"), "uses the AppleScript exists command");
+    return script.includes("live-id") ? "true" : "false";
+  });
+  assert.equal(await anchorExists("live-id"), true);
+  assert.equal(await anchorExists("dead-id"), false);
+  setOsaRunnerForTest(async () => {
+    throw new Error("osascript unavailable");
+  });
+  assert.equal(await anchorExists("any"), false, "an AppleScript failure degrades to false");
+  setOsaRunnerForTest(null);
 });
 
 test("launchGhostty aborts the plan when osascript fails, leaving the layout clean", async () => {

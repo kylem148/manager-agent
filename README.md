@@ -413,11 +413,15 @@ interlock, not a nicety — there is no code path that dispatches without it.
 **On macOS with Ghostty**, a confirmed dispatch opens a visible split pane in your
 current tab and runs the agent there interactively, so you can watch it and answer
 its questions live. Placement follows a fixed scheme: designate the crew pane once
-with `co pane my-saas` (focus the pane, and it's tagged so the dispatcher finds it
-every time and across restarts); the first job takes over that anchor pane, and
-each later job splits the newest crew pane, alternating beside/below, up to a cap
-(default 4) after which the oldest finished pane is reused or the job queues. The
-split direction sequence and the cap are config values you can retune.
+with `co pane my-saas` — it gives you a few seconds to click the pane you want crew
+jobs to grow from, then records that terminal's stable id (Ghostty's API can't tag
+a pane, so the id is the handle; a dispatch verifies it still exists and asks you
+to re-run `co pane` if you've since closed it). The first job takes over that
+anchor pane, and each later job splits the newest crew pane, alternating
+beside/below, up to a cap (default 4) after which the oldest finished pane is
+reused or the job queues. The split direction sequence and the cap are config
+values you can retune. Requires Ghostty 1.3+ and a one-time macOS Automation
+permission (granted the first time it scripts Ghostty).
 
 **Everywhere else** (no Ghostty, or automation unavailable), the same dispatch
 runs as a detached background process instead, with no pane geometry. The

@@ -250,6 +250,13 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
         );
         io.wake("dispatch-complete");
       },
+      onAnchorLost: () => {
+        io.appendBlock(
+          c.yellow(
+            "  · the designated crew pane is gone (closed since `co pane`). Running in the background instead; re-run `co pane` to restore the visible pane.",
+          ),
+        );
+      },
     });
   }
 
