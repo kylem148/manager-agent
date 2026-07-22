@@ -48,12 +48,13 @@ export type DocCommand = (typeof DOC_COMMANDS)[number];
 /**
  * Tool activity the REPL may surface to the user: external work only. Memory
  * reads and writes are the co-manager's private bookkeeping and never announce
- * themselves, so they are deliberately absent here.
+ * themselves, so they are deliberately absent here. `dispatch_order` surfaces its
+ * own pending-confirm banner through the arm callback, so it is not listed here.
  */
 export const SURFACED_TOOLS = new Set<string>(["search_web", "fetch_url"]);
 
-export function toolDefinitions(): Tool[] {
-  return [
+export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
+  const tools: Tool[] = [
     {
       name: "read_live_memory",
       description:
@@ -223,6 +224,32 @@ export function toolDefinitions(): Tool[] {
       },
     },
   ];
+
+  // The dispatch tool is only exposed when the instance has been linked to a
+  // repo (co link). It ARMS a dispatch — it never runs anything. The actual
+  // launch happens only after the captain types `confirm` in the session loop,
+  // which is the structural interlock; this tool has no path to execute.
+  if (opts.dispatch) {
+    tools.push({
+      name: "dispatch_order",
+      description:
+        "Arm a direct dispatch of an implementation-ready order to the crew (the registered coding agent). This does NOT run anything: it stages the order and shows the captain the exact order text plus the resolved command, and waits. The dispatch fires only if the captain then types `confirm`; any other input cancels it. Use this instead of writing plain-text orders when the captain wants the order run directly. Draft the full order (same checklist as a written order: read-docs-first, goal, context, decisions, constraints, acceptance, verification, commit) as the `order` argument. Arm at most one order per turn.",
+      input_schema: {
+        type: "object",
+        properties: {
+          order: {
+            type: "string",
+            description:
+              "The complete, implementation-ready order text to hand to the coding agent as its prompt.",
+          },
+        },
+        required: ["order"],
+        additionalProperties: false,
+      },
+    });
+  }
+
+  return tools;
 }
 
 /** Records what the tool loop changed, so the REPL can drive the sync guard. */
@@ -247,6 +274,14 @@ export interface ExecutorContext {
   /** Optional callback so the REPL can surface external work (web search, fetch)
    *  as activity. Memory operations never call it — they stay silent. */
   onNotice?: (msg: string) => void;
+  /**
+   * Arm a dispatch (dispatch_order tool). The REPL supplies this only when the
+   * instance is linked. It records the order for the confirm interlock and puts
+   * the TUI into the pending-confirm state; it MUST NOT launch anything. Returns
+   * a short human-readable confirmation of what was armed (or an error string if
+   * arming is impossible), which becomes the tool result the model sees.
+   */
+  onArmDispatch?: (order: string) => { armed: true; summary: string } | { armed: false; reason: string };
 }
 
 function ok(id: string, obj: unknown): ToolResult {
@@ -364,6 +399,26 @@ export function makeExecutor(ctx: ExecutorContext) {
           const res = await fetchUrl(research, String(input.url ?? ""));
           ctx.onNotice?.(`fetched ${res.url}`);
           return ok(id, res);
+        }
+        case "dispatch_order": {
+          const order = String(input.order ?? "").trim();
+          if (!order) return err(id, "dispatch_order requires a non-empty order.");
+          if (!ctx.onArmDispatch) {
+            return err(
+              id,
+              "Dispatch is not available: this instance is not linked to a repo. Run `co link` first, or write the order as plain text for the captain to copy.",
+            );
+          }
+          const res = ctx.onArmDispatch(order);
+          if (!res.armed) return err(id, res.reason);
+          // Armed, not run. The model must now stop and let the captain confirm;
+          // it must NOT claim the order ran.
+          return ok(id, {
+            armed: true,
+            note:
+              "Order armed and shown to the captain, awaiting a typed `confirm`. Do NOT say it has run. " +
+              res.summary,
+          });
         }
         default:
           return err(id, `Unknown tool: ${block.name}`);
