@@ -152,8 +152,21 @@ export async function anchorExists(id: string): Promise<boolean> {
  * The agent argv is shell-quoted token by token; the {prompt} token already holds
  * the full order text as one argv element (see resolveArgv), so quoting it once
  * here is correct regardless of newlines or metacharacters in the order.
+ *
+ * An optional `note` is echoed into the capture ahead of the crew output — used
+ * by the background fallback to record WHY it ran in the background (e.g. a stale
+ * crew pane) so a degraded run is self-describing rather than looking like a
+ * plain background dispatch. The note rides the same `2>&1 | tee` as the crew
+ * output, so it lands at the top of the capture without a second write that the
+ * tee (overwrite) would clobber. It sits before the crew command, so the sidecar
+ * still records the CREW's `$?`, not the note echo's.
  */
-export function buildShellCommand(argv: string[], captureFile: string, cwd?: string): string {
+export function buildShellCommand(
+  argv: string[],
+  captureFile: string,
+  cwd?: string,
+  note?: string,
+): string {
   const quotedCmd = argv.map(shellQuote).join(" ");
   const quotedCapture = shellQuote(captureFile);
   const quotedExit = shellQuote(`${captureFile}.exit`);
@@ -162,8 +175,9 @@ export function buildShellCommand(argv: string[], captureFile: string, cwd?: str
   // into the capture. `echo $? > <exit>` runs in the same subshell as the crew
   // command, right after it, so it records the crew status (not tee's) portably.
   const cdPrefix = cwd && cwd.trim() ? `cd ${shellQuote(cwd)} || exit 1; ` : "";
+  const notePrefix = note && note.trim() ? `echo ${shellQuote(note)}; ` : "";
   return (
-    `${cdPrefix}{ ${quotedCmd}; echo $? > ${quotedExit}; } 2>&1 | tee ${quotedCapture}; ` +
+    `${cdPrefix}{ ${notePrefix}${quotedCmd}; echo $? > ${quotedExit}; } 2>&1 | tee ${quotedCapture}; ` +
     `echo "${SENTINEL_PREFIX} $(cat ${quotedExit} 2>/dev/null)" | tee -a ${quotedCapture}; ` +
     `rm -f ${quotedExit}`
   );
@@ -265,10 +279,36 @@ async function ensureCaptureDir(paths: InstancePaths): Promise<void> {
 }
 
 /**
+ * A pane launch that couldn't target its Ghostty pane: the anchor id no longer
+ * resolves (Ghostty's -1719 "Invalid index"), an `exists` check came back false,
+ * or `osascript` failed some other way. Distinct from a generic Error so the
+ * registry can tell "the pane is gone, run in the background" apart from a real
+ * bug and degrade cleanly instead of failing the whole dispatch. `paneId` is the
+ * id we tried to target, for the background note.
+ */
+export class PaneUnavailableError extends Error {
+  readonly paneId: string;
+  constructor(paneId: string, cause: string) {
+    super(`crew pane ${paneId} unavailable: ${cause}`);
+    this.name = "PaneUnavailableError";
+    this.paneId = paneId;
+  }
+}
+
+/**
  * Launch a job on the visible-Ghostty path. Consumes crewpanes.ts seams: plan()
  * to decide placement, then commit(newPaneId) with the id AppleScript returns —
  * or abort() if the launch fails, so a dead dispatch never corrupts the layout.
  * A `queue` decision places nothing and is returned to the caller to hold.
+ *
+ * Any AppleScript failure targeting the pane (a closed/stale anchor surfaces as
+ * Ghostty error -1719, plus permission or not-running failures) is re-raised as a
+ * PaneUnavailableError so the registry falls back to the background transport
+ * rather than failing the dispatch. The capture is NOT pre-written here: the
+ * pane's `tee` creates it on success, and on failure the background fallback owns
+ * it — an empty pre-write would only be a blank log to leave behind if a failure
+ * somehow bypassed the fallback (job ids are unique per session, so nothing stale
+ * needs clearing either).
  */
 export async function launchGhostty(args: {
   paths: InstancePaths;
@@ -282,7 +322,6 @@ export async function launchGhostty(args: {
   const { paths, config, layout, jobId, order, agentName } = args;
   await ensureCaptureDir(paths);
   const captureFile = paths.captureFile(jobId);
-  await fsp.writeFile(captureFile, "", "utf8"); // fresh capture
 
   const decision = layout.plan();
   if (decision.kind === "queue") {
@@ -295,17 +334,24 @@ export async function launchGhostty(args: {
   // directory is set by the `cd` inside the shell command.
   const shellCommand = buildShellCommand(argv, captureFile, config.repoPath);
   const script = composeSplitScript({ decision, shellCommand });
+  // The id we're aiming at, for a PaneUnavailableError note if the launch fails.
+  const targetId =
+    decision.kind === "split" ? decision.target : decision.paneId;
 
+  let returnedId: string;
   try {
-    const returnedId = await osaRunner(script);
-    // takeover/reuse return the known pane id; split returns the fresh one.
-    const paneId = decision.kind === "split" ? returnedId : decision.paneId;
-    layout.commit(paneId);
-    return { transport: "ghostty", paneId, placement: decision };
+    returnedId = await osaRunner(script);
   } catch (e) {
     layout.abort();
-    throw e;
+    // Every osascript failure on this path is a pane-targeting failure: the
+    // anchor was closed (-1719), automation was denied, or Ghostty went away.
+    // Surface it as PaneUnavailableError so the registry degrades to background.
+    throw new PaneUnavailableError(targetId, (e as Error).message);
   }
+  // takeover/reuse return the known pane id; split returns the fresh one.
+  const paneId = decision.kind === "split" ? returnedId : decision.paneId;
+  layout.commit(paneId);
+  return { transport: "ghostty", paneId, placement: decision };
 }
 
 /**
@@ -313,6 +359,12 @@ export async function launchGhostty(args: {
  * captured to the same per-job file, and the sentinel is appended on exit. The
  * child is fully detached and unref'd so the co-manager session never blocks on
  * it and it survives being backgrounded. No pane geometry is involved.
+ *
+ * `note` is written to the top of the capture when present — the registry passes
+ * a "target pane <id> unavailable; ran in background" line when it degrades here
+ * from a failed pane launch, so a fallback that stood in for a dead pane is never
+ * a silently-empty log. This is the SOLE writer of the capture on this path (the
+ * pane launch no longer pre-writes it), so the note can't be clobbered by a tee.
  */
 export async function launchFallback(args: {
   paths: InstancePaths;
@@ -321,8 +373,11 @@ export async function launchFallback(args: {
   order: string;
   /** The confirm-time agent override; omit to use the config default. */
   agentName?: string;
+  /** A human-readable note recorded at the top of the capture (e.g. why we fell
+   *  back to background). Omit for a plain background dispatch. */
+  note?: string;
 }): Promise<LaunchResult> {
-  const { paths, config, jobId, order, agentName } = args;
+  const { paths, config, jobId, order, agentName, note } = args;
   await ensureCaptureDir(paths);
   const captureFile = paths.captureFile(jobId);
   const argv = jobArgv(config, order, agentName);
@@ -333,7 +388,12 @@ export async function launchFallback(args: {
   // missing repo degrades to the spawn cwd (undefined → inherit) rather than a
   // hard `cd ... || exit` failure the moment a repo hasn't been created yet.
   const repoExists = Boolean(config.repoPath) && fs.existsSync(config.repoPath);
-  const shellCommand = buildShellCommand(argv, captureFile, repoExists ? config.repoPath : undefined);
+  const shellCommand = buildShellCommand(
+    argv,
+    captureFile,
+    repoExists ? config.repoPath : undefined,
+    note,
+  );
 
   // We run through `sh -c` so the tee + sentinel contract matches the pane path.
   // detached:true puts the child in its own process group; unref() lets the

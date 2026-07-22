@@ -19,6 +19,7 @@ import {
   launchGhostty,
   anchorExists,
   setOsaRunnerForTest,
+  PaneUnavailableError,
 } from "./transport.js";
 
 /**
@@ -311,6 +312,58 @@ test("launchGhostty aborts the plan when osascript fails, leaving the layout cle
     assert.deepEqual(layout.plan(), { kind: "takeover", paneId: "anchor-1" });
   } finally {
     setOsaRunnerForTest(null);
+    await cleanup();
+  }
+});
+
+test("launchGhostty raises PaneUnavailableError (with the target id) on a stale pane", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    const layout = new CrewPaneLayout({ id: "ghostty-uuid", title: crewPaneTitle("inst") }, config.pane);
+    // Reproduce the live -1719: Ghostty can't resolve the stored terminal id.
+    setOsaRunnerForTest(async () => {
+      throw new Error(
+        'Ghostty got an error: Can\'t get terminal 1 whose id = "ghostty-uuid". Invalid index. (-1719)',
+      );
+    });
+    const err = await launchGhostty({ paths, config, layout, jobId: "j1", order: "x" }).then(
+      () => null,
+      (e) => e,
+    );
+    assert.ok(err instanceof PaneUnavailableError, `expected PaneUnavailableError, got ${err}`);
+    assert.equal(err.paneId, "ghostty-uuid", "carries the id we tried to target, for the fallback note");
+    assert.match(err.message, /-1719/, "wraps the underlying Ghostty error");
+    // No empty capture is left behind: the fallback owns the capture on this path.
+    await assert.rejects(() => fsp.readFile(paths.captureFile("j1"), "utf8"));
+  } finally {
+    setOsaRunnerForTest(null);
+    await cleanup();
+  }
+});
+
+test("fallback writes a background note to the capture and still reports the real exit code", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    // Crew command prints output then exits nonzero, so we can prove the note
+    // rides ahead of the crew output WITHOUT masking the crew's real exit code
+    // (the note echo must not become the sidecar's captured status).
+    config.agents = [{ name: "fake", command: `sh -c 'echo CREW-OUTPUT; exit 5'` }];
+    config.defaultAgent = "fake";
+    const note = "target crew pane ghostty-uuid unavailable; ran in the background instead.";
+    await launchFallback({ paths, config, jobId: "job-note", order: "x", note });
+    const captured = await waitForSentinel(paths.captureFile("job-note"));
+    assert.ok(captured.includes(note), "the background note is written into the capture");
+    assert.ok(captured.includes("CREW-OUTPUT"), "the crew output is still captured");
+    assert.ok(
+      captured.indexOf(note) < captured.indexOf("CREW-OUTPUT"),
+      "the note precedes the crew output at the top of the capture",
+    );
+    assert.deepEqual(parseSentinel(captured), { exitCode: 5 }, "the note must not clobber the crew exit code");
+  } finally {
     await cleanup();
   }
 });

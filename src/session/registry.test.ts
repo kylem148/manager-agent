@@ -255,6 +255,60 @@ test("activeTransport degrades to fallback on Ghostty without a designated ancho
   }
 });
 
+test("a stale/unresolvable pane id runs in the background with a populated capture, not a failure", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config: DispatchConfig = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = { id: "ghostty-uuid", title: crewPaneTitle("inst") };
+    // A fake crew agent that prints and exits nonzero, so we prove the real exit
+    // code survives the degrade to background.
+    config.agents = [{ name: "fake", command: `sh -c 'echo CREW-RAN; exit 4'` }];
+    config.defaultAgent = "fake";
+    // The config must be on disk too: dispatch re-reads it before launching.
+    await writeDispatchConfig(paths, config);
+
+    setGhosttyAvailableForTest(true);
+    // Reproduce the live -1719: Ghostty can't resolve the stored terminal id.
+    setOsaRunnerForTest(async () => {
+      throw new Error('Ghostty got an error: Can\'t get terminal 1 whose id = "ghostty-uuid". (-1719)');
+    });
+
+    let anchorLost = 0;
+    const done = onCompleteOnce();
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: done.handler,
+        transportOverride: "ghostty",
+        skipAnchorCheck: true, // exercise the LAUNCH-time failure, not the exists probe
+        pollIntervalMs: 25,
+        onAnchorLost: () => anchorLost++,
+      },
+      async (reg) => {
+        const job = await reg.dispatch("do it");
+        // No thrown error, and the job did not fail to launch: it degraded.
+        assert.notEqual(job.status, "failed", "a stale pane must not fail the dispatch");
+        assert.equal(job.transport, "fallback", "degraded to the background transport");
+        assert.equal(anchorLost, 1, "the dead anchor was reported lost");
+
+        const finished = await done.promise;
+        assert.equal(finished.status, "failed", "exit 4 is a failed run");
+        assert.equal(finished.exitCode, 4, "the crew's real exit code is reported, not tee's 0");
+        const captured = await fsp.readFile(finished.captureFile, "utf8");
+        assert.ok(captured.length > 0, "the capture is not empty");
+        assert.match(captured, /unavailable; ran in the background/, "records why it fell back");
+        assert.ok(captured.includes("CREW-RAN"), "the crew still ran and its output was captured");
+      },
+    );
+  } finally {
+    setGhosttyAvailableForTest(null);
+    setOsaRunnerForTest(null);
+    await cleanup();
+  }
+});
+
 test("dispatch reads the pane id fresh from config, so `co pane` takes effect with no restart", async () => {
   const { paths, cleanup } = await tmpInstance();
   try {

@@ -8,6 +8,7 @@ import {
   launchFallback,
   launchGhostty,
   parseSentinel,
+  PaneUnavailableError,
   type TransportKind,
 } from "./transport.js";
 
@@ -228,22 +229,29 @@ export class DispatchRegistry {
 
     try {
       if (this.layout) {
-        const launched = await this.launchOnPane(job);
-        if (!launched) {
-          // At the pane cap with nothing free: hold this job until one frees.
-          job.status = "queued";
-          job.startedAt = null;
-          this.queue.push(job.id);
+        try {
+          const launched = await this.launchOnPane(job);
+          if (!launched) {
+            // At the pane cap with nothing free: hold this job until one frees.
+            job.status = "queued";
+            job.startedAt = null;
+            this.queue.push(job.id);
+          }
+        } catch (e) {
+          if (!(e instanceof PaneUnavailableError)) throw e;
+          // The target pane is gone/stale (e.g. Ghostty -1719) — don't fail the
+          // dispatch, run it in the background with a note explaining why, so the
+          // capture is populated rather than an empty failed log. The anchor we
+          // just discovered dead is dropped for the rest of the session.
+          this.layout = null;
+          this.onAnchorLost?.();
+          job.transport = "fallback";
+          await this.runFallback(job, order, agentName, {
+            note: `target crew pane ${e.paneId} unavailable; ran in the background instead.`,
+          });
         }
       } else {
-        const res = await launchFallback({
-          paths: this.paths,
-          config: this.config,
-          jobId: id,
-          order,
-          agentName,
-        });
-        job.pid = res.pid;
+        await this.runFallback(job, order, agentName);
       }
     } catch (e) {
       job.status = "failed";
@@ -256,6 +264,26 @@ export class DispatchRegistry {
 
     this.ensurePolling();
     return job;
+  }
+
+  /** Launch a job on the background transport, recording its pid on the job. A
+   *  `note` is written to the top of the capture when the fallback is standing in
+   *  for a failed pane launch, so the run is never a silently-empty log. */
+  private async runFallback(
+    job: Job,
+    order: string,
+    agentName: string | undefined,
+    opts: { note?: string } = {},
+  ): Promise<void> {
+    const res = await launchFallback({
+      paths: this.paths,
+      config: this.config,
+      jobId: job.id,
+      order,
+      ...(agentName ? { agentName } : {}),
+      ...(opts.note ? { note: opts.note } : {}),
+    });
+    job.pid = res.pid;
   }
 
   /**
@@ -381,6 +409,26 @@ export class DispatchRegistry {
       try {
         launched = await this.launchOnPane(job);
       } catch (e) {
+        if (e instanceof PaneUnavailableError) {
+          // The pane died while this job waited in the queue. Drop pane geometry
+          // for the session and run it in the background with a note, rather than
+          // failing it — same degrade path as a first-time dispatch.
+          this.queue.shift();
+          this.layout = null;
+          this.onAnchorLost?.();
+          job.transport = "fallback";
+          try {
+            await this.runFallback(job, job.order, job.agentName, {
+              note: `target crew pane ${e.paneId} unavailable; ran in the background instead.`,
+            });
+            this.ensurePolling();
+          } catch (fe) {
+            job.status = "failed";
+            job.error = (fe as Error).message;
+            this.onComplete(job);
+          }
+          continue;
+        }
         this.queue.shift();
         job.status = "failed";
         job.error = (e as Error).message;
