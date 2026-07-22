@@ -14,7 +14,7 @@ import {
   buildShellCommand,
   composeSplitScript,
   osaEscape,
-  jobArgv,
+  jobCommandLine,
   launchFallback,
   launchGhostty,
   anchorExists,
@@ -61,17 +61,26 @@ test("sentinel round-trips through the capture text", () => {
   assert.deepEqual(parseSentinel(`${SENTINEL_PREFIX} notanumber`), { exitCode: -1 });
 });
 
-test("buildShellCommand tees to capture and appends the sentinel", () => {
-  const cmd = buildShellCommand(["echo", "hi there"], "/tmp/cap.log");
-  assert.ok(cmd.includes("'echo' 'hi there'"), "agent argv is shell-quoted");
+test("buildShellCommand runs the crew command verbatim, tees to capture, appends the sentinel", () => {
+  const cmd = buildShellCommand("echo 'hi there'", "/tmp/cap.log");
+  assert.ok(cmd.includes("echo 'hi there'"), "the resolved crew command is run verbatim");
   assert.ok(cmd.includes("tee '/tmp/cap.log'"), "output tees to the capture file");
   assert.ok(cmd.includes(SENTINEL_PREFIX), "sentinel is echoed on completion");
   // No cwd given: no cd prefix.
   assert.ok(!cmd.includes("cd "), "no cd when no cwd is supplied");
 });
 
+test("buildShellCommand preserves an env-var prefix in the crew command", () => {
+  // The whole point of the shell-string model: an env-prefixed command survives.
+  const cmd = buildShellCommand(`CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude 'x'`, "/tmp/cap.log");
+  assert.ok(
+    cmd.includes(`CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude 'x'`),
+    `env prefix must be left for the shell to interpret, got: ${cmd}`,
+  );
+});
+
 test("buildShellCommand cd's into the repo cwd when given one", () => {
-  const cmd = buildShellCommand(["cc", "order"], "/tmp/cap.log", "/my/repo");
+  const cmd = buildShellCommand("claude 'order'", "/tmp/cap.log", "/my/repo");
   assert.ok(
     cmd.startsWith("cd '/my/repo' || exit 1; "),
     `command must cd into the repo first, got: ${cmd}`,
@@ -109,7 +118,7 @@ for (const shell of ["sh", "bash", "zsh", "dash"]) {
       // buggy expansion, zsh/dash would report tee's 0 (or error) instead of 7.
       const capFail = paths.captureFile("shell-fail");
       const failCmd = buildShellCommand(
-        ["sh", "-c", "echo to-stdout; echo to-stderr 1>&2; exit 7"],
+        "sh -c 'echo to-stdout; echo to-stderr 1>&2; exit 7'",
         capFail,
       );
       execFileSync(shPath!, ["-c", failCmd], { stdio: "ignore" });
@@ -124,7 +133,7 @@ for (const shell of ["sh", "bash", "zsh", "dash"]) {
 
       // A clean exit still reads 0.
       const capOk = paths.captureFile("shell-ok");
-      const okCmd = buildShellCommand(["sh", "-c", "echo done; exit 0"], capOk);
+      const okCmd = buildShellCommand("sh -c 'echo done; exit 0'", capOk);
       execFileSync(shPath!, ["-c", okCmd], { stdio: "ignore" });
       assert.deepEqual(parseSentinel(await fsp.readFile(capOk, "utf8")), { exitCode: 0 });
 
@@ -173,28 +182,31 @@ test("composeSplitScript for a takeover targets the anchor by id, no split", () 
   assert.ok(script.includes('send key "enter" to target'));
 });
 
-test("jobArgv resolves the default agent's command with no --dir", () => {
+test("jobCommandLine resolves the default agent's command with no --dir", () => {
   const config = defaultDispatchConfig();
   config.repoPath = "/repo";
   config.agents = [
-    { name: "cc", command: "cc {prompt}" },
-    { name: "ccw", command: "ccw {prompt}" },
+    { name: "cc", command: "claude {prompt}" },
+    { name: "ccw", command: `CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude {prompt}` },
   ];
   config.defaultAgent = "cc";
-  // Bare (no override) → the default agent, and NO --dir flag.
-  assert.deepEqual(jobArgv(config, "build X"), ["cc", "build X"]);
+  // Bare (no override) → the default agent, order shell-quoted, NO --dir flag.
+  assert.equal(jobCommandLine(config, "build X"), "claude 'build X'");
 });
 
-test("jobArgv honors a named-agent override", () => {
+test("jobCommandLine honors a named-agent override and preserves an env prefix", () => {
   const config = defaultDispatchConfig();
   config.repoPath = "/repo";
   config.agents = [
-    { name: "cc", command: "cc {prompt}" },
-    { name: "ccw", command: "ccw {prompt}" },
+    { name: "cc", command: "claude {prompt}" },
+    { name: "ccw", command: `CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude {prompt}` },
   ];
   config.defaultAgent = "cc";
-  // `confirm ccw` selects the work wrapper for this dispatch.
-  assert.deepEqual(jobArgv(config, "build X", "ccw"), ["ccw", "build X"]);
+  // `confirm ccw` selects the work wrapper; its env prefix survives for the shell.
+  assert.equal(
+    jobCommandLine(config, "build X", "ccw"),
+    `CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude 'build X'`,
+  );
 });
 
 test("fallback launch runs a fake echo agent and produces a captured sentinel", async () => {
@@ -203,7 +215,9 @@ test("fallback launch runs a fake echo agent and produces a captured sentinel", 
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
     // Fake agent: print a marker and the order, then exit 0. No tokens, no network.
-    config.agents = [{ name: "fake", command: `sh -c 'echo AGENT-RAN; echo "order={prompt}"'` }];
+    // {prompt} sits as its own shell word (as `claude {prompt}` does); the shell
+    // passes it to the script as $1 rather than us nesting it inside inner quotes.
+    config.agents = [{ name: "fake", command: `sh -c 'echo AGENT-RAN; echo "order=$1"' _ {prompt}` }];
     config.defaultAgent = "fake";
     const res = await launchFallback({ paths, config, jobId: "job-001", order: "hello crew" });
     assert.equal(res.transport, "fallback");

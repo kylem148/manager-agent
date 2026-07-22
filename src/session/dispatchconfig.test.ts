@@ -5,10 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { instancePaths } from "../paths.js";
 import {
-  resolveArgv,
+  resolveCommandLine,
   resolveAgent,
   resolveAgentCommand,
-  tokenizeTemplate,
   shellQuote,
   stripDirFlag,
   displayCommand,
@@ -22,9 +21,11 @@ import {
 
 /**
  * Tests for dispatch config persistence and command-template resolution. The
- * template layer is the one place a mistake becomes a shell-injection or a
- * dropped argument, so quoting and placeholder substitution are exercised
- * directly, including an order that contains newlines and shell metacharacters.
+ * template layer is the one place a mistake becomes a shell-injection, so
+ * quoting and placeholder substitution are exercised directly, including an order
+ * that contains newlines and shell metacharacters. The command template is a
+ * shell string (git's core.editor model): the operator's command runs verbatim
+ * and only the {prompt}/{repo} values are shell-quoted.
  */
 
 async function makeInstance(): Promise<{ home: string; name: string; cleanup: () => Promise<void> }> {
@@ -33,32 +34,42 @@ async function makeInstance(): Promise<{ home: string; name: string; cleanup: ()
   return { home, name, cleanup: () => fsp.rm(home, { recursive: true, force: true }) };
 }
 
-test("tokenizeTemplate splits on whitespace and honors quotes in the template", () => {
-  assert.deepEqual(tokenizeTemplate("cc {prompt}"), ["cc", "{prompt}"]);
-  assert.deepEqual(tokenizeTemplate(`agent --flag "a b c" {prompt}`), [
-    "agent",
-    "--flag",
-    "a b c",
-    "{prompt}",
-  ]);
-});
-
-test("resolveArgv substitutes placeholders as single argv elements", () => {
-  const argv = resolveArgv("cc {prompt}", {
+test("resolveCommandLine leaves the operator command verbatim, shell-quoting only {prompt}", () => {
+  const line = resolveCommandLine("claude {prompt}", {
     prompt: "do the thing",
     repo: "/x/y",
   });
-  // {prompt} stays ONE element even though its value has spaces — critical, or
-  // the agent would see "do", "the", "thing" as separate args. No --dir: the
-  // repo is supplied as the process cwd, not a flag.
-  assert.deepEqual(argv, ["cc", "do the thing"]);
+  // The command word runs verbatim; the order becomes a single quoted literal so
+  // its spaces don't word-split into separate args. No --dir: the repo is the cwd.
+  assert.equal(line, "claude 'do the thing'");
 });
 
-test("resolveArgv keeps a multi-line order intact in one element", () => {
+test("resolveCommandLine preserves an env-var prefix and $VAR references (the work wrapper)", () => {
+  // This is the case per-token quoting could never run: an env-prefixed command.
+  // The prefix and $HOME must survive untouched for the shell to interpret.
+  const line = resolveCommandLine('CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude {prompt}', {
+    prompt: "build X",
+    repo: "/r",
+  });
+  assert.equal(line, `CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude 'build X'`);
+});
+
+test("resolveCommandLine neutralizes metacharacters and newlines in the order", () => {
   const order = "line one\nline two\n$(evil) `also`";
-  const argv = resolveArgv("agent {prompt}", { prompt: order, repo: "/r" });
-  assert.equal(argv.length, 2);
-  assert.equal(argv[1], order); // verbatim, not word-split, not expanded
+  const line = resolveCommandLine("claude {prompt}", { prompt: order, repo: "/r" });
+  // The whole order is inside single quotes, so $(evil)/`also`/newlines are inert
+  // literal text handed to the agent, never interpreted by the shell.
+  assert.equal(line, `claude ${shellQuote(order)}`);
+  assert.ok(line.startsWith("claude '"));
+});
+
+test("resolveCommandLine shell-quotes {repo} too, and leaves an unknown {key} as-is", () => {
+  const line = resolveCommandLine("agent --root {repo} {prompt} {bogus}", {
+    prompt: "o'brien",
+    repo: "/a b/c",
+  });
+  // Both substituted values are quoted; a typo'd placeholder stays visible.
+  assert.equal(line, "agent --root '/a b/c' 'o'\\''brien' {bogus}");
 });
 
 test("shellQuote wraps and escapes single quotes so metacharacters are inert", () => {

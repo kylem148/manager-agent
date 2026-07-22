@@ -398,15 +398,28 @@ to a repo:
 co link my-saas          # register the target repo + the named crew agents
 ```
 
-`co link` records, per instance (in `.dispatch/config.json` under the instance
-folder, not `.env` — none of it is secret): the repo path; one or more **named
-crew agents**, each an agent-agnostic launch command with a `{prompt}`
-placeholder (it ships `cc`/`ccw` for the two Claude Code wrappers and `opencode`,
-and you can name your own); which agent a bare `confirm` uses by default; optional
-safety caps (wall-clock timeout, turn limit); and the crew-pane layout. It's
-re-runnable — run it again to change any of it. The crew process runs with the
-repo as its working directory, so a command needs **no** `--dir` flag to target
-the repo (Claude Code has none).
+`co link` walks a short flow: confirm the repo path, then type the **word you run
+each coding agent with** — `cc` for personal, `ccw` for work (leave work blank to
+skip) — pick which one a bare `confirm` uses by default, and set optional safety
+caps (wall-clock timeout, turn limit).
+
+The word you type is almost always a shell **alias**, which doesn't exist in the
+non-interactive shell a dispatch spawns — so `co link` resolves each word through
+your login shell right then and stores the **real command** it expands to (e.g.
+`cc` → `claude`, `ccw` → `CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude`). It shows
+you what each word resolved to. If a word doesn't resolve to something on your
+PATH, it warns and stores the word as-is so you can install it or re-link. Because
+resolution happens at link time, **re-run `co link` if you change the alias.**
+
+All of it is recorded per instance in `.dispatch/config.json` under the instance
+folder (not `.env` — none of it is secret): the repo path; the resolved crew
+agents (each a launch command with a `{prompt}` placeholder); the default agent;
+the safety caps; and the crew-pane layout. The stored command is treated as a
+shell string (the same model git uses for `core.editor`), so an env-var prefix
+like `CLAUDE_CONFIG_DIR=...` or `$VAR` references work; only the substituted order
+text and repo path are shell-quoted. The crew process runs with the repo as its
+working directory, so a command needs **no** `--dir` flag to target the repo
+(Claude Code has none).
 
 Once linked, the co-manager can **arm** a dispatch instead of only writing text.
 Arming shows you the exact order and the resolved command and waits. Nothing runs

@@ -5,7 +5,6 @@ import type { Config } from "../config.js";
 import { instancePaths, isValidInstanceName } from "../paths.js";
 import { instanceExists } from "../memory/memory.js";
 import {
-  EXAMPLE_AGENTS,
   defaultDispatchConfig,
   readDispatchConfig,
   writeDispatchConfig,
@@ -15,6 +14,7 @@ import {
   type CrewAgent,
   type DispatchConfig,
 } from "../session/dispatchconfig.js";
+import { resolveCommandWord } from "./resolvecommand.js";
 import { crewPaneTitle } from "../session/crewpanes.js";
 import { c, line, write } from "../ui.js";
 
@@ -22,11 +22,17 @@ import { c, line, write } from "../ui.js";
  * `co link <name>` — register how this co-manager dispatches orders to the crew.
  *
  * Records, per instance (under .dispatch/config.json, NOT .env — none of this is
- * secret): the target repo path, the named crew agents (each a launch command
- * with a {prompt} placeholder) and which one is the default, optional safety
- * caps, and the pane layout. Re-runnable: it seeds from any existing config so a
- * second run just updates what changed. The crew process runs with cwd = repo
- * path, so an agent command needs no --dir flag to target the repo.
+ * secret): the target repo path, the crew agents (each a launch command with a
+ * {prompt} placeholder) and which one is the default, optional safety caps, and
+ * the pane layout. Re-runnable: it seeds from any existing config so a second run
+ * just updates what changed. The crew process runs with cwd = repo path, so an
+ * agent command needs no --dir flag to target the repo.
+ *
+ * The operator types a WORD (e.g. `cc`), not a command. That word is almost always
+ * a shell alias, which would not exist in the non-interactive shell a dispatch
+ * spawns — so each word is resolved through the login shell here (see
+ * resolvecommand.ts) and the REAL command it expands to is what gets stored. This
+ * is why a changed alias needs a re-link: resolution is a link-time snapshot.
  *
  * `co pane <name>` — the one-time anchor designation: tag the crew pane the
  * dispatcher splits from. See runPaneAnchor below.
@@ -76,43 +82,40 @@ export async function runLink(cfg: Config, name: string | undefined): Promise<nu
     line(c.yellow(`note: ${resolvedRepo} does not exist yet. Saved anyway; create it before dispatching.`));
   }
 
-  // 2. Crew agents. Each is a named launch command with a {prompt} placeholder.
-  //    The crew process runs with cwd = repo path, so no --dir flag is needed.
-  //    The captain types `confirm <name>` at dispatch time to pick one; a bare
-  //    `confirm` uses the default set below.
+  // 2. Crew agents. You type the WORD you'd run the agent with (e.g. `cc` for
+  //    personal, `ccw` for work). Almost always a shell alias, which would not
+  //    exist in the non-interactive shell a dispatch spawns — so we resolve each
+  //    word through your login shell right here and store the REAL command it
+  //    expands to. The order text is appended as {prompt} at dispatch time; the
+  //    crew process runs with cwd = repo path, so no directory flag is needed.
   line();
-  line(c.dim("Crew agents. Each name maps to a launch command; {prompt} is the order text."));
-  line(c.dim("The agent runs with the repo as its working directory, so no directory flag is needed."));
-  line(c.dim(`  examples: ${EXAMPLE_AGENTS.map((a) => `${a.name} → ${a.command}`).join("   ")}`));
-  const defaultNames = existing.agents.map((a) => a.name).join(" ");
-  const namesRaw = await promptWithDefault(
-    "Agent names (space-separated, e.g. cc ccw): ",
-    defaultNames,
+  line(c.dim("Crew agents. Type the word you run each agent with; I'll resolve it to the real command."));
+  const personal = await promptAgentWord(
+    "Personal agent word (e.g. cc): ",
+    existing.agents[0]?.name ?? "cc",
   );
-  const names = parseAgentNames(namesRaw, existing.agents);
-  const agents: CrewAgent[] = [];
-  for (const nm of names) {
-    const prior = existing.agents.find((a) => a.name === nm);
-    const cmd = await promptWithDefault(`  command for ${nm}: `, prior?.command ?? `${nm} {prompt}`);
-    if (cmd.trim()) agents.push({ name: nm, command: cmd.trim() });
-  }
+  const work = await promptAgentWord(
+    "Work agent word (e.g. ccw, or Enter to skip): ",
+    existing.agents[1]?.name ?? "",
+  );
+  const agents: CrewAgent[] = [personal, work].filter((a): a is CrewAgent => a !== null);
   if (agents.length === 0) {
-    line(c.yellow("no crew agents entered — nothing changed."));
+    line(c.yellow("no crew agent entered — nothing changed."));
     return 1;
   }
 
-  // Which agent a bare `confirm` uses. Default to the prior default when it
-  // still exists, else the first agent.
-  const defaultFallback = agents.some((a) => a.name === existing.defaultAgent)
-    ? existing.defaultAgent
-    : agents[0]!.name;
-  let defaultAgent = defaultFallback;
+  // Which agent a bare `confirm` uses. Only ask when there's a real choice; a
+  // single agent is the default with nothing to pick.
+  let defaultAgent = agents[0]!.name;
   if (agents.length > 1) {
+    const priorDefault = agents.some((a) => a.name === existing.defaultAgent)
+      ? existing.defaultAgent
+      : agents[0]!.name;
     const pick = await promptWithDefault(
-      `Default agent (bare \`confirm\` uses this) [${agents.map((a) => a.name).join(", ")}]: `,
-      defaultFallback,
+      `Default agent — bare \`confirm\` uses this [${agents.map((a) => a.name).join(" / ")}]: `,
+      priorDefault,
     );
-    defaultAgent = agents.some((a) => a.name === pick) ? pick : defaultFallback;
+    defaultAgent = agents.some((a) => a.name === pick) ? pick : priorDefault;
   }
 
   // 3. Safety caps (all optional).
@@ -248,27 +251,43 @@ function untilde(p: string): string {
 }
 
 /**
- * Parse the space-separated agent-names line into a deduped, ordered list.
- * Pressing Enter (empty input) keeps the prior set of names; a fresh instance
- * with no prior agents falls back to the shipped examples so `co link` always
- * ends with at least one agent to prompt a command for.
+ * Prompt for one agent WORD, resolve it through the login shell, and return the
+ * CrewAgent to store (name = the word the captain types with `confirm`, command =
+ * the resolved command line with {prompt} appended). Returns null when the
+ * operator leaves it blank (used to skip the optional work agent).
+ *
+ * The word is resolved to its real command here, at link time, because it is
+ * almost always a shell alias that would not exist in the non-interactive shell a
+ * dispatch spawns (see resolvecommand.ts). We show what it resolved to so the
+ * result is never a mystery. If it does not resolve to something runnable, we WARN
+ * but still store the word verbatim — the operator may know better (a function
+ * that works for them, or a binary they will install), and a re-link is cheap.
  */
-function parseAgentNames(raw: string, priorAgents: CrewAgent[]): string[] {
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return priorAgents.length > 0
-      ? priorAgents.map((a) => a.name)
-      : EXAMPLE_AGENTS.map((a) => a.name);
+async function promptAgentWord(
+  prompt: string,
+  current: string,
+): Promise<CrewAgent | null> {
+  const word = (await promptWithDefault(prompt, current)).trim();
+  if (!word) return null;
+
+  // Always re-resolve, even for an unchanged word: re-running `co link` is the
+  // fix for a config that stored a bare, unrunnable word (the pre-resolution
+  // shape), so keeping a prior command would defeat the re-link. A word is the
+  // only thing this flow captures, so there is no hand-tuned command to preserve
+  // (that is done by editing config.json directly).
+  const res = await resolveCommandWord(word);
+  const command = `${res.command} {prompt}`;
+  if (res.runnable) {
+    const how = res.kind === "alias" ? `resolved alias` : `found on PATH`;
+    line(c.green(`  ${word} → ${res.command}  (${how})`));
+  } else if (res.kind === "shell-word") {
+    line(c.yellow(`  ${word} looks like a shell function/builtin, not a command on PATH.`));
+    line(c.yellow(`  Storing it as-is; if dispatch fails, re-link with the real command.`));
+  } else {
+    line(c.yellow(`  ${word} didn't resolve to a command on your PATH.`));
+    line(c.yellow(`  Storing it as-is; install it or re-link once it resolves.`));
   }
-  const seen = new Set<string>();
-  const names: string[] = [];
-  for (const tok of trimmed.split(/\s+/)) {
-    if (tok && !seen.has(tok)) {
-      seen.add(tok);
-      names.push(tok);
-    }
-  }
-  return names;
+  return { name: word, command };
 }
 
 /**

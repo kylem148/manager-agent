@@ -246,61 +246,19 @@ export function resolveAgentCommand(config: DispatchConfig, wanted?: string): st
 // --- command template resolution --------------------------------------------
 
 /**
- * Split a command template into argv tokens, honoring simple single/double
- * quoting in the TEMPLATE itself (so an author may quote a literal argument that
- * contains spaces). Placeholders are left intact for substitution afterward, so
- * a `{prompt}` token stays exactly one token regardless of what it expands to.
- * This is not a full shell parser — no variable expansion, no operators — just
- * enough to tokenize a command line the user wrote.
+ * The command template is a SHELL STRING, not an argv list. This mirrors how git
+ * runs `core.editor`/`GIT_PAGER`: the configured value is handed to a shell to
+ * interpret, so it can carry arguments, an env-var prefix, `$VAR` references, or
+ * anything else a command line holds. That is a hard requirement here — the work
+ * Claude Code wrapper resolves to `CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude`,
+ * an env-prefixed command that no amount of per-token quoting could exec (there is
+ * no program literally named `CLAUDE_CONFIG_DIR=...`). Only a shell runs it.
+ *
+ * The one thing we do NOT trust to the shell is the substituted values: the order
+ * text ({prompt}) and repo path ({repo}) are attacker-influenced, so each is
+ * single-quoted before it lands in the string (see shellQuote). Everything else in
+ * the template is the command the operator configured at `co link`, run verbatim.
  */
-export function tokenizeTemplate(template: string): string[] {
-  const tokens: string[] = [];
-  let cur = "";
-  let inSingle = false;
-  let inDouble = false;
-  let hasToken = false; // distinguishes "" (a real empty quoted arg) from no arg
-
-  for (let i = 0; i < template.length; i++) {
-    const ch = template[i]!;
-    if (inSingle) {
-      if (ch === "'") inSingle = false;
-      else cur += ch;
-      continue;
-    }
-    if (inDouble) {
-      if (ch === '"') inDouble = false;
-      else cur += ch;
-      continue;
-    }
-    if (ch === "'") { inSingle = true; hasToken = true; continue; }
-    if (ch === '"') { inDouble = true; hasToken = true; continue; }
-    if (ch === " " || ch === "\t") {
-      if (hasToken) { tokens.push(cur); cur = ""; hasToken = false; }
-      continue;
-    }
-    cur += ch;
-    hasToken = true;
-  }
-  if (hasToken) tokens.push(cur);
-  return tokens;
-}
-
-/** Replace {key} placeholders in one token with values from `subs`. Unknown
- *  placeholders are left verbatim (a template typo shows rather than vanishing). */
-function substituteToken(token: string, subs: Record<string, string>): string {
-  return token.replace(/\{(\w+)\}/g, (m, key: string) => (key in subs ? subs[key]! : m));
-}
-
-/**
- * Resolve a command template to a concrete argv array: each placeholder is
- * substituted inline, so {prompt} becomes exactly one argv element holding the
- * full order text (newlines and all). This is what the FALLBACK transport spawns
- * directly — no shell, so there is no quoting to get wrong.
- */
-export function resolveArgv(template: string, subs: { prompt: string; repo: string }): string[] {
-  const map: Record<string, string> = { prompt: subs.prompt, repo: subs.repo };
-  return tokenizeTemplate(template).map((t) => substituteToken(t, map));
-}
 
 /**
  * POSIX single-quote a string for safe use in a shell command line: wrap in
@@ -312,13 +270,30 @@ export function shellQuote(s: string): string {
 }
 
 /**
+ * Resolve a command template into a runnable shell command line. `{prompt}` and
+ * `{repo}` are replaced by their SHELL-QUOTED values so the order text and repo
+ * path are inert literals no matter what metacharacters they contain; the rest of
+ * the template is left verbatim for the shell to interpret. An unknown `{key}` is
+ * left as-is so a template typo shows rather than silently vanishing.
+ */
+export function resolveCommandLine(template: string, subs: { prompt: string; repo: string }): string {
+  return template.replace(/\{(\w+)\}/g, (m, key: string) => {
+    if (key === "prompt") return shellQuote(subs.prompt);
+    if (key === "repo") return shellQuote(subs.repo);
+    return m;
+  });
+}
+
+/**
  * A one-line summary of the resolved command for the confirm UI. The full order
  * text is shown separately, so here the {prompt} placeholder is rendered as a
- * compact marker rather than dumping the whole order into the command preview.
+ * compact marker rather than dumping the whole order into the command preview, and
+ * {repo} shows the plain repo path rather than a quoted literal.
  */
 export function displayCommand(template: string, repo: string): string {
-  const map: Record<string, string> = { prompt: "<order>", repo };
-  return tokenizeTemplate(template)
-    .map((t) => substituteToken(t, map))
-    .join(" ");
+  return template.replace(/\{(\w+)\}/g, (m, key: string) => {
+    if (key === "prompt") return "<order>";
+    if (key === "repo") return repo;
+    return m;
+  });
 }

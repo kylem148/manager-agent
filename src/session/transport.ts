@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fsp from "node:fs/promises";
 import fs from "node:fs";
 import path from "node:path";
-import { resolveArgv, resolveAgentCommand, shellQuote, type DispatchConfig } from "./dispatchconfig.js";
+import { resolveCommandLine, resolveAgentCommand, shellQuote, type DispatchConfig } from "./dispatchconfig.js";
 import type { InstancePaths } from "../paths.js";
 import { CrewPaneLayout, type PlacementDecision } from "./crewpanes.js";
 
@@ -149,9 +149,10 @@ export async function anchorExists(id: string): Promise<boolean> {
  * The sidecar sits next to the capture file (<capture>.exit) and is removed once
  * read; the watcher only ever reads the capture file itself, never the dir.
  *
- * The agent argv is shell-quoted token by token; the {prompt} token already holds
- * the full order text as one argv element (see resolveArgv), so quoting it once
- * here is correct regardless of newlines or metacharacters in the order.
+ * The crew command arrives already resolved to a shell command line (see
+ * resolveCommandLine): the operator-configured template run verbatim, with only
+ * the {prompt}/{repo} values shell-quoted. We interpolate it straight into the
+ * pipeline so the shell interprets any env-var prefix or arguments it carries.
  *
  * An optional `note` is echoed into the capture ahead of the crew output — used
  * by the background fallback to record WHY it ran in the background (e.g. a stale
@@ -162,12 +163,11 @@ export async function anchorExists(id: string): Promise<boolean> {
  * still records the CREW's `$?`, not the note echo's.
  */
 export function buildShellCommand(
-  argv: string[],
+  crewCommand: string,
   captureFile: string,
   cwd?: string,
   note?: string,
 ): string {
-  const quotedCmd = argv.map(shellQuote).join(" ");
   const quotedCapture = shellQuote(captureFile);
   const quotedExit = shellQuote(`${captureFile}.exit`);
   // The sentinel is echoed to BOTH the tee'd file and the pane/terminal so the
@@ -177,21 +177,23 @@ export function buildShellCommand(
   const cdPrefix = cwd && cwd.trim() ? `cd ${shellQuote(cwd)} || exit 1; ` : "";
   const notePrefix = note && note.trim() ? `echo ${shellQuote(note)}; ` : "";
   return (
-    `${cdPrefix}{ ${notePrefix}${quotedCmd}; echo $? > ${quotedExit}; } 2>&1 | tee ${quotedCapture}; ` +
+    `${cdPrefix}{ ${notePrefix}${crewCommand}; echo $? > ${quotedExit}; } 2>&1 | tee ${quotedCapture}; ` +
     `echo "${SENTINEL_PREFIX} $(cat ${quotedExit} 2>/dev/null)" | tee -a ${quotedCapture}; ` +
     `rm -f ${quotedExit}`
   );
 }
 
 /**
- * Build the argv for a job's agent command from the config. Picks the crew agent
- * (the confirm-time override `agentName`, else the config default) and resolves
- * its command's placeholders. Command assembly is live here, not a frozen string:
- * a config persisted before agent selection is migrated on read (see coerce).
+ * Build the shell command line for a job's agent from the config. Picks the crew
+ * agent (the confirm-time override `agentName`, else the config default) and
+ * resolves its template's placeholders into a runnable command line, shell-quoting
+ * only the {prompt}/{repo} values. Command assembly is live here, not a frozen
+ * string: a config persisted before agent selection is migrated on read (see
+ * coerce).
  */
-export function jobArgv(config: DispatchConfig, order: string, agentName?: string): string[] {
+export function jobCommandLine(config: DispatchConfig, order: string, agentName?: string): string {
   const command = resolveAgentCommand(config, agentName);
-  return resolveArgv(command, { prompt: order, repo: config.repoPath });
+  return resolveCommandLine(command, { prompt: order, repo: config.repoPath });
 }
 
 // --- AppleScript composition (pure, unit-testable) --------------------------
@@ -329,10 +331,10 @@ export async function launchGhostty(args: {
     return { transport: "ghostty", placement: decision };
   }
 
-  const argv = jobArgv(config, order, agentName);
+  const crewCommand = jobCommandLine(config, order, agentName);
   // The pane is a plain shell with no spawn cwd of its own, so the repo working
   // directory is set by the `cd` inside the shell command.
-  const shellCommand = buildShellCommand(argv, captureFile, config.repoPath);
+  const shellCommand = buildShellCommand(crewCommand, captureFile, config.repoPath);
   const script = composeSplitScript({ decision, shellCommand });
   // The id we're aiming at, for a PaneUnavailableError note if the launch fails.
   const targetId =
@@ -380,7 +382,7 @@ export async function launchFallback(args: {
   const { paths, config, jobId, order, agentName, note } = args;
   await ensureCaptureDir(paths);
   const captureFile = paths.captureFile(jobId);
-  const argv = jobArgv(config, order, agentName);
+  const crewCommand = jobCommandLine(config, order, agentName);
   // Set the repo cwd two ways that agree: the spawn cwd below (the real working
   // directory of the detached process) and, when the repo exists, the `cd` baked
   // into the shell command so the assembled command is self-describing and
@@ -389,7 +391,7 @@ export async function launchFallback(args: {
   // hard `cd ... || exit` failure the moment a repo hasn't been created yet.
   const repoExists = Boolean(config.repoPath) && fs.existsSync(config.repoPath);
   const shellCommand = buildShellCommand(
-    argv,
+    crewCommand,
     captureFile,
     repoExists ? config.repoPath : undefined,
     note,
