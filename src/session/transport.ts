@@ -23,8 +23,9 @@ import { CrewPaneLayout, type PlacementDecision } from "./crewpanes.js";
  */
 
 /** The marker appended to a capture file after the agent process exits. The
- *  watcher scans for this to know a job is done; the number is the exit code
- *  when we can observe it (fallback) or -1 when we can't (interactive pane). */
+ *  watcher scans for this to know a job is done; the number is the crew
+ *  process's real exit code, captured the same way on both transports (see
+ *  buildShellCommand). It is -1 only when the code is missing or unparseable. */
 export const SENTINEL_PREFIX = "__CO_DISPATCH_DONE__";
 
 export function sentinelLine(exitCode: number): string {
@@ -124,8 +125,8 @@ export async function anchorExists(id: string): Promise<boolean> {
 /**
  * The interactive command run inside a pane or as a detached process. It cd's
  * into the repo, launches the agent, tees output to the capture file, then
- * appends the sentinel with the captured exit code. Written as a single `sh -c`
- * string so both transports share the same completion contract.
+ * appends the sentinel with the crew process's real exit code. Written as a
+ * single string so both transports share the same completion contract.
  *
  * The repo is supplied as the working directory (a leading `cd`), not as a
  * command-line flag: Claude Code has no --dir, and --add-dir only adds extra
@@ -134,6 +135,20 @@ export async function anchorExists(id: string): Promise<boolean> {
  * of silently running the agent in the wrong directory. An empty repo path skips
  * the cd and runs wherever the transport's own cwd points.
  *
+ * Exit-code capture is shell-agnostic. The crew command is piped into `tee`, so
+ * its status lives in the pipe's first stage, not in `$?` (which holds tee's 0).
+ * We do NOT read it back with `${PIPESTATUS[0]}`: that array is bash-only. This
+ * string runs under two shells we do not choose — the fallback's `sh` (dash on
+ * many Linux hosts, where `${PIPESTATUS...}` is a hard "Bad substitution") and,
+ * on the pane path, the user's interactive login shell (zsh, where PIPESTATUS is
+ * unset and the expansion silently falls back to tee's 0, masking failures). So
+ * instead the crew command writes its own `$?` to a sidecar file the instant it
+ * exits — inside the pipe's first stage, before tee runs — and the sentinel
+ * reads that file. `$?` immediately after a command is portable to every POSIX
+ * shell, so this reports the crew process's real code whatever shell runs it.
+ * The sidecar sits next to the capture file (<capture>.exit) and is removed once
+ * read; the watcher only ever reads the capture file itself, never the dir.
+ *
  * The agent argv is shell-quoted token by token; the {prompt} token already holds
  * the full order text as one argv element (see resolveArgv), so quoting it once
  * here is correct regardless of newlines or metacharacters in the order.
@@ -141,14 +156,16 @@ export async function anchorExists(id: string): Promise<boolean> {
 export function buildShellCommand(argv: string[], captureFile: string, cwd?: string): string {
   const quotedCmd = argv.map(shellQuote).join(" ");
   const quotedCapture = shellQuote(captureFile);
-  // `command; code=$?` captures the agent's real exit status even in a pane; the
-  // sentinel is echoed to BOTH the tee'd file and the pane so the user sees the
-  // run finish and the watcher sees the marker. `2>&1` folds stderr into capture.
+  const quotedExit = shellQuote(`${captureFile}.exit`);
+  // The sentinel is echoed to BOTH the tee'd file and the pane/terminal so the
+  // user sees the run finish and the watcher sees the marker. `2>&1` folds stderr
+  // into the capture. `echo $? > <exit>` runs in the same subshell as the crew
+  // command, right after it, so it records the crew status (not tee's) portably.
   const cdPrefix = cwd && cwd.trim() ? `cd ${shellQuote(cwd)} || exit 1; ` : "";
   return (
-    `${cdPrefix}{ ${quotedCmd}; } 2>&1 | tee ${quotedCapture}; ` +
-    `code=\${PIPESTATUS[0]:-$?}; ` +
-    `echo "${SENTINEL_PREFIX} $code" | tee -a ${quotedCapture}`
+    `${cdPrefix}{ ${quotedCmd}; echo $? > ${quotedExit}; } 2>&1 | tee ${quotedCapture}; ` +
+    `echo "${SENTINEL_PREFIX} $(cat ${quotedExit} 2>/dev/null)" | tee -a ${quotedCapture}; ` +
+    `rm -f ${quotedExit}`
   );
 }
 

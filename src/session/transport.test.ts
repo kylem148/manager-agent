@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -80,6 +81,63 @@ test("buildShellCommand cd's into the repo cwd when given one", () => {
   // Still no --dir anywhere.
   assert.ok(!cmd.includes("--dir"), "cwd replaces --dir entirely");
 });
+
+/**
+ * The assembled command runs under two shells the transport does NOT choose:
+ * the fallback's `sh` (dash on many Linux hosts) and, on the pane path, the
+ * user's interactive login shell (zsh here). The old `${PIPESTATUS[0]:-$?}`
+ * read the crew status only under bash: zsh left PIPESTATUS unset so it fell
+ * back to tee's 0 (masking failures), and dash rejected it outright as a "Bad
+ * substitution". This drives the SAME assembled string through every shell on
+ * the box and asserts the sentinel reports the crew process's real code. */
+function shellPath(name: string): string | null {
+  try {
+    return execFileSync("command", ["-v", name], { shell: "/bin/sh", encoding: "utf8" }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+for (const shell of ["sh", "bash", "zsh", "dash"]) {
+  const shPath = shellPath(shell);
+  const label = `buildShellCommand sentinel reports the crew exit code under ${shell}`;
+  test(label, { skip: shPath ? false : `${shell} not installed` }, async () => {
+    const { paths, cleanup } = await tmpInstance();
+    try {
+      // Crew command prints to stdout AND stderr, then exits nonzero. Under the
+      // buggy expansion, zsh/dash would report tee's 0 (or error) instead of 7.
+      const capFail = paths.captureFile("shell-fail");
+      const failCmd = buildShellCommand(
+        ["sh", "-c", "echo to-stdout; echo to-stderr 1>&2; exit 7"],
+        capFail,
+      );
+      execFileSync(shPath!, ["-c", failCmd], { stdio: "ignore" });
+      const failCap = await fsp.readFile(capFail, "utf8");
+      assert.ok(failCap.includes("to-stdout"), "stdout is captured");
+      assert.ok(failCap.includes("to-stderr"), "stderr is folded into the capture");
+      assert.deepEqual(
+        parseSentinel(failCap),
+        { exitCode: 7 },
+        `sentinel must report the crew code (7), not tee's 0, under ${shell}`,
+      );
+
+      // A clean exit still reads 0.
+      const capOk = paths.captureFile("shell-ok");
+      const okCmd = buildShellCommand(["sh", "-c", "echo done; exit 0"], capOk);
+      execFileSync(shPath!, ["-c", okCmd], { stdio: "ignore" });
+      assert.deepEqual(parseSentinel(await fsp.readFile(capOk, "utf8")), { exitCode: 0 });
+
+      // The sidecar exit file is cleaned up and never leaks into the capture dir.
+      const entries = await fsp.readdir(paths.captures);
+      assert.ok(
+        !entries.some((e) => e.endsWith(".exit")),
+        `sidecar .exit file must be removed, saw: ${entries.join(", ")}`,
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+}
 
 test("osaEscape escapes backslashes and quotes for an AppleScript literal", () => {
   assert.equal(osaEscape('a"b'), 'a\\"b');
