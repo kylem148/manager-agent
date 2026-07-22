@@ -388,7 +388,7 @@ it responds and updates memory appropriately
 on exit, the stale-activeContext guard keeps live state honest
 ```
 
-## Dispatching orders to the crew
+## Crew dispatch
 
 By default the co-manager hands you an order as text and you carry it to a coding
 agent yourself. If you'd rather have it run the order for you, link the instance
@@ -455,6 +455,23 @@ paste anything back. The session stays fully interactive the whole time, includi
 several jobs running at once; a failed or timed-out job never takes the session
 down. This layer is macOS + Ghostty only for the visible pane; the background
 fallback is portable.
+
+Both transports share one completion contract, so a run reports the same way
+whether it lands in a pane or the background. The agent runs with the repo as its
+working directory, set by a `cd '<repo>' || exit 1;` prepended to the command
+rather than a directory flag (Claude Code has none), so a bad repo path fails
+loudly and gets captured instead of silently running the agent somewhere else.
+(The background fallback also sets the repo as the process's spawn directory, and
+skips the `cd` when the repo doesn't exist yet so a not-yet-created repo degrades
+to the inherited directory instead of a hard failure.) An interactive pane hands
+back no clean exit code, so completion is detected by a sentinel rather than by
+waiting on a process. When the agent exits, its real exit code is written to a
+sidecar file (`<capture>.exit`) the instant it finishes (inside the pipe, so it's
+the agent's code and not `tee`'s), then a `__CO_DISPATCH_DONE__ <code>` line is
+appended to the capture and the sidecar is removed. The watcher tails each capture
+for that marker: a nonzero code marks the job failed, zero marks it done, and
+either way the co-manager then reviews the capture. If the code can't be read it
+records `-1`.
 
 ## What makes a turn slow
 
