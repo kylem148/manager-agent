@@ -387,7 +387,7 @@ async function runOpeningGreeting(state: SessionState): Promise<void> {
   // the co does: summarise state that is already sitting in the system prompt,
   // no tools, no reasoning. Spending session-default effort here bought nothing
   // but a longer wait before the captain could type.
-  await drive(state, "low");
+  await drive(state, { effort: "low" });
 }
 
 /**
@@ -396,8 +396,19 @@ async function runOpeningGreeting(state: SessionState): Promise<void> {
  * `effort` runs this one turn at a different depth than the session default —
  * used by the cold-start greeting, which is pure summarisation of context the
  * model already has and does not need the session's reasoning depth.
+ *
+ * `quiet` runs the turn without rendering the model's spoken reply to the
+ * screen. Its tool calls still execute (so memory writes happen) and its output
+ * is still recorded to the durable transcript — only the on-screen "co ›"
+ * stream, busy indicator, and surfaced-tool notices are suppressed. Used by the
+ * end-of-session distill: that turn is the co's own bookkeeping, and rendering
+ * it made `/exit` look like the co was replying to a chat message.
  */
-async function drive(state: SessionState, effort?: Effort): Promise<void> {
+async function drive(
+  state: SessionState,
+  opts: { effort?: Effort; quiet?: boolean } = {},
+): Promise<void> {
+  const { effort, quiet } = opts;
   const { io } = state;
   const executor = makeExecutor({
     paths: state.paths,
@@ -406,8 +417,9 @@ async function drive(state: SessionState, effort?: Effort): Promise<void> {
     onNotice: (msg) => {
       // Only external work (web search, fetch) reaches here; memory operations
       // are silent and never call onNotice. Surface the activity and keep it in
-      // the raw transcript, interleaved with talk.
-      io.appendBlock(c.dim(`  · ${msg}`));
+      // the raw transcript, interleaved with talk. A quiet turn (exit distill)
+      // still records to the transcript but shows nothing on screen.
+      if (!quiet) io.appendBlock(c.dim(`  · ${msg}`));
       void appendTranscript(state.transcript, "note", msg);
     },
     // Only wired when the instance is linked. Arming shows the confirm banner and
@@ -424,13 +436,14 @@ async function drive(state: SessionState, effort?: Effort): Promise<void> {
   // Accumulate the visible answer verbatim (no ANSI) for the durable transcript.
   let answer = "";
 
-  io.appendBlock(""); // blank spacer before the assistant turn
+  if (!quiet) io.appendBlock(""); // blank spacer before the assistant turn
 
   // The busy indicator runs from the moment we call the model until the first
   // token lands, and again for the duration of every tool call. Without it, a
   // silent memory write plus the follow-up model call is several seconds of a
-  // terminal that looks hung.
-  io.setBusy(pirateChore());
+  // terminal that looks hung. A quiet turn stays off the wheel entirely — it
+  // runs after `/exit`, where any flicker reads as the co still talking.
+  if (!quiet) io.setBusy(pirateChore());
 
   let result;
   try {
@@ -445,17 +458,21 @@ async function drive(state: SessionState, effort?: Effort): Promise<void> {
         // the TUI frame rather than corrupting the alt screen.
         onTiming: (l) => io.appendBlock(c.dim(`  ⏱ ${l}`)),
         onText: (d) => {
+          // Always accumulate for the durable transcript; only render when the
+          // turn is not quiet.
+          startedText = true;
+          answer += d;
+          if (quiet) return;
           io.setBusy(null);
           if (mode !== "text") {
             io.flushStream();
             io.appendStream(c.green("co  › "), { markdown: true });
             mode = "text";
           }
-          startedText = true;
-          answer += d;
           io.appendStream(d, { markdown: true });
         },
         onToolUse: (name) => {
+          if (quiet) return;
           io.flushStream();
           // Only surface external work in the transcript. Memory reads and
           // writes are the co-manager's private bookkeeping and stay invisible
@@ -474,14 +491,17 @@ async function drive(state: SessionState, effort?: Effort): Promise<void> {
     io.setBusy(null);
   }
 
-  // If the model produced no streamed text but a final string exists, show it.
+  // If the model produced no streamed text but a final string exists, show it
+  // (unless quiet — still capture it for the transcript).
   if (!startedText && result.finalText) {
-    io.flushStream();
-    io.appendStream(c.green("co  › "), { markdown: true });
-    io.appendStream(result.finalText, { markdown: true });
     answer = result.finalText;
+    if (!quiet) {
+      io.flushStream();
+      io.appendStream(c.green("co  › "), { markdown: true });
+      io.appendStream(result.finalText, { markdown: true });
+    }
   }
-  io.flushStream();
+  if (!quiet) io.flushStream();
   state.messages = result.messages;
 
   // Persist the co's turn as soon as it lands — the "save along the way" path.
@@ -733,7 +753,10 @@ async function syncActiveContext(state: SessionState, force: boolean, quiet = fa
       " acknowledgement, and do not narrate the memory write or say things like" +
       " saved, logged, or wrote to memory.",
   });
-  await drive(state);
+  // On the exit distill (quiet), the model's acknowledgement is suppressed on
+  // screen so `/exit` doesn't look like the co replied to a chat message; the
+  // memory write still happens and the reply is still kept in the transcript.
+  await drive(state, { quiet });
 
   const after = state.effects.liveRewritten.has("activeContext.md");
   const rewrote = after && !before;
