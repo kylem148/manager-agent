@@ -195,7 +195,7 @@ test("composeCloseScript targets the terminal by id", () => {
   assert.ok(script.includes('close (first terminal whose id = "pane-9")'));
 });
 
-test("buildJobScript pins PATH, isolates the order in the file, holds only when asked", () => {
+test("buildJobScript pins PATH, runs the crew bare on the pane tty, holds only when asked", () => {
   const text = buildJobScript({
     crewCommand: "claude 'line one\nline two'",
     captureFile: "/caps/j1.log",
@@ -207,48 +207,105 @@ test("buildJobScript pins PATH, isolates the order in the file, holds only when 
     text.includes("PATH='/usr/bin:/me/.local/bin'; export PATH"),
     "the co process's PATH is baked in (a command-launched surface gets only the bare GUI PATH)",
   );
-  assert.ok(text.includes("cd '/repo' || exit 1"), "cd fails loudly");
-  assert.ok(text.includes("claude 'line one\nline two'"), "the multi-line order lives in the file verbatim");
-  assert.ok(text.includes("/usr/bin/script -q"), "the crew runs under the pty recorder, absolute path");
+  assert.ok(text.includes("cd '/repo' ||"), "cd fails loudly");
+  assert.ok(text.includes("\nclaude 'line one\nline two'\n"), "the multi-line order lives in the file verbatim");
+  assert.ok(
+    !text.includes("script -q") && !text.includes("| tee"),
+    "NOTHING is interposed between the crew and the pane tty — no recorder, no pipe",
+  );
+  assert.ok(text.includes("trap : INT"), "Ctrl-C is left to the crew; the wrapper survives to report");
+  assert.ok(text.includes("finish 129; exit 129' HUP"), "a closed pane still writes the sentinel");
   assert.ok(text.includes(SENTINEL_PREFIX), "sentinel is appended after the run");
   assert.ok(text.includes(`if [ "$1" = hold ]`), "hold branch exists");
   assert.ok(text.includes('exec "${SHELL:-/bin/zsh}" -l'), "hold keeps the pane open as a shell");
 });
 
-test("job script end-to-end: real tty for the crew, capture, sentinel, self-cleanup", async () => {
+/** Write a job script for a fake crew command and return its paths. */
+async function writeJobScript(
+  paths: ReturnType<typeof instancePaths>,
+  jobId: string,
+  crewTemplate: string,
+  order: string,
+): Promise<{ captureFile: string; scriptPath: string }> {
+  const config = defaultDispatchConfig();
+  config.repoPath = paths.root;
+  config.agents = [{ name: "fake", command: crewTemplate }];
+  config.defaultAgent = "fake";
+  const captureFile = paths.captureFile(jobId);
+  const scriptPath = `${captureFile}.sh`;
+  await fsp.writeFile(
+    scriptPath,
+    buildJobScript({
+      crewCommand: jobCommandLine(config, order),
+      captureFile,
+      scriptPath,
+      cwd: paths.root,
+      pathEnv: process.env.PATH ?? "",
+    }),
+    "utf8",
+  );
+  return { captureFile, scriptPath };
+}
+
+test("job script end-to-end: order intact, sentinel code, self-cleanup", async () => {
   const { paths, cleanup } = await tmpInstance();
   try {
-    const config = defaultDispatchConfig();
-    config.repoPath = paths.root;
-    // The crew reports whether it got a REAL tty on both ends — the whole point
-    // of script(1) over `| tee` (a piped stdout knocks Claude Code out of
-    // interactive mode) — then exits nonzero to prove the code survives the pty.
-    config.agents = [
-      {
-        name: "fake",
-        command: `sh -c 'echo "order=$1"; test -t 0 && echo IN-TTY; test -t 1 && echo OUT-TTY; exit 4' _ {prompt}`,
-      },
-    ];
-    config.defaultAgent = "fake";
     const order = "line one\nit's got an apostrophe\nline two";
-    const crewCommand = jobCommandLine(config, order);
-    const captureFile = paths.captureFile("job-script");
-    const scriptPath = `${captureFile}.sh`;
-    await fsp.writeFile(
-      scriptPath,
-      buildJobScript({ crewCommand, captureFile, scriptPath, cwd: paths.root, pathEnv: process.env.PATH ?? "" }),
-      "utf8",
+    const { captureFile, scriptPath } = await writeJobScript(
+      paths,
+      "job-script",
+      `sh -c 'echo "order=$1"; exit 4' _ {prompt}`,
+      order,
     );
     execFileSync("/bin/sh", [scriptPath], { stdio: "ignore" });
     const captured = await fsp.readFile(captureFile, "utf8");
-    assert.ok(captured.includes("order=line one"), `order reached the crew, got:\n${captured}`);
-    assert.ok(captured.includes("it's got an apostrophe"), "newlines and apostrophes survive the file path");
-    assert.ok(captured.includes("IN-TTY"), "crew stdin is a real tty under script(1)");
-    assert.ok(captured.includes("OUT-TTY"), "crew stdout is a real tty under script(1)");
     assert.deepEqual(parseSentinel(captured), { exitCode: 4 }, "sentinel carries the crew's real exit code");
     const entries = await fsp.readdir(paths.captures);
-    assert.ok(!entries.some((e) => e.endsWith(".exit")), "exit sidecar removed");
     assert.ok(!entries.some((e) => e.endsWith(".sh")), "the job script removes itself");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("job script survives Ctrl-C (SIGINT to the process group) and still writes the sentinel", async () => {
+  // Quitting an interactive agent with Ctrl-C sends SIGINT to the pane's whole
+  // foreground group — the wrapper sh included. The trap must keep the wrapper
+  // alive so the completion sentinel is still written with the crew's real
+  // code; without it, Ctrl-C'd jobs never report back (the live defect).
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const { captureFile, scriptPath } = await writeJobScript(
+      paths,
+      "job-int",
+      // A "crew" that idles like an interactive agent until killed.
+      `sh -c 'sleep 30'`,
+      "x",
+    );
+    const { spawn } = await import("node:child_process");
+    const child = spawn("/bin/sh", [scriptPath], { stdio: "ignore", detached: true });
+    await new Promise((r) => setTimeout(r, 400));
+    process.kill(-child.pid!, "SIGINT"); // the whole group, like a terminal does
+    await new Promise<void>((resolve) => child.on("exit", () => resolve()));
+    const captured = await fsp.readFile(captureFile, "utf8");
+    const sentinel = parseSentinel(captured);
+    assert.ok(sentinel, `sentinel must still be written after group SIGINT, capture:\n${captured}`);
+    assert.equal(sentinel!.exitCode, 130, "reports the crew's real code (128+SIGINT)");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("job script writes the sentinel even when the pane is torn down (SIGHUP)", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const { captureFile, scriptPath } = await writeJobScript(paths, "job-hup", `sh -c 'sleep 30'`, "x");
+    const { spawn } = await import("node:child_process");
+    const child = spawn("/bin/sh", [scriptPath], { stdio: "ignore", detached: true });
+    await new Promise((r) => setTimeout(r, 400));
+    process.kill(-child.pid!, "SIGHUP"); // closing a pane HUPs its process group
+    await new Promise<void>((resolve) => child.on("exit", () => resolve()));
+    const captured = await fsp.readFile(captureFile, "utf8");
+    assert.deepEqual(parseSentinel(captured), { exitCode: 129 }, "a closed pane still reports completion");
   } finally {
     await cleanup();
   }

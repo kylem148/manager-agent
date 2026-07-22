@@ -38,6 +38,7 @@ import {
 } from "./dispatchconfig.js";
 import { DispatchRegistry, readFileTail, type Job } from "./registry.js";
 import { scrubCapture } from "./transport.js";
+import { findCrewTranscript, renderTranscriptForReview } from "./crewtranscript.js";
 
 /**
  * Interactive terminal session for one co-manager instance.
@@ -289,14 +290,21 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
 
   try {
     while (true) {
+      // Deliver any completed crew reviews BEFORE idling on input. This is the
+      // single drain point: a completion that fired mid-turn calls io.wake()
+      // while no question() is pending — the wake is dropped by design — and a
+      // slash-command turn `continue`s without reaching any post-turn hook, so
+      // draining anywhere later than the top of the loop leaves queued reviews
+      // parked until an unrelated event. Every path re-enters here.
+      await drainReviews(state);
+
       const input = await io.question();
       if (input === null) break; // EOF → clean exit, run the guard below
 
       // Wake sentinel: a background dispatch finished (or another out-of-band
-      // event) and asked for a turn. Drain any pending reviews, then re-prompt.
-      // The captain's half-typed line is preserved by the TUI across the wake.
+      // event) and asked for a turn. The loop top drains the queue on the next
+      // iteration; the captain's half-typed line is preserved across the wake.
       if (input === WAKE_SENTINEL) {
-        await drainReviews(state);
         continue;
       }
 
@@ -352,10 +360,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
       // conversational substance worth preserving, even if no tool ran.
       state.userTurns++;
       await runUserTurn(state, raw);
-
-      // A turn may have finished a dispatch while the model was talking; surface
-      // any reviews now rather than waiting for the next idle prompt.
-      await drainReviews(state);
+      // Reviews that completed during the turn are drained at the loop top.
     }
   } finally {
     state.registry?.stop();
@@ -622,43 +627,78 @@ async function fireDispatch(state: SessionState, order: string, agentName?: stri
 }
 
 /**
- * Drain completed jobs into review turns. For each finished job the co reads the
- * capture file itself (the captain pastes nothing) and reports a review using the
- * standard report-review protocol. Runs on the next idle prompt or right after a
- * turn. Serial, so multiple completions review in order.
+ * Drain completed jobs into review turns. For each finished job the co gathers
+ * the run's record itself (the captain pastes nothing) and reports a review
+ * using the standard report-review protocol. Serial, so multiple completions
+ * review in order — and each job resolves its OWN record, keyed by the job.
+ *
+ * The record source depends on how the job ran. A pane job is a fully native
+ * interactive agent with nothing recording its tty, so its reviewable record is
+ * the agent's own session transcript (located by matching the job's order text
+ * — see crewtranscript.ts); the capture file only proves launch + completion.
+ * A background job's capture holds real output (print mode) and is used
+ * directly, as is any capture when no transcript can be found.
  */
 async function drainReviews(state: SessionState): Promise<void> {
   while (state.reviewQueue.length > 0) {
     const job = state.reviewQueue.shift()!;
-    let captured = "";
-    try {
-      captured = await readCapture(state, job.captureFile);
-    } catch {
-      captured = "(the capture file could not be read)";
+
+    let record = "";
+    let source = "";
+    const config = state.dispatch;
+    if (config) {
+      try {
+        const transcript = await findCrewTranscript({
+          agentCommand: resolveAgentCommand(config, job.agentName),
+          repoPath: config.repoPath,
+          order: job.order,
+          startedAtMs: job.startedAt ?? 0,
+        });
+        if (transcript) {
+          const raw = await readFileTail(transcript, 4 * 1024 * 1024);
+          record = renderTranscriptForReview(raw, 16000);
+          source = "the crew agent's own session transcript";
+        }
+      } catch {
+        /* fall through to the capture */
+      }
     }
+    if (!record) {
+      try {
+        record = await readCapture(state, job.captureFile);
+        source = "the raw run capture";
+      } catch {
+        record = "(no transcript was found and the capture file could not be read)";
+        source = "nothing — no record was recoverable";
+      }
+    }
+
     state.userTurns++;
     state.messages.push({
       role: "user",
       content:
         "SYSTEM: A crew dispatch you launched has finished; review it now for the captain. This is" +
         " not something the captain typed — you triggered it. The agent ran in a separate coding" +
-        " session against the registered repo; below is the captured output of that run. Review it" +
-        " per the report-review protocol (what went right, what went wrong, escalations, then a" +
-        " verdict: accept / fix-commit / rework). Be concise. Do NOT ask the captain to paste" +
-        " anything; you already have the capture. Separate verified from claimed.\n\n" +
+        " session against the registered repo; below is the record of that run, taken from " +
+        source +
+        ". Review it per the report-review protocol (what went right, what went wrong, escalations," +
+        " then a verdict: accept / fix-commit / rework). Be concise. Do NOT ask the captain to paste" +
+        " anything; you already have the record. Separate verified from claimed. If the record is" +
+        " only a completion marker with no content, say plainly that the run left no reviewable" +
+        " record and what the exit code implies.\n\n" +
         `Job: ${job.id} (${job.label})\nStatus: ${job.status}` +
         (job.exitCode !== undefined ? ` (exit ${job.exitCode})` : "") +
-        `\n\n--- captured run output ---\n${captured}`,
+        `\n\n--- record of the run ---\n${record}`,
     });
     await drive(state);
   }
 }
 
 /** Read a capture file for review, capping its size so a runaway log can't blow
- *  the context window. Pane captures are pty recordings (an interactive agent's
- *  full TUI stream), so this reads only the file tail, scrubs the terminal
- *  escape noise into readable text, then keeps the last MAX characters — where
- *  the agent's conclusion and the sentinel live. */
+ *  the context window. Reads only the file tail, scrubs terminal escape noise
+ *  into readable text, and keeps the last MAX characters — where the run's
+ *  conclusion and the sentinel live. (Pane captures hold just probe + sentinel;
+ *  this mainly serves background-run captures and degrade notes.) */
 async function readCapture(_state: SessionState, file: string): Promise<string> {
   const raw = await readFileTail(file, 256 * 1024);
   const clean = scrubCapture(raw);

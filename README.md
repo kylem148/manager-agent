@@ -448,50 +448,63 @@ permission (granted the first time it scripts Ghostty).
 runs as a detached background process instead, with no pane geometry. The
 co-manager tells you which transport it used.
 
-Either way the run's output is captured to a per-job log under the instance's
-`.dispatch/captures/` (named with the job id plus a per-session tag, so logs from
-different sessions never collide), and when it finishes the co-manager reads that
-capture and reports a review on its own — you never paste anything back. The
-session stays fully interactive the whole time, including with several jobs
-running at once; a failed or timed-out job never takes the session down. This
-layer is macOS + Ghostty only for the visible pane; the background fallback is
-portable.
+Either way, when a job finishes the co-manager gathers that run's record and
+reports a review on its own — you never paste anything back, and every job
+reports independently (a later job finishing while an earlier one still runs
+delivers its own review). The session stays fully interactive the whole time,
+including with several jobs running at once; a failed or timed-out job never
+takes the session down. This layer is macOS + Ghostty only for the visible
+pane; the background fallback is portable.
 
 On the pane path, the job — the `cd` into the repo, the agent command, the
-(possibly multi-line) order text, capture and completion bookkeeping — is written
-to a **per-job script file** next to the capture, and the pane only ever receives
-a launch of that file. A fresh split is created already running it (Ghostty's
-surface `command`), so nothing is typed into a new pane at all; the script ends
-by exec'ing a login shell, so that freshly-split pane stays open and reusable
-instead of closing when the job exits. Taking over or reusing an existing pane
-pastes a single short `/bin/sh '<script>'` line instead. The order itself never
-travels through the keystroke stream, so newlines and quotes in an order can't
-be re-interpreted by whatever the pane is doing. If the pane doesn't start the
-job within about four seconds (something else — an editor, another agent — owns
-it), the dispatch degrades to the background transport with a note in the
-capture saying why. Inside the script the agent runs under `script(1)`, a pty
-recorder: it keeps a real terminal on both ends — so an interactive agent stays
-interactive and visible in the pane — while everything is recorded to the
-capture file. The co-manager's own `PATH` is baked into the script, because a
-command-launched Ghostty surface otherwise inherits only the bare GUI `PATH` and
-wouldn't find a user-installed agent binary. The background fallback instead
-pipes output straight to the capture (no pty, agents run in their non-interactive
-mode there), sets the repo as the working directory, and skips the `cd` when the
-repo doesn't exist yet so a not-yet-created repo degrades to the inherited
-directory instead of a hard failure.
+(possibly multi-line) order text, completion bookkeeping — is written to a
+**per-job script file** under `.dispatch/captures/` (named with the job id plus
+a per-session tag, so jobs from different sessions never collide), and the pane
+only ever receives a launch of that file. A fresh split is created already
+running it (Ghostty's surface `command`), so nothing is typed into a new pane
+at all; the script ends by exec'ing a login shell, so that freshly-split pane
+stays open and reusable instead of closing when the job exits. Taking over or
+reusing an existing pane pastes a single short `/bin/sh '<script>'` line
+instead. The order itself never travels through the keystroke stream, so
+newlines and quotes in an order can't be re-interpreted by whatever the pane is
+doing. If the pane doesn't start the job within about four seconds (something
+else — an editor, another agent — owns it), the dispatch degrades to the
+background transport with a note in the capture saying why. The co-manager's
+own `PATH` is baked into the script, because a command-launched Ghostty surface
+otherwise inherits only the bare GUI `PATH` and wouldn't find a user-installed
+agent binary.
+
+Inside the script the agent runs attached **directly to the pane's terminal** —
+no recorder, no pipe, nothing interposed — so a dispatched pane behaves exactly
+like one you opened yourself: correct rendering, native keybindings
+(Shift+Enter newline included), live resize. Because nothing records that
+terminal, the reviewable record of a pane run is the agent's **own session
+transcript**: for Claude Code, the session JSONL under its config dir
+(`CLAUDE_CONFIG_DIR` parsed from the agent command; `~/.claude` by default).
+The job's transcript is identified by content — the dispatch order is the
+session's first prompt — so concurrent jobs in the same repo each resolve their
+own record, and the co reviews message text and tool calls instead of terminal
+escape soup. If no transcript can be found (a non-Claude agent, say), the
+review falls back to the capture file and says plainly that the run left no
+recording. The background fallback still records real output to the capture
+(agents run in their non-interactive print mode there), sets the repo as the
+working directory, and skips the `cd` when the repo doesn't exist yet so a
+not-yet-created repo degrades to the inherited directory instead of a hard
+failure.
 
 Both transports share one completion contract, so a run reports the same way
-whether it lands in a pane or the background. A bad repo path fails the `cd ||
-exit 1` loudly and gets captured instead of silently running the agent somewhere
-else. An interactive pane hands back no clean exit code, so completion is
-detected by a sentinel rather than by waiting on a process: when the agent
-exits, its real exit code is written to a sidecar file (`<capture>.exit`) the
-instant it finishes, then a `__CO_DISPATCH_DONE__ <code>` line is appended to
-the capture and the sidecar is removed. The watcher tails each capture for that
+whether it lands in a pane or the background. A bad repo path fails the `cd`
+loudly and gets captured instead of silently running the agent somewhere else.
+An interactive pane hands back no clean exit code, so completion is detected by
+a sentinel rather than by waiting on a process: when the agent exits, a
+`__CO_DISPATCH_DONE__ <code>` line with its real exit code is appended to the
+capture file. The wrapper that writes it survives the ways humans actually
+close an agent: Ctrl-C is trapped so the crew handles its own interrupt while
+the wrapper lives on to report, and a torn-down pane (HUP) or kill (TERM)
+still writes the sentinel before dying. The watcher tails each capture for the
 marker: a nonzero code marks the job failed, zero marks it done, and either way
-the co-manager then reviews the capture (stripped of terminal escape noise and
-capped, since a pty recording of a full agent session can be large). If the code
-can't be read it records `-1`.
+the co-manager then reviews the run's record. If the code can't be read it
+records `-1`.
 
 ## What makes a turn slow
 

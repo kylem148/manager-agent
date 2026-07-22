@@ -43,22 +43,24 @@ import { CrewPaneLayout, type PlacementDecision } from "./crewpanes.js";
  * ate the head as input while the tail spilled onto the prompt. The script file
  * exists so no order byte ever rides the keystroke path.
  *
- * Inside the script, the crew command runs under `/usr/bin/script -q` (a pty
- * recorder) rather than `... | tee`: with tee the agent's stdout is a pipe, and
- * agents like Claude Code drop to non-interactive print mode when stdout isn't
- * a tty — the visible pane would sit blank until the run ended. script(1) keeps
- * a real tty on both ends (verified live) while recording to the capture file.
- * The absolute /usr/bin path matters: a brew-installed util-linux `script` has
- * incompatible flags. The co process's PATH is baked into the script because a
- * command-launched Ghostty surface gets only the bare GUI PATH (verified:
- * /usr/bin:/bin:...), which would not find a user-installed agent binary.
+ * Inside the script the crew runs attached DIRECTLY to the pane tty — nothing
+ * interposed — so the pane behaves exactly like a human-opened agent session.
+ * The capture file is therefore NOT a recording: it is the launch probe plus
+ * the completion sentinel (and degrade notes). The reviewable record of a pane
+ * run comes from the agent's own session transcript (crewtranscript.ts); the
+ * background fallback still records real output since print-mode agents write
+ * plain text. See buildJobScript for why (a pty recorder broke native
+ * behavior and produced unreviewable escape soup). The co process's PATH is
+ * baked into the script because a command-launched Ghostty surface gets only
+ * the bare GUI PATH (verified: /usr/bin:/bin:...), which would not find a
+ * user-installed agent binary.
  */
 
 /** The marker appended to a capture file after the agent process exits. The
  *  watcher scans for this to know a job is done; the number is the crew
- *  process's real exit code, captured via a sidecar file on both transports
- *  (see buildJobScript for the pane path, buildShellCommand for the fallback).
- *  It is -1 only when the code is missing or unparseable. */
+ *  process's real exit code — taken from `$?` directly on the pane path (see
+ *  buildJobScript) and via the `.exit` sidecar on the fallback's tee pipeline
+ *  (see buildShellCommand). It is -1 only when missing or unparseable. */
 export const SENTINEL_PREFIX = "__CO_DISPATCH_DONE__";
 
 export function sentinelLine(exitCode: number): string {
@@ -236,27 +238,37 @@ export function jobCommandLine(config: DispatchConfig, order: string, agentName?
  * sh as a file, so a multi-line order or an apostrophe can never be re-tokenized
  * by a terminal's input handling.
  *
- * Layout: the script calls ITSELF (via /usr/bin/script) with a `run` argument
- * for the inner branch, so the crew command's quoting appears exactly once —
- * there is no shell-inside-shell re-quoting.
+ * The crew command runs attached DIRECTLY to the pane's tty — no recorder, no
+ * pipe, nothing interposed — so a dispatched agent is indistinguishable from
+ * one a human launched in that pane: same termios, same window-size updates on
+ * resize, same in-band key-protocol negotiation with Ghostty. An earlier
+ * revision wrapped the crew in /usr/bin/script(1) to record a capture; that
+ * intermediary pty broke native behavior (verified: macOS script(1) does not
+ * forward SIGWINCH, so the agent renders at a stale size after any pane
+ * resize) and its recording of a full-screen TUI was escape-mangled past
+ * usefulness for review anyway. The reviewable record now comes from the
+ * agent's own session transcript (see crewtranscript.ts); the capture file
+ * remains as the launch probe + completion sentinel channel only.
  *
- *  - run branch: cd into the repo (fail loudly), run the crew command with the
- *    pane's tty (script(1) gives it a real pty pair), then write its $? to the
- *    `.exit` sidecar. `$?` immediately after the command is portable to every
- *    POSIX shell; the sidecar exists because the outer branch can't see the
- *    inner exit code any other way that survives every shell/signal combination.
- *  - outer branch: pre-create the capture (this is the launch probe the
- *    transport polls for — see launchGhostty), record the run under
- *    /usr/bin/script, then append the sentinel with the sidecar's code and
- *    remove both sidecar and self. With `hold` (a pane born from a surface
- *    configuration, which would otherwise close when its command exits) it
- *    finally execs a login shell so the pane stays open and reusable — the
- *    same end state as a pane that started as a shell.
+ * Completion must survive how humans actually close an agent:
+ *  - Ctrl-C: SIGINT goes to the pane's foreground process GROUP — this sh as
+ *    well as the agent. `trap : INT` keeps sh alive (a command trap is NOT
+ *    inherited by children, so the agent still receives its own SIGINT and
+ *    handles it per its UX); sh then writes the sentinel with the agent's real
+ *    exit code. Without this, quitting an agent with Ctrl-C killed the wrapper
+ *    before the sentinel was written and the job never reported back.
+ *  - Pane closed / kill: HUP and TERM write the sentinel (129/143) before
+ *    dying, so even a torn-down pane reports completion.
  *
  * PATH is pinned to the co process's own PATH: a command-launched Ghostty
  * surface inherits only the bare GUI PATH, which won't contain a user-installed
- * agent (e.g. ~/.local/bin/claude). The co was started from the user's shell,
- * so its PATH is the right one, frozen at dispatch time.
+ * agent (e.g. ~/.local/bin/claude). The rest of the surface env is fine as
+ * Ghostty ships it (LANG, TERM, TERMINFO, COLORTERM all verified present).
+ *
+ * With `hold` (a pane born from a surface configuration, which would otherwise
+ * close when its command exits) the script finally execs a login shell so the
+ * pane stays open and reusable — the same end state as a pane that started as
+ * a shell.
  */
 export function buildJobScript(args: {
   crewCommand: string;
@@ -267,25 +279,37 @@ export function buildJobScript(args: {
 }): string {
   const { crewCommand, captureFile, scriptPath, cwd, pathEnv } = args;
   const qCapture = shellQuote(captureFile);
-  const qExit = shellQuote(`${captureFile}.exit`);
   const qSelf = shellQuote(scriptPath);
   const lines = [
     "#!/bin/sh",
     "# Generated by co dispatch for a single crew job; removes itself when done.",
     ...(pathEnv ? [`PATH=${shellQuote(pathEnv)}; export PATH`] : []),
-    `if [ "$1" = run ]; then`,
-    ...(cwd && cwd.trim() ? [`  cd ${shellQuote(cwd)} || exit 1`] : []),
-    `  ${crewCommand}`,
-    `  echo $? > ${qExit}`,
-    `  exit 0`,
-    `fi`,
+    `finished=0`,
+    `finish() {`,
+    `  [ "$finished" = 1 ] && return`,
+    `  finished=1`,
+    `  printf '%s %s\\n' ${shellQuote(SENTINEL_PREFIX)} "$1" >> ${qCapture}`,
+    `  rm -f ${qSelf}`,
+    `}`,
+    // Ctrl-C belongs to the crew; this sh survives it to report completion.
+    `trap : INT`,
+    `trap 'finish 129; exit 129' HUP`,
+    `trap 'finish 143; exit 143' TERM`,
+    // Creating the capture is the launch probe the transport polls for.
     `: > ${qCapture}`,
-    `/usr/bin/script -q ${qCapture} /bin/sh ${qSelf} run`,
-    `code=$(cat ${qExit} 2>/dev/null)`,
-    `rm -f ${qExit}`,
-    `printf '%s %s\\n' ${shellQuote(SENTINEL_PREFIX)} "\${code:--1}" >> ${qCapture}`,
-    `printf 'co dispatch: job finished (exit %s)\\n' "\${code:--1}"`,
-    `rm -f ${qSelf}`,
+    ...(cwd && cwd.trim()
+      ? [
+          `cd ${shellQuote(cwd)} || {`,
+          `  echo "co dispatch: cannot cd to ${cwd.replace(/"/g, '\\"')}" >> ${qCapture}`,
+          `  finish 1`,
+          `  exit 1`,
+          `}`,
+        ]
+      : []),
+    crewCommand,
+    `code=$?`,
+    `finish "$code"`,
+    `printf 'co dispatch: job finished (exit %s)\\n' "$code"`,
     `if [ "$1" = hold ]; then`,
     `  exec "\${SHELL:-/bin/zsh}" -l`,
     `fi`,
@@ -295,13 +319,12 @@ export function buildJobScript(args: {
 }
 
 /**
- * Make a raw capture readable for review. Pane captures are pty recordings
- * (script(1)), so an interactive agent leaves cursor-movement escape codes and
- * carriage-return overwrites in the file. This strips OSC/CSI/other escape
- * sequences, resolves `\r` overwrites by keeping the last write of each line,
- * drops remaining control bytes, and collapses blank-line runs — best-effort
- * readability, not terminal-faithful rendering. The sentinel line is appended
- * outside the pty and is never touched by any of this.
+ * Make a raw capture readable for review. Background captures can carry color
+ * codes and progress-line `\r` overwrites from agents that style their print
+ * output. This strips OSC/CSI/other escape sequences, resolves `\r` overwrites
+ * by keeping the last write of each line, drops remaining control bytes, and
+ * collapses blank-line runs — best-effort readability, not terminal-faithful
+ * rendering. The sentinel line is plain text and survives untouched.
  */
 export function scrubCapture(raw: string): string {
   let s = raw.replace(/\r\n/g, "\n");
