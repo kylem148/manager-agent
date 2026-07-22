@@ -548,11 +548,17 @@ async function drive(
  * summary for the tool result. Re-arming replaces any prior armed order — only
  * one can be pending, and the last one the model staged this turn wins.
  */
-function armDispatch(
+async function armDispatch(
   state: SessionState,
   order: string,
-): { armed: true; summary: string } | { armed: false; reason: string } {
-  const config = state.dispatch;
+): Promise<{ armed: true; summary: string } | { armed: false; reason: string }> {
+  // Read the config the NEXT dispatch will actually use, re-reading disk so a
+  // mid-session `co link` is reflected. Without this the banner shows the config
+  // snapshotted at session start (state.dispatch) — the exact bug where a
+  // re-linked crew command still displayed the old, broken word. We refresh the
+  // cached snapshot too so the `confirm <agent>` validation agrees with the banner.
+  const config = state.registry ? await state.registry.currentConfig() : state.dispatch;
+  if (config) state.dispatch = config;
   if (!config) return { armed: false, reason: "This instance is not linked; run `co link` first." };
   if (!config.repoPath) {
     return { armed: false, reason: "No repo path is registered. Re-run `co link` to set one." };

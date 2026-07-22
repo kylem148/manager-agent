@@ -353,3 +353,39 @@ test("dispatch reads the pane id fresh from config, so `co pane` takes effect wi
     await cleanup();
   }
 });
+
+test("currentConfig re-reads disk on the fallback path so a mid-session re-link takes effect", async () => {
+  // The arming banner reads currentConfig(); before this it read a config
+  // snapshotted at session start, so a `co link` that fixed a broken crew
+  // command still showed (and, off Ghostty, ran) the old one. This proves the
+  // disk re-read now happens on the fallback transport too, not just Ghostty.
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.agents = [{ name: "cc", command: "ccw {prompt}" }]; // the old, broken word
+    config.defaultAgent = "cc";
+    await writeDispatchConfig(paths, config);
+
+    await withRegistry(
+      { paths, config, onComplete: () => {}, transportOverride: "fallback", pollIntervalMs: 10_000 },
+      async (reg) => {
+        // A `co link` in another process rewrites the config with the resolved command.
+        const fixed = {
+          ...config,
+          agents: [{ name: "cc", command: 'CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude {prompt}' }],
+        };
+        await writeDispatchConfig(paths, fixed);
+
+        const current = await reg.currentConfig();
+        assert.equal(
+          current.agents[0]!.command,
+          'CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude {prompt}',
+          "currentConfig reflects the re-link without a session restart",
+        );
+      },
+    );
+  } finally {
+    await cleanup();
+  }
+});

@@ -281,7 +281,9 @@ export interface ExecutorContext {
    * a short human-readable confirmation of what was armed (or an error string if
    * arming is impossible), which becomes the tool result the model sees.
    */
-  onArmDispatch?: (order: string) => { armed: true; summary: string } | { armed: false; reason: string };
+  onArmDispatch?: (
+    order: string,
+  ) => Promise<{ armed: true; summary: string } | { armed: false; reason: string }>;
 }
 
 function ok(id: string, obj: unknown): ToolResult {
@@ -409,7 +411,7 @@ export function makeExecutor(ctx: ExecutorContext) {
               "Dispatch is not available: this instance is not linked to a repo. Run `co link` first, or write the order as plain text for the captain to copy.",
             );
           }
-          const res = ctx.onArmDispatch(order);
+          const res = await ctx.onArmDispatch(order);
           if (!res.armed) return err(id, res.reason);
           // Armed, not run. The model must now stop and let the captain confirm;
           // it must NOT claim the order ran.

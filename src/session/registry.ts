@@ -156,6 +156,18 @@ export class DispatchRegistry {
   }
 
   /**
+   * Re-read the dispatch config from disk and return the current in-memory copy.
+   * This is the SAME refresh a dispatch does, exposed so the arming banner shows
+   * exactly what the next dispatch will run — otherwise the banner reads a config
+   * snapshotted at session start and a mid-session `co link` makes it lie (it
+   * would show the old crew command while dispatch quietly uses the new one).
+   */
+  async currentConfig(): Promise<DispatchConfig> {
+    await this.refreshConfig();
+    return this.config;
+  }
+
+  /**
    * Re-read the dispatch config from disk and, if the designated anchor changed
    * (a `co pane` in another process while this session runs), rebuild the layout
    * on the new anchor so the very next dispatch targets it — no session restart.
@@ -167,14 +179,18 @@ export class DispatchRegistry {
    * re-probed for existence on its first pane launch (anchorChecked reset).
    *
    * Best-effort: an unreadable/corrupt config keeps the current in-memory config
-   * rather than tearing down a working session. Only runs on the Ghostty path;
-   * off Ghostty there is no pane geometry to refresh.
+   * rather than tearing down a working session.
    */
   private async refreshConfig(): Promise<void> {
-    if (this.transport !== "ghostty") return;
     const fresh = await readDispatchConfig(this.paths);
     if (!fresh) return; // never linked, or unreadable: keep what we have
     this.config = fresh;
+
+    // The rest reconciles pane geometry, which only exists on the Ghostty path.
+    // The config re-read above must happen on EVERY transport, though: a
+    // mid-session `co link` (e.g. correcting a crew command) has to take effect
+    // for background dispatches too, not just paned ones.
+    if (this.transport !== "ghostty") return;
 
     const anchor = fresh.anchor;
     const currentAnchorId = this.layout?.anchorPaneId ?? null;
