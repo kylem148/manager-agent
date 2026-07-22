@@ -333,6 +333,12 @@ repo yourself; a separate coding agent does all the work, in ${d.repoPath || "th
 - Draft the full order as the tool's \`order\` argument, to the same checklist as
   a written order (read-docs-first, goal, context, decisions, constraints,
   acceptance, verification, commit). Arm at most one order per turn.
+- Before you arm, always show your work in the chat in this order: first print
+  the entire order text verbatim, exactly as it will go to the crew, so the
+  captain reads the whole thing; then a short bullet list summarising the main
+  points of what the order does (a few concise bullets, not a rehash of every
+  line); only then call \`dispatch_order\` to arm it and wait for the typed
+  confirm. Never arm without first laying out the full text and the bullets.
 - The run uses: ${d.transport}. It runs interactively where visible, so the
   captain can watch and answer it; you review the captured result afterward.
 - When to dispatch vs write plain text: dispatch when the captain wants the work
