@@ -210,6 +210,40 @@ export interface DocSource {
 }
 
 /**
+ * What the landing gate reviews and does - the Ctrl-O overlay's third mode,
+ * opened programmatically via openLandingReview when a prepared feature awaits
+ * the human's verdict. Injected like DocSource so the Tui never touches git
+ * itself: `execute` is the ONLY path to the merge, and the Tui calls it at
+ * most once, solely from the [m] keystroke over a mergeable prepare. There is
+ * no automatic path.
+ */
+export interface LandingReview {
+  /** Feature name, shown in the header bar. */
+  feature: string;
+  /** The integration branch the merge would write (e.g. "dev"). */
+  target: string;
+  /** The prepare outcome under review. Only "green" is mergeable. */
+  prepared: LandingPrepared;
+  /**
+   * Perform the gated merge. Resolves with a one-line confirmation to flash;
+   * rejects with the refusal/failure (e.g. a stale green), which the gate
+   * surfaces in place. Called at most once per review.
+   */
+  execute(): Promise<string>;
+}
+
+/** A prepare outcome shaped for display. The session layer maps the landing
+ *  engine's result onto this, so the Tui stays free of git types. */
+export type LandingPrepared =
+  | { kind: "green"; commits: string[]; diff: string }
+  | { kind: "conflict"; conflictFiles: string[]; detail: string }
+  | { kind: "failed"; exitCode: number; output: string };
+
+/** How a landing review ended: the human merged, declined, or dismissed a
+ *  review whose merge attempt was refused. Only "merged" moved anything. */
+export type LandingGateOutcome = "merged" | "rejected" | "failed";
+
+/**
  * Render a whole markdown document to visual rows through the SAME renderer the
  * transcript uses, so the overlay looks identical to inline output. Tables are
  * laid out from their raw form at `width` (never word-wrapped), honoring the
@@ -227,6 +261,89 @@ export function renderMarkdownDoc(content: string, width: number): string[] {
   }
   for (const e of md.flushBlock(width)) push(e);
   return out;
+}
+
+/** Style one raw patch line the way git colours a diff. The file-header lines
+ *  are checked before the +/- content lines, which they'd otherwise match. */
+function colorDiffLine(l: string): string {
+  if (
+    l.startsWith("diff --git") ||
+    l.startsWith("index ") ||
+    l.startsWith("+++") ||
+    l.startsWith("---")
+  ) {
+    return c.bold(l);
+  }
+  if (l.startsWith("@@")) return c.cyan(l);
+  if (l.startsWith("+")) return c.green(l);
+  if (l.startsWith("-")) return c.red(l);
+  return l;
+}
+
+/** Files touched by a patch, counted from its per-file headers. */
+function diffFileCount(diff: string): number {
+  let n = 0;
+  for (const l of diff.split("\n")) if (l.startsWith("diff --git ")) n++;
+  return n;
+}
+
+/**
+ * Render the landing review's body to visual rows: a summary (commit list,
+ * changed-file count) followed by the full diff, every line wrapped so nothing
+ * is clipped out of a review. A conflict/failed prepare renders its reason
+ * instead - there is no tested state to diff, so there is nothing to merge. A
+ * failed merge attempt (status "failed") banners its error at the top.
+ */
+function renderLandingBody(
+  review: LandingReview,
+  status: "review" | "merging" | "failed",
+  error: string | null,
+  width: number,
+): string[] {
+  const wrap = (s: string): string[] => (s === "" ? [""] : wrapLine(s, width));
+  const rows: string[] = [""];
+  if (status === "failed") {
+    rows.push(...wrap("  " + c.red(`merge failed: ${error ?? "unknown error"}`)));
+    rows.push("");
+  }
+  const p = review.prepared;
+  if (p.kind === "conflict") {
+    rows.push(...wrap("  " + c.yellow(`rebase onto ${review.target} hit conflicts; there is no tested state to merge`)));
+    rows.push("");
+    rows.push(...wrap("  conflicted paths:"));
+    for (const f of p.conflictFiles) rows.push(...wrap("    " + c.red(f)));
+    rows.push("");
+    for (const l of p.detail.split("\n")) rows.push(...wrap("  " + c.dim(l)));
+    return rows;
+  }
+  if (p.kind === "failed") {
+    rows.push(...wrap("  " + c.red(`build+test failed on the rebased state (exit ${p.exitCode})`)));
+    rows.push("");
+    for (const l of p.output.split("\n")) rows.push(...wrap("  " + l));
+    return rows;
+  }
+  const files = diffFileCount(p.diff);
+  const summary =
+    `${p.commits.length} commit${p.commits.length === 1 ? "" : "s"} · ` +
+    `${files} file${files === 1 ? "" : "s"} changed`;
+  rows.push(...wrap("  " + c.bold(summary)));
+  rows.push("");
+  if (p.commits.length === 0) {
+    rows.push(...wrap("  " + c.yellow(`no commits beyond ${review.target}; nothing to land`)));
+    return rows;
+  }
+  for (const cl of p.commits) {
+    const sp = cl.indexOf(" ");
+    const styled = sp === -1 ? c.dim(cl) : c.dim(cl.slice(0, sp)) + " " + cl.slice(sp + 1);
+    rows.push(...wrap("  " + styled));
+  }
+  if (p.diff !== "") {
+    rows.push("");
+    rows.push(...wrap(c.dim(`── diff vs ${review.target} ──`)));
+    rows.push("");
+    for (const l of p.diff.split("\n")) rows.push(...wrap(colorDiffLine(l)));
+  }
+  return rows;
 }
 
 /** The subset of a readable TTY stream the Tui needs. */
@@ -338,7 +455,32 @@ const OVERLAY_LABELS = "123456789abcdefghijklmnopqrstuvwxyz";
  */
 type Overlay =
   | { mode: "list"; docs: string[]; loading: boolean; error: string | null }
-  | { mode: "doc"; name: string; content: string; rows: string[]; scroll: number; error: string | null };
+  | { mode: "doc"; name: string; content: string; rows: string[]; scroll: number; error: string | null }
+  | {
+      mode: "landing";
+      review: LandingReview;
+      /** Rendered summary + diff body. Rebuilt on resize and on state change. */
+      rows: string[];
+      scroll: number;
+      /** "review": [m] can fire (green prepare only). "merging": execute() is in
+       *  flight and every gate key is ignored - the fire-once interlock.
+       *  "failed": the merge was refused; [m] stays off (a stale green needs a
+       *  fresh prepare, not a retry) and dismissing is the only exit. */
+      status: "review" | "merging" | "failed";
+      /** The execute() refusal/failure message when status is "failed". */
+      error: string | null;
+      /** Resolve openLandingReview's promise. Idempotent: first call wins. */
+      settle: (outcome: LandingGateOutcome) => void;
+    };
+
+/**
+ * The landing overlay state. Unlike the doc overlay (replaced wholesale on
+ * scroll), this one object is MUTATED in place for its whole life: the [m]
+ * handler's async continuation holds a reference and checks it against
+ * this.overlay to know whether the gate is still on screen, so its identity
+ * must survive scrolling and status changes.
+ */
+type LandingOverlay = Extract<Overlay, { mode: "landing" }>;
 
 /**
  * A decoded overlay keystroke: either a printable char (a doc-list selector or
@@ -533,6 +675,12 @@ export class Tui implements SessionIO {
     // Drop the doc-viewer live-refresh subscription so the write queue doesn't
     // keep calling into a torn-down Tui.
     if (this.unsubscribeDocs) { this.unsubscribeDocs(); this.unsubscribeDocs = null; }
+    // A landing gate open at teardown settles as a non-merge so its caller
+    // never hangs; mid-merge, the execute continuation delivers the real
+    // outcome (see approveLanding).
+    if (this.overlay?.mode === "landing" && this.overlay.status !== "merging") {
+      this.overlay.settle(this.overlay.status === "failed" ? "failed" : "rejected");
+    }
     this.overlay = null;
     if (this.statusTimer) { clearTimeout(this.statusTimer); this.statusTimer = null; }
     if (this.busyTimer) { clearInterval(this.busyTimer); this.busyTimer = null; }
@@ -1883,35 +2031,39 @@ export class Tui implements SessionIO {
     }
   }
 
-  /** Re-lay the open doc out at the current width (resize). */
+  /** Re-lay the open doc or landing review out at the current width (resize). */
   private reflowOverlay(): void {
     const ov = this.overlay;
-    if (!ov || ov.mode !== "doc") return;
-    const rows = renderMarkdownDoc(ov.content, this.cols);
+    if (!ov || ov.mode === "list") return;
+    const rows =
+      ov.mode === "doc"
+        ? renderMarkdownDoc(ov.content, this.cols)
+        : renderLandingBody(ov.review, ov.status, ov.error, this.cols);
     const scroll = Math.min(ov.scroll, Math.max(0, rows.length - this.overlayViewport()));
-    this.overlay = { ...ov, rows, scroll };
+    if (ov.mode === "doc") this.overlay = { ...ov, rows, scroll };
+    else { ov.rows = rows; ov.scroll = scroll; } // mutated in place; see LandingOverlay
   }
 
   private overlayScrollBy(delta: number): void {
     const ov = this.overlay;
-    if (!ov || ov.mode !== "doc") return;
+    if (!ov || ov.mode === "list") return;
     const max = Math.max(0, ov.rows.length - this.overlayViewport());
     const next = Math.max(0, Math.min(max, ov.scroll + delta));
-    if (next !== ov.scroll) {
-      this.overlay = { ...ov, scroll: next };
-      this.paint();
-    }
+    if (next === ov.scroll) return;
+    if (ov.mode === "doc") this.overlay = { ...ov, scroll: next };
+    else ov.scroll = next; // mutated in place; see LandingOverlay
+    this.paint();
   }
 
   private overlayScrollTo(pos: number): void {
     const ov = this.overlay;
-    if (!ov || ov.mode !== "doc") return;
+    if (!ov || ov.mode === "list") return;
     const max = Math.max(0, ov.rows.length - this.overlayViewport());
     const next = Math.max(0, Math.min(max, pos));
-    if (next !== ov.scroll) {
-      this.overlay = { ...ov, scroll: next };
-      this.paint();
-    }
+    if (next === ov.scroll) return;
+    if (ov.mode === "doc") this.overlay = { ...ov, scroll: next };
+    else ov.scroll = next; // mutated in place; see LandingOverlay
+    this.paint();
   }
 
   /** Parse one key/sequence while the overlay is open. Returns bytes consumed. */
@@ -2008,7 +2160,8 @@ export class Tui implements SessionIO {
     const ov = this.overlay;
     if (!ov) return;
     if (ov.mode === "list") this.overlayListInput(input, ov);
-    else this.overlayDocInput(input);
+    else if (ov.mode === "doc") this.overlayDocInput(input);
+    else this.overlayLandingInput(input, ov);
   }
 
   private overlayListInput(input: OverlayInput, ov: Extract<Overlay, { mode: "list" }>): void {
@@ -2027,31 +2180,166 @@ export class Tui implements SessionIO {
 
   private overlayDocInput(input: OverlayInput): void {
     if ("nav" in input) {
+      if (input.nav === "escape") { this.closeOverlay(); return; }
+      if (input.nav === "back") { this.backToList(); return; }
+      this.overlayScrollInput(input);
+      return;
+    }
+    if (input.ch === "q") { this.closeOverlay(); return; }
+    this.overlayScrollInput(input);
+  }
+
+  /**
+   * The less-style paging shared by every scrollable overlay body (a doc, the
+   * landing diff): space/f/b page, d/u half, j/k line, g/G ends, plus the nav
+   * keys. Escape/back are NOT here - each mode owns its exits, so a paging key
+   * can never dismiss a gate by accident. Returns false for keys that aren't
+   * paging so callers can tell an ignored key from a scrolled one.
+   */
+  private overlayScrollInput(input: OverlayInput): boolean {
+    const half = Math.max(1, Math.floor(this.overlayPage() / 2));
+    if ("nav" in input) {
       switch (input.nav) {
-        case "escape": this.closeOverlay(); return;
-        case "back": this.backToList(); return;
-        case "up": this.overlayScrollBy(-1); return;
-        case "down": this.overlayScrollBy(1); return;
-        case "pageup": this.overlayScrollBy(-this.overlayPage()); return;
-        case "pagedown": this.overlayScrollBy(this.overlayPage()); return;
-        case "halfup": this.overlayScrollBy(-Math.max(1, Math.floor(this.overlayPage() / 2))); return;
-        case "halfdown": this.overlayScrollBy(Math.max(1, Math.floor(this.overlayPage() / 2))); return;
-        case "top": this.overlayScrollTo(0); return;
-        case "bottom": this.overlayScrollTo(Number.MAX_SAFE_INTEGER); return;
+        case "up": this.overlayScrollBy(-1); return true;
+        case "down": this.overlayScrollBy(1); return true;
+        case "pageup": this.overlayScrollBy(-this.overlayPage()); return true;
+        case "pagedown": this.overlayScrollBy(this.overlayPage()); return true;
+        case "halfup": this.overlayScrollBy(-half); return true;
+        case "halfdown": this.overlayScrollBy(half); return true;
+        case "top": this.overlayScrollTo(0); return true;
+        case "bottom": this.overlayScrollTo(Number.MAX_SAFE_INTEGER); return true;
+        default: return false;
       }
     }
     switch (input.ch) {
-      case "q": this.closeOverlay(); return;
       case " ":
-      case "f": this.overlayScrollBy(this.overlayPage()); return;
-      case "b": this.overlayScrollBy(-this.overlayPage()); return;
-      case "d": this.overlayScrollBy(Math.max(1, Math.floor(this.overlayPage() / 2))); return;
-      case "u": this.overlayScrollBy(-Math.max(1, Math.floor(this.overlayPage() / 2))); return;
-      case "j": this.overlayScrollBy(1); return;
-      case "k": this.overlayScrollBy(-1); return;
-      case "g": this.overlayScrollTo(0); return;
-      case "G": this.overlayScrollTo(Number.MAX_SAFE_INTEGER); return;
+      case "f": this.overlayScrollBy(this.overlayPage()); return true;
+      case "b": this.overlayScrollBy(-this.overlayPage()); return true;
+      case "d": this.overlayScrollBy(half); return true;
+      case "u": this.overlayScrollBy(-half); return true;
+      case "j": this.overlayScrollBy(1); return true;
+      case "k": this.overlayScrollBy(-1); return true;
+      case "g": this.overlayScrollTo(0); return true;
+      case "G": this.overlayScrollTo(Number.MAX_SAFE_INTEGER); return true;
+      default: return false;
     }
+  }
+
+  // --- the landing gate (Ctrl-O overlay, landing mode) ------------------------
+  //
+  // The human approval surface between prepareLanding and executeLanding: a
+  // prepared feature is shown as a summary + paged diff with an action bar, and
+  // the merge fires ONLY from the [m] keystroke here. It reuses the doc
+  // viewer's modality, paging, and paint frame; it is opened programmatically
+  // (by the session layer) rather than by the Ctrl-O keybinding, which keeps
+  // opening the doc list exactly as before.
+
+  /**
+   * Open the landing gate for a prepared feature and wait for the human's
+   * verdict. Resolves "merged" after review.execute() succeeds, "rejected"
+   * when dismissed with no merge ([r]/q/Esc, or session teardown), and
+   * "failed" when a merge attempt was refused and the review then dismissed.
+   * Modal like the doc viewer; a doc view that happens to be open yields to
+   * it. review.execute() is called only from the [m] keystroke - never here,
+   * never on a timer, never on close.
+   */
+  openLandingReview(review: LandingReview): Promise<LandingGateOutcome> {
+    return new Promise((resolve) => {
+      this.dismissOverlay();
+      this.clearSelection();
+      let settled = false;
+      const ov: LandingOverlay = {
+        mode: "landing",
+        review,
+        rows: [],
+        scroll: 0,
+        status: "review",
+        error: null,
+        settle: (outcome) => {
+          if (settled) return;
+          settled = true;
+          resolve(outcome);
+        },
+      };
+      ov.rows = renderLandingBody(review, ov.status, ov.error, this.cols);
+      this.overlay = ov;
+      this.paint();
+    });
+  }
+
+  /**
+   * Clear whatever overlay is up through its own teardown path, so a landing
+   * review can take the screen without leaking a doc subscription or hanging
+   * a gate promise. A gate mid-merge only loses its screen: its execute
+   * continuation still settles the real outcome (see approveLanding).
+   */
+  private dismissOverlay(): void {
+    const ov = this.overlay;
+    if (!ov) return;
+    if (ov.mode === "landing") {
+      if (ov.status !== "merging") ov.settle(ov.status === "failed" ? "failed" : "rejected");
+      this.overlay = null;
+      return;
+    }
+    this.closeOverlay(); // list/doc: drops the docs subscription
+  }
+
+  private overlayLandingInput(input: OverlayInput, ov: LandingOverlay): void {
+    if ("nav" in input) {
+      if (input.nav === "escape") { this.dismissLanding(ov); return; }
+      if (input.nav === "back") return; // there is no list behind the gate
+      this.overlayScrollInput(input);
+      return;
+    }
+    switch (input.ch) {
+      case "m": this.approveLanding(ov); return;
+      case "r":
+      case "q": this.dismissLanding(ov); return;
+      default: this.overlayScrollInput(input);
+    }
+  }
+
+  /**
+   * The [m] keystroke - the ONE call site of review.execute(), and therefore
+   * the only way a merge can happen. Fire-once: flipping to "merging"
+   * synchronously makes a repeat press a no-op before the promise ever
+   * settles. Success settles "merged" and dismisses with the confirmation
+   * flashed; refusal/failure keeps the gate up with the error rendered in
+   * place and [m] off - the cure for a stale green is a fresh prepare, not a
+   * retry from here.
+   */
+  private approveLanding(ov: LandingOverlay): void {
+    const p = ov.review.prepared;
+    if (ov.status !== "review" || p.kind !== "green" || p.commits.length === 0) return;
+    ov.status = "merging";
+    this.paint();
+    void ov.review.execute().then(
+      (confirmation) => {
+        ov.settle("merged");
+        if (this.overlay !== ov) return; // the screen moved on (teardown)
+        this.overlay = null;
+        this.paint();
+        this.setStatus(confirmation);
+      },
+      (e: unknown) => {
+        ov.status = "failed";
+        ov.error = e instanceof Error ? e.message : String(e);
+        ov.rows = renderLandingBody(ov.review, ov.status, ov.error, this.cols);
+        ov.scroll = 0; // the error banners at the top; make sure it's seen
+        if (this.overlay === ov) this.paint();
+      },
+    );
+  }
+
+  /** [r]/q/Esc: dismiss with no merge. From "review" this is a rejection (the
+   *  feature's branch and worktree stay intact); from "failed" it closes a
+   *  review whose merge attempt was refused. Ignored mid-merge: a merge in
+   *  flight can't be cancelled, so the gate waits for its outcome. */
+  private dismissLanding(ov: LandingOverlay): void {
+    if (ov.status === "merging") return;
+    ov.settle(ov.status === "failed" ? "failed" : "rejected");
+    this.overlay = null;
+    this.paint();
   }
 
   /** Paint the full-screen overlay: header bar, content viewport, footer hints. */
@@ -2060,10 +2348,13 @@ export class Tui implements SessionIO {
     if (!ov) return;
     const w = this.cols;
     const vp = this.overlayViewport();
-    const title = ov.mode === "list" ? "docs" : `docs · ${ov.name}`;
+    const title =
+      ov.mode === "list" ? "docs"
+      : ov.mode === "doc" ? `docs · ${ov.name}`
+      : `landing · ${ov.review.feature} → ${ov.review.target}`;
 
     const body = ov.mode === "list" ? this.overlayListRows() : ov.rows;
-    const start = ov.mode === "doc" ? ov.scroll : 0;
+    const start = ov.mode === "list" ? 0 : ov.scroll;
 
     const frame: string[] = [term.moveTo(1, 1) + term.clearLine + this.overlayHeader(title)];
     for (let r = 0; r < vp; r++) {
@@ -2108,6 +2399,7 @@ export class Tui implements SessionIO {
   }
 
   private overlayFooter(ov: Overlay, total: number, start: number, vp: number): string {
+    if (ov.mode === "landing") return this.landingFooter(ov, total, start, vp);
     const w = this.cols;
     const hint =
       ov.mode === "list"
@@ -2121,6 +2413,44 @@ export class Tui implements SessionIO {
     const left = ` ${hint} `;
     const fill = Math.max(0, w - visibleWidth(left) - visibleWidth(right));
     return c.dim(this.clip(left + "─".repeat(fill) + right, w));
+  }
+
+  /**
+   * The gate's action bar. Built piecewise rather than dimmed wholesale so the
+   * m/r action keys can stand out (an inner colour reset would cancel a
+   * blanket dim). [m] appears armed only for a mergeable prepare still under
+   * review; every other state names why it's off.
+   */
+  private landingFooter(ov: LandingOverlay, total: number, start: number, vp: number): string {
+    const w = this.cols;
+    let left: string;
+    if (ov.status === "merging") {
+      left = " " + c.cyan(`merging into ${ov.review.target}…`) + " ";
+    } else {
+      const p = ov.review.prepared;
+      const mergeable = ov.status === "review" && p.kind === "green" && p.commits.length > 0;
+      if (mergeable) {
+        left =
+          " " + c.cyan("m") + c.dim(" merge · ") + c.cyan("r") +
+          c.dim(" reject · space/b page · Esc close") + " ";
+      } else {
+        const why =
+          ov.status === "failed" ? "merge failed"
+          : p.kind === "conflict" ? "conflict"
+          : p.kind === "failed" ? "build+test red"
+          : "nothing to land";
+        left =
+          " " + c.dim(`m disabled (${why}) · `) + c.cyan("r") +
+          c.dim(" close · space/b page · Esc close") + " ";
+      }
+    }
+    let right = "";
+    if (total > vp) {
+      const below = total - (start + vp);
+      right = c.dim(below > 0 ? `${below} more below ` : "end ");
+    }
+    const fill = Math.max(0, w - visibleWidth(left) - visibleWidth(right));
+    return this.clip(left + c.dim("─".repeat(fill)) + right, w);
   }
 
   // --- input history ---------------------------------------------------------

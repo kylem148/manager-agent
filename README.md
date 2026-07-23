@@ -596,7 +596,7 @@ src/
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
   session/   session.ts prompt.ts tools.ts
              crewpanes.ts dispatchconfig.ts transport.ts registry.ts
-             worktrees.ts landing.ts
+             worktrees.ts landing.ts landinggate.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
 ```
 
@@ -678,11 +678,24 @@ so no checkout of dev ever exists and a concurrent move fails loudly),
 per-job commits preserved, then teardown through the existing guards. It
 refuses a stale green (dev moved since the prepare) and can be pinned to the
 exact tested sha. A `LandingQueue` keeps the ordered awaiting-landing record.
-Nothing invokes the engine yet — the Ctrl-O gate and live wiring are the
-next slice; `main` stays human-only throughout.
+
+`landinggate.ts` is the human gate between those two phases: `reviewLanding`
+prepares a feature and presents the result in the session's overlay (the same
+modal surface as the Ctrl-O doc viewer, with its paging) as a summary
+(commits, changed-file count), the full paged diff, and an action bar.
+Pressing `m` there is the only live call site of `executeLanding`, pinned to
+the exact sha the review covered, so approval can never merge more than what
+was shown; `r`/Esc dismisses with no merge, leaving the branch and worktree
+intact. A conflict or failed prepare opens the gate too, showing why the
+feature is not mergeable with `m` disabled, and a refused merge (a green gone
+stale under the open gate) surfaces its error in place without touching
+anything. The co's orchestration tools that trigger a review are the next
+slice; `main` stays human-only throughout.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
-the multi-line line editor, markdown → ANSI rendering, and ANSI-aware wrapping.
+the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,
+and the modal Ctrl-O overlay that hosts both the doc viewer and the landing
+gate's review screen.
 `keys.ts` is the pure decode table that maps both legacy control bytes and
 enhanced-protocol CSI-u sequences onto one set of bindings. `tui.ts` is
 deliberately one large file: the render loop, input handling, and scroll state
