@@ -5,6 +5,12 @@ import path from "node:path";
 import { resolveCommandLine, resolveAgentCommand, shellQuote, type DispatchConfig } from "./dispatchconfig.js";
 import type { InstancePaths } from "../paths.js";
 import { CrewPaneLayout, type PlacementDecision } from "./crewpanes.js";
+import { SENTINEL_PREFIX, sentinelLine, parseSentinel } from "./sentinel.js";
+
+// Re-exported so every existing importer of the sentinel (registry, tests) keeps
+// working unchanged; the marker itself now lives in sentinel.ts so the Stop-hook
+// entry can share it without pulling in this transport graph. Contract identical.
+export { SENTINEL_PREFIX, sentinelLine, parseSentinel };
 
 /**
  * Two transports for launching a coding agent, chosen automatically:
@@ -56,27 +62,13 @@ import { CrewPaneLayout, type PlacementDecision } from "./crewpanes.js";
  * user-installed agent binary.
  */
 
-/** The marker appended to a capture file after the agent process exits. The
- *  watcher scans for this to know a job is done; the number is the crew
- *  process's real exit code — taken from `$?` directly on the pane path (see
- *  buildJobScript) and via the `.exit` sidecar on the fallback's tee pipeline
- *  (see buildShellCommand). It is -1 only when missing or unparseable. */
-export const SENTINEL_PREFIX = "__CO_DISPATCH_DONE__";
-
-export function sentinelLine(exitCode: number): string {
-  return `${SENTINEL_PREFIX} ${exitCode}`;
-}
-
-/** Parse a completion sentinel out of captured text. Returns the exit code, or
- *  null if the run hasn't signalled completion yet. */
-export function parseSentinel(captured: string): { exitCode: number } | null {
-  // Scan from the end: the sentinel is the last meaningful line.
-  const idx = captured.lastIndexOf(SENTINEL_PREFIX);
-  if (idx === -1) return null;
-  const rest = captured.slice(idx + SENTINEL_PREFIX.length).trim();
-  const code = Number.parseInt(rest.split(/\s/)[0] ?? "", 10);
-  return { exitCode: Number.isFinite(code) ? code : -1 };
-}
+// SENTINEL_PREFIX / sentinelLine / parseSentinel now live in sentinel.ts and are
+// re-exported at the top of this module (see the import). The marker on the pane
+// path comes from the crew's real `$?` (see buildJobScript); on the background
+// fallback from the `.exit` sidecar (buildShellCommand); and, once the crew is a
+// Claude Code run, the Stop hook appends an early exit-0 sentinel on the first
+// finish (crewstophook.ts). parseSentinel scans from the end, so the last marker
+// present — the real process exit code — wins when more than one is written.
 
 export type TransportKind = "ghostty" | "fallback";
 
@@ -232,6 +224,42 @@ export function jobCommandLine(config: DispatchConfig, order: string, agentName?
 }
 
 /**
+ * The correlation the Stop hook reads from its inherited environment (see
+ * crewstophook.ts): the job stem and the absolute captures dir, derived FROM the
+ * capture file so they can never drift from what the registry polls. The stem is
+ * the capture basename minus its `.log`, so the hook rebuilds the exact same
+ * <dir>/<stem>.log to append its sentinel and writes <dir>/<stem>.stop.json
+ * beside it. Exported so both transports and the registry agree on the sidecar.
+ */
+export function dispatchCorrelation(captureFile: string): { job: string; captureDir: string } {
+  return {
+    job: path.basename(captureFile).replace(/\.log$/, ""),
+    captureDir: path.dirname(captureFile),
+  };
+}
+
+/** The correlation as a child-process environment fragment: the two vars the
+ *  Stop hook reads (crewstophook.ts) from CO_DISPATCH_JOB / CO_DISPATCH_CAPTURE_DIR.
+ *  Used by the background fallback, which sets the crew process env directly via
+ *  spawn; the pane path bakes the same values into its generated script instead. */
+export function dispatchCorrelationEnv(captureFile: string): {
+  CO_DISPATCH_JOB: string;
+  CO_DISPATCH_CAPTURE_DIR: string;
+} {
+  const { job, captureDir } = dispatchCorrelation(captureFile);
+  return { CO_DISPATCH_JOB: job, CO_DISPATCH_CAPTURE_DIR: captureDir };
+}
+
+/** The per-job launch script written beside a capture file on the pane path
+ *  (see buildJobScript). One resolver shared with the registry: the script's
+ *  last act is removing itself, so its continued existence is the live signal
+ *  that the crew process is still running in its pane — which is how the
+ *  registry knows a hook-completed pane is not yet reusable. */
+export function jobScriptFile(captureFile: string): string {
+  return `${captureFile}.sh`;
+}
+
+/**
  * The per-job launch script for the PANE path. Written to disk next to the
  * capture file; the pane only ever receives `/bin/sh '<this file>'` (plus a
  * `hold` argument on the split path). Everything fragile lives in here, read by
@@ -280,10 +308,15 @@ export function buildJobScript(args: {
   const { crewCommand, captureFile, scriptPath, cwd, pathEnv } = args;
   const qCapture = shellQuote(captureFile);
   const qSelf = shellQuote(scriptPath);
+  // Hand the crew process (and thus its inherited-environment Stop hook) the
+  // correlation the hook reads to find this exact capture — see crewstophook.ts.
+  const { job, captureDir } = dispatchCorrelation(captureFile);
   const lines = [
     "#!/bin/sh",
     "# Generated by co dispatch for a single crew job; removes itself when done.",
     ...(pathEnv ? [`PATH=${shellQuote(pathEnv)}; export PATH`] : []),
+    `CO_DISPATCH_JOB=${shellQuote(job)}; export CO_DISPATCH_JOB`,
+    `CO_DISPATCH_CAPTURE_DIR=${shellQuote(captureDir)}; export CO_DISPATCH_CAPTURE_DIR`,
     `finished=0`,
     `finish() {`,
     `  [ "$finished" = 1 ] && return`,
@@ -310,6 +343,10 @@ export function buildJobScript(args: {
     `code=$?`,
     `finish "$code"`,
     `printf 'co dispatch: job finished (exit %s)\\n' "$code"`,
+    // The held shell outlives the job: drop the job identity so a claude the
+    // human later launches by hand in this pane doesn't inherit it. (Fire-once
+    // would suppress a stray capture anyway; this keeps the env honest too.)
+    `unset CO_DISPATCH_JOB CO_DISPATCH_CAPTURE_DIR`,
     `if [ "$1" = hold ]; then`,
     `  exec "\${SHELL:-/bin/zsh}" -l`,
     `fi`,
@@ -525,7 +562,7 @@ export async function launchGhostty(args: {
   const crewCommand = jobCommandLine(config, order, agentName);
   // The job script owns everything fragile: cd, the (possibly multi-line) order,
   // capture, exit sidecar, sentinel. The pane only ever sees the launch line.
-  const scriptPath = `${captureFile}.sh`;
+  const scriptPath = jobScriptFile(captureFile);
   await fsp.writeFile(
     scriptPath,
     buildJobScript({
@@ -634,11 +671,14 @@ export async function launchFallback(args: {
   // We run through `sh -c` so the tee + sentinel contract matches the pane path.
   // detached:true puts the child in its own process group; unref() lets the
   // parent event loop exit independently. stdio is ignored because all output is
-  // already tee'd to the capture file by the shell command itself.
+  // already tee'd to the capture file by the shell command itself. The
+  // correlation env lets a Claude Code crew's Stop hook capture on first finish;
+  // it rides in the child env just as the pane script bakes it in.
   const child = spawn("sh", ["-c", shellCommand], {
     cwd: repoExists ? config.repoPath : undefined,
     detached: true,
     stdio: "ignore",
+    env: { ...process.env, ...dispatchCorrelationEnv(captureFile) },
   });
   child.unref();
   return { transport: "fallback", pid: child.pid };

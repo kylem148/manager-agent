@@ -274,6 +274,13 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
           ),
         );
       },
+      onHookIssue: (message) => {
+        io.appendBlock(
+          c.yellow(
+            `  · crew completion hook not installed: ${message} Results will land when the pane closes.`,
+          ),
+        );
+      },
     });
   }
 
@@ -634,10 +641,15 @@ async function fireDispatch(state: SessionState, order: string, agentName?: stri
  *
  * The record source depends on how the job ran. A pane job is a fully native
  * interactive agent with nothing recording its tty, so its reviewable record is
- * the agent's own session transcript (located by matching the job's order text
- * — see crewtranscript.ts); the capture file only proves launch + completion.
- * A background job's capture holds real output (print mode) and is used
- * directly, as is any capture when no transcript can be found.
+ * the agent's own session transcript; the capture file only proves launch +
+ * completion. The transcript is located two ways, in order of trust:
+ *  1. The Stop hook's report: when the crew is a Claude Code run, the completion
+ *     hook hands us the exact transcript path (and the last message) for THIS
+ *     session (crewstophook.ts), so we render that directly — no guessing.
+ *  2. By content: for an agent that reported no path, find the transcript whose
+ *     first user message matches the job's order (crewtranscript.ts).
+ * Failing both, the hook's captured last message is used, then the raw capture
+ * (which for a background print-mode run holds the real output).
  */
 async function drainReviews(state: SessionState): Promise<void> {
   while (state.reviewQueue.length > 0) {
@@ -646,7 +658,20 @@ async function drainReviews(state: SessionState): Promise<void> {
     let record = "";
     let source = "";
     const config = state.dispatch;
-    if (config) {
+
+    // 1. The Stop hook's exact transcript path for this job's session, if any.
+    if (job.transcriptPath) {
+      try {
+        const raw = await readFileTail(job.transcriptPath, 4 * 1024 * 1024);
+        record = renderTranscriptForReview(raw, 16000);
+        if (record) source = "the crew agent's own session transcript";
+      } catch {
+        /* fall through to locating it by order text */
+      }
+    }
+    // 2. Locate the transcript by matching the order text (no hook, or its path
+    //    was unreadable).
+    if (!record && config) {
       try {
         const transcript = await findCrewTranscript({
           agentCommand: resolveAgentCommand(config, job.agentName),
@@ -657,12 +682,19 @@ async function drainReviews(state: SessionState): Promise<void> {
         if (transcript) {
           const raw = await readFileTail(transcript, 4 * 1024 * 1024);
           record = renderTranscriptForReview(raw, 16000);
-          source = "the crew agent's own session transcript";
+          if (record) source = "the crew agent's own session transcript";
         }
       } catch {
-        /* fall through to the capture */
+        /* fall through to the hook message / capture */
       }
     }
+    // 3. The hook's captured last assistant message — a real result even when no
+    //    transcript could be read.
+    if (!record && job.lastAssistantMessage) {
+      record = job.lastAssistantMessage;
+      source = "the crew agent's final message";
+    }
+    // 4. The raw capture (background print-mode output, or a degrade note).
     if (!record) {
       try {
         record = await readCapture(state, job.captureFile);

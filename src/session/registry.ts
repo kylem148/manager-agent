@@ -1,30 +1,59 @@
 import fsp from "node:fs/promises";
+import fs from "node:fs";
 import type { InstancePaths } from "../paths.js";
 import { CrewPaneLayout } from "./crewpanes.js";
-import { readDispatchConfig, type DispatchConfig } from "./dispatchconfig.js";
+import { readDispatchConfig, resolveAgentCommand, type DispatchConfig } from "./dispatchconfig.js";
 import {
   anchorExists,
   chooseTransport,
+  dispatchCorrelation,
+  jobScriptFile,
   launchFallback,
   launchGhostty,
   parseSentinel,
   PaneUnavailableError,
   type TransportKind,
 } from "./transport.js";
+import { installCrewStopHook, type InstallResult } from "./crewhook.js";
+import { stopCaptureFile, type StopCapture } from "./crewstophook.js";
 
 /**
  * The dispatch job registry and capture watcher.
  *
  * One registry per session. It owns every in-flight crew job: it launches each
- * on the chosen transport, polls its capture file for the completion sentinel,
- * enforces the wall-clock timeout, and drains the queue when a pane frees. It is
- * fully non-blocking: nothing here is ever awaited on the conversation path — the
+ * on the chosen transport, polls its capture file for completion, enforces the
+ * wall-clock timeout, and drains the queue when a pane frees. It is fully
+ * non-blocking: nothing here is ever awaited on the conversation path — the
  * session arms and fires a dispatch and moves on, and the registry notifies via a
  * callback when a job finishes. Multiple jobs run concurrently.
  *
- * Completion detection is by SENTINEL, not exit code: an interactive agent in a
- * Ghostty pane gives us no process to wait on, so both transports echo a sentinel
- * line into the capture file when the agent exits and we watch for it.
+ * COMPLETION is detected from the capture file, which now carries two kinds of
+ * marker sharing one sentinel contract (sentinel.ts):
+ *
+ *  - A Claude Code crew's Stop hook (crewstophook.ts, installed per agent at
+ *    dispatch time) appends an exit-0 sentinel the moment the crew FIRST
+ *    finishes responding, plus a <job>.stop.json sidecar naming the run's own
+ *    transcript. This is the primary signal: the review fires while the pane
+ *    stays open and interactive — no /exit needed.
+ *  - Both transports still append a sentinel with the real exit code when the
+ *    crew PROCESS exits — the backstop for non-Claude agents and failed runs.
+ *
+ * These two markers force COMPLETION and PANE RELEASE apart on the pane path.
+ * The old exit-time sentinel meant both at once: the crew process was gone, its
+ * pane back to an idle shell, safe to reuse (reuse pastes a launch line into the
+ * pane, so it MUST be an idle shell, not a live agent). The Stop hook fires on
+ * the crew's FIRST finish, while the agent is still live in its pane — so a
+ * hook-completed job's review must fire, but its pane must NOT be offered for
+ * reuse, or a later dispatch would paste a launch line into a running agent.
+ *
+ * The ground-truth "the crew process is gone" signal is the per-job launch
+ * script deleting itself: buildJobScript's finish() does `rm -f <self>` only
+ * when the crew actually exits (and the pane's held shell has taken over). So a
+ * pane job completes in two steps: finalize() fires the review immediately, but
+ * releases the pane to the planner only once jobScriptFile() is gone. When the
+ * script is already gone at completion time (a non-Claude agent, or a run whose
+ * only marker is the exit-time sentinel) the release happens inline; otherwise
+ * the job waits in pendingRelease and tick() releases it when the script clears.
  */
 
 export type JobStatus = "running" | "queued" | "done" | "failed";
@@ -50,6 +79,12 @@ export interface Job {
   exitCode?: number;
   /** Populated when status is "failed": why it failed to launch or run. */
   error?: string;
+  /** The crew agent's own session transcript path, if the Stop hook reported one
+   *  (crewstophook.ts). Preferred over locating the transcript by order text. */
+  transcriptPath?: string;
+  /** The text of the crew agent's last response, if the Stop hook captured it.
+   *  A fallback review record when no transcript can be read. */
+  lastAssistantMessage?: string;
 }
 
 /** Fired when a job reaches a terminal state (done or failed). */
@@ -73,8 +108,16 @@ export interface RegistryOptions {
   /** Called once if the designated crew anchor pane has been closed since
    *  `co pane` ran; the registry then falls back to background for the session. */
   onAnchorLost?: () => void;
+  /** Called when the crew completion hook could not be installed (e.g. an
+   *  unparseable settings.json in the agent's config dir). Advisory only: the
+   *  dispatch still runs and completion falls back to the exit-time sentinel. */
+  onHookIssue?: (message: string) => void;
   /** Test seam: skip the live anchor `exists` check (assume it's present). */
   skipAnchorCheck?: boolean;
+  /** Test seam: replace the crew Stop-hook installer, so tests never write into
+   *  the real ~/.claude. Defaults to installCrewStopHook (the real merge into the
+   *  agent's config dir). */
+  installHook?: (agentCommand: string) => Promise<InstallResult>;
 }
 
 export class DispatchRegistry {
@@ -107,11 +150,27 @@ export class DispatchRegistry {
   private poller: ReturnType<typeof setInterval> | null = null;
   private jobSeq = 0;
   private stopped = false;
+  /** Agent commands whose crew Stop hook we've already installed this session, so
+   *  the (idempotent) install runs at most once per distinct agent — the hook
+   *  lands in the agent's own config dir and teaches its Claude Code to report
+   *  completion on first finish. Keyed by the resolved command string, since two
+   *  agents (cc/ccw) resolve to different config dirs. */
+  private readonly hookInstalled = new Set<string>();
+  /** Jobs that have COMPLETED (their review has fired) but whose Ghostty pane
+   *  still hosts a LIVE interactive agent — the Stop hook reports completion on
+   *  the crew's FIRST finish, long before the human closes it. The pane is
+   *  released for reuse only once the crew PROCESS exits, which buildJobScript
+   *  signals by removing its own launch script (jobScriptFile). Polled in tick();
+   *  never populated on the fallback path (no pane) nor for a completion detected
+   *  after the script was already gone (released inline). Keyed by job id. */
+  private readonly pendingRelease = new Set<string>();
   /** Whether we've confirmed the designated anchor pane still exists this
    *  session. Checked once, lazily, on the first pane launch: a pane closed
    *  since `co pane` ran would otherwise fail the dispatch. */
   private anchorChecked = false;
   private readonly onAnchorLost?: () => void;
+  private readonly onHookIssue?: (message: string) => void;
+  private readonly installHook: (agentCommand: string) => Promise<InstallResult>;
 
   constructor(opts: RegistryOptions) {
     this.paths = opts.paths;
@@ -132,6 +191,8 @@ export class DispatchRegistry {
         ? new CrewPaneLayout(this.config.anchor, this.config.pane)
         : null;
     this.onAnchorLost = opts.onAnchorLost;
+    this.onHookIssue = opts.onHookIssue;
+    this.installHook = opts.installHook ?? ((agentCommand) => installCrewStopHook({ agentCommand }));
     // Tests (and the no-anchor case) skip the live existence probe.
     this.anchorChecked = this.skipAnchorCheck || !this.layout;
   }
@@ -224,6 +285,12 @@ export class DispatchRegistry {
     // the last dispatch) before deciding transport for this job.
     await this.refreshConfig();
 
+    // Teach this agent's Claude Code to report completion on first finish (the
+    // Stop hook, crewstophook.ts). Idempotent and best-effort: an install failure
+    // only means the review waits until the pane closes, exactly the old
+    // behaviour, so it never blocks the dispatch.
+    await this.ensureStopHook(agentName);
+
     const id = this.nextJobId();
     const label = firstLine(order);
     // Tagged with the session's runTag so a job-001 from a previous session
@@ -255,6 +322,11 @@ export class DispatchRegistry {
     }
     // activeTransport may have just changed; reflect it on the job.
     job.transport = this.activeTransport;
+
+    // Reclaim any hook-completed pane whose agent has since been closed before
+    // this job plans its placement, so a genuinely-free pane is reused now
+    // instead of this dispatch queueing until the next poll tick.
+    await this.releaseFinishedPanes();
 
     try {
       if (this.layout) {
@@ -293,6 +365,30 @@ export class DispatchRegistry {
 
     this.ensurePolling();
     return job;
+  }
+
+  /**
+   * Install the crew-completion Stop hook into the config dir the given agent
+   * uses, at most once per distinct agent command per session. The hook is what
+   * makes a dispatched run report its result the moment Claude first finishes,
+   * with the pane still open (crewstophook.ts / crewhook.ts). The install is
+   * idempotent and surgical (merges one hook, preserves the rest of the user's
+   * settings.json); a failure is reported via onHookIssue but never blocks the
+   * dispatch, since the transport's own exit-time sentinel remains the backstop.
+   */
+  private async ensureStopHook(agentName?: string): Promise<void> {
+    const command = resolveAgentCommand(this.config, agentName);
+    if (!command || this.hookInstalled.has(command)) return;
+    // Mark before awaiting so two rapid dispatches for the same agent don't both
+    // run the install; a failure below still leaves it marked (we don't retry a
+    // broken settings.json every dispatch — it's reported once).
+    this.hookInstalled.add(command);
+    try {
+      const res = await this.installHook(command);
+      if (res.error) this.onHookIssue?.(res.error);
+    } catch (e) {
+      this.onHookIssue?.(`could not install the crew completion hook: ${(e as Error).message}`);
+    }
   }
 
   /** Launch a job on the background transport, recording its pid on the job. A
@@ -351,13 +447,21 @@ export class DispatchRegistry {
     // assertion can't leak a live interval.
   }
 
-  /** One poll: check each running job for completion or timeout. */
+  /** One poll: check each running job for completion or timeout, then reclaim any
+   *  pane whose hook-completed agent has since been closed. */
   private async tick(): Promise<void> {
     const running = this.list().filter((j) => j.status === "running");
     for (const job of running) {
       await this.checkJob(job);
     }
-    // Nothing left to watch and nothing queued: stop the timer.
+    // A hook-completed pane whose agent the human has since closed (its launch
+    // script self-deleted) rejoins the reusable set here and drains any queued
+    // job into it. Runs before the stop check so a release that launches a
+    // queued job keeps the poller alive for it.
+    await this.releaseFinishedPanes();
+    // Nothing left to watch and nothing queued: stop the timer. A pane still
+    // pending release with nothing queued does NOT hold the poller (and the
+    // process) open — a future dispatch that needs the pane re-drains it.
     if (this.activeCount() === 0 && this.poller) {
       clearInterval(this.poller);
       this.poller = null;
@@ -388,11 +492,35 @@ export class DispatchRegistry {
     const sentinel = parseSentinel(captured);
     if (!sentinel) return;
 
+    // The completion marker may have come from the crew's Stop hook, which drops
+    // a sidecar (<job>.stop.json) beside the capture carrying the agent's own
+    // session transcript path and last message. Prefer that record for the
+    // review — it's exact, not located by matching the order text. Absent (a
+    // non-Claude agent, or an exit-time transport sentinel), the review falls
+    // back to finding the transcript by order and then to the raw capture.
+    const stop = await this.readStopCapture(job);
+
     const status: JobStatus = sentinel.exitCode > 0 ? "failed" : "done";
     await this.finalize(job, status, {
       exitCode: sentinel.exitCode,
+      ...(stop?.transcript_path ? { transcriptPath: stop.transcript_path } : {}),
+      ...(stop?.last_assistant_message ? { lastAssistantMessage: stop.last_assistant_message } : {}),
       ...(status === "failed" ? { error: `agent exited ${sentinel.exitCode}` } : {}),
     });
+  }
+
+  /** Read the Stop hook's sidecar (<job>.stop.json) for a job, or null when the
+   *  hook didn't fire (non-Claude agent, or completion came from the transport's
+   *  exit-time sentinel). Best-effort: a missing or malformed sidecar is just an
+   *  absent record, never an error. */
+  private async readStopCapture(job: Job): Promise<StopCapture | null> {
+    const { job: stem, captureDir } = dispatchCorrelation(job.captureFile);
+    try {
+      const raw = await fsp.readFile(stopCaptureFile(captureDir, stem), "utf8");
+      return JSON.parse(raw) as StopCapture;
+    } catch {
+      return null;
+    }
   }
 
   /** Kill a fallback job's process group on timeout (no-op for pane jobs). */
@@ -406,18 +534,67 @@ export class DispatchRegistry {
     }
   }
 
-  /** Move a job to a terminal state, free its pane, drain the queue, notify. The
-   *  queue drain is awaited so a freed pane deterministically relaunches the next
-   *  queued job before the caller (a poll tick) returns. */
+  /** Move a job to a terminal state, fire its review, and release its pane for
+   *  reuse — but only once that pane no longer hosts a live agent. The queue
+   *  drain is awaited so a released pane deterministically relaunches the next
+   *  queued job before the caller (a poll tick) returns.
+   *
+   *  COMPLETION and PANE RELEASE are separate on the pane path (see the class
+   *  doc): the Stop hook fires on the crew's first finish while the agent is
+   *  still live in the pane, so we notify immediately but must not offer that
+   *  pane for reuse until the crew process is truly gone. buildJobScript deletes
+   *  the launch script (jobScriptFile) as its last act, so the script's absence
+   *  is that signal. If it is already gone (exit-time sentinel, or a non-Claude
+   *  agent) we release inline; otherwise the job waits in pendingRelease and
+   *  tick() releases it when the script clears. */
   private async finalize(job: Job, status: "done" | "failed", extra: Partial<Job>): Promise<void> {
     job.status = status;
     Object.assign(job, extra);
     // Notify first so the review is enqueued before we relaunch anything; the
     // ordering keeps a completion callback ahead of the next job's launch notices.
     this.onComplete(job);
-    if (job.paneId && this.layout) {
-      this.layout.finish(job.paneId);
-      await this.drainQueue();
+    if (!job.paneId || !this.layout) return; // fallback path: no pane to release
+    if (this.paneAgentGone(job)) {
+      await this.releasePane(job);
+    } else {
+      // The agent is still live in its pane (hook fired on first finish). Hold
+      // the pane; tick() releases it once the launch script self-deletes.
+      this.pendingRelease.add(job.id);
+    }
+  }
+
+  /** Whether the crew PROCESS behind a pane job has exited, so its pane is back
+   *  to an idle held shell and safe to reuse. True once the per-job launch script
+   *  has removed itself (buildJobScript's last act) — or when there was never a
+   *  script (defensive; the fallback path has no pane and never reaches here). */
+  private paneAgentGone(job: Job): boolean {
+    return !fs.existsSync(jobScriptFile(job.captureFile));
+  }
+
+  /** Free a completed job's pane in the planner and drain the queue into it.
+   *  Idempotent per job via pendingRelease removal by the caller. */
+  private async releasePane(job: Job): Promise<void> {
+    if (!job.paneId || !this.layout) return;
+    this.layout.finish(job.paneId);
+    await this.drainQueue();
+  }
+
+  /** Release any completed-but-still-live pane whose crew process has now exited
+   *  (its launch script self-deleted). Run each poll tick alongside the running
+   *  jobs so a hook-completed pane rejoins the reusable set the moment its agent
+   *  is closed — without blocking the review, which already fired at completion. */
+  private async releaseFinishedPanes(): Promise<void> {
+    if (this.pendingRelease.size === 0) return;
+    for (const id of [...this.pendingRelease]) {
+      const job = this.jobs.get(id);
+      if (!job || !job.paneId) {
+        this.pendingRelease.delete(id); // job vanished; nothing to release
+        continue;
+      }
+      if (this.paneAgentGone(job)) {
+        this.pendingRelease.delete(id);
+        await this.releasePane(job);
+      }
     }
   }
 

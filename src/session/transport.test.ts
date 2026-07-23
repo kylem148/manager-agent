@@ -23,6 +23,8 @@ import {
   anchorExists,
   setOsaRunnerForTest,
   PaneUnavailableError,
+  dispatchCorrelation,
+  dispatchCorrelationEnv,
 } from "./transport.js";
 
 /**
@@ -218,6 +220,32 @@ test("buildJobScript pins PATH, runs the crew bare on the pane tty, holds only w
   assert.ok(text.includes(SENTINEL_PREFIX), "sentinel is appended after the run");
   assert.ok(text.includes(`if [ "$1" = hold ]`), "hold branch exists");
   assert.ok(text.includes('exec "${SHELL:-/bin/zsh}" -l'), "hold keeps the pane open as a shell");
+  // The correlation the Stop hook reads from its inherited environment, derived
+  // from the capture file so the hook finds this exact capture.
+  assert.ok(
+    text.includes("CO_DISPATCH_JOB='j1'; export CO_DISPATCH_JOB"),
+    "the job stem is exported for the Stop hook",
+  );
+  assert.ok(
+    text.includes("CO_DISPATCH_CAPTURE_DIR='/caps'; export CO_DISPATCH_CAPTURE_DIR"),
+    "the captures dir is exported for the Stop hook",
+  );
+});
+
+test("dispatchCorrelation derives the job stem and dir from the capture file", () => {
+  assert.deepEqual(dispatchCorrelation("/caps/job-001-abc.log"), {
+    job: "job-001-abc",
+    captureDir: "/caps",
+  });
+  // A space in the path is preserved (the exports single-quote it).
+  assert.deepEqual(dispatchCorrelation("/my caps/job-002.log"), {
+    job: "job-002",
+    captureDir: "/my caps",
+  });
+  assert.deepEqual(dispatchCorrelationEnv("/caps/job-003.log"), {
+    CO_DISPATCH_JOB: "job-003",
+    CO_DISPATCH_CAPTURE_DIR: "/caps",
+  });
 });
 
 /** Write a job script for a fake crew command and return its paths. */

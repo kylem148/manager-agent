@@ -481,30 +481,58 @@ like one you opened yourself: correct rendering, native keybindings
 terminal, the reviewable record of a pane run is the agent's **own session
 transcript**: for Claude Code, the session JSONL under its config dir
 (`CLAUDE_CONFIG_DIR` parsed from the agent command; `~/.claude` by default).
-The job's transcript is identified by content — the dispatch order is the
-session's first prompt — so concurrent jobs in the same repo each resolve their
-own record, and the co reviews message text and tool calls instead of terminal
-escape soup. If no transcript can be found (a non-Claude agent, say), the
-review falls back to the capture file and says plainly that the run left no
-recording. The background fallback still records real output to the capture
-(agents run in their non-interactive print mode there), sets the repo as the
-working directory, and skips the `cd` when the repo doesn't exist yet so a
-not-yet-created repo degrades to the inherited directory instead of a hard
-failure.
+The co locates it two ways, in order of trust: the completion hook (below)
+hands back the exact transcript path for that session, so there's no guessing;
+absent a hook path, the transcript is identified by content — the dispatch
+order is the session's first prompt — so concurrent jobs in the same repo each
+resolve their own record. Either way the co reviews message text and tool calls
+instead of terminal escape soup. If no transcript can be read (a non-Claude
+agent, say), the review falls back to the hook's captured last message, then to
+the capture file, and says plainly when a run left no recording. The background
+fallback still records real output to the capture (agents run in their
+non-interactive print mode there), sets the repo as the working directory, and
+skips the `cd` when the repo doesn't exist yet so a not-yet-created repo
+degrades to the inherited directory instead of a hard failure.
 
 Both transports share one completion contract, so a run reports the same way
 whether it lands in a pane or the background. A bad repo path fails the `cd`
 loudly and gets captured instead of silently running the agent somewhere else.
 An interactive pane hands back no clean exit code, so completion is detected by
-a sentinel rather than by waiting on a process: when the agent exits, a
-`__CO_DISPATCH_DONE__ <code>` line with its real exit code is appended to the
-capture file. The wrapper that writes it survives the ways humans actually
-close an agent: Ctrl-C is trapped so the crew handles its own interrupt while
-the wrapper lives on to report, and a torn-down pane (HUP) or kill (TERM)
-still writes the sentinel before dying. The watcher tails each capture for the
-marker: a nonzero code marks the job failed, zero marks it done, and either way
-the co-manager then reviews the run's record. If the code can't be read it
-records `-1`.
+a sentinel rather than by waiting on a process: a `__CO_DISPATCH_DONE__ <code>`
+line is appended to the capture file, and the watcher tails each capture for
+that marker (a nonzero code marks the job failed, zero marks it done). If the
+code can't be read it records `-1`.
+
+For a Claude Code crew the marker arrives the moment the agent **first finishes
+responding**, via a `Stop` hook — so the review lands with the pane still open
+and usable, and you never type `/exit` to trigger it. On the first dispatch to
+each agent the co installs the hook idempotently into that agent's own
+`settings.json` (merging one entry, never clobbering your other settings or
+hooks), and it hands the crew process two environment variables identifying the
+job's capture. When the agent finishes, the hook writes a sidecar
+(`<job>.stop.json`, carrying the session id, transcript path, and last message)
+and appends the sentinel. It is **fire-once**: the sidecar is created with an
+exclusive open, so the first finish wins and every later turn you type in that
+same pane is a no-op — no second capture, no re-notification. The hook is
+observe-only (it always exits 0 and never blocks), so a dispatched session stays
+fully interactive after its result has been captured.
+
+Because the hook fires while the agent is still live in its pane, completion and
+pane reuse are kept separate: the review lands immediately, but that pane is not
+offered to a later dispatch until the crew process actually exits. The per-job
+launch script deletes itself as its last act, so its absence is the signal that
+the pane is back to an idle shell and safe to reuse — until then a new dispatch
+that hits the pane cap splits or queues rather than pasting a launch line into a
+running agent. Close the crew when you're done with it and the pane rejoins the
+reusable set on the next poll (or the next dispatch that needs it).
+
+Even without the hook the run still reports: the script wrapper writes the
+sentinel with the crew's real exit code when the agent process exits, and it
+survives the ways humans actually close an agent — Ctrl-C is trapped so the crew
+handles its own interrupt while the wrapper lives on to report, and a torn-down
+pane (HUP) or kill (TERM) still writes the sentinel before dying. So a
+non-Claude agent, or a Claude whose hook couldn't be installed, simply reports
+when the pane closes, exactly as before.
 
 ## What makes a turn slow
 
