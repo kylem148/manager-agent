@@ -596,7 +596,7 @@ src/
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
   session/   session.ts prompt.ts tools.ts
              crewpanes.ts dispatchconfig.ts transport.ts registry.ts
-             worktrees.ts
+             worktrees.ts landing.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
 ```
 
@@ -661,8 +661,25 @@ worktree on first use (reused for every later dispatch to that feature),
 launches the crew process with the worktree as its working directory on both
 transports (an agent binds to a checkout by being launched inside it), and
 records the job-to-feature link on the job. One live agent per worktree at a
-time; a plain dispatch keeps its repo cwd untouched. Teardown at landing,
-the merge queue, the rebase, and the human gate are later slices.
+time; a plain dispatch keeps its repo cwd untouched.
+
+`landing.ts` is the landing engine that moves a finished feature onto `dev`,
+split in two so a human gate can sit between testing and merging.
+`prepareLanding` rebases the feature branch onto the current dev tip in its
+own worktree and runs the project's combined build+test there (injectable;
+the default is the repo's own typecheck + test scripts) — on the combined
+rebased state, because feature A green and feature B green does not make A+B
+green. It reports green (with the diff the gate will show), conflict (the
+rebase is aborted, the branch restored byte-for-byte), or failed (the branch
+is left rebased so a fix dispatch lands in the exact red state); dev is never
+written. `executeLanding` is the separate gated callable: a `--no-ff` merge
+commit built with plumbing (commit-tree plus a compare-and-swap update-ref,
+so no checkout of dev ever exists and a concurrent move fails loudly),
+per-job commits preserved, then teardown through the existing guards. It
+refuses a stale green (dev moved since the prepare) and can be pinned to the
+exact tested sha. A `LandingQueue` keeps the ordered awaiting-landing record.
+Nothing invokes the engine yet — the Ctrl-O gate and live wiring are the
+next slice; `main` stays human-only throughout.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, and ANSI-aware wrapping.

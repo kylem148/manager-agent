@@ -13,7 +13,8 @@ import path from "node:path";
  * up zombies after a crash. Deterministic plumbing — no model, no network.
  * The dispatch registry consumes provisionWorktree for its feature-scoped
  * dispatches (a crew process launched with cwd = the feature's worktree);
- * teardown and reconcile await the landing flow.
+ * landing.ts (the rebase + build+test + gated-merge engine) consumes
+ * teardownWorktree and the exported git helpers below.
  *
  * Safety posture (the invariants everything below preserves):
  *  - `main` is human-only: nothing here writes to it, checks it out, or
@@ -89,7 +90,7 @@ export interface WorktreeOptions {
   baseBranch?: string;
 }
 
-interface ResolvedOptions {
+export interface ResolvedWorktreeOptions {
   repoPath: string;
   baseDir: string;
   devBranch: string;
@@ -102,7 +103,7 @@ export function defaultWorktreeBase(repoPath: string): string {
   return path.join(path.dirname(r), `${path.basename(r)}-worktrees`);
 }
 
-function resolveOptions(opts: WorktreeOptions): ResolvedOptions {
+export function resolveWorktreeOptions(opts: WorktreeOptions): ResolvedWorktreeOptions {
   const repoPath = path.resolve(opts.repoPath);
   const baseDir = opts.baseDir ? path.resolve(opts.baseDir) : defaultWorktreeBase(repoPath);
   // A base inside the repo would litter the working tree with nested checkouts;
@@ -141,7 +142,7 @@ export function featureBranch(feature: string): string {
 
 // --- git plumbing ------------------------------------------------------------
 
-interface GitResult {
+export interface GitResult {
   code: number;
   stdout: string;
   stderr: string;
@@ -150,7 +151,7 @@ interface GitResult {
 /** Run git with an argv array (no shell), collecting output. Never throws on a
  *  nonzero exit — callers that need the code (ancestor checks, existence
  *  probes) read it; `git()` below wraps this for must-succeed calls. */
-function runGit(cwd: string, args: string[]): Promise<GitResult> {
+export function runGit(cwd: string, args: string[]): Promise<GitResult> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
@@ -163,7 +164,7 @@ function runGit(cwd: string, args: string[]): Promise<GitResult> {
 }
 
 /** Run git and throw with the command and stderr on failure. */
-async function git(cwd: string, args: string[]): Promise<string> {
+export async function git(cwd: string, args: string[]): Promise<string> {
   const res = await runGit(cwd, args);
   if (res.code !== 0) {
     throw new Error(`git ${args.join(" ")} exited ${res.code}: ${res.stderr.trim() || res.stdout.trim()}`);
@@ -171,7 +172,7 @@ async function git(cwd: string, args: string[]): Promise<string> {
   return res.stdout;
 }
 
-async function branchExists(repoPath: string, branch: string): Promise<boolean> {
+export async function branchExists(repoPath: string, branch: string): Promise<boolean> {
   const res = await runGit(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
   return res.code === 0;
 }
@@ -179,14 +180,14 @@ async function branchExists(repoPath: string, branch: string): Promise<boolean> 
 /** Whether `branch` is fully contained in `target` — the guard that decides a
  *  feature branch is safe to delete. Exit 1 from --is-ancestor means "no", any
  *  other nonzero is a real error (a missing ref, say) and throws. */
-async function isMergedInto(repoPath: string, branch: string, target: string): Promise<boolean> {
+export async function isMergedInto(repoPath: string, branch: string, target: string): Promise<boolean> {
   const res = await runGit(repoPath, ["merge-base", "--is-ancestor", branch, target]);
   if (res.code === 0) return true;
   if (res.code === 1) return false;
   throw new Error(`git merge-base --is-ancestor ${branch} ${target} exited ${res.code}: ${res.stderr.trim()}`);
 }
 
-interface WorktreeEntry {
+export interface WorktreeEntry {
   path: string;
   /** Full ref (`refs/heads/...`), or null for a detached/bare entry. */
   branch: string | null;
@@ -194,7 +195,7 @@ interface WorktreeEntry {
 
 /** Parse `git worktree list --porcelain`. The primary tree is the first entry;
  *  detached worktrees carry no branch line and parse as branch: null. */
-async function listWorktrees(repoPath: string): Promise<WorktreeEntry[]> {
+export async function listWorktrees(repoPath: string): Promise<WorktreeEntry[]> {
   const out = await git(repoPath, ["worktree", "list", "--porcelain"]);
   const entries: WorktreeEntry[] = [];
   let current: WorktreeEntry | null = null;
@@ -257,7 +258,7 @@ async function unlinkArtifacts(worktreePath: string): Promise<void> {
  *  own artifact symlinks. The links are provisioning plumbing, not work — in a
  *  repo that doesn't gitignore them they'd show as untracked and make every
  *  provisioned worktree read as dirty forever. */
-async function isWorktreeDirty(worktreePath: string): Promise<boolean> {
+export async function isWorktreeDirty(worktreePath: string): Promise<boolean> {
   const out = await git(worktreePath, ["status", "--porcelain"]);
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;
@@ -281,7 +282,7 @@ async function isWorktreeDirty(worktreePath: string): Promise<boolean> {
  * a ref, nothing else.
  */
 export async function ensureDevBranch(opts: WorktreeOptions): Promise<{ created: boolean; devBranch: string }> {
-  const r = resolveOptions(opts);
+  const r = resolveWorktreeOptions(opts);
   if (await branchExists(r.repoPath, r.devBranch)) return { created: false, devBranch: r.devBranch };
   if (!(await branchExists(r.repoPath, r.baseBranch))) {
     throw new Error(
@@ -305,7 +306,7 @@ export async function ensureDevBranch(opts: WorktreeOptions): Promise<{ created:
  * guessing which half-state to destroy.
  */
 export async function provisionWorktree(opts: WorktreeOptions, feature: string): Promise<FeatureRecord> {
-  const r = resolveOptions(opts);
+  const r = resolveWorktreeOptions(opts);
   const slug = featureSlug(feature);
   const branch = `${FEATURE_BRANCH_PREFIX}${slug}`;
   const worktreePath = path.join(r.baseDir, slug);
@@ -358,7 +359,7 @@ export interface TeardownResult {
  * the result.
  */
 export async function teardownWorktree(opts: WorktreeOptions, feature: string): Promise<TeardownResult> {
-  const r = resolveOptions(opts);
+  const r = resolveWorktreeOptions(opts);
   const slug = featureSlug(feature);
   const branch = `${FEATURE_BRANCH_PREFIX}${slug}`;
 
@@ -428,7 +429,7 @@ export async function reconcileWorktrees(
   opts: WorktreeOptions,
   extra: { keep?: string[] } = {},
 ): Promise<ReconcileReport> {
-  const r = resolveOptions(opts);
+  const r = resolveWorktreeOptions(opts);
   const keepBranches = new Set(
     (extra.keep ?? []).map((k) => (k.startsWith(FEATURE_BRANCH_PREFIX) ? k : featureBranch(k))),
   );
