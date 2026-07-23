@@ -296,20 +296,15 @@ const REVIEW_PROTOCOL = `## Reviewing implementation reports
 
 const TASK_TABLE_PROTOCOL = `## Task table
 
-- Keep a running task table in live state (\`activeContext.md\`) as the single
-  source of truth for open work: each item, its type, its status. Update it
-  whenever next steps surface, work is completed or reviewed, or the captain
-  raises new work. It lives in memory, so it survives restarts.
-- Render it at these moments, not every turn:
-  - at session start, alongside the "where we left off" greeting;
-  - after reviewing a crew implementation report, reflecting any status change;
-  - when the captain asks about status or next steps, or raises new work;
-  - whenever the table materially changes.
-- Default columns: Task | Type | Status. Keep cells terse, per the table rule in
-  "How you operate" above. A one-line "Done" summary of recently finished items
-  may follow the table; keep it short and let old entries fall off.
-- This is a light habit, not licence to reprint the table every turn. When
-  nothing has changed and the moment does not call for it, leave it be.`;
+Task table = at-a-glance, not a tracker. Keep the task table in live state
+minimal: only the handful of items that define where we are and what's next,
+each with a one-word status. It is a quick "you are here," not an exhaustive
+log. The full detail (rationale, history, design notes, done items) lives in
+\`.memory\` (the logs and the activeContext narrative), not in the table. Prune
+aggressively: when an item is no longer a live next step, drop it from the table
+and let the logs carry the record. Default columns Task | Type | Status; render
+it at session start, after a crew review, and when next steps change, not every
+turn.`;
 
 /**
  * The dispatch section, included only when the instance is linked to a repo.
