@@ -388,3 +388,186 @@ test("reconcileFeatures rebuilds a record AND surfaces an anomaly side by side",
     await fx.cleanup();
   }
 });
+
+// --- serial merge queue (end to end, real git + scripted gate) ---------------
+
+test("merge queue: enqueue two, head processes to ready, [m] merges and the second advances onto the NEW dev", async () => {
+  const seen: LandingReview[] = [];
+  const fx = await makeFixture(approvingHost(seen));
+  try {
+    const a = await fx.features.create("alpha");
+    const b = await fx.features.create("beta");
+    await commitIn(a.feature.worktreePath, "a.txt", "a\n", "job: alpha");
+    await commitIn(b.feature.worktreePath, "b.txt", "b\n", "job: beta");
+    const devStart = run(fx.repo, ["rev-parse", "dev"]);
+
+    // Enqueue alpha: it becomes head and is processed (rebase + build+test) to ready.
+    const eA = await fx.features.enqueue("alpha");
+    assert.equal(eA.enqueued, true);
+    if (!eA.enqueued) return;
+    assert.equal(eA.head?.feature, "alpha");
+    assert.equal(eA.head?.status, "ready");
+    assert.equal(eA.head?.commitsReady, 1);
+
+    // Enqueue beta: alpha stays the ready head; beta waits queued, UNprocessed.
+    const eB = await fx.features.enqueue("beta");
+    if (!eB.enqueued) return;
+    assert.equal(eB.head?.feature, "alpha");
+    assert.equal(eB.entry.position, 2);
+    assert.equal(eB.entry.status, "queued");
+    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devStart, "dev has not moved yet");
+
+    // Merge the head (alpha) through the gate -> [m].
+    const m1 = await fx.features.mergeHead();
+    assert.equal(m1.merged, true);
+    assert.equal(m1.feature, "alpha");
+    const devAfterA = run(fx.repo, ["rev-parse", "dev"]);
+    assert.equal(devAfterA, m1.mergeSha);
+    assert.notEqual(devAfterA, devStart, "dev advanced to alpha's merge");
+    assert.ok(!branchExists(fx.repo, "co/feat-alpha"), "alpha's worktree/branch torn down");
+    assert.equal(fx.registry.getFeature("alpha"), undefined, "alpha's record dropped");
+
+    // The queue advanced: beta is now head and was processed AGAINST the new dev.
+    assert.equal(m1.head?.feature, "beta");
+    assert.equal(m1.head?.status, "ready");
+
+    // Merge beta: it lands on top of alpha's dev, and the queue empties.
+    const m2 = await fx.features.mergeHead();
+    assert.equal(m2.merged, true);
+    assert.equal(m2.feature, "beta");
+    assert.equal(m2.head, null, "the queue is now empty");
+    assert.equal(fx.features.queueView().size, 0);
+    const devAfterB = run(fx.repo, ["rev-parse", "dev"]);
+    assert.equal(devAfterB, m2.mergeSha);
+    assert.equal(run(fx.repo, ["rev-parse", "dev^1"]), devAfterA, "beta merged on top of alpha's dev");
+    // Both features' work is on dev, as two serial merge commits; main untouched.
+    assert.equal(run(fx.repo, ["show", "dev:a.txt"]), "a");
+    assert.equal(run(fx.repo, ["show", "dev:b.txt"]), "b");
+    assert.equal(run(fx.repo, ["rev-list", "--merges", "--count", "dev"]), "2");
+    assert.equal(run(fx.repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("enqueue refuses a feature that was never created", async () => {
+  const fx = await makeFixture();
+  try {
+    const res = await fx.features.enqueue("ghost");
+    assert.equal(res.enqueued, false);
+    if (res.enqueued) return;
+    assert.match(res.reason, /no feature 'ghost'/);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("feature_land refuses a feature that is in the merge queue (it must land via the head)", async () => {
+  const seen: LandingReview[] = [];
+  const fx = await makeFixture(approvingHost(seen));
+  try {
+    const a = await fx.features.create("queued-one");
+    await commitIn(a.feature.worktreePath, "q.txt", "q\n", "job: q");
+    await fx.features.enqueue("queued-one");
+
+    const res = await fx.features.land("queued-one");
+    assert.equal(res.outcome, "rejected");
+    assert.match(res.error ?? "", /enqueued/);
+    assert.equal(seen.length, 0, "the direct-land gate never opened for a queued feature");
+    assert.ok(branchExists(fx.repo, "co/feat-queued-one"), "nothing was landed");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("abandoning the head removes it from the queue and advances to the next", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("drop-me");
+    const b = await fx.features.create("keep-me");
+    await commitIn(a.feature.worktreePath, "a.txt", "a\n", "job: a");
+    await commitIn(b.feature.worktreePath, "b.txt", "b\n", "job: b");
+    await fx.features.enqueue("drop-me");
+    await fx.features.enqueue("keep-me");
+    assert.equal(fx.features.queueView().head?.feature, "drop-me");
+
+    const res = await fx.features.abandon("drop-me");
+    assert.equal(res.abandoned, true);
+
+    const q = fx.features.queueView();
+    assert.equal(q.size, 1);
+    assert.equal(q.head?.feature, "keep-me");
+    assert.equal(q.head?.status, "ready", "the new head was processed on advance");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a real rebase conflict blocks the head and mergeHead refuses to land it", async () => {
+  const seen: LandingReview[] = [];
+  const fx = await makeFixture(approvingHost(seen));
+  try {
+    const a = await fx.features.create("left");
+    const b = await fx.features.create("right");
+    await commitIn(a.feature.worktreePath, "file.txt", "from left\n", "job: left");
+    await commitIn(b.feature.worktreePath, "file.txt", "from right\n", "job: right");
+
+    // Land left first so dev holds the conflicting change.
+    await fx.features.enqueue("left");
+    assert.equal((await fx.features.mergeHead()).merged, true);
+
+    // Enqueue right: rebasing its file.txt edit onto the left-updated dev conflicts.
+    const eb = await fx.features.enqueue("right");
+    assert.equal(eb.enqueued, true);
+    if (!eb.enqueued) return;
+    assert.equal(eb.head?.feature, "right");
+    assert.equal(eb.head?.status, "blocked");
+    assert.match(eb.head?.blockedReason ?? "", /conflict/);
+
+    // The blocked head holds the queue; mergeHead refuses and writes nothing.
+    const devBefore = run(fx.repo, ["rev-parse", "dev"]);
+    const mr = await fx.features.mergeHead();
+    assert.equal(mr.merged, false);
+    assert.equal(mr.outcome, "not-ready");
+    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devBefore, "a blocked head merges nothing");
+    assert.ok(branchExists(fx.repo, "co/feat-right"), "right's branch is intact for a fix");
+    // The aborted rebase left right's worktree clean and on its branch.
+    assert.equal(run(b.feature.worktreePath, ["status", "--porcelain"]), "");
+    assert.equal(run(b.feature.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]), "co/feat-right");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("feature_list and feature_status surface queue position and head state", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("head-feat");
+    const b = await fx.features.create("tail-feat");
+    await commitIn(a.feature.worktreePath, "a.txt", "a\n", "job: a");
+    await commitIn(b.feature.worktreePath, "b.txt", "b\n", "job: b");
+    await fx.features.enqueue("head-feat");
+    await fx.features.enqueue("tail-feat");
+
+    const list = fx.features.list();
+    const head = list.find((f) => f.slug === "head-feat")!;
+    const tail = list.find((f) => f.slug === "tail-feat")!;
+    assert.equal(head.queue?.position, 1);
+    assert.equal(head.queue?.isHead, true);
+    assert.equal(head.queue?.status, "ready");
+    assert.equal(tail.queue?.position, 2);
+    assert.equal(tail.queue?.isHead, false);
+    assert.equal(tail.queue?.status, "queued");
+
+    const status = await fx.features.status("tail-feat");
+    assert.equal(status?.queue?.position, 2);
+    assert.equal(status?.queue?.status, "queued");
+
+    // A feature that was never enqueued carries no queue field.
+    await fx.features.create("solo-feat");
+    const solo = await fx.features.status("solo-feat");
+    assert.equal(solo?.queue, undefined);
+  } finally {
+    await fx.cleanup();
+  }
+});

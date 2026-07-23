@@ -1,6 +1,13 @@
 import fs from "node:fs";
-import { DEFAULT_BUILD_TEST_COMMAND } from "./landing.js";
+import { DEFAULT_BUILD_TEST_COMMAND, prepareLanding } from "./landing.js";
 import { reviewLanding, type LandingGateHost, type LandingGateResult } from "./landinggate.js";
+import {
+  MergeQueue,
+  type EnqueueResult,
+  type MergeHeadResult,
+  type QueueEntryView,
+  type QueueView,
+} from "./mergequeue.js";
 import type { DispatchRegistry } from "./registry.js";
 import {
   featureBranch,
@@ -46,6 +53,7 @@ export interface FeatureManagerDeps {
   provision: typeof provisionWorktree;
   teardown: typeof teardownWorktree;
   reconcile: typeof reconcileFeatures;
+  prepare: typeof prepareLanding;
   review: typeof reviewLanding;
 }
 
@@ -77,6 +85,10 @@ export interface FeatureView {
   /** Whether a crew agent is currently running or queued in the worktree. A
    *  feature runs one agent at a time. */
   busy: boolean;
+  /** The feature's place in the serial merge queue, when it is enqueued: its
+   *  position, whether it is the head, and its queue status (queued /
+   *  head-processing / ready / blocked). Absent when the feature isn't queued. */
+  queue?: QueueEntryView;
 }
 
 export interface CreateResult {
@@ -112,6 +124,10 @@ export class FeatureManager {
   private readonly gateHost?: LandingGateHost;
   private readonly buildTestCommand: string;
   private readonly deps: FeatureManagerDeps;
+  /** The serial merge queue (mergequeue.ts). Owns the ordered "done" features
+   *  and the head-only state machine; drives the EXISTING prepare + gate through
+   *  the deps below. FeatureManager is its host (busy check + record cleanup). */
+  private readonly queue: MergeQueue;
   /** Intents keyed by slug, so status/list can echo the feature's purpose. Not
    *  durable: reconcile can't recover an intent from a branch, so a restart
    *  drops it (the co's memory is the durable record). */
@@ -126,8 +142,31 @@ export class FeatureManager {
       provision: opts.deps?.provision ?? provisionWorktree,
       teardown: opts.deps?.teardown ?? teardownWorktree,
       reconcile: opts.deps?.reconcile ?? reconcileFeatures,
+      prepare: opts.deps?.prepare ?? prepareLanding,
       review: opts.deps?.review ?? reviewLanding,
     };
+    this.queue = new MergeQueue({
+      repoPath: this.repoPath,
+      buildTestCommand: this.buildTestCommand,
+      ...(this.gateHost ? { gateHost: this.gateHost } : {}),
+      host: {
+        isBusy: (feature) => this.isBusy(feature),
+        forget: (feature) => {
+          this.registry.removeFeature(feature);
+          this.intents.delete(safeSlug(feature));
+        },
+      },
+      deps: { prepare: this.deps.prepare, review: this.deps.review },
+    });
+  }
+
+  /** Whether a crew agent is currently running or queued in the feature's
+   *  worktree — a feature is worked one agent at a time, so this gates landing
+   *  and queue processing. */
+  private isBusy(feature: string): boolean {
+    return this.registry
+      .jobsForFeature(feature)
+      .some((j) => j.status === "running" || j.status === "queued");
   }
 
   private worktreeOptions(): WorktreeOptions {
@@ -146,10 +185,9 @@ export class FeatureManager {
     const jobs = this.registry
       .jobsForFeature(record.feature)
       .map((j) => ({ id: j.id, status: j.status, label: j.label }));
-    const busy = this.registry
-      .jobsForFeature(record.feature)
-      .some((j) => j.status === "running" || j.status === "queued");
+    const busy = this.isBusy(record.feature);
     const intent = this.intents.get(record.slug);
+    const queue = this.queue.viewFor(record.feature);
     return {
       feature: record.feature,
       slug: record.slug,
@@ -159,6 +197,7 @@ export class FeatureManager {
       ...(intent ? { intent } : {}),
       jobs,
       busy,
+      ...(queue ? { queue } : {}),
     };
   }
 
@@ -217,10 +256,19 @@ export class FeatureManager {
         error: "no landing gate available (non-interactive session)",
       };
     }
-    const busy = this.registry
-      .jobsForFeature(feature)
-      .some((j) => j.status === "running" || j.status === "queued");
-    if (busy) {
+    // A feature in the merge queue lands only through its head (strict serial,
+    // head-only). The direct feature_land path is for features that were never
+    // enqueued; sending a queued one here would bypass the queue's ordering.
+    if (this.queue.has(feature)) {
+      return {
+        feature,
+        outcome: "rejected",
+        prepared: "failed",
+        summary: `'${feature}' is in the merge queue; land it via the queue (feature_merge_head) when it is the head, not directly.`,
+        error: "feature is enqueued; merge it as the queue head",
+      };
+    }
+    if (this.isBusy(feature)) {
       return {
         feature,
         outcome: "rejected",
@@ -289,7 +337,57 @@ export class FeatureManager {
     const teardown = await this.deps.teardown(this.worktreeOptions(), feature);
     this.registry.removeFeature(feature);
     if (record) this.intents.delete(record.slug);
+    // Drop it from the merge queue too, so an abandoned feature never lingers as
+    // a stale entry. If it was the head, this advances the queue and processes
+    // the new head against the current dev tip.
+    await this.queue.remove(feature);
     return { abandoned: true, teardown };
+  }
+
+  // --- serial merge queue -----------------------------------------------------
+  //
+  // The "mark done" flow (D-20260723-14/-21/-23): features the captain declares
+  // done join an ordered queue; only the head is processed at a time (rebase +
+  // build+test via the EXISTING landing prepare); a green head is offered for the
+  // captain's merge keystroke via the EXISTING gate; on merge the queue advances
+  // and the next feature is processed against the new dev tip. See mergequeue.ts.
+
+  /**
+   * Enqueue a feature as "done" (mark-done). No confirm gate — enqueue is the
+   * trigger, and the only gate in the flow is the merge keystroke on the head.
+   * When the feature becomes the head, it is processed immediately (rebase onto
+   * the current dev tip + combined build+test); re-enqueuing a blocked head is
+   * the retry lever. Reports not-found for a feature that was never created.
+   */
+  async enqueue(name: string): Promise<
+    ({ enqueued: true } & EnqueueResult) | { enqueued: false; feature: string; reason: string }
+  > {
+    const record = this.findRecord(name);
+    if (!record) {
+      return {
+        enqueued: false,
+        feature: name,
+        reason: `no feature '${name}' is tracked; create it with feature_create first.`,
+      };
+    }
+    const res = await this.queue.enqueue(record.feature);
+    return { enqueued: true, ...res };
+  }
+
+  /**
+   * Merge the current queue head through the EXISTING [m]/[r] gate. Only a ready
+   * (green) head merges; on [m] it lands to dev, tears down, and the queue
+   * advances (the new head is processed against the new dev tip). Refuses cleanly
+   * — never throws — when there is no head, no interactive gate, the head is busy,
+   * or the head is not ready.
+   */
+  async mergeHead(): Promise<MergeHeadResult> {
+    return this.queue.mergeHead();
+  }
+
+  /** The full merge-queue snapshot (order + head + per-entry status). */
+  queueView(): QueueView {
+    return this.queue.view();
   }
 
   /**

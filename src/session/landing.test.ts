@@ -8,7 +8,6 @@ import path from "node:path";
 import {
   DEFAULT_BUILD_TEST_COMMAND,
   executeLanding,
-  LandingQueue,
   prepareLanding,
   type PrepareGreen,
 } from "./landing.js";
@@ -373,32 +372,4 @@ test("executeLanding refuses while dev is checked out somewhere", async () => {
   } finally {
     await cleanup();
   }
-});
-
-test("LandingQueue keeps order, dedups, records prepares, and drops landed features", () => {
-  const q = new LandingQueue();
-  q.enqueue("aaa");
-  q.enqueue("bbb");
-  const again = q.enqueue("aaa"); // idempotent: keeps position
-  assert.equal(again.feature, "aaa");
-  assert.deepEqual(q.list().map((e) => e.feature), ["aaa", "bbb"]);
-  assert.equal(q.head()?.feature, "aaa");
-  assert.equal(q.size, 2);
-
-  const entry = q.recordPrepare("aaa", {
-    kind: "conflict",
-    feature: "aaa",
-    branch: "co/feat-aaa",
-    devSha: "abc",
-    conflictFiles: ["file.txt"],
-    detail: "could not apply",
-  });
-  assert.equal(entry.prepared?.kind, "conflict");
-  assert.equal(q.get("aaa")?.prepared?.kind, "conflict");
-  assert.throws(() => q.recordPrepare("nope", entry.prepared!), /not queued/);
-
-  assert.equal(q.remove("aaa"), true);
-  assert.equal(q.remove("aaa"), false);
-  assert.equal(q.head()?.feature, "bbb");
-  assert.equal(q.size, 1);
 });
