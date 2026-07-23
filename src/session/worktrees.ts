@@ -10,8 +10,10 @@ import path from "node:path";
  * works there in isolation, and higher layers later rebase the finished branch
  * onto dev, build, test, and merge behind a human gate. This module is only
  * the hands: ensure dev exists, provision a worktree, tear one down, and sweep
- * up zombies after a crash. Deterministic plumbing — no model, no network —
- * and NOT yet wired into the live dispatch flow.
+ * up zombies after a crash. Deterministic plumbing — no model, no network.
+ * The dispatch registry consumes provisionWorktree for its feature-scoped
+ * dispatches (a crew process launched with cwd = the feature's worktree);
+ * teardown and reconcile await the landing flow.
  *
  * Safety posture (the invariants everything below preserves):
  *  - `main` is human-only: nothing here writes to it, checks it out, or

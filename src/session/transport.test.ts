@@ -605,6 +605,65 @@ test("launchGhostty raises PaneUnavailableError (with the target id) on a stale 
   }
 });
 
+test("jobCommandLine resolves {repo} to the cwd override when one is given", () => {
+  const config = defaultDispatchConfig();
+  config.repoPath = "/repo";
+  config.agents = [{ name: "cc", command: "agent --root {repo} {prompt}" }];
+  config.defaultAgent = "cc";
+  assert.equal(jobCommandLine(config, "x"), "agent --root '/repo' 'x'");
+  // A feature-scoped dispatch launches in the worktree; a {repo} reference in
+  // the template must agree with that launch directory.
+  assert.equal(jobCommandLine(config, "x", undefined, "/wt/auth"), "agent --root '/wt/auth' 'x'");
+});
+
+test("fallback runs the crew in a cwd override (a feature worktree), not the linked repo", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.agents = [{ name: "fake", command: `sh -c 'pwd'` }];
+    config.defaultAgent = "fake";
+    const worktree = path.join(paths.root, "wt-auth");
+    await fsp.mkdir(worktree, { recursive: true });
+    await launchFallback({ paths, config, jobId: "job-wt", order: "x", cwd: worktree });
+    const captured = await waitForSentinel(paths.captureFile("job-wt"));
+    const realWt = await fsp.realpath(worktree);
+    const printed = captured.split("\n").map((l) => l.trim());
+    assert.ok(
+      printed.includes(realWt) || printed.includes(worktree),
+      `crew cwd should be the worktree.\n  want: ${realWt}\n  got:\n${captured}`,
+    );
+    const realRepo = await fsp.realpath(paths.root);
+    assert.ok(!printed.includes(realRepo), "the linked repo was not the cwd");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("launchGhostty bakes a cwd override into the job script instead of the repo", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = "/linked/repo";
+    const layout = new CrewPaneLayout({ id: "anchor-1", title: crewPaneTitle("inst") }, config.pane);
+    // Stub osascript, playing the launched job's first act (the capture file)
+    // so the transport's launch probe passes.
+    setOsaRunnerForTest(async (script) => {
+      const m = script.match(/\/bin\/sh '([^']+)\.sh'/);
+      if (m) await fsp.writeFile(m[1]!, "", "utf8");
+      return "anchor-1";
+    });
+    const res = await launchGhostty({ paths, config, layout, jobId: "jwt", order: "x", cwd: "/wt/auth" });
+    assert.equal(res.paneId, "anchor-1");
+    const script = await fsp.readFile(`${paths.captureFile("jwt")}.sh`, "utf8");
+    assert.ok(script.includes("cd '/wt/auth' ||"), "the job script cd's into the worktree");
+    assert.ok(!script.includes("'/linked/repo'"), "the linked repo path appears nowhere in the job");
+  } finally {
+    setOsaRunnerForTest(null);
+    await cleanup();
+  }
+});
+
 test("fallback writes a background note to the capture and still reports the real exit code", async () => {
   const { paths, cleanup } = await tmpInstance();
   try {

@@ -1,5 +1,6 @@
 import fsp from "node:fs/promises";
 import fs from "node:fs";
+import path from "node:path";
 import type { InstancePaths } from "../paths.js";
 import { CrewPaneLayout } from "./crewpanes.js";
 import { readDispatchConfig, resolveAgentCommand, type DispatchConfig } from "./dispatchconfig.js";
@@ -16,7 +17,14 @@ import {
 } from "./transport.js";
 import { installCrewStopHook, type InstallResult } from "./crewhook.js";
 import { stopCaptureFile, type StopCapture } from "./crewstophook.js";
-import type { FeatureRecord } from "./worktrees.js";
+import {
+  defaultWorktreeBase,
+  featureBranch,
+  featureSlug,
+  provisionWorktree,
+  type FeatureRecord,
+  type WorktreeOptions,
+} from "./worktrees.js";
 
 /**
  * The dispatch job registry and capture watcher.
@@ -73,6 +81,15 @@ export interface Job {
   status: JobStatus;
   paneId?: string;
   pid?: number;
+  /** The feature this job is scoped to, when dispatched with one: the
+   *  job<->feature linkage. The feature's worktree record lives in the
+   *  registry's feature map (getFeature). Absent for a plain dispatch. */
+  feature?: string;
+  /** The working directory the crew process was launched in, when it isn't the
+   *  linked repo: a feature-scoped job runs inside the feature's worktree.
+   *  Kept on the job so a queued relaunch and the degrade-to-background path
+   *  land in the same checkout. Absent for a plain dispatch. */
+  cwd?: string;
   captureFile: string;
   /** Epoch ms when the job started running (set on launch, not on queue). */
   startedAt: number | null;
@@ -119,6 +136,21 @@ export interface RegistryOptions {
    *  the real ~/.claude. Defaults to installCrewStopHook (the real merge into the
    *  agent's config dir). */
   installHook?: (agentCommand: string) => Promise<InstallResult>;
+  /** Test seam: replace the worktree provisioner, so tests can drive the
+   *  feature-scoped dispatch path without a real git repo. Defaults to
+   *  provisionWorktree (worktrees.ts), which is idempotent for an intact
+   *  feature and throws with a reconcile pointer on any half-state. */
+  provisionWorktree?: (opts: WorktreeOptions, feature: string) => Promise<FeatureRecord>;
+}
+
+/** Per-dispatch options beyond the order and agent. */
+export interface DispatchOptions {
+  /** Scope the dispatch to a feature: its worktree is provisioned on first use
+   *  (reused on every later dispatch until landing) and the crew process runs
+   *  with the worktree as its working directory, so the agent operates in the
+   *  feature's isolated checkout on its `co/feat-<slug>` branch, never the
+   *  primary tree. Omit for the plain repo-cwd dispatch. */
+  feature?: string;
 }
 
 export class DispatchRegistry {
@@ -175,6 +207,7 @@ export class DispatchRegistry {
   private readonly onAnchorLost?: () => void;
   private readonly onHookIssue?: (message: string) => void;
   private readonly installHook: (agentCommand: string) => Promise<InstallResult>;
+  private readonly provisionFeature: (opts: WorktreeOptions, feature: string) => Promise<FeatureRecord>;
 
   constructor(opts: RegistryOptions) {
     this.paths = opts.paths;
@@ -197,6 +230,7 @@ export class DispatchRegistry {
     this.onAnchorLost = opts.onAnchorLost;
     this.onHookIssue = opts.onHookIssue;
     this.installHook = opts.installHook ?? ((agentCommand) => installCrewStopHook({ agentCommand }));
+    this.provisionFeature = opts.provisionWorktree ?? provisionWorktree;
     // Tests (and the no-anchor case) skip the live existence probe.
     this.anchorChecked = this.skipAnchorCheck || !this.layout;
   }
@@ -234,8 +268,9 @@ export class DispatchRegistry {
   //
   // Per-feature worktree state for the parallel-dispatch flow (worktrees.ts):
   // which branch and isolated checkout a feature owns, and where its provision
-  // stands. Purely additive bookkeeping — nothing in the job flow reads these
-  // yet, so every existing registry consumer is untouched.
+  // stands. A feature-scoped dispatch (DispatchOptions.feature) reads and
+  // maintains these (provision on first use, reuse thereafter) while a plain
+  // dispatch never touches them.
 
   /** Record (or update) a feature's worktree state. */
   upsertFeature(record: FeatureRecord): void {
@@ -254,6 +289,12 @@ export class DispatchRegistry {
   /** Drop a feature record (after teardown). Returns whether one existed. */
   removeFeature(feature: string): boolean {
     return this.features.delete(feature);
+  }
+
+  /** The jobs dispatched under a feature, oldest first: the other direction of
+   *  the job<->feature linkage (each scoped Job carries its feature name). */
+  jobsForFeature(feature: string): Job[] {
+    return this.list().filter((j) => j.feature === feature);
   }
 
   /**
@@ -309,8 +350,17 @@ export class DispatchRegistry {
    * Launch (or queue) a dispatch for `order`. Returns the created Job. Never
    * throws into the caller: a launch failure marks the job failed and notifies,
    * so a bad dispatch can't crash the session. Starts the poller if idle.
+   *
+   * With `opts.feature`, the dispatch is scoped to that feature: its worktree is
+   * provisioned if this is the feature's first dispatch (ensureFeatureWorktree),
+   * reused otherwise, and the crew process runs with the worktree as its cwd;
+   * the agent binds to the isolated checkout by being launched inside it. A
+   * worktree is worked serially (agents in one checkout would trample each
+   * other's index and files), so a second dispatch to a feature whose job is
+   * still running or queued fails cleanly instead of launching. Provisioning
+   * failures take the same marked-failed-and-notified path as launch failures.
    */
-  async dispatch(order: string, agentName?: string): Promise<Job> {
+  async dispatch(order: string, agentName?: string, opts: DispatchOptions = {}): Promise<Job> {
     // Pick up a `co pane` / `co link` change made since the session started (or
     // the last dispatch) before deciding transport for this job.
     await this.refreshConfig();
@@ -332,6 +382,7 @@ export class DispatchRegistry {
       order,
       label,
       ...(agentName ? { agentName } : {}),
+      ...(opts.feature ? { feature: opts.feature } : {}),
       transport: this.activeTransport,
       status: "running",
       captureFile,
@@ -359,6 +410,25 @@ export class DispatchRegistry {
     await this.releaseFinishedPanes();
 
     try {
+      // Feature scoping happens inside the try so its failures ride the same
+      // marked-failed-and-notified path as launch failures: a bad provision
+      // (a half-state worktree, a missing repo) can't crash the session.
+      if (job.feature) {
+        const clash = this.list().find(
+          (j) =>
+            j.id !== job.id &&
+            j.feature === job.feature &&
+            (j.status === "running" || j.status === "queued"),
+        );
+        if (clash) {
+          throw new Error(
+            `feature '${job.feature}' already has an active job (${clash.id}); ` +
+              `a feature's worktree runs one agent at a time`,
+          );
+        }
+        const record = await this.ensureFeatureWorktree(job.feature);
+        job.cwd = record.worktreePath;
+      }
       if (this.layout) {
         try {
           const launched = await this.launchOnPane(job);
@@ -421,6 +491,42 @@ export class DispatchRegistry {
     }
   }
 
+  /**
+   * The feature's worktree, provisioned on first use and reused thereafter.
+   * A record already marked ready whose directory still exists is returned
+   * without touching git: the once-per-feature cost stays once-per-feature
+   * across the many dispatches a feature consumes. Anything else (first
+   * dispatch this session, a failed earlier provision, a worktree deleted out
+   * from under us) goes through provisionWorktree, which is itself idempotent
+   * for an intact feature (a session restart quietly rebinds to the existing
+   * worktree) and throws with a reconcile pointer on half-states. The
+   * record's provision status is tracked through the attempt so a concurrent
+   * listFeatures() never sees a fiction.
+   */
+  private async ensureFeatureWorktree(feature: string): Promise<FeatureRecord> {
+    const existing = this.features.get(feature);
+    if (existing?.provisionStatus === "ready" && fs.existsSync(existing.worktreePath)) {
+      return existing;
+    }
+    const slug = featureSlug(feature);
+    const pending: FeatureRecord = {
+      feature,
+      slug,
+      branch: featureBranch(feature),
+      worktreePath: path.join(defaultWorktreeBase(this.config.repoPath), slug),
+      provisionStatus: "provisioning",
+    };
+    this.upsertFeature(pending);
+    try {
+      const record = await this.provisionFeature({ repoPath: this.config.repoPath }, feature);
+      this.upsertFeature(record);
+      return record;
+    } catch (e) {
+      this.upsertFeature({ ...pending, provisionStatus: "failed" });
+      throw e;
+    }
+  }
+
   /** Launch a job on the background transport, recording its pid on the job. A
    *  `note` is written to the top of the capture when the fallback is standing in
    *  for a failed pane launch, so the run is never a silently-empty log. */
@@ -437,6 +543,7 @@ export class DispatchRegistry {
       order,
       captureFile: job.captureFile,
       ...(agentName ? { agentName } : {}),
+      ...(job.cwd ? { cwd: job.cwd } : {}),
       ...(opts.note ? { note: opts.note } : {}),
     });
     job.pid = res.pid;
@@ -456,6 +563,7 @@ export class DispatchRegistry {
       order: job.order,
       captureFile: job.captureFile,
       ...(job.agentName ? { agentName: job.agentName } : {}),
+      ...(job.cwd ? { cwd: job.cwd } : {}),
     });
     if (res.placement && res.placement.kind === "queue") return false;
     job.paneId = res.paneId;

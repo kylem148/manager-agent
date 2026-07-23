@@ -217,10 +217,21 @@ export function buildShellCommand(
  * only the {prompt}/{repo} values. Command assembly is live here, not a frozen
  * string: a config persisted before agent selection is migrated on read (see
  * coerce).
+ *
+ * `cwd` overrides what {repo} resolves to (default: the linked repo path). A
+ * feature-scoped dispatch launches the crew inside the feature's worktree, and a
+ * template that references {repo} must agree with that launch directory: an
+ * agent told to run in the worktree but pointed at the primary tree would write
+ * to the wrong checkout.
  */
-export function jobCommandLine(config: DispatchConfig, order: string, agentName?: string): string {
+export function jobCommandLine(
+  config: DispatchConfig,
+  order: string,
+  agentName?: string,
+  cwd?: string,
+): string {
   const command = resolveAgentCommand(config, agentName);
-  return resolveCommandLine(command, { prompt: order, repo: config.repoPath });
+  return resolveCommandLine(command, { prompt: order, repo: cwd ?? config.repoPath });
 }
 
 /**
@@ -543,6 +554,10 @@ export async function launchGhostty(args: {
   order: string;
   /** The confirm-time agent override; omit to use the config default. */
   agentName?: string;
+  /** Working-directory override for the crew process: a feature-scoped dispatch
+   *  passes the feature's worktree path so the agent operates in that isolated
+   *  checkout. Omitted, the linked repo is the cwd, exactly as before. */
+  cwd?: string;
   /** Capture file override (the registry namespaces these per session); defaults
    *  to the instance's captureFile(jobId) for direct callers and tests. */
   captureFile?: string;
@@ -559,7 +574,7 @@ export async function launchGhostty(args: {
     return { transport: "ghostty", placement: decision };
   }
 
-  const crewCommand = jobCommandLine(config, order, agentName);
+  const crewCommand = jobCommandLine(config, order, agentName, args.cwd);
   // The job script owns everything fragile: cd, the (possibly multi-line) order,
   // capture, exit sidecar, sentinel. The pane only ever sees the launch line.
   const scriptPath = jobScriptFile(captureFile);
@@ -569,7 +584,7 @@ export async function launchGhostty(args: {
       crewCommand,
       captureFile,
       scriptPath,
-      cwd: config.repoPath,
+      cwd: args.cwd ?? config.repoPath,
       ...(process.env.PATH ? { pathEnv: process.env.PATH } : {}),
     }),
     "utf8",
@@ -643,6 +658,10 @@ export async function launchFallback(args: {
   order: string;
   /** The confirm-time agent override; omit to use the config default. */
   agentName?: string;
+  /** Working-directory override for the crew process: a feature-scoped dispatch
+   *  passes the feature's worktree path so the agent operates in that isolated
+   *  checkout. Omitted, the linked repo is the cwd, exactly as before. */
+  cwd?: string;
   /** A human-readable note recorded at the top of the capture (e.g. why we fell
    *  back to background). Omit for a plain background dispatch. */
   note?: string;
@@ -653,18 +672,19 @@ export async function launchFallback(args: {
   const { paths, config, jobId, order, agentName, note } = args;
   await ensureCaptureDir(paths);
   const captureFile = args.captureFile ?? paths.captureFile(jobId);
-  const crewCommand = jobCommandLine(config, order, agentName);
-  // Set the repo cwd two ways that agree: the spawn cwd below (the real working
-  // directory of the detached process) and, when the repo exists, the `cd` baked
-  // into the shell command so the assembled command is self-describing and
+  const crewCommand = jobCommandLine(config, order, agentName, args.cwd);
+  // Set the working directory two ways that agree: the spawn cwd below (the real
+  // working directory of the detached process) and, when the dir exists, the `cd`
+  // baked into the shell command so the assembled command is self-describing and
   // matches the pane path exactly. Only pass the cd when the path exists, so a
   // missing repo degrades to the spawn cwd (undefined → inherit) rather than a
   // hard `cd ... || exit` failure the moment a repo hasn't been created yet.
-  const repoExists = Boolean(config.repoPath) && fs.existsSync(config.repoPath);
+  const workDir = args.cwd ?? config.repoPath;
+  const workDirExists = Boolean(workDir) && fs.existsSync(workDir);
   const shellCommand = buildShellCommand(
     crewCommand,
     captureFile,
-    repoExists ? config.repoPath : undefined,
+    workDirExists ? workDir : undefined,
     note,
   );
 
@@ -675,7 +695,7 @@ export async function launchFallback(args: {
   // correlation env lets a Claude Code crew's Stop hook capture on first finish;
   // it rides in the child env just as the pane script bakes it in.
   const child = spawn("sh", ["-c", shellCommand], {
-    cwd: repoExists ? config.repoPath : undefined,
+    cwd: workDirExists ? workDir : undefined,
     detached: true,
     stdio: "ignore",
     env: { ...process.env, ...dispatchCorrelationEnv(captureFile) },

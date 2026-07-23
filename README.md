@@ -647,7 +647,7 @@ completion-sentinel contract. `registry.ts` owns in-flight jobs: it launches on
 the chosen transport, polls captures for the sentinel, enforces timeouts, drains
 the pane queue, and fires a completion callback, all non-blocking.
 
-`worktrees.ts` is the git-worktree lifecycle harness for the upcoming
+`worktrees.ts` is the git-worktree lifecycle harness for the
 parallel-dispatch feature: ensure a `dev` integration branch exists (created
 off `main`, create-only), provision a per-feature worktree on a fresh
 `co/feat-<slug>` branch cut from `dev` (with `node_modules`/`dist` symlinked
@@ -655,8 +655,14 @@ from the primary tree so it builds without an install), tear a finished
 feature down (branch deletion is guarded by a merge-base check, so unmerged
 work is never destroyed), and a reconcile sweep that cleans zombies left by a
 crashed run. Feature worktrees live outside the repo, by default in a sibling
-directory `<repo>-worktrees`. Deterministic plumbing only; it is not wired
-into the live dispatch flow yet.
+directory `<repo>-worktrees`. Deterministic plumbing; the registry consumes
+it for feature-scoped dispatch: a dispatch scoped to a feature provisions the
+worktree on first use (reused for every later dispatch to that feature),
+launches the crew process with the worktree as its working directory on both
+transports (an agent binds to a checkout by being launched inside it), and
+records the job-to-feature link on the job. One live agent per worktree at a
+time; a plain dispatch keeps its repo cwd untouched. Teardown at landing,
+the merge queue, the rebase, and the human gate are later slices.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, and ANSI-aware wrapping.

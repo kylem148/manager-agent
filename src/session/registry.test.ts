@@ -1,10 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fsp from "node:fs/promises";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { instancePaths } from "../paths.js";
+import { defaultWorktreeBase } from "./worktrees.js";
 import {
   defaultDispatchConfig,
   writeDispatchConfig,
@@ -64,6 +66,24 @@ function onCompleteOnce(): { promise: Promise<Job>; handler: (j: Job) => void } 
   let resolve!: (j: Job) => void;
   const promise = new Promise<Job>((r) => (resolve = r));
   return { promise, handler: (j) => resolve(j) };
+}
+
+/** Like onCompleteOnce but for several sequential completions: take() awaits
+ *  the next completed job, buffering any that land before it is called. */
+function onCompleteQueue(): { handler: (j: Job) => void; take: () => Promise<Job> } {
+  const buffered: Job[] = [];
+  const waiters: ((j: Job) => void)[] = [];
+  return {
+    handler: (j) => {
+      const w = waiters.shift();
+      if (w) w(j);
+      else buffered.push(j);
+    },
+    take: () => {
+      const b = buffered.shift();
+      return b ? Promise.resolve(b) : new Promise((r) => waiters.push(r));
+    },
+  };
 }
 
 /**
@@ -644,5 +664,269 @@ test("feature records are additive bookkeeping that never touches the job flow",
     );
   } finally {
     await cleanup();
+  }
+});
+
+test("a feature-scoped dispatch provisions once, runs in the worktree, and links jobs to the feature", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.agents = [{ name: "fake", command: `sh -c 'pwd'` }];
+    config.defaultAgent = "fake";
+    const worktree = path.join(paths.root, "wt", "auth");
+    await fsp.mkdir(worktree, { recursive: true });
+    let provisions = 0;
+    const queue = onCompleteQueue();
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: queue.handler,
+        transportOverride: "fallback",
+        pollIntervalMs: 25,
+        provisionWorktree: async (opts, feature) => {
+          provisions++;
+          assert.equal(opts.repoPath, config.repoPath, "provision targets the linked repo");
+          return {
+            feature,
+            slug: feature,
+            branch: `co/feat-${feature}`,
+            worktreePath: worktree,
+            provisionStatus: "ready",
+          };
+        },
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one", undefined, { feature: "auth" });
+        assert.equal(j1.feature, "auth", "the job records its feature");
+        assert.equal(j1.cwd, worktree, "the job records the worktree cwd");
+        const f1 = await queue.take();
+        assert.equal(f1.status, "done");
+        const realWt = await fsp.realpath(worktree);
+        const printed = (await fsp.readFile(f1.captureFile, "utf8")).split("\n").map((l) => l.trim());
+        assert.ok(
+          printed.includes(realWt) || printed.includes(worktree),
+          `the crew process ran inside the worktree, got:\n${printed.join("\n")}`,
+        );
+
+        // The second dispatch to the same feature reuses the provisioned
+        // worktree: no re-provision, same cwd.
+        const j2 = await reg.dispatch("two", undefined, { feature: "auth" });
+        assert.equal(j2.cwd, worktree, "the second dispatch lands in the same worktree");
+        const f2 = await queue.take();
+        assert.equal(f2.status, "done");
+        assert.equal(provisions, 1, "provision ran once; the second dispatch reused the record");
+        assert.deepEqual(
+          reg.jobsForFeature("auth").map((j) => j.id),
+          [j1.id, j2.id],
+          "both jobs are linked to the feature",
+        );
+        assert.equal(reg.getFeature("auth")?.provisionStatus, "ready");
+      },
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a feature dispatch on the pane path cd's the job script into the worktree; the plain path is untouched", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config: DispatchConfig = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    const worktree = path.join(paths.root, "wt", "auth");
+    await fsp.mkdir(worktree, { recursive: true });
+
+    let split = 0;
+    setGhosttyAvailableForTest(true);
+    setOsaRunnerForTest(async (s) => {
+      await touchCaptureFromScript(s);
+      return s.includes("split ") ? `pane-${++split}` : "anchor-1";
+    });
+
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: () => {},
+        transportOverride: "ghostty",
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000, // never let the fake jobs complete
+        provisionWorktree: async (_opts, feature) => ({
+          feature,
+          slug: feature,
+          branch: `co/feat-${feature}`,
+          worktreePath: worktree,
+          provisionStatus: "ready",
+        }),
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one", undefined, { feature: "auth" });
+        assert.equal(j1.transport, "ghostty");
+        assert.equal(j1.paneId, "anchor-1");
+        const script = await fsp.readFile(`${j1.captureFile}.sh`, "utf8");
+        assert.ok(script.includes(`cd '${worktree}' ||`), "the job script cd's into the feature worktree");
+        assert.ok(!script.includes(`cd '${paths.root}' ||`), "not into the primary repo");
+
+        // One live agent per worktree: a second dispatch to the feature while
+        // its job runs fails cleanly instead of launching alongside.
+        const j2 = await reg.dispatch("two", undefined, { feature: "auth" });
+        assert.equal(j2.status, "failed");
+        assert.match(j2.error ?? "", /already has an active job/);
+
+        // A plain dispatch in the same session is untouched: repo cwd, no feature.
+        const j3 = await reg.dispatch("three");
+        assert.equal(j3.status, "running");
+        assert.equal(j3.feature, undefined);
+        const plainScript = await fsp.readFile(`${j3.captureFile}.sh`, "utf8");
+        assert.ok(plainScript.includes(`cd '${paths.root}' ||`), "the plain job still cd's into the repo");
+      },
+    );
+  } finally {
+    setGhosttyAvailableForTest(null);
+    setOsaRunnerForTest(null);
+    await cleanup();
+  }
+});
+
+test("a provisioning failure fails the job cleanly and records the failed feature status", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    const done = onCompleteOnce();
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: done.handler,
+        transportOverride: "fallback",
+        pollIntervalMs: 25,
+        provisionWorktree: async () => {
+          throw new Error("branch 'co/feat-auth' already exists without a worktree; run reconcile or teardown first");
+        },
+      },
+      async (reg) => {
+        const job = await reg.dispatch("one", undefined, { feature: "auth" });
+        assert.equal(job.status, "failed", "the dispatch call returns a failed job, never throws");
+        assert.match(job.error ?? "", /already exists without a worktree/);
+        assert.equal(job.cwd, undefined, "no cwd was bound");
+        const notified = await done.promise;
+        assert.equal(notified.id, job.id, "the failure notifies like any launch failure");
+        assert.equal(reg.getFeature("auth")?.provisionStatus, "failed");
+      },
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a plain dispatch never touches the provisioning path", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.agents = [{ name: "fake", command: `sh -c 'echo PLAIN'` }];
+    config.defaultAgent = "fake";
+    let provisions = 0;
+    const done = onCompleteOnce();
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: done.handler,
+        transportOverride: "fallback",
+        pollIntervalMs: 25,
+        provisionWorktree: async (_opts, feature) => {
+          provisions++;
+          return { feature, slug: feature, branch: "x", worktreePath: "/x", provisionStatus: "ready" };
+        },
+      },
+      async (reg) => {
+        const job = await reg.dispatch("just do it");
+        assert.equal(job.feature, undefined);
+        assert.equal(job.cwd, undefined);
+        const finished = await done.promise;
+        assert.equal(finished.status, "done");
+        assert.equal(provisions, 0, "no provisioning happens for a plain dispatch");
+      },
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+/** Run git in a fixture repo for the end-to-end feature dispatch below. */
+function runGit(cwd: string, args: string[]): string {
+  const res = spawnSync("git", args, { cwd, encoding: "utf8" });
+  if (res.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed (${res.status}): ${res.stderr}`);
+  }
+  return res.stdout.trim();
+}
+
+test("feature dispatch end-to-end: real provision, crew cwd = worktree on co/feat-*, reuse on the second dispatch", async () => {
+  // The whole provision → dispatch-isolated → capture loop against a real git
+  // repo: the registry provisions through worktrees.ts for real, the (fake)
+  // crew process reports its own cwd and branch, and the capture, written to
+  // the instance's absolute captures dir from inside the worktree, carries the
+  // completion sentinel as usual. The tmp root is realpath'd so macOS's
+  // /var → /private/var spelling can't fool the path assertions.
+  const root = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "co-registry-feat-")));
+  try {
+    const repo = path.join(root, "repo");
+    await fsp.mkdir(repo);
+    runGit(repo, ["init", "-q", "-b", "main"]);
+    runGit(repo, ["config", "user.email", "test@test"]);
+    runGit(repo, ["config", "user.name", "test"]);
+    runGit(repo, ["config", "commit.gpgsign", "false"]);
+    await fsp.writeFile(path.join(repo, "file.txt"), "hello\n", "utf8");
+    runGit(repo, ["add", "."]);
+    runGit(repo, ["commit", "-q", "-m", "init"]);
+
+    const paths = instancePaths(path.join(root, "home"), "inst");
+    await fsp.mkdir(paths.captures, { recursive: true });
+    const config = defaultDispatchConfig();
+    config.repoPath = repo;
+    // The fake crew reports where it ran and on which branch: the two facts
+    // that prove worktree isolation.
+    config.agents = [{ name: "fake", command: `sh -c 'pwd; git rev-parse --abbrev-ref HEAD'` }];
+    config.defaultAgent = "fake";
+
+    const queue = onCompleteQueue();
+    await withRegistry(
+      { paths, config, onComplete: queue.handler, transportOverride: "fallback", pollIntervalMs: 25 },
+      async (reg) => {
+        const worktree = path.join(defaultWorktreeBase(repo), "auth");
+        const j1 = await reg.dispatch("one", undefined, { feature: "auth" });
+        assert.equal(j1.cwd, worktree, "the crew cwd is the provisioned worktree in the sibling base dir");
+        const f1 = await queue.take();
+        assert.equal(f1.status, "done", "the run completed via the sentinel, from inside the worktree");
+        const printed = (await fsp.readFile(f1.captureFile, "utf8")).split("\n").map((l) => l.trim());
+        assert.ok(printed.includes(worktree), `the crew ran inside the worktree, got:\n${printed.join("\n")}`);
+        assert.ok(printed.includes("co/feat-auth"), "on the feature branch, never main or dev");
+        assert.equal(reg.getFeature("auth")?.provisionStatus, "ready");
+
+        // Second dispatch to the same feature: same worktree, nothing recreated.
+        const worktreesBefore = runGit(repo, ["worktree", "list", "--porcelain"]);
+        const j2 = await reg.dispatch("two", undefined, { feature: "auth" });
+        assert.equal(j2.cwd, worktree, "the second dispatch reuses the same worktree");
+        const f2 = await queue.take();
+        assert.equal(f2.status, "done");
+        assert.equal(
+          runGit(repo, ["worktree", "list", "--porcelain"]),
+          worktreesBefore,
+          "no second worktree was created",
+        );
+        assert.deepEqual(reg.jobsForFeature("auth").map((j) => j.id), [j1.id, j2.id]);
+
+        // The primary tree never moved off main.
+        assert.equal(runGit(repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+      },
+    );
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
   }
 });
