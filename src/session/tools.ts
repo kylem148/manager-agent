@@ -19,6 +19,7 @@ import {
 } from "../memory/docs.js";
 import { searchWeb, fetchUrl } from "../research.js";
 import type { SearchOptions } from "../research.js";
+import type { FeatureManager } from "./features.js";
 
 /**
  * The co-manager's internal capability surface, exposed to the model as tools.
@@ -225,15 +226,17 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     },
   ];
 
-  // The dispatch tool is only exposed when the instance has been linked to a
-  // repo (co link). It ARMS a dispatch — it never runs anything. The actual
-  // launch happens only after the captain types `confirm` in the session loop,
-  // which is the structural interlock; this tool has no path to execute.
+  // The dispatch + feature tools are only exposed when the instance has been
+  // linked to a repo (co link). dispatch_order ARMS a dispatch — it never runs
+  // anything; the launch happens only after the captain types `confirm` in the
+  // session loop, which is the structural interlock. The feature levers drive
+  // the parallel-worktree flow: create a feature's isolated worktree, target a
+  // dispatch at it, and land it through the Ctrl-O review gate.
   if (opts.dispatch) {
     tools.push({
       name: "dispatch_order",
       description:
-        "Arm a direct dispatch of an implementation-ready order to the crew (the registered coding agent). This does NOT run anything: it stages the order and shows the captain the exact order text plus the resolved command, and waits. The dispatch fires only if the captain then types `confirm`; any other input cancels it. Use this instead of writing plain-text orders when the captain wants the order run directly. Draft the full order (same checklist as a written order: read-docs-first, goal, context, decisions, constraints, acceptance, verification, commit) as the `order` argument. Arm at most one order per turn.",
+        "Arm a direct dispatch of an implementation-ready order to the crew (the registered coding agent). This does NOT run anything: it stages the order and shows the captain the exact order text plus the resolved command and target, and waits. The dispatch fires only if the captain then types `confirm`; any other input cancels it. Use this instead of writing plain-text orders when the captain wants the order run directly. Draft the full order (same checklist as a written order: read-docs-first, goal, context, decisions, constraints, acceptance, verification, commit) as the `order` argument. Optionally scope it to a feature with `feature`: the crew then runs inside that feature's isolated worktree (provisioned on first use) instead of the bare main tree. Arm at most one order per turn.",
       input_schema: {
         type: "object",
         properties: {
@@ -242,8 +245,79 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
             description:
               "The complete, implementation-ready order text to hand to the coding agent as its prompt.",
           },
+          feature: {
+            type: "string",
+            description:
+              "Optional. Scope this dispatch to a feature: the crew runs in that feature's isolated worktree on its `co/feat-<slug>` branch, provisioned on first use. Use the same feature name you created (or will create) with feature_create. Omit to run on the bare main tree.",
+          },
         },
         required: ["order"],
+        additionalProperties: false,
+      },
+    });
+    tools.push({
+      name: "feature_create",
+      description:
+        "Provision an isolated worktree for a feature: a fresh `co/feat-<slug>` branch cut from the `dev` integration branch, with its own checkout, so crew can work it in parallel with other features and never touch the main tree. Runs directly (no confirm gate) — it writes nothing to `dev` or `main`, only creates the feature's own branch and checkout. Idempotent: creating an existing feature returns its worktree. After creating, dispatch orders into it by passing the same name as `dispatch_order`'s `feature`, then land it with feature_land.",
+      input_schema: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "The feature name (a human handle, e.g. \"user auth\"). Slugged for the branch.",
+          },
+          intent: {
+            type: "string",
+            description:
+              "Optional one-line statement of what the feature is for, echoed back in feature_status/feature_list this session.",
+          },
+        },
+        required: ["name"],
+        additionalProperties: false,
+      },
+    });
+    tools.push({
+      name: "feature_land",
+      description:
+        "Land a finished feature onto `dev`: rebase its branch onto the current `dev` tip, run the project's build+test on that combined state, and open the Ctrl-O review gate showing the diff and result. The gate IS the confirmation — the merge happens ONLY if the captain presses [m] over a green result; a conflict or a red build+test is shown but not mergeable. On a merge the feature's worktree and branch are torn down. Needs an interactive terminal (the gate); reports cleanly if there is none or a crew agent is still working the feature.",
+      input_schema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "The feature to land (name or slug)." },
+        },
+        required: ["name"],
+        additionalProperties: false,
+      },
+    });
+    tools.push({
+      name: "feature_list",
+      description:
+        "List every tracked feature: its branch, worktree path, provision status, whether a crew agent is currently working it, and its dispatched jobs. Use to see what is in flight across the parallel-worktree flow.",
+      input_schema: { type: "object", properties: {}, additionalProperties: false },
+    });
+    tools.push({
+      name: "feature_status",
+      description:
+        "Show one feature's full picture: branch, worktree path, provision status, whether its worktree has uncommitted changes, whether a crew agent is active, and its jobs. Returns not-found if nothing is tracked under that name or slug.",
+      input_schema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "The feature to inspect (name or slug)." },
+        },
+        required: ["name"],
+        additionalProperties: false,
+      },
+    });
+    tools.push({
+      name: "feature_abandon",
+      description:
+        "Tear down a feature's worktree WITHOUT landing it: remove the checkout and delete its branch if fully merged. Refuses (reports, never forces) a worktree with uncommitted changes — discarding unsaved work is the captain's call. Committed-but-unmerged work is preserved: the branch is kept and the reason reported. Use to drop an abandoned or superseded feature.",
+      input_schema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "The feature to abandon (name or slug)." },
+        },
+        required: ["name"],
         additionalProperties: false,
       },
     });
@@ -276,15 +350,26 @@ export interface ExecutorContext {
   onNotice?: (msg: string) => void;
   /**
    * Arm a dispatch (dispatch_order tool). The REPL supplies this only when the
-   * instance is linked. It records the order for the confirm interlock and puts
-   * the TUI into the pending-confirm state; it MUST NOT launch anything. Returns
-   * a short human-readable confirmation of what was armed (or an error string if
-   * arming is impossible), which becomes the tool result the model sees.
+   * instance is linked. It records the order (and optional feature target) for
+   * the confirm interlock and puts the TUI into the pending-confirm state; it
+   * MUST NOT launch anything. Returns a short human-readable confirmation of what
+   * was armed (or an error string if arming is impossible), which becomes the
+   * tool result the model sees.
    */
   onArmDispatch?: (
     order: string,
+    feature?: string,
   ) => Promise<{ armed: true; summary: string } | { armed: false; reason: string }>;
+  /**
+   * The feature levers (feature_create/land/list/status/abandon). Supplied only
+   * when the instance is linked. Absent means the tools report dispatch is
+   * unavailable, exactly like onArmDispatch.
+   */
+  features?: FeatureManager;
 }
+
+const FEATURE_UNAVAILABLE =
+  "Feature tools are not available: this instance is not linked to a repo. Run `co link` first.";
 
 function ok(id: string, obj: unknown): ToolResult {
   return { tool_use_id: id, content: typeof obj === "string" ? obj : JSON.stringify(obj) };
@@ -411,7 +496,8 @@ export function makeExecutor(ctx: ExecutorContext) {
               "Dispatch is not available: this instance is not linked to a repo. Run `co link` first, or write the order as plain text for the captain to copy.",
             );
           }
-          const res = await ctx.onArmDispatch(order);
+          const feature = input.feature === undefined ? undefined : String(input.feature).trim() || undefined;
+          const res = await ctx.onArmDispatch(order, feature);
           if (!res.armed) return err(id, res.reason);
           // Armed, not run. The model must now stop and let the captain confirm;
           // it must NOT claim the order ran.
@@ -421,6 +507,44 @@ export function makeExecutor(ctx: ExecutorContext) {
               "Order armed and shown to the captain, awaiting a typed `confirm`. Do NOT say it has run. " +
               res.summary,
           });
+        }
+        case "feature_create": {
+          if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
+          const name = String(input.name ?? "").trim();
+          if (!name) return err(id, "feature_create requires a non-empty name.");
+          const intent = input.intent === undefined ? undefined : String(input.intent);
+          const res = await ctx.features.create(name, intent);
+          ctx.onNotice?.(
+            res.created ? `provisioned worktree for feature ${res.feature.slug}` : `feature ${res.feature.slug} already provisioned`,
+          );
+          return ok(id, res);
+        }
+        case "feature_land": {
+          if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
+          const name = String(input.name ?? "").trim();
+          if (!name) return err(id, "feature_land requires a non-empty name.");
+          const res = await ctx.features.land(name);
+          return ok(id, res);
+        }
+        case "feature_list": {
+          if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
+          return ok(id, { features: ctx.features.list() });
+        }
+        case "feature_status": {
+          if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
+          const name = String(input.name ?? "").trim();
+          if (!name) return err(id, "feature_status requires a non-empty name.");
+          const res = await ctx.features.status(name);
+          if (!res) return ok(id, { found: false, feature: name });
+          return ok(id, { found: true, ...res });
+        }
+        case "feature_abandon": {
+          if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
+          const name = String(input.name ?? "").trim();
+          if (!name) return err(id, "feature_abandon requires a non-empty name.");
+          const res = await ctx.features.abandon(name);
+          if (res.abandoned) ctx.onNotice?.(`abandoned feature ${name}`);
+          return ok(id, res);
         }
         default:
           return err(id, `Unknown tool: ${block.name}`);

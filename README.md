@@ -597,7 +597,7 @@ src/
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
   session/   session.ts prompt.ts tools.ts
              crewpanes.ts dispatchconfig.ts transport.ts registry.ts
-             worktrees.ts landing.ts landinggate.ts
+             worktrees.ts landing.ts landinggate.ts features.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
 ```
 
@@ -693,8 +693,24 @@ was shown; `r`/Esc dismisses with no merge, leaving the branch and worktree
 intact. A conflict or failed prepare opens the gate too, showing why the
 feature is not mergeable with `m` disabled, and a refused merge (a green gone
 stale under the open gate) surfaces its error in place without touching
-anything. The co's orchestration tools that trigger a review are the next
-slice; `main` stays human-only throughout.
+anything. `main` stays human-only throughout.
+
+`features.ts` is the co-facing lever layer: the small verb set the model
+calls to drive the harness end to end. `feature_create` provisions a feature's
+worktree off dev and registers it (idempotent, no confirm gate — it writes
+nothing to dev or main); a dispatch can target a feature so the crew runs in
+its worktree (provisioned on first use), and the arm banner names the target
+worktree or says plainly it targets the bare main tree. `feature_land` runs
+the landing prepare and opens the Ctrl-O gate — the gate is the confirmation,
+there is no separate prompt, and the merge fires only on `m` over a green.
+`feature_list`/`feature_status` read the registry; `feature_abandon` tears a
+clean worktree down but refuses one with uncommitted changes and never
+force-deletes an unmerged branch. At session start a non-destructive reconcile
+(`reconcileFeatures`) rebuilds feature records from the on-disk worktrees so a
+feature survives a restart, and surfaces anomalies (a branch with no worktree,
+a half-landed branch, a stray directory) for the co to relay rather than acting
+on them. The co's reach stops at `dev`: it never touches `main` and there is no
+promote path.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,

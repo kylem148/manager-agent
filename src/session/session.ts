@@ -37,6 +37,8 @@ import {
   type DispatchConfig,
 } from "./dispatchconfig.js";
 import { DispatchRegistry, readFileTail, type Job } from "./registry.js";
+import { FeatureManager } from "./features.js";
+import { defaultWorktreeBase, featureSlug } from "./worktrees.js";
 import { scrubCapture } from "./transport.js";
 import { findCrewTranscript, renderTranscriptForReview } from "./crewtranscript.js";
 
@@ -76,9 +78,13 @@ interface SessionState {
   dispatch: DispatchConfig | null;
   /** The job registry + capture watcher, created only when linked. */
   registry: DispatchRegistry | null;
+  /** The feature levers (create/land/list/status/abandon), created only when
+   *  linked. Drives the parallel-worktree flow over the registry + landing gate. */
+  features: FeatureManager | null;
   /** The order armed and awaiting a typed `confirm`, or null. Set by the arm
-   *  callback; consumed by the confirm interlock in the input loop. */
-  armed: { order: string } | null;
+   *  callback; consumed by the confirm interlock in the input loop. `feature`
+   *  scopes the dispatch to a feature's worktree (undefined = bare main tree). */
+  armed: { order: string; feature?: string } | null;
   /** Completed jobs waiting for a review turn, drained on the next idle prompt. */
   reviewQueue: Job[];
 }
@@ -249,6 +255,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     userTurns: 0,
     dispatch,
     registry: null,
+    features: null,
     armed: null,
     reviewQueue: [],
   };
@@ -282,9 +289,47 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
         );
       },
     });
+
+    // The feature levers drive the parallel-worktree flow over the registry.
+    // The landing gate needs the interactive overlay (openLandingReview), which
+    // only the Tui provides; on PlainIO (piped/non-TTY) feature_land reports it
+    // needs an interactive session rather than crashing.
+    state.features = new FeatureManager({
+      registry: state.registry,
+      repoPath: dispatch.repoPath,
+      ...(io instanceof Tui ? { gateHost: io } : {}),
+    });
   }
 
   io.start();
+
+  // Boot reconcile: rebuild feature records from the on-disk worktrees so a
+  // feature (1 feature → 1 worktree → 1 branch) survives a restart. Read-only
+  // over feature state — it rebuilds records and SURFACES anomalies (a branch
+  // with no worktree, a half-landed branch, a stray dir), destroying nothing.
+  // Best-effort: a repo that has never seen the flow, or a git hiccup, must not
+  // block the session opening.
+  if (state.features) {
+    try {
+      const report = await state.features.reconcileAtBoot();
+      if (report.records.length > 0) {
+        io.appendBlock(
+          c.dim(
+            `  · recovered ${report.records.length} feature worktree(s): ${report.records
+              .map((r) => r.slug)
+              .join(", ")}`,
+          ),
+        );
+      }
+      for (const a of report.anomalies) {
+        io.appendBlock(c.yellow(`  · feature anomaly (${a.kind}): ${a.detail}`));
+      }
+    } catch (e) {
+      io.appendBlock(
+        c.yellow(`  · could not reconcile feature worktrees at startup: ${(e as Error).message}`),
+      );
+    }
+  }
 
   // On a real terminal, open with a short spoken greeting: the co reads its
   // live state (already in the system prompt) and reports where we left off,
@@ -343,7 +388,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
           state.armed = null;
           io.setConfirmBanner(null);
           await appendTranscript(state.transcript, "you", raw);
-          await fireDispatch(state, armed.order, confirm.agent);
+          await fireDispatch(state, armed.order, confirm.agent, armed.feature);
           continue;
         }
         state.armed = null;
@@ -469,8 +514,12 @@ async function drive(
     },
     // Only wired when the instance is linked. Arming shows the confirm banner and
     // records the order; it never launches — the input loop's `confirm` branch is
-    // the only path that fires a dispatch.
-    ...(state.dispatch ? { onArmDispatch: (order: string) => armDispatch(state, order) } : {}),
+    // the only path that fires a dispatch. The feature levers ride the same link
+    // gate, so they are exposed together.
+    ...(state.dispatch
+      ? { onArmDispatch: (order: string, feature?: string) => armDispatch(state, order, feature) }
+      : {}),
+    ...(state.features ? { features: state.features } : {}),
   });
 
   // Streaming render state. "mode" tracks whether the open transcript line is
@@ -564,6 +613,7 @@ async function drive(
 async function armDispatch(
   state: SessionState,
   order: string,
+  feature?: string,
 ): Promise<{ armed: true; summary: string } | { armed: false; reason: string }> {
   // Read the config the NEXT dispatch will actually use, re-reading disk so a
   // mid-session `co link` is reflected. Without this the banner shows the config
@@ -579,7 +629,8 @@ async function armDispatch(
   if (config.agents.length === 0) {
     return { armed: false, reason: "No crew agent is registered. Re-run `co link` to set one." };
   }
-  state.armed = { order };
+  const target = feature && feature.trim() ? feature.trim() : undefined;
+  state.armed = { order, ...(target ? { feature: target } : {}) };
 
   const cmd = displayCommand(resolveAgentCommand(config), config.repoPath);
   // Dispatch is visible-only: a crew agent runs in a visible Ghostty pane or not
@@ -589,6 +640,10 @@ async function armDispatch(
   const transport = paneReady
     ? "visible Ghostty pane"
     : "no crew pane available — run `co pane` to designate one";
+  // Where the crew will run: a feature's isolated worktree (naming the path when
+  // it is already provisioned) or the bare main tree. This is the target line the
+  // captain confirms against — an invisible cwd is the surprise it forecloses.
+  const targetLine = describeTarget(state, target, config.repoPath);
   // Offer the named alternatives only when there's a real choice to make.
   const others = config.agents.map((a) => a.name).filter((n) => n !== config.defaultAgent);
   const overrideHint =
@@ -596,19 +651,52 @@ async function armDispatch(
   state.io.setConfirmBanner([
     c.yellow(c.bold("  ⚑ dispatch armed — type `confirm` to launch, anything else cancels")),
     c.dim(`  transport: ${transport}   agent: ${config.defaultAgent}   command: ${cmd}`),
+    c.dim(`  target: ${targetLine}`),
     ...(overrideHint ? [c.dim(overrideHint)] : []),
     c.dim(`  order: ${firstLineOf(order)}`),
   ]);
+  const targetSummary = target
+    ? ` It targets feature '${target}' (its isolated worktree${
+        state.features?.list().some((f) => f.feature === target || f.slug === target)
+          ? ""
+          : ", provisioned on first use"
+      }).`
+    : " It targets the bare main tree (no feature).";
   return {
     armed: true,
-    summary: paneReady
-      ? `It will run in a visible Ghostty pane as: ${cmd} (agent ${config.defaultAgent}).` +
-        (others.length > 0
-          ? ` The captain can type \`confirm <${others.join("|")}>\` to pick another.`
-          : "")
-      : `No crew pane is available, so a dispatch will fail cleanly until one is designated with \`co pane\`.` +
-        ` The intended command is: ${cmd} (agent ${config.defaultAgent}).`,
+    summary:
+      (paneReady
+        ? `It will run in a visible Ghostty pane as: ${cmd} (agent ${config.defaultAgent}).` +
+          (others.length > 0
+            ? ` The captain can type \`confirm <${others.join("|")}>\` to pick another.`
+            : "")
+        : `No crew pane is available, so a dispatch will fail cleanly until one is designated with \`co pane\`.` +
+          ` The intended command is: ${cmd} (agent ${config.defaultAgent}).`) + targetSummary,
   };
+}
+
+/** The human-readable dispatch target for the arm banner: a feature's worktree
+ *  path when known, the branch/first-use note when the feature isn't provisioned
+ *  yet, or the bare main tree. Deterministic and side-effect-free — it never
+ *  provisions anything (that happens at fire time). */
+function describeTarget(state: SessionState, feature: string | undefined, repoPath: string): string {
+  if (!feature) return `bare main tree (${repoPath})`;
+  const record = state.features?.list().find((f) => f.feature === feature || f.slug === feature);
+  if (record && record.provisionStatus === "ready") {
+    return `feature '${feature}' worktree: ${record.worktreePath}`;
+  }
+  const projected = path.join(defaultWorktreeBase(repoPath), safeFeatureSlug(feature));
+  return `feature '${feature}' worktree (provisioned on first use): ${projected}`;
+}
+
+/** Slug for display in the arm banner, tolerant of a degenerate name (the real
+ *  provision would reject it, but the banner must not throw before that). */
+function safeFeatureSlug(feature: string): string {
+  try {
+    return featureSlug(feature);
+  } catch {
+    return feature;
+  }
 }
 
 /**
@@ -618,24 +706,32 @@ async function armDispatch(
  * completion callback. A dispatch that can't place a pane comes back failed (no
  * background path); we surface that cleanly. Never throws into the loop.
  */
-async function fireDispatch(state: SessionState, order: string, agentName?: string): Promise<void> {
+async function fireDispatch(
+  state: SessionState,
+  order: string,
+  agentName?: string,
+  feature?: string,
+): Promise<void> {
   const { io, registry } = state;
   if (!registry) {
     io.appendBlock(c.yellow("  · dispatch unavailable (not linked)."));
     return;
   }
   try {
-    const job = await registry.dispatch(order, agentName);
+    const job = await registry.dispatch(order, agentName, feature ? { feature } : {});
     if (job.status === "failed") {
       io.appendBlock(c.red(`  · dispatch failed to launch: ${job.error ?? "unknown error"}`));
       return;
     }
     const agentNote = job.agentName ? ` [${job.agentName}]` : "";
+    const featureNote = job.feature ? ` in feature '${job.feature}'` : "";
     const where =
       job.status === "queued"
         ? "queued for a free crew pane"
         : `running in a Ghostty pane (${job.paneId ?? "?"})`;
-    io.appendBlock(c.green(`  · dispatched ${job.id}${agentNote}: ${where}. I'll review it when it finishes.`));
+    io.appendBlock(
+      c.green(`  · dispatched ${job.id}${agentNote}${featureNote}: ${where}. I'll review it when it finishes.`),
+    );
   } catch (e) {
     io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));
   }

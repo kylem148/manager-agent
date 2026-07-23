@@ -360,7 +360,47 @@ run with that repo as its working directory.
   offer, do not assume.
 - On completion you are handed the run's captured output automatically and asked
   to review it. The captain pastes nothing. Review per the report-review
-  protocol and separate what is verified from what is merely claimed.`;
+  protocol and separate what is verified from what is merely claimed.
+
+### Features (parallel worktrees)
+
+A dispatch can run against the bare repo (the default) or inside an isolated
+feature worktree. A feature is one unit of parallel work: one feature maps to one
+worktree on its own \`co/feat-<slug>\` branch, cut from the \`dev\` integration
+branch, so several features progress side by side and none touches \`main\`. Your
+reach stops at \`dev\`; you never write \`main\` and there is no promote path.
+
+- \`feature_create(name, intent)\` — provision a feature's worktree. Runs directly,
+  no confirm gate: it only cuts the feature's own branch and checkout, writing
+  nothing to \`dev\` or \`main\`. Idempotent. Do this before (or as) you dispatch
+  work you want isolated.
+- Dispatch into a feature by passing its name as \`dispatch_order\`'s \`feature\`
+  argument. The crew then runs inside that worktree (provisioned on first use if
+  you skipped feature_create). The arm banner shows the target worktree path, or
+  says plainly it targets the bare main tree. A feature runs one crew agent at a
+  time; a second dispatch while one is live is refused.
+- \`feature_land(name)\` — when a feature is done, land it onto \`dev\`. This rebases
+  its branch onto the current \`dev\` tip, runs the project build+test on that
+  combined state, and opens the Ctrl-O review gate showing the diff and result.
+  The gate IS the confirmation: the merge fires only if the captain presses [m]
+  over a green result. A conflict or a red build+test is shown but not mergeable.
+  On a merge the worktree and branch are torn down. There is no separate confirm
+  step and no way to merge without that keystroke, so never claim a feature
+  landed just because you called feature_land.
+- \`feature_list\` / \`feature_status(name)\` — read the feature registry: branch,
+  worktree path, provision status, whether a crew agent is active, dirty state,
+  and the jobs dispatched under each. Use these to see what is in flight.
+- \`feature_abandon(name)\` — drop a feature WITHOUT landing: tears down its
+  worktree and deletes the branch only if it is fully merged. It refuses a
+  worktree with uncommitted changes (it reports instead of forcing) and keeps a
+  committed-but-unmerged branch rather than lose work. If it refuses, tell the
+  captain what is uncommitted and let them decide.
+- Use a feature when work should stay isolated (a risky change, parallel tracks,
+  anything you will want to review and land as a unit). Use a bare dispatch for a
+  quick one-off directly on the tree. Feature state is rebuilt from disk at
+  startup, so a feature survives a restart; if startup surfaces an anomaly (a
+  branch with no worktree, a half-landed branch), relay it rather than acting
+  blindly.`;
 }
 
 export async function buildSystemPrompt(

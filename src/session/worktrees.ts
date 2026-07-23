@@ -498,6 +498,148 @@ export async function reconcileWorktrees(
   return report;
 }
 
+// --- boot reconcile (non-destructive) ----------------------------------------
+
+/** What a boot reconcile could not cleanly account for. Every anomaly is
+ *  SURFACED for a human/the co to resolve; reconcileFeatures never acts on one. */
+export type FeatureAnomalyKind =
+  /** A `co/feat-*` branch with no worktree that is NOT merged into dev: it holds
+   *  unmerged work but its checkout is gone (a crashed run, a manually-removed
+   *  worktree). Re-provision or investigate before the work is lost. */
+  | "branch-without-worktree"
+  /** A `co/feat-*` branch with no worktree that IS fully contained in dev: a
+   *  landing merged it but teardown never deleted the branch, or it never
+   *  diverged. No unmerged work; safe to tear down. */
+  | "half-landed"
+  /** A directory under the managed base that git does not list as a worktree:
+   *  an orphaned checkout (registration lost) or something foreign. Never ours
+   *  to delete blindly, so it is reported for a human to judge. */
+  | "stray-directory";
+
+export interface FeatureAnomaly {
+  kind: FeatureAnomalyKind;
+  /** The branch name or directory path the anomaly concerns. */
+  ref: string;
+  /** A one-line human-readable account of what was found and what it implies. */
+  detail: string;
+}
+
+export interface FeatureReconcileReport {
+  /** Feature records rebuilt from the on-disk `co/feat-*` worktrees, keyed by
+   *  slug (the original human name is not recoverable from a branch, so
+   *  `feature` is set to the slug). Ready to seed the in-memory registry. */
+  records: FeatureRecord[];
+  /** Everything that could not be turned into a clean record. Surfaced, never
+   *  destroyed. */
+  anomalies: FeatureAnomaly[];
+}
+
+/**
+ * Boot reconcile: rebuild the in-memory feature picture from what is actually on
+ * disk, so a feature (1 feature → 1 worktree → 1 branch) survives a session
+ * restart. This is the READ counterpart to reconcileWorktrees' crash-cleanup
+ * sweep, and it is deliberately NON-DESTRUCTIVE: it prunes only git's own stale
+ * metadata (directories already gone), never removes a branch, worktree, or
+ * directory, and reports anything it can't cleanly account for as an anomaly for
+ * a human to resolve.
+ *
+ * Why not reuse reconcileWorktrees at boot: that sweep removes every clean
+ * `co/feat-*` worktree not in its `keep` list. At boot the in-memory feature map
+ * is empty, so it would tear down every in-progress feature — the exact opposite
+ * of surviving a restart.
+ *
+ *  - Every registered `co/feat-*` worktree whose directory exists becomes a
+ *    ready record.
+ *  - A `co/feat-*` branch with no worktree is an anomaly: `half-landed` when it
+ *    is fully contained in dev (a landing that didn't finish tearing down, or a
+ *    never-diverged branch — no unmerged work), else `branch-without-worktree`
+ *    (unmerged work whose checkout is gone).
+ *  - A directory under the managed base that git doesn't list as a worktree is a
+ *    `stray-directory` anomaly (an orphaned checkout or something foreign).
+ */
+export async function reconcileFeatures(opts: WorktreeOptions): Promise<FeatureReconcileReport> {
+  const r = resolveWorktreeOptions(opts);
+  const records: FeatureRecord[] = [];
+  const anomalies: FeatureAnomaly[] = [];
+
+  // Clear metadata for worktrees whose directory is already gone. This is the
+  // only mutation reconcileFeatures makes, and it touches nothing real — it just
+  // stops a deleted dir from masquerading as a live worktree below.
+  await git(r.repoPath, ["worktree", "prune"]);
+
+  const worktrees = await listWorktrees(r.repoPath);
+  const devExists = await branchExists(r.repoPath, r.devBranch);
+
+  // Pass 1: registered feature worktrees → a ready record each.
+  const attached = new Set<string>();
+  const registeredPaths = new Set<string>();
+  for (const entry of worktrees) {
+    registeredPaths.add(realpathOr(entry.path));
+    const branch = entry.branch?.startsWith("refs/heads/") ? entry.branch.slice("refs/heads/".length) : null;
+    if (!branch || !branch.startsWith(FEATURE_BRANCH_PREFIX)) continue;
+    attached.add(branch);
+    if (!fs.existsSync(entry.path)) continue; // pruned above; defensive
+    const slug = branch.slice(FEATURE_BRANCH_PREFIX.length);
+    records.push({
+      feature: slug,
+      slug,
+      branch,
+      worktreePath: entry.path,
+      provisionStatus: "ready",
+    });
+  }
+
+  // Pass 2: feature branches with no worktree.
+  const refsOut = await git(r.repoPath, [
+    "for-each-ref",
+    "--format=%(refname:short)",
+    `refs/heads/${FEATURE_BRANCH_PREFIX}*`,
+  ]);
+  for (const branch of refsOut.split("\n").map((l) => l.trim()).filter(Boolean)) {
+    if (attached.has(branch)) continue;
+    const merged = devExists && (await isMergedInto(r.repoPath, branch, r.devBranch));
+    if (merged) {
+      anomalies.push({
+        kind: "half-landed",
+        ref: branch,
+        detail:
+          `branch '${branch}' is fully contained in '${r.devBranch}' but has no worktree — ` +
+          `a landing left it behind (or it never diverged). No unmerged work; safe to tear down.`,
+      });
+    } else {
+      anomalies.push({
+        kind: "branch-without-worktree",
+        ref: branch,
+        detail: devExists
+          ? `branch '${branch}' has commits not in '${r.devBranch}' but its worktree is gone — ` +
+            `unmerged work whose checkout was lost. Re-provision or investigate before dropping it.`
+          : `branch '${branch}' exists with no worktree and there is no '${r.devBranch}' to compare against.`,
+      });
+    }
+  }
+
+  // Pass 3: directories under the managed base git doesn't list as worktrees.
+  if (fs.existsSync(r.baseDir)) {
+    for (const name of await fsp.readdir(r.baseDir)) {
+      const dir = path.join(r.baseDir, name);
+      if (registeredPaths.has(realpathOr(dir))) continue;
+      const st = await fsp.lstat(dir).catch(() => null);
+      if (!st?.isDirectory()) continue;
+      const ours = await isOrphanedFeatureWorktree(dir, r.repoPath);
+      anomalies.push({
+        kind: "stray-directory",
+        ref: dir,
+        detail: ours
+          ? `${dir} looks like an orphaned worktree of this repo (its registration was lost). ` +
+            `Left in place; a human should confirm before removing it.`
+          : `${dir} sits in the worktree base but git does not track it as a worktree. Left untouched.`,
+      });
+    }
+  }
+
+  return { records, anomalies };
+}
+
 /** Whether a directory is one of OUR orphaned worktrees: its `.git` file (a
  *  linked worktree has a file, not a dir) names a gitdir under this repo's
  *  .git/worktrees/. This is the guard before reconcile rm -rf's anything the
