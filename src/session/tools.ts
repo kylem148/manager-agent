@@ -292,7 +292,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "feature_enqueue",
       description:
-        "Mark a feature done and add it to the serial merge queue. This is how a finished feature gets in line to land on `dev`. There is NO confirm gate on enqueue — call it as soon as the captain says a feature is done. Features land ONE AT A TIME in queue order: only the head is processed (rebased onto the current `dev` tip and build+tested on that combined state), and only the head can merge. When the enqueued feature becomes the head it is processed immediately, so the result tells you whether the head is `ready` (green, press the merge gate via feature_merge_head), `blocked` (rebase conflict or red build+test — it holds the queue until resolved or removed), or still `queued`. Re-calling feature_enqueue on a blocked head retries it after a fix. Idempotent: enqueuing an already-queued feature keeps its position.",
+        "Mark a feature done and add it to the serial merge queue. This is how a finished feature gets in line to land on `dev`. There is NO confirm gate on enqueue — call it as soon as the captain says a feature is done. Features land ONE AT A TIME in queue order: only the head is processed (rebased onto the current `dev` tip and build+tested on that combined state), and only the head can merge. When the enqueued feature becomes the head it is processed immediately, so the result tells you whether the head is `ready` (green, press the merge gate via feature_merge_head), `blocked` (a rebase conflict OR a red build+test — the result's `blockedKind` says which; it holds the queue until resolved or removed), `resolving` (a fresh crew agent is fixing it in its worktree), or still `queued`. On a blocked head you can dispatch a fresh resolver agent with feature_resolve_head, re-call feature_enqueue to retry after a manual fix, or feature_abandon it. Idempotent: enqueuing an already-queued feature keeps its position.",
       input_schema: {
         type: "object",
         properties: {
@@ -309,15 +309,21 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
       input_schema: { type: "object", properties: {}, additionalProperties: false },
     });
     tools.push({
+      name: "feature_resolve_head",
+      description:
+        "Dispatch a FRESH crew agent to unblock the current merge-queue HEAD when it is `blocked` by a rebase conflict or a red build+test. The agent runs in the FEATURE'S OWN isolated worktree, on its `co/feat-<slug>` branch (never `dev`): it rebases onto the current `dev` tip, resolves the conflict, makes the combined build+test pass, and commits — it does NOT merge. Like every dispatch this is CONFIRM-GATED: it ARMS the resolver order (shown to the captain with the target worktree) and fires only when the captain types `confirm`; it launches nothing on its own. While the agent works, the head is `resolving`; when it finishes the head is automatically re-processed (rebase + build+test) and becomes `ready` if green or `blocked` again if not. Bounded to a few attempts per head; after the limit the head stays blocked for the captain to resolve by hand or abandon. Use this on a blocked head instead of resolving conflicts yourself.",
+      input_schema: { type: "object", properties: {}, additionalProperties: false },
+    });
+    tools.push({
       name: "feature_list",
       description:
-        "List every tracked feature: its branch, worktree path, provision status, whether a crew agent is currently working it, its dispatched jobs, and — for enqueued features — its merge-queue position and head state (queued / head-processing / ready / blocked). Also returns the full merge queue in landing order. Use to see what is in flight across the parallel-worktree flow.",
+        "List every tracked feature: its branch, worktree path, provision status, whether a crew agent is currently working it, its dispatched jobs, and — for enqueued features — its merge-queue position and head state (queued / head-processing / ready / blocked / resolving). Also returns the full merge queue in landing order. Use to see what is in flight across the parallel-worktree flow.",
       input_schema: { type: "object", properties: {}, additionalProperties: false },
     });
     tools.push({
       name: "feature_status",
       description:
-        "Show one feature's full picture: branch, worktree path, provision status, whether its worktree has uncommitted changes, whether a crew agent is active, its jobs, and — if it is enqueued — its merge-queue position and head state (queued / head-processing / ready / blocked). Returns not-found if nothing is tracked under that name or slug.",
+        "Show one feature's full picture: branch, worktree path, provision status, whether its worktree has uncommitted changes, whether a crew agent is active, its jobs, and — if it is enqueued — its merge-queue position and head state (queued / head-processing / ready / blocked / resolving), including whether a block is a conflict or a red build+test. Returns not-found if nothing is tracked under that name or slug.",
       input_schema: {
         type: "object",
         properties: {
@@ -385,6 +391,15 @@ export interface ExecutorContext {
    * unavailable, exactly like onArmDispatch.
    */
   features?: FeatureManager;
+  /**
+   * Arm a fresh-agent resolver dispatch for the blocked merge-queue head
+   * (feature_resolve_head tool). Like onArmDispatch it ARMS a confirm-gated,
+   * feature-scoped dispatch and launches nothing; the REPL supplies it only when
+   * linked. Returns a short confirmation of what was armed, or a refusal (no
+   * resolvable head, retry bound spent). Marking the head "resolving" happens at
+   * fire time, not here, so a cancelled arm burns no attempt.
+   */
+  onArmResolve?: () => Promise<{ armed: true; summary: string } | { armed: false; reason: string }>;
 }
 
 const FEATURE_UNAVAILABLE =
@@ -558,6 +573,25 @@ export function makeExecutor(ctx: ExecutorContext) {
           const res = await ctx.features.mergeHead();
           if (res.merged) ctx.onNotice?.(`merged ${res.feature} onto ${res.target}`);
           return ok(id, res);
+        }
+        case "feature_resolve_head": {
+          if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
+          if (!ctx.onArmResolve) {
+            return err(
+              id,
+              "Resolving the head needs the confirm-gated dispatch path, which is unavailable in this session (not linked, or non-interactive).",
+            );
+          }
+          const res = await ctx.onArmResolve();
+          if (!res.armed) return err(id, res.reason);
+          // Armed, not run. Same interlock as dispatch_order: the model must stop
+          // and let the captain confirm; it must NOT claim the resolver ran.
+          return ok(id, {
+            armed: true,
+            note:
+              "Resolver armed and shown to the captain, awaiting a typed `confirm`. Do NOT say it has run. " +
+              res.summary,
+          });
         }
         case "feature_list": {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);

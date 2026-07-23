@@ -325,10 +325,14 @@ test("end to end: [r] then [m] on a real Tui drive the real engine", async () =>
     await commitIn(rec.worktreePath, "e.txt", "e2e work\n", "job: e2e work");
     const opts = { repoPath: repo, baseDir: base, buildTestCommand: "true" };
 
-    // First pass: reject. The gate shows the real diff; r merges nothing.
+    // First pass: reject. Registering the review flashes a hint (no auto-pop);
+    // Ctrl-O opens the panel onto the review, which shows the real diff; r merges
+    // nothing.
     const rejected = reviewLanding(h.tui, opts, "e2e");
-    await until(() => h.lastFramePlain().includes("landing · e2e"));
-    assert.match(h.lastFramePlain(), /\+e2e work/, "the gate shows the real diff");
+    await until(() => h.lastFramePlain().includes("press Ctrl-O"));
+    h.send("\x0f");
+    await until(() => h.lastFramePlain().includes("review · e2e"));
+    assert.match(h.lastFramePlain(), /\+e2e work/, "the panel shows the real diff");
     const devBefore = sha(repo, "dev");
     h.send("r");
     assert.equal((await rejected).outcome, "rejected");
@@ -337,7 +341,9 @@ test("end to end: [r] then [m] on a real Tui drive the real engine", async () =>
 
     // Second pass: the m keystroke is the merge.
     const approved = reviewLanding(h.tui, opts, "e2e");
-    await until(() => h.lastFramePlain().includes("landing · e2e"));
+    await until(() => h.lastFramePlain().includes("press Ctrl-O"));
+    h.send("\x0f");
+    await until(() => h.lastFramePlain().includes("review · e2e"));
     h.send("m");
     const res = await approved;
     assert.equal(res.outcome, "merged");
