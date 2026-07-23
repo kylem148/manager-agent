@@ -142,6 +142,39 @@ test("installCrewStopHook merges into an existing settings.json without losing c
   }
 });
 
+test("stopHookScriptPath resolves into dist/ even when running from src (tsx dev)", async () => {
+  // This test itself runs under tsx from src/, so it exercises the dev-run case
+  // directly: the resolved command must point at the BUILT hook under dist/,
+  // never at a src/session/crewstophook.js that does not exist. Without the
+  // dist anchoring, a dev-linked session would write that dead command into the
+  // user's real settings.json.
+  const { stopHookScriptPath } = await import("./crewhook.js");
+  const p = stopHookScriptPath();
+  assert.ok(
+    p.endsWith(path.join("dist", "session", "crewstophook.js")),
+    `must resolve the built hook under dist/, got: ${p}`,
+  );
+  assert.ok(!p.includes(`${path.sep}src${path.sep}`), `must not point into src/, got: ${p}`);
+});
+
+test("installCrewStopHook skips non-Claude agents without touching any config", async () => {
+  const home = await fsp.mkdtemp(path.join(os.tmpdir(), "co-crewhook-"));
+  try {
+    const res = await installCrewStopHook({
+      agentCommand: "opencode run {prompt}",
+      scriptPath: SCRIPT,
+      nodePath: NODE,
+      home,
+    });
+    assert.equal(res.changed, false, "nothing installed for a non-Claude crew");
+    assert.equal(res.error, undefined, "a skip is not an error");
+    // No ~/.claude (or anything else) was created under the home.
+    assert.deepEqual(await fsp.readdir(home), [], "no config dir was created");
+  } finally {
+    await fsp.rm(home, { recursive: true, force: true });
+  }
+});
+
 test("installCrewStopHook refuses to overwrite an unparseable settings.json", async () => {
   const home = await fsp.mkdtemp(path.join(os.tmpdir(), "co-crewhook-"));
   try {

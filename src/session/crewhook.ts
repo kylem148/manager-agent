@@ -98,10 +98,23 @@ export function mergeStopHook(settings: Settings, command: string): { settings: 
   return { settings: next, changed: true };
 }
 
-/** Resolve the absolute path of the built Stop-hook script (dist sibling of this
- *  module). Overridable for tests that don't run from dist. */
+/** Resolve the absolute path of the BUILT Stop-hook script, anchored through the
+ *  package root: <root>/dist/session/crewstophook.js. From the installed build
+ *  (dist/session/) that is this module's own sibling; from a `tsx` dev run
+ *  (src/session/) it still lands on the dist build — resolving a sibling there
+ *  would register src/session/crewstophook.js, a file that never exists, and
+ *  write that dead command into the user's real settings.json. The hook command
+ *  must be a plain `node <file.js>`, so only dist can serve it. Overridable for
+ *  tests via installCrewStopHook's scriptPath. */
 export function stopHookScriptPath(): string {
-  return path.join(path.dirname(fileURLToPath(import.meta.url)), "crewstophook.js");
+  return path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "dist",
+    "session",
+    "crewstophook.js",
+  );
 }
 
 export interface InstallResult {
@@ -133,6 +146,14 @@ export async function installCrewStopHook(args: {
   nodePath?: string;
   home?: string;
 }): Promise<InstallResult> {
+  // Only a Claude Code launch can fire a Claude Code Stop hook. For any other
+  // crew (opencode etc.) there is no config dir to teach — claudeConfigDir
+  // would default to ~/.claude and we'd be editing the config of a tool this
+  // dispatch never runs. Skip quietly, without an error: those agents simply
+  // keep the exit-time sentinel as their completion signal.
+  if (!/\bclaude\b/.test(args.agentCommand)) {
+    return { configDir: "", changed: false };
+  }
   const configDir = claudeConfigDir(args.agentCommand, args.home);
   const settingsFile = path.join(configDir, "settings.json");
   const command = stopHookCommand(args.nodePath ?? process.execPath, args.scriptPath ?? stopHookScriptPath());
