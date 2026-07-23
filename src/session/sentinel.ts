@@ -23,9 +23,9 @@ export function sentinelLine(exitCode: number): string {
 
 /** Parse a completion sentinel out of captured text. Returns the exit code, or
  *  null if the run hasn't signalled completion yet. Scans from the END, so when
- *  more than one sentinel is present (the hook's early one plus a transport's
- *  exit-time one, as happens on the background fallback) the last — the real
- *  process exit code — wins. */
+ *  more than one sentinel is present (the Stop hook's early one on first finish
+ *  plus the job script's exit-time one when the crew process finally exits) the
+ *  last — the real process exit code — wins. */
 export function parseSentinel(captured: string): { exitCode: number } | null {
   const idx = captured.lastIndexOf(SENTINEL_PREFIX);
   if (idx === -1) return null;

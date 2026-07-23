@@ -444,35 +444,41 @@ reused or the job queues. The split direction sequence and the cap are config
 values you can retune. Requires Ghostty 1.3+ and a one-time macOS Automation
 permission (granted the first time it scripts Ghostty).
 
-**Everywhere else** (no Ghostty, or automation unavailable), the same dispatch
-runs as a detached background process instead, with no pane geometry. The
-co-manager tells you which transport it used.
+**Dispatch is visible-only.** A crew agent runs in a visible Ghostty pane or it
+does not run at all — there is deliberately no background/headless path. If a
+pane can't be placed (Ghostty isn't reachable, or no crew pane has been
+designated with `co pane`, or the designated pane was closed), the dispatch
+fails cleanly with an actionable message and launches nothing; it never runs an
+agent somewhere you can't see. This is a safety property, not a limitation: an
+invisible agent is one you can re-dispatch by accident, and two agents racing on
+the same checkout corrupt the tree. The arming banner tells you up front whether
+a pane is ready, so you know before you confirm. Requires macOS + Ghostty 1.3+.
 
-Either way, when a job finishes the co-manager gathers that run's record and
-reports a review on its own — you never paste anything back, and every job
-reports independently (a later job finishing while an earlier one still runs
-delivers its own review). The session stays fully interactive the whole time,
-including with several jobs running at once; a failed or timed-out job never
-takes the session down. This layer is macOS + Ghostty only for the visible
-pane; the background fallback is portable.
+When a job finishes the co-manager gathers that run's record and reports a
+review on its own — you never paste anything back, and every job reports
+independently (a later job finishing while an earlier one still runs delivers
+its own review). The session stays fully interactive the whole time, including
+with several jobs running at once; a failed or timed-out job never takes the
+session down.
 
-On the pane path, the job — the `cd` into the repo, the agent command, the
-(possibly multi-line) order text, completion bookkeeping — is written to a
-**per-job script file** under `.dispatch/captures/` (named with the job id plus
-a per-session tag, so jobs from different sessions never collide), and the pane
-only ever receives a launch of that file. A fresh split is created already
-running it (Ghostty's surface `command`), so nothing is typed into a new pane
-at all; the script ends by exec'ing a login shell, so that freshly-split pane
-stays open and reusable instead of closing when the job exits. Taking over or
-reusing an existing pane pastes a single short `/bin/sh '<script>'` line
-instead. The order itself never travels through the keystroke stream, so
-newlines and quotes in an order can't be re-interpreted by whatever the pane is
-doing. If the pane doesn't start the job within about four seconds (something
-else — an editor, another agent — owns it), the dispatch degrades to the
-background transport with a note in the capture saying why. The co-manager's
-own `PATH` is baked into the script, because a command-launched Ghostty surface
-otherwise inherits only the bare GUI `PATH` and wouldn't find a user-installed
-agent binary.
+The job — the `cd` into the repo, the agent command, the (possibly multi-line)
+order text, completion bookkeeping — is written to a **per-job script file**
+under `.dispatch/captures/` (named with the job id plus a per-session tag plus a
+per-dispatch random nonce, so jobs from different sessions never collide and even
+the same order re-run back-to-back never shares a capture file or completion
+marker), and the pane only ever receives a launch of that file. A fresh split is
+created already running it (Ghostty's surface `command`), so nothing is typed
+into a new pane at all; the script ends by exec'ing a login shell, so that
+freshly-split pane stays open and reusable instead of closing when the job
+exits. Taking over or reusing an existing pane pastes a single short
+`/bin/sh '<script>'` line instead. The order itself never travels through the
+keystroke stream, so newlines and quotes in an order can't be re-interpreted by
+whatever the pane is doing. If the pane doesn't start the job within about four
+seconds (something else — an editor, another agent — owns it), the dispatch
+fails cleanly and launches nothing rather than running the agent somewhere you
+can't see. The co-manager's own `PATH` is baked into the script, because a
+command-launched Ghostty surface otherwise inherits only the bare GUI `PATH` and
+wouldn't find a user-installed agent binary.
 
 Inside the script the agent runs attached **directly to the pane's terminal** —
 no recorder, no pipe, nothing interposed — so a dispatched pane behaves exactly
@@ -488,16 +494,11 @@ order is the session's first prompt — so concurrent jobs in the same repo each
 resolve their own record. Either way the co reviews message text and tool calls
 instead of terminal escape soup. If no transcript can be read (a non-Claude
 agent, say), the review falls back to the hook's captured last message, then to
-the capture file, and says plainly when a run left no recording. The background
-fallback still records real output to the capture (agents run in their
-non-interactive print mode there), sets the repo as the working directory, and
-skips the `cd` when the repo doesn't exist yet so a not-yet-created repo
-degrades to the inherited directory instead of a hard failure.
+the capture file, and says plainly when a run left no recording.
 
-Both transports share one completion contract, so a run reports the same way
-whether it lands in a pane or the background. A bad repo path fails the `cd`
-loudly and gets captured instead of silently running the agent somewhere else.
-An interactive pane hands back no clean exit code, so completion is detected by
+A bad repo path fails the `cd` loudly and gets captured instead of silently
+running the agent somewhere else. An interactive pane hands back no clean exit
+code, so completion is detected by
 a sentinel rather than by waiting on a process: a `__CO_DISPATCH_DONE__ <code>`
 line is appended to the capture file, and the watcher tails each capture for
 that marker (a nonzero code marks the job failed, zero marks it done). If the
@@ -641,11 +642,14 @@ per-instance `.dispatch/config.json`, resolves which named crew agent a dispatch
 uses (default or `confirm <name>` override), and resolves that agent's command
 into a runnable shell command line (git-style: the template runs verbatim, only
 the substituted `{prompt}`/`{repo}` values are shell-quoted). `transport.ts` has
-the two launchers — a Ghostty/AppleScript visible-pane path that consumes the
-planner, and a detached-subprocess fallback — both sharing one capture-file +
-completion-sentinel contract. `registry.ts` owns in-flight jobs: it launches on
-the chosen transport, polls captures for the sentinel, enforces timeouts, drains
-the pane queue, and fires a completion callback, all non-blocking.
+the one launcher — a Ghostty/AppleScript visible-pane path that consumes the
+planner and delivers each job as a per-job script file, with a capture-file +
+completion-sentinel contract. There is no background/headless launcher by
+design: a pane that can't be placed raises a `PaneUnavailableError` and the
+dispatch fails cleanly. `registry.ts` owns in-flight jobs: it launches into a
+pane, polls captures for the sentinel, enforces timeouts, drains the pane queue,
+mints a unique capture key per dispatch, and fires a completion callback, all
+non-blocking.
 
 `worktrees.ts` is the git-worktree lifecycle harness for the
 parallel-dispatch feature: ensure a `dev` integration branch exists (created

@@ -120,15 +120,16 @@ export function runStopHook(args: {
   }
 
   // Append the sentinel to the SAME capture file the registry polls. Appending
-  // (not truncating) preserves whatever the transport already wrote — the pane
-  // script pre-creates an empty capture; the background fallback tees real
-  // output there — and the registry's parseSentinel finds this marker on its
-  // next poll. exit 0: a Stop fire is always a clean finish.
+  // (not truncating) preserves whatever the pane job script already wrote (it
+  // pre-creates an empty capture as its launch probe) and the registry's
+  // parseSentinel finds this marker on its next poll. exit 0: a Stop fire is
+  // always a clean finish.
   try {
     fs.appendFileSync(captureLogFile(captureDir, job), sentinelLine(0) + "\n");
   } catch {
-    // The capture may not exist yet on some transports; the sidecar is written,
-    // so the registry can still resolve the job from it. Never throw.
+    // The capture may not exist yet (a hook that fires before the script created
+    // it); the sidecar is written, so the registry can still resolve the job from
+    // it. Never throw.
   }
   return { fired: true };
 }

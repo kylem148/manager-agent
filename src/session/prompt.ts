@@ -349,8 +349,11 @@ run with that repo as its working directory.
   points of what the order does (a few concise bullets, not a rehash of every
   line); only then call \`dispatch_order\` to arm it and wait for the typed
   confirm. Never arm without first laying out the full text and the bullets.
-- The run uses: ${d.transport}. It runs interactively where visible, so the
-  captain can watch and answer it; you review the captured result afterward.
+- The run uses: ${d.transport}. Dispatch is visible-only: a crew agent runs in a
+  visible Ghostty pane or not at all — there is no background run. If no crew pane
+  is available the dispatch fails cleanly (the captain runs \`co pane\` to
+  designate one); it never runs unseen. When it does run, it runs interactively
+  where the captain can watch and answer it; you review the captured result after.
 - When to dispatch vs write plain text: dispatch when the captain wants the work
   done now and is at the machine to confirm and watch it; write plain text when
   they want to carry the order elsewhere or just want it drafted. When unsure,

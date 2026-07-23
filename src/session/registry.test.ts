@@ -17,10 +17,21 @@ import { setGhosttyAvailableForTest, setOsaRunnerForTest } from "./transport.js"
 import { DispatchRegistry, type Job, type RegistryOptions } from "./registry.js";
 
 /**
- * Tests for the job registry + capture watcher. The fallback path runs a real
- * fake echo agent so completion detection via the sentinel is exercised for
- * real; the Ghostty path uses a stubbed osascript so cap/queue/reuse can be
- * driven without a GUI. A fast poll interval keeps the suite quick.
+ * Tests for the job registry + capture watcher. Dispatch is VISIBLE-ONLY: a crew
+ * agent runs in a visible Ghostty pane or the dispatch fails cleanly — there is
+ * no background/headless path. So every launch here drives the Ghostty transport
+ * through a stubbed osascript (setOsaRunnerForTest) that plays the launched
+ * script's first act (creating the capture file, the launch probe) so cap /
+ * queue / reuse can be exercised without a GUI. Completion is simulated the way a
+ * real crew signals it: the completion sentinel is appended to the capture and
+ * the per-job launch script is removed (buildJobScript's self-delete on exit).
+ *
+ * On the pane path the capture file is a launch-probe + sentinel CHANNEL, not a
+ * recording of the agent's stdout (the crew runs attached directly to the pane
+ * tty). So these tests assert on the sentinel, on job state, on the Stop-hook
+ * sidecar, and on the generated job SCRIPT — not on captured agent output. The
+ * end-to-end "the script really runs a fake agent and writes the sentinel" proof
+ * lives in transport.test.ts.
  *
  * Every registry is created through withRegistry(), which ALWAYS stop()s it in a
  * finally — the poller is intentionally not unref'd (a real session should stay
@@ -89,70 +100,105 @@ function onCompleteQueue(): { handler: (j: Job) => void; take: () => Promise<Job
 /**
  * Play the launched job's first act for a stubbed pane launch. The transport
  * probes for the capture file the job script creates the moment it starts (that
- * is how a busy pane is detected), so a stub that only returns a pane id would
- * look like a launch that went nowhere and degrade to background. The script
- * path rides inside the AppleScript as `/bin/sh '<capture>.sh'`.
+ * is how a busy pane is detected), so a stub that only returned a pane id would
+ * look like a launch that went nowhere and fail with a PaneUnavailableError. The
+ * script path rides inside the AppleScript as `/bin/sh '<capture>.sh'`.
  */
 async function touchCaptureFromScript(script: string): Promise<void> {
   const m = script.match(/\/bin\/sh '([^']+)\.sh'/);
   if (m) await fsp.writeFile(m[1]!, "", "utf8");
 }
 
-test("fallback dispatch runs a fake agent and fires a done review with the capture", async () => {
+/**
+ * Install a stubbed Ghostty transport for a test: available, and an osascript
+ * runner that plays the launch probe and hands back a pane id (a fresh `pane-N`
+ * for a split, the anchor id for a takeover). Returns a teardown to call in the
+ * finally.
+ */
+function stubGhostty(): () => void {
+  let split = 0;
+  setGhosttyAvailableForTest(true);
+  setOsaRunnerForTest(async (s) => {
+    await touchCaptureFromScript(s);
+    return s.includes("split ") ? `pane-${++split}` : "anchor-1";
+  });
+  return () => {
+    setGhosttyAvailableForTest(null);
+    setOsaRunnerForTest(null);
+  };
+}
+
+/**
+ * Simulate a pane job's crew PROCESS finishing exactly as buildJobScript does:
+ * append the completion sentinel to the capture AND remove the launch script (the
+ * self-delete that signals the process is gone and the pane is reusable). Then
+ * run one manual poll so the registry finalizes it. `exitCode` defaults to a
+ * clean 0.
+ */
+async function completeJob(reg: DispatchRegistry, job: Job, exitCode = 0): Promise<void> {
+  await fsp.writeFile(job.captureFile, `done\n__CO_DISPATCH_DONE__ ${exitCode}\n`, "utf8");
+  await fsp.rm(`${job.captureFile}.sh`, { force: true });
+  await (reg as unknown as { tick: () => Promise<void> }).tick();
+}
+
+/** The per-dispatch nonce is the last dash-segment of the capture basename
+ *  (<captures>/job-NNN-<runTag>-<nonce>.log). Extracted to prove two dispatches
+ *  never share a capture key. */
+function captureNonce(captureFile: string): string {
+  return path.basename(captureFile).replace(/\.log$/, "").split("-").pop()!;
+}
+
+test("a pane dispatch runs on the visible Ghostty path and fires a done review on completion", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
-    config.agents = [{ name: "fake", command: `sh -c 'echo HELLO-FROM-AGENT'` }];
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    config.agents = [{ name: "fake", command: `sh -c 'echo HELLO'` }];
     config.defaultAgent = "fake";
     const done = onCompleteOnce();
     await withRegistry(
-      { paths, config, onComplete: done.handler, transportOverride: "fallback", pollIntervalMs: 25 },
+      { paths, config, onComplete: done.handler, skipAnchorCheck: true, pollIntervalMs: 10_000 },
       async (reg) => {
         const job = await reg.dispatch("do it");
-        assert.equal(job.transport, "fallback");
+        assert.equal(job.transport, "ghostty");
         assert.equal(job.status, "running");
+        assert.equal(job.paneId, "anchor-1");
 
+        await completeJob(reg, job, 0);
         const finished = await done.promise;
         assert.equal(finished.status, "done");
         assert.equal(finished.exitCode, 0);
-        const captured = await fsp.readFile(finished.captureFile, "utf8");
-        assert.ok(captured.includes("HELLO-FROM-AGENT"));
       },
     );
   } finally {
+    teardown();
     await cleanup();
   }
 });
 
 test("the crew Stop hook is installed once per distinct agent, best-effort", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
     config.agents = [
       { name: "cc", command: `sh -c 'echo A'` },
       { name: "ccw", command: `sh -c 'echo B'` },
     ];
     config.defaultAgent = "cc";
+    config.pane = { directionSequence: ["right", "down"], cap: 4 };
     const installed: string[] = [];
-    let done = 0;
-    let installFinished!: () => void;
-    // Three real detached children run here; resolve once all three have written
-    // their completion sentinel so cleanup() can't rm -rf the captures dir out
-    // from under a child still writing to it (an ENOTEMPTY flake).
-    const allDone = new Promise<void>((resolve) => {
-      installFinished = (): void => {
-        if (++done === 3) resolve();
-      };
-    });
     await withRegistry(
       {
         paths,
         config,
-        onComplete: () => installFinished(),
-        transportOverride: "fallback",
-        pollIntervalMs: 25,
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
         installHook: async (agentCommand) => {
           installed.push(agentCommand);
           return { configDir: "/fake", changed: true };
@@ -167,19 +213,21 @@ test("the crew Stop hook is installed once per distinct agent, best-effort", asy
           [`sh -c 'echo A'`, `sh -c 'echo B'`],
           "installed once per distinct resolved command, not once per dispatch",
         );
-        await allDone; // let every detached child finish before cleanup
       },
     );
   } finally {
+    teardown();
     await cleanup();
   }
 });
 
 test("a hook install failure is surfaced via onHookIssue but never fails the dispatch", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
     config.agents = [{ name: "fake", command: `sh -c 'echo HELLO'` }];
     config.defaultAgent = "fake";
     const issues: string[] = [];
@@ -189,14 +237,15 @@ test("a hook install failure is surfaced via onHookIssue but never fails the dis
         paths,
         config,
         onComplete: done.handler,
-        transportOverride: "fallback",
-        pollIntervalMs: 25,
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
         onHookIssue: (m) => issues.push(m),
         installHook: async () => ({ configDir: "/fake", changed: false, error: "settings.json is not valid JSON" }),
       },
       async (reg) => {
         const job = await reg.dispatch("do it");
         assert.notEqual(job.status, "failed", "a hook install problem does not fail the dispatch");
+        await completeJob(reg, job, 0);
         const finished = await done.promise;
         assert.equal(finished.status, "done", "the run still completes");
         assert.equal(issues.length, 1, "the install issue is reported once");
@@ -204,23 +253,23 @@ test("a hook install failure is surfaced via onHookIssue but never fails the dis
       },
     );
   } finally {
+    teardown();
     await cleanup();
   }
 });
 
 test("the Stop hook's sidecar is read into the job's transcript path and last message", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
-    // A slightly slow agent so the sidecar is reliably in place before the run's
-    // own sentinel is polled — this stands in for the Stop hook having written
-    // the sidecar on first finish, while completion is detected as normal.
-    config.agents = [{ name: "fake", command: `sh -c 'sleep 0.3; echo done'` }];
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    config.agents = [{ name: "fake", command: `sh -c 'echo done'` }];
     config.defaultAgent = "fake";
     const done = onCompleteOnce();
     await withRegistry(
-      { paths, config, onComplete: done.handler, transportOverride: "fallback", pollIntervalMs: 25 },
+      { paths, config, onComplete: done.handler, skipAnchorCheck: true, pollIntervalMs: 10_000 },
       async (reg) => {
         const job = await reg.dispatch("do it");
         // Drop the hook's sidecar next to the capture, mirroring crewstophook.ts.
@@ -236,6 +285,7 @@ test("the Stop hook's sidecar is read into the job's transcript path and last me
           }),
         );
 
+        await completeJob(reg, job, 0);
         const finished = await done.promise;
         assert.equal(finished.status, "done");
         assert.equal(finished.transcriptPath, "/home/x/.claude/projects/-repo/sess-1.jsonl");
@@ -243,72 +293,83 @@ test("the Stop hook's sidecar is read into the job's transcript path and last me
       },
     );
   } finally {
+    teardown();
     await cleanup();
   }
 });
 
 test("a nonzero agent exit is reported as a failed job", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
     config.agents = [{ name: "fake", command: `sh -c 'echo nope; exit 7'` }];
     config.defaultAgent = "fake";
     const done = onCompleteOnce();
     await withRegistry(
-      { paths, config, onComplete: done.handler, transportOverride: "fallback", pollIntervalMs: 25 },
+      { paths, config, onComplete: done.handler, skipAnchorCheck: true, pollIntervalMs: 10_000 },
       async (reg) => {
-        await reg.dispatch("x");
+        const job = await reg.dispatch("x");
+        await completeJob(reg, job, 7);
         const finished = await done.promise;
         assert.equal(finished.status, "failed");
         assert.equal(finished.exitCode, 7);
       },
     );
   } finally {
+    teardown();
     await cleanup();
   }
 });
 
 test("a confirm-time agent override selects that agent's command for the run", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
-    // Two agents that print distinct markers; default is cc, we override to ccw.
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    // Two agents with distinct commands; default is cc, we override to ccw. On the
+    // pane path the chosen command is baked into the generated job script, so we
+    // read that to prove the override selected the right command.
     config.agents = [
       { name: "cc", command: `sh -c 'echo RAN-CC'` },
       { name: "ccw", command: `sh -c 'echo RAN-CCW'` },
     ];
     config.defaultAgent = "cc";
-    const done = onCompleteOnce();
     await withRegistry(
-      { paths, config, onComplete: done.handler, transportOverride: "fallback", pollIntervalMs: 25 },
+      { paths, config, onComplete: () => {}, skipAnchorCheck: true, pollIntervalMs: 10_000 },
       async (reg) => {
         const job = await reg.dispatch("do it", "ccw");
         assert.equal(job.agentName, "ccw", "the override is recorded on the job");
-        const finished = await done.promise;
-        const captured = await fsp.readFile(finished.captureFile, "utf8");
-        assert.ok(captured.includes("RAN-CCW"), "the overridden agent ran");
-        assert.ok(!captured.includes("RAN-CC\n"), "the default agent did not run");
+        const script = await fsp.readFile(`${job.captureFile}.sh`, "utf8");
+        assert.ok(script.includes("RAN-CCW"), "the overridden agent's command is in the job script");
+        assert.ok(!script.includes("RAN-CC'"), "the default agent's command is not");
       },
     );
   } finally {
+    teardown();
     await cleanup();
   }
 });
 
-test("a hung agent is killed and failed when it exceeds the wall-clock timeout", async () => {
+test("a hung agent is failed when it exceeds the wall-clock timeout", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
     config.agents = [{ name: "fake", command: `sh -c 'sleep 30'` }];
     config.defaultAgent = "fake";
     config.caps = { timeoutSec: 1 };
     const done = onCompleteOnce();
     await withRegistry(
-      { paths, config, onComplete: done.handler, transportOverride: "fallback", pollIntervalMs: 50 },
+      { paths, config, onComplete: done.handler, skipAnchorCheck: true, pollIntervalMs: 50 },
       async (reg) => {
+        // Launch, then never write a sentinel: the poller times it out after 1s.
         await reg.dispatch("hang");
         const finished = await done.promise;
         assert.equal(finished.status, "failed");
@@ -316,30 +377,24 @@ test("a hung agent is killed and failed when it exceeds the wall-clock timeout",
       },
     );
   } finally {
+    teardown();
     await cleanup();
   }
 });
 
 test("Ghostty path takes over the anchor then splits the newest pane", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config: DispatchConfig = defaultDispatchConfig();
     config.repoPath = paths.root;
     config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
-
-    let split = 0;
-    setGhosttyAvailableForTest(true);
-    setOsaRunnerForTest(async (s) => {
-      await touchCaptureFromScript(s);
-      return s.includes("split ") ? `pane-${++split}` : "anchor-1";
-    });
 
     await withRegistry(
       {
         paths,
         config,
         onComplete: () => {},
-        transportOverride: "ghostty",
         skipAnchorCheck: true,
         pollIntervalMs: 10_000, // don't let the fake "agent" ever complete here
       },
@@ -353,33 +408,25 @@ test("Ghostty path takes over the anchor then splits the newest pane", async () 
       },
     );
   } finally {
-    setGhosttyAvailableForTest(null);
-    setOsaRunnerForTest(null);
+    teardown();
     await cleanup();
   }
 });
 
 test("at the pane cap the next job queues, then reuses a freed pane on completion", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config: DispatchConfig = defaultDispatchConfig();
     config.repoPath = paths.root;
     config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
     config.pane = { directionSequence: ["right", "down"], cap: 2 };
 
-    let split = 0;
-    setGhosttyAvailableForTest(true);
-    setOsaRunnerForTest(async (s) => {
-      await touchCaptureFromScript(s);
-      return s.includes("split ") ? `pane-${++split}` : "anchor-1";
-    });
-
     await withRegistry(
       {
         paths,
         config,
         onComplete: () => {},
-        transportOverride: "ghostty",
         skipAnchorCheck: true,
         pollIntervalMs: 10_000,
       },
@@ -409,8 +456,7 @@ test("at the pane cap the next job queues, then reuses a freed pane on completio
       },
     );
   } finally {
-    setGhosttyAvailableForTest(null);
-    setOsaRunnerForTest(null);
+    teardown();
     await cleanup();
   }
 });
@@ -420,20 +466,15 @@ test("a hook-completed pane is NOT reused while its agent is still live, but is 
   // still interactive in its pane. Releasing that pane for reuse then would paste
   // a launch line into a running agent. The registry must fire the review but hold
   // the pane until the crew PROCESS exits — signalled by buildJobScript removing
-  // its own launch script (<capture>.sh). This proves both halves.
+  // its own launch script (<capture>.sh). This proves both halves — and that a
+  // LIVE pane is never reused.
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config: DispatchConfig = defaultDispatchConfig();
     config.repoPath = paths.root;
     config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
     config.pane = { directionSequence: ["right", "down"], cap: 2 };
-
-    let split = 0;
-    setGhosttyAvailableForTest(true);
-    setOsaRunnerForTest(async (s) => {
-      await touchCaptureFromScript(s);
-      return s.includes("split ") ? `pane-${++split}` : "anchor-1";
-    });
 
     const completed: string[] = [];
     await withRegistry(
@@ -441,7 +482,6 @@ test("a hook-completed pane is NOT reused while its agent is still live, but is 
         paths,
         config,
         onComplete: (j) => completed.push(j.id),
-        transportOverride: "ghostty",
         skipAnchorCheck: true,
         pollIntervalMs: 10_000,
       },
@@ -474,42 +514,86 @@ test("a hook-completed pane is NOT reused while its agent is still live, but is 
       },
     );
   } finally {
+    teardown();
+    await cleanup();
+  }
+});
+
+test("without a designated anchor a dispatch fails cleanly and launches nothing", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = null; // never ran `co pane`
+    config.agents = [{ name: "fake", command: `sh -c 'echo HELLO'` }];
+    config.defaultAgent = "fake";
+    setGhosttyAvailableForTest(true);
+    // If the transport were ever reached it would blow up the test; a clean
+    // no-pane failure must never touch osascript.
+    setOsaRunnerForTest(async () => {
+      throw new Error("osascript must not be called when no pane is available");
+    });
+    const done = onCompleteOnce();
+    await withRegistry(
+      { paths, config, onComplete: done.handler, pollIntervalMs: 10_000 },
+      async (reg) => {
+        assert.equal(reg.paneReady, false, "no anchor means no pane is ready");
+        const job = await reg.dispatch("do it");
+        assert.equal(job.status, "failed", "the dispatch fails; there is no background path");
+        assert.match(job.error ?? "", /couldn't open a crew pane/);
+        assert.match(job.error ?? "", /co pane/, "the message names the fix");
+        assert.equal(job.paneId, undefined, "nothing was placed");
+        const notified = await done.promise;
+        assert.equal(notified.id, job.id, "the failure notifies like any launch failure");
+
+        // Launched NOTHING: no job script and no capture file were written.
+        const entries = await fsp.readdir(paths.captures);
+        assert.deepEqual(entries, [], `no partial job left behind, saw: ${entries.join(", ")}`);
+      },
+    );
+  } finally {
     setGhosttyAvailableForTest(null);
     setOsaRunnerForTest(null);
     await cleanup();
   }
 });
 
-test("activeTransport degrades to fallback on Ghostty without a designated anchor", async () => {
+test("when Ghostty is unreachable a dispatch fails cleanly with an actionable message", async () => {
   const { paths, cleanup } = await tmpInstance();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
-    config.anchor = null; // never ran `co pane`
-    setGhosttyAvailableForTest(true);
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") }; // anchor set, but no Ghostty
+    config.agents = [{ name: "fake", command: `sh -c 'echo HELLO'` }];
+    config.defaultAgent = "fake";
+    const done = onCompleteOnce();
     await withRegistry(
-      { paths, config, onComplete: () => {}, transportOverride: "ghostty", pollIntervalMs: 10_000 },
+      { paths, config, onComplete: done.handler, ghosttyAvailable: false, pollIntervalMs: 10_000 },
       async (reg) => {
-        assert.equal(reg.activeTransport, "fallback");
+        assert.equal(reg.paneReady, false, "no Ghostty means no pane is ready");
+        const job = await reg.dispatch("do it");
+        assert.equal(job.status, "failed");
+        assert.match(job.error ?? "", /couldn't open a crew pane/);
+        assert.match(job.error ?? "", /Ghostty isn't reachable/, "the message names why");
+        const notified = await done.promise;
+        assert.equal(notified.id, job.id);
+        const entries = await fsp.readdir(paths.captures);
+        assert.deepEqual(entries, [], "nothing launched");
       },
     );
   } finally {
-    setGhosttyAvailableForTest(null);
     await cleanup();
   }
 });
 
-test("a stale/unresolvable pane id runs in the background with a populated capture, not a failure", async () => {
+test("a stale/unresolvable pane id fails the dispatch cleanly, launches nothing, and drops the anchor", async () => {
   const { paths, cleanup } = await tmpInstance();
   try {
     const config: DispatchConfig = defaultDispatchConfig();
     config.repoPath = paths.root;
     config.anchor = { id: "ghostty-uuid", title: crewPaneTitle("inst") };
-    // A fake crew agent that prints and exits nonzero, so we prove the real exit
-    // code survives the degrade to background.
-    config.agents = [{ name: "fake", command: `sh -c 'echo CREW-RAN; exit 4'` }];
+    config.agents = [{ name: "fake", command: `sh -c 'echo CREW-RAN'` }];
     config.defaultAgent = "fake";
-    // The config must be on disk too: dispatch re-reads it before launching.
     await writeDispatchConfig(paths, config);
 
     setGhosttyAvailableForTest(true);
@@ -525,30 +609,63 @@ test("a stale/unresolvable pane id runs in the background with a populated captu
         paths,
         config,
         onComplete: done.handler,
-        transportOverride: "ghostty",
         skipAnchorCheck: true, // exercise the LAUNCH-time failure, not the exists probe
-        pollIntervalMs: 25,
+        pollIntervalMs: 10_000,
         onAnchorLost: () => anchorLost++,
       },
       async (reg) => {
         const job = await reg.dispatch("do it");
-        // No thrown error, and the job did not fail to launch: it degraded.
-        assert.notEqual(job.status, "failed", "a stale pane must not fail the dispatch");
-        assert.equal(job.transport, "fallback", "degraded to the background transport");
+        assert.equal(job.status, "failed", "a stale pane fails the dispatch; there is no background path");
+        assert.match(job.error ?? "", /couldn't open a crew pane/);
         assert.equal(anchorLost, 1, "the dead anchor was reported lost");
 
-        const finished = await done.promise;
-        assert.equal(finished.status, "failed", "exit 4 is a failed run");
-        assert.equal(finished.exitCode, 4, "the crew's real exit code is reported, not tee's 0");
-        const captured = await fsp.readFile(finished.captureFile, "utf8");
-        assert.ok(captured.length > 0, "the capture is not empty");
-        assert.match(captured, /unavailable; ran in the background/, "records why it fell back");
-        assert.ok(captured.includes("CREW-RAN"), "the crew still ran and its output was captured");
+        const notified = await done.promise;
+        assert.equal(notified.id, job.id, "it notifies like any launch failure");
+
+        // The transport removes the job script it wrote when the launch fails, so
+        // no partial job is left behind.
+        assert.ok(!fs.existsSync(`${job.captureFile}.sh`), "the job script was cleaned up");
+        assert.ok(!fs.existsSync(job.captureFile), "no capture file was left behind");
+
+        // paneReady is now false: the anchor was dropped for the session.
+        assert.equal(reg.paneReady, false, "the dropped anchor leaves no pane ready");
       },
     );
   } finally {
     setGhosttyAvailableForTest(null);
     setOsaRunnerForTest(null);
+    await cleanup();
+  }
+});
+
+test("each dispatch mints a unique capture key, even for the same order re-run back-to-back", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
+  try {
+    const config: DispatchConfig = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    config.agents = [{ name: "fake", command: `sh -c 'echo HELLO'` }];
+    config.defaultAgent = "fake";
+    await withRegistry(
+      { paths, config, onComplete: () => {}, skipAnchorCheck: true, pollIntervalMs: 10_000 },
+      async (reg) => {
+        // The exact same order text, dispatched twice in a row.
+        const j1 = await reg.dispatch("do the thing");
+        const j2 = await reg.dispatch("do the thing");
+        assert.notEqual(j1.id, j2.id, "distinct job ids");
+        assert.notEqual(j1.captureFile, j2.captureFile, "distinct capture files");
+        assert.notEqual(
+          captureNonce(j1.captureFile),
+          captureNonce(j2.captureFile),
+          "the per-dispatch nonce differs, so no two dispatches share a capture/identity key",
+        );
+        // The nonce is real randomness (8 hex chars), not the job id or run tag.
+        assert.match(captureNonce(j1.captureFile), /^[0-9a-f]{8}$/);
+      },
+    );
+  } finally {
+    teardown();
     await cleanup();
   }
 });
@@ -574,7 +691,6 @@ test("dispatch reads the pane id fresh from config, so `co pane` takes effect wi
         paths,
         config,
         onComplete: () => {},
-        transportOverride: "ghostty",
         skipAnchorCheck: true,
         pollIntervalMs: 10_000, // don't let the fake job complete
       },
@@ -599,11 +715,11 @@ test("dispatch reads the pane id fresh from config, so `co pane` takes effect wi
   }
 });
 
-test("currentConfig re-reads disk on the fallback path so a mid-session re-link takes effect", async () => {
+test("currentConfig re-reads disk so a mid-session re-link takes effect", async () => {
   // The arming banner reads currentConfig(); before this it read a config
   // snapshotted at session start, so a `co link` that fixed a broken crew
-  // command still showed (and, off Ghostty, ran) the old one. This proves the
-  // disk re-read now happens on the fallback transport too, not just Ghostty.
+  // command still showed the old one. This proves the disk re-read happens
+  // regardless of whether a pane is available.
   const { paths, cleanup } = await tmpInstance();
   try {
     const config = defaultDispatchConfig();
@@ -613,7 +729,7 @@ test("currentConfig re-reads disk on the fallback path so a mid-session re-link 
     await writeDispatchConfig(paths, config);
 
     await withRegistry(
-      { paths, config, onComplete: () => {}, transportOverride: "fallback", pollIntervalMs: 10_000 },
+      { paths, config, onComplete: () => {}, ghosttyAvailable: false, pollIntervalMs: 10_000 },
       async (reg) => {
         // A `co link` in another process rewrites the config with the resolved command.
         const fixed = {
@@ -641,7 +757,7 @@ test("feature records are additive bookkeeping that never touches the job flow",
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
     await withRegistry(
-      { paths, config, onComplete: () => {}, transportOverride: "fallback", pollIntervalMs: 10_000 },
+      { paths, config, onComplete: () => {}, ghosttyAvailable: false, pollIntervalMs: 10_000 },
       async (reg) => {
         assert.deepEqual(reg.listFeatures(), []);
         const record = {
@@ -669,9 +785,12 @@ test("feature records are additive bookkeeping that never touches the job flow",
 
 test("a feature-scoped dispatch provisions once, runs in the worktree, and links jobs to the feature", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    config.pane = { directionSequence: ["right", "down"], cap: 4 };
     config.agents = [{ name: "fake", command: `sh -c 'pwd'` }];
     config.defaultAgent = "fake";
     const worktree = path.join(paths.root, "wt", "auth");
@@ -683,8 +802,8 @@ test("a feature-scoped dispatch provisions once, runs in the worktree, and links
         paths,
         config,
         onComplete: queue.handler,
-        transportOverride: "fallback",
-        pollIntervalMs: 25,
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
         provisionWorktree: async (opts, feature) => {
           provisions++;
           assert.equal(opts.repoPath, config.repoPath, "provision targets the linked repo");
@@ -701,19 +820,19 @@ test("a feature-scoped dispatch provisions once, runs in the worktree, and links
         const j1 = await reg.dispatch("one", undefined, { feature: "auth" });
         assert.equal(j1.feature, "auth", "the job records its feature");
         assert.equal(j1.cwd, worktree, "the job records the worktree cwd");
+        // On the pane path the worktree cwd is baked into the job script.
+        const script1 = await fsp.readFile(`${j1.captureFile}.sh`, "utf8");
+        assert.ok(script1.includes(`cd '${worktree}' ||`), "the job script cd's into the feature worktree");
+        await completeJob(reg, j1, 0);
         const f1 = await queue.take();
         assert.equal(f1.status, "done");
-        const realWt = await fsp.realpath(worktree);
-        const printed = (await fsp.readFile(f1.captureFile, "utf8")).split("\n").map((l) => l.trim());
-        assert.ok(
-          printed.includes(realWt) || printed.includes(worktree),
-          `the crew process ran inside the worktree, got:\n${printed.join("\n")}`,
-        );
 
         // The second dispatch to the same feature reuses the provisioned
-        // worktree: no re-provision, same cwd.
+        // worktree: no re-provision, same cwd. (The first job has completed and
+        // released its pane, so the feature is free for the second dispatch.)
         const j2 = await reg.dispatch("two", undefined, { feature: "auth" });
         assert.equal(j2.cwd, worktree, "the second dispatch lands in the same worktree");
+        await completeJob(reg, j2, 0);
         const f2 = await queue.take();
         assert.equal(f2.status, "done");
         assert.equal(provisions, 1, "provision ran once; the second dispatch reused the record");
@@ -726,12 +845,14 @@ test("a feature-scoped dispatch provisions once, runs in the worktree, and links
       },
     );
   } finally {
+    teardown();
     await cleanup();
   }
 });
 
 test("a feature dispatch on the pane path cd's the job script into the worktree; the plain path is untouched", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config: DispatchConfig = defaultDispatchConfig();
     config.repoPath = paths.root;
@@ -739,19 +860,11 @@ test("a feature dispatch on the pane path cd's the job script into the worktree;
     const worktree = path.join(paths.root, "wt", "auth");
     await fsp.mkdir(worktree, { recursive: true });
 
-    let split = 0;
-    setGhosttyAvailableForTest(true);
-    setOsaRunnerForTest(async (s) => {
-      await touchCaptureFromScript(s);
-      return s.includes("split ") ? `pane-${++split}` : "anchor-1";
-    });
-
     await withRegistry(
       {
         paths,
         config,
         onComplete: () => {},
-        transportOverride: "ghostty",
         skipAnchorCheck: true,
         pollIntervalMs: 10_000, // never let the fake jobs complete
         provisionWorktree: async (_opts, feature) => ({
@@ -785,25 +898,26 @@ test("a feature dispatch on the pane path cd's the job script into the worktree;
       },
     );
   } finally {
-    setGhosttyAvailableForTest(null);
-    setOsaRunnerForTest(null);
+    teardown();
     await cleanup();
   }
 });
 
 test("a provisioning failure fails the job cleanly and records the failed feature status", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
     const done = onCompleteOnce();
     await withRegistry(
       {
         paths,
         config,
         onComplete: done.handler,
-        transportOverride: "fallback",
-        pollIntervalMs: 25,
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
         provisionWorktree: async () => {
           throw new Error("branch 'co/feat-auth' already exists without a worktree; run reconcile or teardown first");
         },
@@ -819,15 +933,18 @@ test("a provisioning failure fails the job cleanly and records the failed featur
       },
     );
   } finally {
+    teardown();
     await cleanup();
   }
 });
 
 test("a plain dispatch never touches the provisioning path", async () => {
   const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
   try {
     const config = defaultDispatchConfig();
     config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
     config.agents = [{ name: "fake", command: `sh -c 'echo PLAIN'` }];
     config.defaultAgent = "fake";
     let provisions = 0;
@@ -837,8 +954,8 @@ test("a plain dispatch never touches the provisioning path", async () => {
         paths,
         config,
         onComplete: done.handler,
-        transportOverride: "fallback",
-        pollIntervalMs: 25,
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
         provisionWorktree: async (_opts, feature) => {
           provisions++;
           return { feature, slug: feature, branch: "x", worktreePath: "/x", provisionStatus: "ready" };
@@ -848,12 +965,14 @@ test("a plain dispatch never touches the provisioning path", async () => {
         const job = await reg.dispatch("just do it");
         assert.equal(job.feature, undefined);
         assert.equal(job.cwd, undefined);
+        await completeJob(reg, job, 0);
         const finished = await done.promise;
         assert.equal(finished.status, "done");
         assert.equal(provisions, 0, "no provisioning happens for a plain dispatch");
       },
     );
   } finally {
+    teardown();
     await cleanup();
   }
 });
@@ -868,13 +987,15 @@ function runGit(cwd: string, args: string[]): string {
 }
 
 test("feature dispatch end-to-end: real provision, crew cwd = worktree on co/feat-*, reuse on the second dispatch", async () => {
-  // The whole provision → dispatch-isolated → capture loop against a real git
-  // repo: the registry provisions through worktrees.ts for real, the (fake)
-  // crew process reports its own cwd and branch, and the capture, written to
-  // the instance's absolute captures dir from inside the worktree, carries the
-  // completion sentinel as usual. The tmp root is realpath'd so macOS's
+  // The whole provision → dispatch-isolated loop against a real git repo: the
+  // registry provisions through worktrees.ts for real, and the (stubbed) pane
+  // launch bakes the worktree as the crew's cwd into the job script. We verify
+  // isolation from git's own view (a real worktree on the feature branch) and
+  // from the generated job script's cd, since on the pane path the crew's stdout
+  // goes to the pane tty, not the capture. The tmp root is realpath'd so macOS's
   // /var → /private/var spelling can't fool the path assertions.
   const root = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "co-registry-feat-")));
+  const teardown = stubGhostty();
   try {
     const repo = path.join(root, "repo");
     await fsp.mkdir(repo);
@@ -890,29 +1011,34 @@ test("feature dispatch end-to-end: real provision, crew cwd = worktree on co/fea
     await fsp.mkdir(paths.captures, { recursive: true });
     const config = defaultDispatchConfig();
     config.repoPath = repo;
-    // The fake crew reports where it ran and on which branch: the two facts
-    // that prove worktree isolation.
-    config.agents = [{ name: "fake", command: `sh -c 'pwd; git rev-parse --abbrev-ref HEAD'` }];
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    config.pane = { directionSequence: ["right", "down"], cap: 4 };
+    config.agents = [{ name: "fake", command: `sh -c 'true'` }];
     config.defaultAgent = "fake";
 
     const queue = onCompleteQueue();
     await withRegistry(
-      { paths, config, onComplete: queue.handler, transportOverride: "fallback", pollIntervalMs: 25 },
+      { paths, config, onComplete: queue.handler, skipAnchorCheck: true, pollIntervalMs: 10_000 },
       async (reg) => {
         const worktree = path.join(defaultWorktreeBase(repo), "auth");
         const j1 = await reg.dispatch("one", undefined, { feature: "auth" });
         assert.equal(j1.cwd, worktree, "the crew cwd is the provisioned worktree in the sibling base dir");
-        const f1 = await queue.take();
-        assert.equal(f1.status, "done", "the run completed via the sentinel, from inside the worktree");
-        const printed = (await fsp.readFile(f1.captureFile, "utf8")).split("\n").map((l) => l.trim());
-        assert.ok(printed.includes(worktree), `the crew ran inside the worktree, got:\n${printed.join("\n")}`);
-        assert.ok(printed.includes("co/feat-auth"), "on the feature branch, never main or dev");
+        // The real worktree exists, checked out on the feature branch (never main).
+        const branchAtWorktree = runGit(worktree, ["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert.equal(branchAtWorktree, "co/feat-auth", "the worktree is on the feature branch");
+        // The generated job script cd's the crew into that worktree.
+        const script1 = await fsp.readFile(`${j1.captureFile}.sh`, "utf8");
+        assert.ok(script1.includes(`cd '${worktree}' ||`), "the crew is launched inside the worktree");
         assert.equal(reg.getFeature("auth")?.provisionStatus, "ready");
+        await completeJob(reg, j1, 0);
+        const f1 = await queue.take();
+        assert.equal(f1.status, "done");
 
         // Second dispatch to the same feature: same worktree, nothing recreated.
         const worktreesBefore = runGit(repo, ["worktree", "list", "--porcelain"]);
         const j2 = await reg.dispatch("two", undefined, { feature: "auth" });
         assert.equal(j2.cwd, worktree, "the second dispatch reuses the same worktree");
+        await completeJob(reg, j2, 0);
         const f2 = await queue.take();
         assert.equal(f2.status, "done");
         assert.equal(
@@ -927,6 +1053,7 @@ test("feature dispatch end-to-end: real provision, crew cwd = worktree on co/fea
       },
     );
   } finally {
+    teardown();
     await fsp.rm(root, { recursive: true, force: true });
   }
 });

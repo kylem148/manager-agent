@@ -221,8 +221,8 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
       ? {
           repoPath: dispatch.repoPath,
           transport: dispatch.anchor
-            ? "visible pane (Ghostty) with background fallback"
-            : "background (no crew pane designated yet)",
+            ? "visible Ghostty pane"
+            : "none yet — no crew pane designated (`co pane`); a dispatch fails cleanly until one is",
           agents: dispatch.agents.map((a) => a.name),
           defaultAgent: dispatch.defaultAgent,
         }
@@ -582,8 +582,13 @@ async function armDispatch(
   state.armed = { order };
 
   const cmd = displayCommand(resolveAgentCommand(config), config.repoPath);
-  const transport =
-    state.registry?.activeTransport === "ghostty" ? "visible Ghostty pane" : "background run";
+  // Dispatch is visible-only: a crew agent runs in a visible Ghostty pane or not
+  // at all. When no pane can be placed the banner says so up front so the captain
+  // isn't surprised by a clean failure at fire time.
+  const paneReady = state.registry?.paneReady ?? false;
+  const transport = paneReady
+    ? "visible Ghostty pane"
+    : "no crew pane available — run `co pane` to designate one";
   // Offer the named alternatives only when there's a real choice to make.
   const others = config.agents.map((a) => a.name).filter((n) => n !== config.defaultAgent);
   const overrideHint =
@@ -596,17 +601,22 @@ async function armDispatch(
   ]);
   return {
     armed: true,
-    summary:
-      `It will run via ${transport} as: ${cmd} (agent ${config.defaultAgent}).` +
-      (others.length > 0 ? ` The captain can type \`confirm <${others.join("|")}>\` to pick another.` : ""),
+    summary: paneReady
+      ? `It will run in a visible Ghostty pane as: ${cmd} (agent ${config.defaultAgent}).` +
+        (others.length > 0
+          ? ` The captain can type \`confirm <${others.join("|")}>\` to pick another.`
+          : "")
+      : `No crew pane is available, so a dispatch will fail cleanly until one is designated with \`co pane\`.` +
+        ` The intended command is: ${cmd} (agent ${config.defaultAgent}).`,
   };
 }
 
 /**
  * Fire a confirmed dispatch: hand the order to the registry, which launches it
- * on the chosen transport and watches for completion. Non-blocking — we report
- * which transport was used and return immediately; the review lands later via the
- * completion callback. Never throws into the loop.
+ * into a visible Ghostty pane and watches for completion. Non-blocking — we
+ * report where it landed and return immediately; the review lands later via the
+ * completion callback. A dispatch that can't place a pane comes back failed (no
+ * background path); we surface that cleanly. Never throws into the loop.
  */
 async function fireDispatch(state: SessionState, order: string, agentName?: string): Promise<void> {
   const { io, registry } = state;
@@ -622,11 +632,9 @@ async function fireDispatch(state: SessionState, order: string, agentName?: stri
     }
     const agentNote = job.agentName ? ` [${job.agentName}]` : "";
     const where =
-      job.transport === "ghostty"
-        ? job.status === "queued"
-          ? "queued for a free crew pane"
-          : `running in a Ghostty pane (${job.paneId ?? "?"})`
-        : "running in the background";
+      job.status === "queued"
+        ? "queued for a free crew pane"
+        : `running in a Ghostty pane (${job.paneId ?? "?"})`;
     io.appendBlock(c.green(`  · dispatched ${job.id}${agentNote}: ${where}. I'll review it when it finishes.`));
   } catch (e) {
     io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));

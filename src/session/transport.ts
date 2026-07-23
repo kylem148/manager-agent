@@ -13,19 +13,22 @@ import { SENTINEL_PREFIX, sentinelLine, parseSentinel } from "./sentinel.js";
 export { SENTINEL_PREFIX, sentinelLine, parseSentinel };
 
 /**
- * Two transports for launching a coding agent, chosen automatically:
+ * The ONE transport for launching a coding agent: a visible Ghostty pane.
  *
- *  - GHOSTTY (macOS only): open a visible split pane in the user's current tab
- *    via AppleScript and launch the agent interactively there so the user can
- *    watch and answer it. Pane placement is delegated wholesale to crewpanes.ts
- *    (plan/commit); this module only turns a PlacementDecision into `osascript`
- *    calls.
- *  - FALLBACK (everywhere else): a detached background subprocess with output
- *    redirected to the same capture file. No geometry, no GUI.
+ * A crew agent runs in a visible split pane in the user's current tab (opened
+ * via AppleScript) or it does not run at all. There is deliberately NO
+ * background/headless path: an agent the operator can't see is an agent they
+ * can re-dispatch by accident, and two agents racing on the same checkout
+ * corrupt the tree. When a visible pane can't be opened the dispatch fails with
+ * an actionable error and launches nothing (see PaneUnavailableError and the
+ * registry's failure path); it never silently runs somewhere invisible.
  *
- * Both write a per-job capture file and both append a COMPLETION SENTINEL line
- * once the agent exits, because an interactive pane gives us no clean exit code
- * to observe — the watcher (registry.ts) tails the file for that marker.
+ * Pane placement is delegated wholesale to crewpanes.ts (plan/commit); this
+ * module only turns a PlacementDecision into `osascript` calls.
+ *
+ * The pane writes a per-job capture file and appends a COMPLETION SENTINEL line,
+ * because an interactive pane gives us no clean exit code to observe — the
+ * watcher (registry.ts) tails the file for that marker.
  *
  * HOW A PANE JOB IS DELIVERED (and why): the full job — cd, crew command with
  * the order text, capture, sentinel — is written to a per-job SCRIPT FILE, and
@@ -40,8 +43,8 @@ export { SENTINEL_PREFIX, sentinelLine, parseSentinel };
  *    whatever owns the pane, so this is only safe because the line is tiny and
  *    because we PROBE afterwards: the script's first act is creating the capture
  *    file, so if it doesn't appear quickly the pane wasn't an idle shell (an
- *    editor, a running agent...) and the launch degrades to the background
- *    transport via PaneUnavailableError instead of corrupting that program.
+ *    editor, a running agent...) and the launch fails with a PaneUnavailableError
+ *    instead of corrupting that program. Nothing is retried in the background.
  *
  * An earlier revision assembled one giant shell string — order text included —
  * and typed it into the pane. A multi-line order pastes as multiple lines, and
@@ -52,34 +55,32 @@ export { SENTINEL_PREFIX, sentinelLine, parseSentinel };
  * Inside the script the crew runs attached DIRECTLY to the pane tty — nothing
  * interposed — so the pane behaves exactly like a human-opened agent session.
  * The capture file is therefore NOT a recording: it is the launch probe plus
- * the completion sentinel (and degrade notes). The reviewable record of a pane
- * run comes from the agent's own session transcript (crewtranscript.ts); the
- * background fallback still records real output since print-mode agents write
- * plain text. See buildJobScript for why (a pty recorder broke native
- * behavior and produced unreviewable escape soup). The co process's PATH is
- * baked into the script because a command-launched Ghostty surface gets only
- * the bare GUI PATH (verified: /usr/bin:/bin:...), which would not find a
- * user-installed agent binary.
+ * the completion sentinel. The reviewable record of a pane run comes from the
+ * agent's own session transcript (crewtranscript.ts). See buildJobScript for
+ * why nothing is interposed (a pty recorder broke native behavior and produced
+ * unreviewable escape soup). The co process's PATH is baked into the script
+ * because a command-launched Ghostty surface gets only the bare GUI PATH
+ * (verified: /usr/bin:/bin:...), which would not find a user-installed agent
+ * binary.
  */
 
 // SENTINEL_PREFIX / sentinelLine / parseSentinel now live in sentinel.ts and are
-// re-exported at the top of this module (see the import). The marker on the pane
-// path comes from the crew's real `$?` (see buildJobScript); on the background
-// fallback from the `.exit` sidecar (buildShellCommand); and, once the crew is a
-// Claude Code run, the Stop hook appends an early exit-0 sentinel on the first
-// finish (crewstophook.ts). parseSentinel scans from the end, so the last marker
+// re-exported at the top of this module (see the import). The marker comes from
+// the crew's real `$?` (see buildJobScript) and, once the crew is a Claude Code
+// run, the Stop hook appends an early exit-0 sentinel on the first finish
+// (crewstophook.ts). parseSentinel scans from the end, so the last marker
 // present — the real process exit code — wins when more than one is written.
 
-export type TransportKind = "ghostty" | "fallback";
+/** The only transport. A one-member union kept as a named type so Job/LaunchResult
+ *  read the same as before; there is no background/headless kind by design. */
+export type TransportKind = "ghostty";
 
 export interface LaunchResult {
   transport: TransportKind;
   /** The Ghostty pane id the run occupies, when applicable. */
   paneId?: string;
-  /** The placement decision taken (ghostty only), for reporting/queueing. */
+  /** The placement decision taken, for reporting/queueing. */
   placement?: PlacementDecision;
-  /** Detached child pid (fallback only), so a timeout can kill the group. */
-  pid?: number;
 }
 
 /**
@@ -93,7 +94,8 @@ export interface LaunchResult {
  * automation access to Ghostty, so this reuses that one grant instead of
  * requiring a SECOND grant for System Events. If `osascript` is missing, the
  * automation permission is denied, or Ghostty isn't running, this returns false
- * and we fall back — never throwing into the caller.
+ * and the dispatch fails cleanly (there is no background path) — never throwing
+ * into the caller.
  */
 let ghosttyAvailableCache: boolean | null = null;
 
@@ -103,7 +105,7 @@ export function isGhosttyAvailable(): boolean {
   return ghosttyAvailableCache;
 }
 
-/** Test seam: force the transport decision without a real probe. */
+/** Test seam: force the availability decision without a real probe. */
 export function setGhosttyAvailableForTest(v: boolean | null): void {
   ghosttyAvailableCache = v;
 }
@@ -116,16 +118,11 @@ function probeGhostty(): boolean {
       timeout: 4000,
     });
     // A version string on success; anything else (not installed, permission
-    // denied, not scriptable) means fall back.
+    // denied, not scriptable) means the pane path is unavailable.
     return !res.error && res.status === 0 && res.stdout.trim().length > 0;
   } catch {
     return false;
   }
-}
-
-/** Pick the transport for this environment. Ghostty when available, else fallback. */
-export function chooseTransport(): TransportKind {
-  return isGhosttyAvailable() ? "ghostty" : "fallback";
 }
 
 /**
@@ -133,8 +130,9 @@ export function chooseTransport(): TransportKind {
  * stored by id (the API can't tag panes), and a pane can be closed between
  * sessions, so before treating the anchor as usable we verify it. Uses the
  * dictionary's `exists`, which returns false cleanly for a stale id rather than
- * erroring. Best-effort: any AppleScript failure returns false so we degrade to
- * the background transport instead of throwing.
+ * erroring. Best-effort: any AppleScript failure returns false, and the caller
+ * (the registry) then drops the anchor and fails the dispatch cleanly — there is
+ * no background path — rather than treating a probe error as a live pane.
  */
 export async function anchorExists(id: string): Promise<boolean> {
   const script = [
@@ -147,67 +145,6 @@ export async function anchorExists(id: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-/**
- * The interactive command run inside a pane or as a detached process. It cd's
- * into the repo, launches the agent, tees output to the capture file, then
- * appends the sentinel with the crew process's real exit code. Written as a
- * single string so both transports share the same completion contract.
- *
- * The repo is supplied as the working directory (a leading `cd`), not as a
- * command-line flag: Claude Code has no --dir, and --add-dir only adds extra
- * readable dirs rather than setting the working directory. A `cd ... || exit`
- * makes a bad repo path fail loudly (captured, with a nonzero sentinel) instead
- * of silently running the agent in the wrong directory. An empty repo path skips
- * the cd and runs wherever the transport's own cwd points.
- *
- * Exit-code capture is shell-agnostic. The crew command is piped into `tee`, so
- * its status lives in the pipe's first stage, not in `$?` (which holds tee's 0).
- * We do NOT read it back with `${PIPESTATUS[0]}`: that array is bash-only. This
- * string runs under two shells we do not choose — the fallback's `sh` (dash on
- * many Linux hosts, where `${PIPESTATUS...}` is a hard "Bad substitution") and,
- * on the pane path, the user's interactive login shell (zsh, where PIPESTATUS is
- * unset and the expansion silently falls back to tee's 0, masking failures). So
- * instead the crew command writes its own `$?` to a sidecar file the instant it
- * exits — inside the pipe's first stage, before tee runs — and the sentinel
- * reads that file. `$?` immediately after a command is portable to every POSIX
- * shell, so this reports the crew process's real code whatever shell runs it.
- * The sidecar sits next to the capture file (<capture>.exit) and is removed once
- * read; the watcher only ever reads the capture file itself, never the dir.
- *
- * The crew command arrives already resolved to a shell command line (see
- * resolveCommandLine): the operator-configured template run verbatim, with only
- * the {prompt}/{repo} values shell-quoted. We interpolate it straight into the
- * pipeline so the shell interprets any env-var prefix or arguments it carries.
- *
- * An optional `note` is echoed into the capture ahead of the crew output — used
- * by the background fallback to record WHY it ran in the background (e.g. a stale
- * crew pane) so a degraded run is self-describing rather than looking like a
- * plain background dispatch. The note rides the same `2>&1 | tee` as the crew
- * output, so it lands at the top of the capture without a second write that the
- * tee (overwrite) would clobber. It sits before the crew command, so the sidecar
- * still records the CREW's `$?`, not the note echo's.
- */
-export function buildShellCommand(
-  crewCommand: string,
-  captureFile: string,
-  cwd?: string,
-  note?: string,
-): string {
-  const quotedCapture = shellQuote(captureFile);
-  const quotedExit = shellQuote(`${captureFile}.exit`);
-  // The sentinel is echoed to BOTH the tee'd file and the pane/terminal so the
-  // user sees the run finish and the watcher sees the marker. `2>&1` folds stderr
-  // into the capture. `echo $? > <exit>` runs in the same subshell as the crew
-  // command, right after it, so it records the crew status (not tee's) portably.
-  const cdPrefix = cwd && cwd.trim() ? `cd ${shellQuote(cwd)} || exit 1; ` : "";
-  const notePrefix = note && note.trim() ? `echo ${shellQuote(note)}; ` : "";
-  return (
-    `${cdPrefix}{ ${notePrefix}${crewCommand}; echo $? > ${quotedExit}; } 2>&1 | tee ${quotedCapture}; ` +
-    `echo "${SENTINEL_PREFIX} $(cat ${quotedExit} 2>/dev/null)" | tee -a ${quotedCapture}; ` +
-    `rm -f ${quotedExit}`
-  );
 }
 
 /**
@@ -247,18 +184,6 @@ export function dispatchCorrelation(captureFile: string): { job: string; capture
     job: path.basename(captureFile).replace(/\.log$/, ""),
     captureDir: path.dirname(captureFile),
   };
-}
-
-/** The correlation as a child-process environment fragment: the two vars the
- *  Stop hook reads (crewstophook.ts) from CO_DISPATCH_JOB / CO_DISPATCH_CAPTURE_DIR.
- *  Used by the background fallback, which sets the crew process env directly via
- *  spawn; the pane path bakes the same values into its generated script instead. */
-export function dispatchCorrelationEnv(captureFile: string): {
-  CO_DISPATCH_JOB: string;
-  CO_DISPATCH_CAPTURE_DIR: string;
-} {
-  const { job, captureDir } = dispatchCorrelation(captureFile);
-  return { CO_DISPATCH_JOB: job, CO_DISPATCH_CAPTURE_DIR: captureDir };
 }
 
 /** The per-job launch script written beside a capture file on the pane path
@@ -418,8 +343,9 @@ export function osaEscape(s: string): string {
  *  - for an EXISTING pane (takeover/reuse) there is no way to set a command, so
  *    the launch line is pasted with `input text <cmd> to <terminal>` then
  *    `send key "enter"`. `input text` pastes into whatever owns the pane, which
- *    is why the caller probes for the capture file afterwards and degrades to
- *    the background transport if the job never started.
+ *    is why the caller probes for the capture file afterwards and fails the
+ *    dispatch (PaneUnavailableError) if the job never started — it never falls
+ *    back to running invisibly.
  *
  * Note what the API does NOT allow: a terminal's title is read-only, so panes
  * cannot be tagged for discovery — the stable `id` is the only handle, which is
@@ -496,9 +422,10 @@ async function ensureCaptureDir(paths: InstancePaths): Promise<void> {
  * A pane launch that couldn't target its Ghostty pane: the anchor id no longer
  * resolves (Ghostty's -1719 "Invalid index"), an `exists` check came back false,
  * or `osascript` failed some other way. Distinct from a generic Error so the
- * registry can tell "the pane is gone, run in the background" apart from a real
- * bug and degrade cleanly instead of failing the whole dispatch. `paneId` is the
- * id we tried to target, for the background note.
+ * registry can tell "the pane is gone" apart from a real bug, drop the dead
+ * anchor, and fail the dispatch with an actionable message — there is no
+ * background path to fall back to. `paneId` is the id we tried to target, for
+ * that message.
  */
 export class PaneUnavailableError extends Error {
   readonly paneId: string;
@@ -510,9 +437,9 @@ export class PaneUnavailableError extends Error {
 }
 
 /** How long a pane launch gets to prove the job started (the script's first act
- *  is creating the capture file) before we call the pane busy and degrade to the
- *  background transport. Generous: a fresh surface or an idle shell starts the
- *  script within a few hundred ms; only the failure case waits this long. */
+ *  is creating the capture file) before we call the pane busy and fail the
+ *  dispatch. Generous: a fresh surface or an idle shell starts the script within
+ *  a few hundred ms; only the failure case waits this long. */
 const PANE_START_TIMEOUT_MS = 4000;
 const PANE_START_POLL_MS = 120;
 
@@ -537,14 +464,15 @@ async function waitForFileCreation(file: string, timeoutMs: number): Promise<boo
  * either, we wait for the capture file the script creates on startup. If it
  * never appears, the pane didn't run the launch line (it wasn't an idle shell —
  * an editor or another agent owns it), so the plan is aborted, a
- * split-we-created is closed, and the job degrades to the background transport.
+ * split-we-created is closed, and a PaneUnavailableError is raised. Nothing runs
+ * invisibly: a busy pane means the operator retargets, not a background run.
  *
  * Any AppleScript failure targeting the pane (a closed/stale anchor surfaces as
  * Ghostty error -1719, plus permission or not-running failures) is likewise
- * re-raised as a PaneUnavailableError so the registry falls back to the
- * background transport rather than failing the dispatch. The capture file is
- * created only by the launched script itself — that is what makes it a
- * trustworthy launch probe.
+ * re-raised as a PaneUnavailableError, which the registry turns into a clean
+ * dispatch failure with an actionable message (there is no background path). The
+ * capture file is created only by the launched script itself — that is what
+ * makes it a trustworthy launch probe.
  */
 export async function launchGhostty(args: {
   paths: InstancePaths;
@@ -606,7 +534,8 @@ export async function launchGhostty(args: {
     await fsp.rm(scriptPath, { force: true }).catch(() => {});
     // Every osascript failure on this path is a pane-targeting failure: the
     // anchor was closed (-1719), automation was denied, or Ghostty went away.
-    // Surface it as PaneUnavailableError so the registry degrades to background.
+    // Surface it as PaneUnavailableError so the registry fails the dispatch
+    // cleanly (there is no background path).
     throw new PaneUnavailableError(targetId, (e as Error).message);
   }
   // takeover/reuse return the known pane id; split returns the fresh one.
@@ -614,7 +543,8 @@ export async function launchGhostty(args: {
 
   // The launch probe: the script creates the capture file immediately. No file,
   // no launch — the pane was busy (or the surface command failed), so undo the
-  // placement and let the registry run this job in the background instead.
+  // placement and fail the dispatch (PaneUnavailableError). Nothing runs
+  // headless: a busy pane means the operator retargets, not an invisible run.
   const started = await waitForFileCreation(
     captureFile,
     args.paneStartTimeoutMs ?? PANE_START_TIMEOUT_MS,
@@ -637,69 +567,4 @@ export async function launchGhostty(args: {
   }
   layout.commit(paneId);
   return { transport: "ghostty", paneId, placement: decision };
-}
-
-/**
- * Launch a job as a detached background subprocess (portable fallback). Output is
- * captured to the same per-job file, and the sentinel is appended on exit. The
- * child is fully detached and unref'd so the co-manager session never blocks on
- * it and it survives being backgrounded. No pane geometry is involved.
- *
- * `note` is written to the top of the capture when present — the registry passes
- * a "target pane <id> unavailable; ran in background" line when it degrades here
- * from a failed pane launch, so a fallback that stood in for a dead pane is never
- * a silently-empty log. This is the SOLE writer of the capture on this path (the
- * pane launch no longer pre-writes it), so the note can't be clobbered by a tee.
- */
-export async function launchFallback(args: {
-  paths: InstancePaths;
-  config: DispatchConfig;
-  jobId: string;
-  order: string;
-  /** The confirm-time agent override; omit to use the config default. */
-  agentName?: string;
-  /** Working-directory override for the crew process: a feature-scoped dispatch
-   *  passes the feature's worktree path so the agent operates in that isolated
-   *  checkout. Omitted, the linked repo is the cwd, exactly as before. */
-  cwd?: string;
-  /** A human-readable note recorded at the top of the capture (e.g. why we fell
-   *  back to background). Omit for a plain background dispatch. */
-  note?: string;
-  /** Capture file override (the registry namespaces these per session); defaults
-   *  to the instance's captureFile(jobId) for direct callers and tests. */
-  captureFile?: string;
-}): Promise<LaunchResult> {
-  const { paths, config, jobId, order, agentName, note } = args;
-  await ensureCaptureDir(paths);
-  const captureFile = args.captureFile ?? paths.captureFile(jobId);
-  const crewCommand = jobCommandLine(config, order, agentName, args.cwd);
-  // Set the working directory two ways that agree: the spawn cwd below (the real
-  // working directory of the detached process) and, when the dir exists, the `cd`
-  // baked into the shell command so the assembled command is self-describing and
-  // matches the pane path exactly. Only pass the cd when the path exists, so a
-  // missing repo degrades to the spawn cwd (undefined → inherit) rather than a
-  // hard `cd ... || exit` failure the moment a repo hasn't been created yet.
-  const workDir = args.cwd ?? config.repoPath;
-  const workDirExists = Boolean(workDir) && fs.existsSync(workDir);
-  const shellCommand = buildShellCommand(
-    crewCommand,
-    captureFile,
-    workDirExists ? workDir : undefined,
-    note,
-  );
-
-  // We run through `sh -c` so the tee + sentinel contract matches the pane path.
-  // detached:true puts the child in its own process group; unref() lets the
-  // parent event loop exit independently. stdio is ignored because all output is
-  // already tee'd to the capture file by the shell command itself. The
-  // correlation env lets a Claude Code crew's Stop hook capture on first finish;
-  // it rides in the child env just as the pane script bakes it in.
-  const child = spawn("sh", ["-c", shellCommand], {
-    cwd: workDirExists ? workDir : undefined,
-    detached: true,
-    stdio: "ignore",
-    env: { ...process.env, ...dispatchCorrelationEnv(captureFile) },
-  });
-  child.unref();
-  return { transport: "fallback", pid: child.pid };
 }

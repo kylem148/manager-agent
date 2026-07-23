@@ -11,28 +11,27 @@ import {
   SENTINEL_PREFIX,
   sentinelLine,
   parseSentinel,
-  buildShellCommand,
   buildJobScript,
   scrubCapture,
   composeSplitScript,
   composeCloseScript,
   osaEscape,
   jobCommandLine,
-  launchFallback,
   launchGhostty,
   anchorExists,
   setOsaRunnerForTest,
   PaneUnavailableError,
   dispatchCorrelation,
-  dispatchCorrelationEnv,
 } from "./transport.js";
 
 /**
- * Tests for the two transports. The AppleScript and shell composition are pure
- * and tested directly; the fallback is exercised end-to-end with a fake echo
- * agent (a shell command, no tokens spent) so the capture-file + sentinel
- * contract is verified for real. The Ghostty path is tested with a stubbed
- * osascript runner — a live GUI launch can only be verified by hand.
+ * Tests for the ONE transport: a visible Ghostty pane. The AppleScript and
+ * job-script composition are pure and tested directly; the per-job script is
+ * exercised end-to-end with a fake echo agent (a shell command, no tokens spent)
+ * so the capture-file + sentinel contract is verified for real. The Ghostty
+ * launch itself is tested with a stubbed osascript runner — a live GUI launch can
+ * only be verified by hand. There is no background/headless transport to test:
+ * when a pane can't be placed the dispatch fails cleanly (see registry.test.ts).
  */
 
 async function tmpInstance(): Promise<{ paths: ReturnType<typeof instancePaths>; cleanup: () => Promise<void> }> {
@@ -42,22 +41,6 @@ async function tmpInstance(): Promise<{ paths: ReturnType<typeof instancePaths>;
   return { paths, cleanup: () => fsp.rm(home, { recursive: true, force: true }) };
 }
 
-/** Poll a capture file until it contains the sentinel or we time out. */
-async function waitForSentinel(file: string, timeoutMs = 5000): Promise<string> {
-  const start = Date.now();
-  for (;;) {
-    let content = "";
-    try {
-      content = await fsp.readFile(file, "utf8");
-    } catch {
-      /* not created yet */
-    }
-    if (parseSentinel(content)) return content;
-    if (Date.now() - start > timeoutMs) throw new Error(`sentinel never appeared in ${file}:\n${content}`);
-    await new Promise((r) => setTimeout(r, 50));
-  }
-}
-
 test("sentinel round-trips through the capture text", () => {
   assert.equal(parseSentinel("no marker here"), null);
   assert.deepEqual(parseSentinel(`output\n${sentinelLine(0)}\n`), { exitCode: 0 });
@@ -65,94 +48,6 @@ test("sentinel round-trips through the capture text", () => {
   // A garbled code degrades to -1 rather than NaN.
   assert.deepEqual(parseSentinel(`${SENTINEL_PREFIX} notanumber`), { exitCode: -1 });
 });
-
-test("buildShellCommand runs the crew command verbatim, tees to capture, appends the sentinel", () => {
-  const cmd = buildShellCommand("echo 'hi there'", "/tmp/cap.log");
-  assert.ok(cmd.includes("echo 'hi there'"), "the resolved crew command is run verbatim");
-  assert.ok(cmd.includes("tee '/tmp/cap.log'"), "output tees to the capture file");
-  assert.ok(cmd.includes(SENTINEL_PREFIX), "sentinel is echoed on completion");
-  // No cwd given: no cd prefix.
-  assert.ok(!cmd.includes("cd "), "no cd when no cwd is supplied");
-});
-
-test("buildShellCommand preserves an env-var prefix in the crew command", () => {
-  // The whole point of the shell-string model: an env-prefixed command survives.
-  const cmd = buildShellCommand(`CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude 'x'`, "/tmp/cap.log");
-  assert.ok(
-    cmd.includes(`CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude 'x'`),
-    `env prefix must be left for the shell to interpret, got: ${cmd}`,
-  );
-});
-
-test("buildShellCommand cd's into the repo cwd when given one", () => {
-  const cmd = buildShellCommand("claude 'order'", "/tmp/cap.log", "/my/repo");
-  assert.ok(
-    cmd.startsWith("cd '/my/repo' || exit 1; "),
-    `command must cd into the repo first, got: ${cmd}`,
-  );
-  // A bad path fails loudly (nonzero) rather than running in the wrong dir.
-  assert.ok(cmd.includes("|| exit 1"), "a failed cd aborts the run");
-  assert.ok(cmd.includes(SENTINEL_PREFIX), "sentinel still emitted");
-  // Still no --dir anywhere.
-  assert.ok(!cmd.includes("--dir"), "cwd replaces --dir entirely");
-});
-
-/**
- * The assembled command runs under two shells the transport does NOT choose:
- * the fallback's `sh` (dash on many Linux hosts) and, on the pane path, the
- * user's interactive login shell (zsh here). The old `${PIPESTATUS[0]:-$?}`
- * read the crew status only under bash: zsh left PIPESTATUS unset so it fell
- * back to tee's 0 (masking failures), and dash rejected it outright as a "Bad
- * substitution". This drives the SAME assembled string through every shell on
- * the box and asserts the sentinel reports the crew process's real code. */
-function shellPath(name: string): string | null {
-  try {
-    return execFileSync("command", ["-v", name], { shell: "/bin/sh", encoding: "utf8" }).trim() || null;
-  } catch {
-    return null;
-  }
-}
-
-for (const shell of ["sh", "bash", "zsh", "dash"]) {
-  const shPath = shellPath(shell);
-  const label = `buildShellCommand sentinel reports the crew exit code under ${shell}`;
-  test(label, { skip: shPath ? false : `${shell} not installed` }, async () => {
-    const { paths, cleanup } = await tmpInstance();
-    try {
-      // Crew command prints to stdout AND stderr, then exits nonzero. Under the
-      // buggy expansion, zsh/dash would report tee's 0 (or error) instead of 7.
-      const capFail = paths.captureFile("shell-fail");
-      const failCmd = buildShellCommand(
-        "sh -c 'echo to-stdout; echo to-stderr 1>&2; exit 7'",
-        capFail,
-      );
-      execFileSync(shPath!, ["-c", failCmd], { stdio: "ignore" });
-      const failCap = await fsp.readFile(capFail, "utf8");
-      assert.ok(failCap.includes("to-stdout"), "stdout is captured");
-      assert.ok(failCap.includes("to-stderr"), "stderr is folded into the capture");
-      assert.deepEqual(
-        parseSentinel(failCap),
-        { exitCode: 7 },
-        `sentinel must report the crew code (7), not tee's 0, under ${shell}`,
-      );
-
-      // A clean exit still reads 0.
-      const capOk = paths.captureFile("shell-ok");
-      const okCmd = buildShellCommand("sh -c 'echo done; exit 0'", capOk);
-      execFileSync(shPath!, ["-c", okCmd], { stdio: "ignore" });
-      assert.deepEqual(parseSentinel(await fsp.readFile(capOk, "utf8")), { exitCode: 0 });
-
-      // The sidecar exit file is cleaned up and never leaks into the capture dir.
-      const entries = await fsp.readdir(paths.captures);
-      assert.ok(
-        !entries.some((e) => e.endsWith(".exit")),
-        `sidecar .exit file must be removed, saw: ${entries.join(", ")}`,
-      );
-    } finally {
-      await cleanup();
-    }
-  });
-}
 
 test("osaEscape escapes backslashes and quotes for an AppleScript literal", () => {
   assert.equal(osaEscape('a"b'), 'a\\"b');
@@ -241,10 +136,6 @@ test("dispatchCorrelation derives the job stem and dir from the capture file", (
   assert.deepEqual(dispatchCorrelation("/my caps/job-002.log"), {
     job: "job-002",
     captureDir: "/my caps",
-  });
-  assert.deepEqual(dispatchCorrelationEnv("/caps/job-003.log"), {
-    CO_DISPATCH_JOB: "job-003",
-    CO_DISPATCH_CAPTURE_DIR: "/caps",
   });
 });
 
@@ -373,65 +264,6 @@ test("jobCommandLine honors a named-agent override and preserves an env prefix",
     jobCommandLine(config, "build X", "ccw"),
     `CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude 'build X'`,
   );
-});
-
-test("fallback launch runs a fake echo agent and produces a captured sentinel", async () => {
-  const { paths, cleanup } = await tmpInstance();
-  try {
-    const config = defaultDispatchConfig();
-    config.repoPath = paths.root;
-    // Fake agent: print a marker and the order, then exit 0. No tokens, no network.
-    // {prompt} sits as its own shell word (as `claude {prompt}` does); the shell
-    // passes it to the script as $1 rather than us nesting it inside inner quotes.
-    config.agents = [{ name: "fake", command: `sh -c 'echo AGENT-RAN; echo "order=$1"' _ {prompt}` }];
-    config.defaultAgent = "fake";
-    const res = await launchFallback({ paths, config, jobId: "job-001", order: "hello crew" });
-    assert.equal(res.transport, "fallback");
-
-    const captured = await waitForSentinel(paths.captureFile("job-001"));
-    assert.ok(captured.includes("AGENT-RAN"), "the agent's output is captured");
-    assert.ok(captured.includes("order=hello crew"), "the order reached the agent as its prompt");
-    assert.deepEqual(parseSentinel(captured), { exitCode: 0 });
-  } finally {
-    await cleanup();
-  }
-});
-
-test("fallback runs the crew process with cwd = repo path (no --dir)", async () => {
-  const { paths, cleanup } = await tmpInstance();
-  try {
-    const config = defaultDispatchConfig();
-    // The repo IS the instance root here; the agent prints its own working dir.
-    config.repoPath = paths.root;
-    config.agents = [{ name: "fake", command: `sh -c 'pwd'` }];
-    config.defaultAgent = "fake";
-    await launchFallback({ paths, config, jobId: "job-cwd", order: "x" });
-    const captured = await waitForSentinel(paths.captureFile("job-cwd"));
-    // macOS resolves /var → /private/var etc., so compare the real paths.
-    const realRepo = await fsp.realpath(paths.root);
-    const printed = captured.split("\n").map((l) => l.trim());
-    assert.ok(
-      printed.includes(realRepo) || printed.includes(paths.root),
-      `crew cwd should be the repo path.\n  want: ${realRepo}\n  got:\n${captured}`,
-    );
-  } finally {
-    await cleanup();
-  }
-});
-
-test("fallback captures a nonzero exit code in the sentinel", async () => {
-  const { paths, cleanup } = await tmpInstance();
-  try {
-    const config = defaultDispatchConfig();
-    config.repoPath = paths.root;
-    config.agents = [{ name: "fake", command: `sh -c 'echo boom; exit 3'` }];
-    config.defaultAgent = "fake";
-    await launchFallback({ paths, config, jobId: "job-002", order: "x" });
-    const captured = await waitForSentinel(paths.captureFile("job-002"));
-    assert.deepEqual(parseSentinel(captured), { exitCode: 3 });
-  } finally {
-    await cleanup();
-  }
 });
 
 test("launchGhostty consults the planner, probes the launch, and commits the pane id", async () => {
@@ -616,30 +448,6 @@ test("jobCommandLine resolves {repo} to the cwd override when one is given", () 
   assert.equal(jobCommandLine(config, "x", undefined, "/wt/auth"), "agent --root '/wt/auth' 'x'");
 });
 
-test("fallback runs the crew in a cwd override (a feature worktree), not the linked repo", async () => {
-  const { paths, cleanup } = await tmpInstance();
-  try {
-    const config = defaultDispatchConfig();
-    config.repoPath = paths.root;
-    config.agents = [{ name: "fake", command: `sh -c 'pwd'` }];
-    config.defaultAgent = "fake";
-    const worktree = path.join(paths.root, "wt-auth");
-    await fsp.mkdir(worktree, { recursive: true });
-    await launchFallback({ paths, config, jobId: "job-wt", order: "x", cwd: worktree });
-    const captured = await waitForSentinel(paths.captureFile("job-wt"));
-    const realWt = await fsp.realpath(worktree);
-    const printed = captured.split("\n").map((l) => l.trim());
-    assert.ok(
-      printed.includes(realWt) || printed.includes(worktree),
-      `crew cwd should be the worktree.\n  want: ${realWt}\n  got:\n${captured}`,
-    );
-    const realRepo = await fsp.realpath(paths.root);
-    assert.ok(!printed.includes(realRepo), "the linked repo was not the cwd");
-  } finally {
-    await cleanup();
-  }
-});
-
 test("launchGhostty bakes a cwd override into the job script instead of the repo", async () => {
   const { paths, cleanup } = await tmpInstance();
   try {
@@ -664,27 +472,3 @@ test("launchGhostty bakes a cwd override into the job script instead of the repo
   }
 });
 
-test("fallback writes a background note to the capture and still reports the real exit code", async () => {
-  const { paths, cleanup } = await tmpInstance();
-  try {
-    const config = defaultDispatchConfig();
-    config.repoPath = paths.root;
-    // Crew command prints output then exits nonzero, so we can prove the note
-    // rides ahead of the crew output WITHOUT masking the crew's real exit code
-    // (the note echo must not become the sidecar's captured status).
-    config.agents = [{ name: "fake", command: `sh -c 'echo CREW-OUTPUT; exit 5'` }];
-    config.defaultAgent = "fake";
-    const note = "target crew pane ghostty-uuid unavailable; ran in the background instead.";
-    await launchFallback({ paths, config, jobId: "job-note", order: "x", note });
-    const captured = await waitForSentinel(paths.captureFile("job-note"));
-    assert.ok(captured.includes(note), "the background note is written into the capture");
-    assert.ok(captured.includes("CREW-OUTPUT"), "the crew output is still captured");
-    assert.ok(
-      captured.indexOf(note) < captured.indexOf("CREW-OUTPUT"),
-      "the note precedes the crew output at the top of the capture",
-    );
-    assert.deepEqual(parseSentinel(captured), { exitCode: 5 }, "the note must not clobber the crew exit code");
-  } finally {
-    await cleanup();
-  }
-});

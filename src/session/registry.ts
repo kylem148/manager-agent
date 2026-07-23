@@ -1,15 +1,15 @@
 import fsp from "node:fs/promises";
 import fs from "node:fs";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import type { InstancePaths } from "../paths.js";
 import { CrewPaneLayout } from "./crewpanes.js";
 import { readDispatchConfig, resolveAgentCommand, type DispatchConfig } from "./dispatchconfig.js";
 import {
   anchorExists,
-  chooseTransport,
   dispatchCorrelation,
+  isGhosttyAvailable,
   jobScriptFile,
-  launchFallback,
   launchGhostty,
   parseSentinel,
   PaneUnavailableError,
@@ -30,13 +30,23 @@ import {
  * The dispatch job registry and capture watcher.
  *
  * One registry per session. It owns every in-flight crew job: it launches each
- * on the chosen transport, polls its capture file for completion, enforces the
+ * in a VISIBLE Ghostty pane, polls its capture file for completion, enforces the
  * wall-clock timeout, and drains the queue when a pane frees. It is fully
  * non-blocking: nothing here is ever awaited on the conversation path — the
  * session arms and fires a dispatch and moves on, and the registry notifies via a
  * callback when a job finishes. Multiple jobs run concurrently.
  *
- * COMPLETION is detected from the capture file, which now carries two kinds of
+ * VISIBLE-PANE-ONLY. A crew agent runs in a pane the operator can watch, or it
+ * does not run. There is no background/headless path. If a visible pane cannot
+ * be opened — Ghostty absent, no anchor designated (`co pane` not run), the
+ * anchor pane closed, or a placement/paste that goes nowhere — the dispatch
+ * FAILS with an actionable message and launches nothing (no process, no
+ * dangling job). This is deliberate: the removed background fallback once let a
+ * dispatch run invisibly, the operator assumed it had failed and re-dispatched,
+ * and two agents raced on the same checkout and corrupted the tree. An invisible
+ * run is exactly the failure mode this design forecloses.
+ *
+ * COMPLETION is detected from the capture file, which carries two kinds of
  * marker sharing one sentinel contract (sentinel.ts):
  *
  *  - A Claude Code crew's Stop hook (crewstophook.ts, installed per agent at
@@ -44,16 +54,18 @@ import {
  *    finishes responding, plus a <job>.stop.json sidecar naming the run's own
  *    transcript. This is the primary signal: the review fires while the pane
  *    stays open and interactive — no /exit needed.
- *  - Both transports still append a sentinel with the real exit code when the
- *    crew PROCESS exits — the backstop for non-Claude agents and failed runs.
+ *  - The pane's launch script still appends a sentinel with the real exit code
+ *    when the crew PROCESS exits — the backstop for non-Claude agents and
+ *    failed runs.
  *
- * These two markers force COMPLETION and PANE RELEASE apart on the pane path.
- * The old exit-time sentinel meant both at once: the crew process was gone, its
- * pane back to an idle shell, safe to reuse (reuse pastes a launch line into the
- * pane, so it MUST be an idle shell, not a live agent). The Stop hook fires on
- * the crew's FIRST finish, while the agent is still live in its pane — so a
- * hook-completed job's review must fire, but its pane must NOT be offered for
- * reuse, or a later dispatch would paste a launch line into a running agent.
+ * These two markers force COMPLETION and PANE RELEASE apart. The old exit-time
+ * sentinel meant both at once: the crew process was gone, its pane back to an
+ * idle shell, safe to reuse (reuse pastes a launch line into the pane, so it
+ * MUST be an idle shell, not a live agent). The Stop hook fires on the crew's
+ * FIRST finish, while the agent is still live in its pane — so a hook-completed
+ * job's review must fire, but its pane must NOT be offered for reuse, or a later
+ * dispatch would paste a launch line into a running agent. This is exactly the
+ * "never launch into a live pane" invariant.
  *
  * The ground-truth "the crew process is gone" signal is the per-job launch
  * script deleting itself: buildJobScript's finish() does `rm -f <self>` only
@@ -80,15 +92,14 @@ export interface Job {
   transport: TransportKind;
   status: JobStatus;
   paneId?: string;
-  pid?: number;
   /** The feature this job is scoped to, when dispatched with one: the
    *  job<->feature linkage. The feature's worktree record lives in the
    *  registry's feature map (getFeature). Absent for a plain dispatch. */
   feature?: string;
   /** The working directory the crew process was launched in, when it isn't the
    *  linked repo: a feature-scoped job runs inside the feature's worktree.
-   *  Kept on the job so a queued relaunch and the degrade-to-background path
-   *  land in the same checkout. Absent for a plain dispatch. */
+   *  Kept on the job so a queued relaunch lands in the same checkout. Absent for
+   *  a plain dispatch. */
   cwd?: string;
   captureFile: string;
   /** Epoch ms when the job started running (set on launch, not on queue). */
@@ -119,12 +130,14 @@ export interface RegistryOptions {
   paths: InstancePaths;
   config: DispatchConfig;
   onComplete: JobCompletionListener;
-  /** Overridable for tests; defaults to the real transport chooser. */
-  transportOverride?: TransportKind;
   clock?: RegistryClock;
   pollIntervalMs?: number;
+  /** Test seam: force whether the visible-pane path is available, bypassing the
+   *  real macOS+Ghostty probe. Defaults to isGhosttyAvailable(). */
+  ghosttyAvailable?: boolean;
   /** Called once if the designated crew anchor pane has been closed since
-   *  `co pane` ran; the registry then falls back to background for the session. */
+   *  `co pane` ran; the dispatch then fails (there is no background path) and the
+   *  operator is told to re-run `co pane`. */
   onAnchorLost?: () => void;
   /** Called when the crew completion hook could not be installed (e.g. an
    *  unparseable settings.json in the agent's config dir). Advisory only: the
@@ -163,7 +176,11 @@ export class DispatchRegistry {
   private readonly onComplete: JobCompletionListener;
   private readonly clock: RegistryClock;
   private readonly pollIntervalMs: number;
-  private readonly transport: TransportKind;
+  /** Whether the visible-pane path is usable at all: macOS + Ghostty reachable
+   *  through AppleScript. Cached once at construction (the answer can't change
+   *  within a session). When false, EVERY dispatch fails with an actionable
+   *  message — there is no background/headless path to fall back to. */
+  private readonly ghosttyAvailable: boolean;
   /** Whether to skip the live anchor `exists` probe (tests, and the no-anchor
    *  case). Remembered so a re-read that swaps in a new anchor re-probes it. */
   private readonly skipAnchorCheck: boolean;
@@ -178,9 +195,11 @@ export class DispatchRegistry {
    *  overwritten — and worse, a stale file still containing a completion
    *  sentinel would instantly "complete" a new job before its launch had even
    *  created the real capture. Derived from the injected clock so tests stay
-   *  deterministic. */
+   *  deterministic. Combined with a per-DISPATCH nonce (see dispatch()) so the
+   *  capture/identity key is unique per dispatch, not merely per session: a
+   *  back-to-back re-run of the same order must never share a capture key. */
   private readonly runTag: string;
-  /** FIFO of jobs waiting for a crew pane to free (Ghostty path, at cap). */
+  /** FIFO of jobs waiting for a crew pane to free (at the pane cap). */
   private readonly queue: string[] = [];
   private layout: CrewPaneLayout | null;
   private poller: ReturnType<typeof setInterval> | null = null;
@@ -197,8 +216,8 @@ export class DispatchRegistry {
    *  the crew's FIRST finish, long before the human closes it. The pane is
    *  released for reuse only once the crew PROCESS exits, which buildJobScript
    *  signals by removing its own launch script (jobScriptFile). Polled in tick();
-   *  never populated on the fallback path (no pane) nor for a completion detected
-   *  after the script was already gone (released inline). Keyed by job id. */
+   *  never populated for a completion detected after the script was already gone
+   *  (released inline). Keyed by job id. */
   private readonly pendingRelease = new Set<string>();
   /** Whether we've confirmed the designated anchor pane still exists this
    *  session. Checked once, lazily, on the first pane launch: a pane closed
@@ -215,16 +234,17 @@ export class DispatchRegistry {
     this.onComplete = opts.onComplete;
     this.clock = opts.clock ?? { now: () => Date.now() };
     this.pollIntervalMs = opts.pollIntervalMs ?? POLL_INTERVAL_MS;
-    this.transport = opts.transportOverride ?? chooseTransport();
+    this.ghosttyAvailable = opts.ghosttyAvailable ?? isGhosttyAvailable();
     this.skipAnchorCheck = Boolean(opts.skipAnchorCheck);
     this.runTag = this.clock.now().toString(36);
 
-    // The placement planner only exists on the Ghostty path AND only once an
-    // anchor has been designated. Off Ghostty, or before `co pane`, there is no
-    // geometry and every job runs immediately (visible-pane path degrades to
-    // fallback if the anchor is missing — see dispatch()).
+    // The placement planner exists only when Ghostty is reachable AND an anchor
+    // has been designated. Without Ghostty, or before `co pane`, there is no
+    // geometry — and there is no background path, so a dispatch in that state
+    // FAILS with an actionable message (see dispatch()) rather than running
+    // anything invisible.
     this.layout =
-      this.transport === "ghostty" && this.config.anchor
+      this.ghosttyAvailable && this.config.anchor
         ? new CrewPaneLayout(this.config.anchor, this.config.pane)
         : null;
     this.onAnchorLost = opts.onAnchorLost;
@@ -235,19 +255,38 @@ export class DispatchRegistry {
     this.anchorChecked = this.skipAnchorCheck || !this.layout;
   }
 
-  /** The transport this registry will actually use for new jobs. */
-  get activeTransport(): TransportKind {
-    // A Ghostty environment without a designated anchor can't place panes, so it
-    // behaves as fallback until `co pane` runs. Report that honestly.
-    return this.transport === "ghostty" && !this.layout ? "fallback" : this.transport;
+  /**
+   * Whether the NEXT dispatch could actually open a visible pane: Ghostty is
+   * reachable and an anchor has been designated (`co pane`). When false, a
+   * dispatch fails cleanly — there is no background path — so the arming banner
+   * warns the operator to run `co pane` (or open Ghostty) before confirming.
+   *
+   * Best-effort at the current moment: it doesn't re-probe a possibly-closed
+   * anchor (that lazy check happens at launch time), so a true here means "the
+   * geometry is set up", not "guaranteed to succeed". A launch that then finds
+   * the pane gone still fails cleanly with an actionable message.
+   */
+  get paneReady(): boolean {
+    return this.ghosttyAvailable && this.layout !== null;
   }
 
   private nextJobId(): string {
     // Stable, sortable, collision-free within a session. Not time-based so tests
-    // are deterministic. Capture FILES additionally carry the runTag, because
-    // the captures dir persists across sessions while these ids restart at 001.
+    // are deterministic. Capture FILES additionally carry the runTag plus a
+    // per-dispatch nonce, because the captures dir persists across sessions while
+    // these ids restart at 001 (and a re-run must never share a capture key).
     this.jobSeq += 1;
     return `job-${String(this.jobSeq).padStart(3, "0")}`;
+  }
+
+  /** A short random nonce that makes each dispatch's capture/identity key unique,
+   *  even for the same order re-run back-to-back in one session. The job id
+   *  (job-NNN) is stable and display-friendly; the capture FILE key additionally
+   *  mixes in the session runTag and this per-dispatch nonce, so two dispatches
+   *  can never share a capture file, a Stop-hook correlation, or a stale-sentinel
+   *  collision. */
+  private dispatchNonce(): string {
+    return randomBytes(4).toString("hex");
   }
 
   /** Snapshot of all jobs, newest last. */
@@ -328,11 +367,12 @@ export class DispatchRegistry {
     if (!fresh) return; // never linked, or unreadable: keep what we have
     this.config = fresh;
 
-    // The rest reconciles pane geometry, which only exists on the Ghostty path.
-    // The config re-read above must happen on EVERY transport, though: a
+    // The rest reconciles pane geometry, which only exists when Ghostty is
+    // reachable. The config re-read above must happen regardless, though: a
     // mid-session `co link` (e.g. correcting a crew command) has to take effect
-    // for background dispatches too, not just paned ones.
-    if (this.transport !== "ghostty") return;
+    // even when no pane can be placed, so the eventual failure names the right
+    // command.
+    if (!this.ghosttyAvailable) return;
 
     const anchor = fresh.anchor;
     const currentAnchorId = this.layout?.anchorPaneId ?? null;
@@ -362,7 +402,7 @@ export class DispatchRegistry {
    */
   async dispatch(order: string, agentName?: string, opts: DispatchOptions = {}): Promise<Job> {
     // Pick up a `co pane` / `co link` change made since the session started (or
-    // the last dispatch) before deciding transport for this job.
+    // the last dispatch) before deciding whether a pane can be placed.
     await this.refreshConfig();
 
     // Teach this agent's Claude Code to report completion on first finish (the
@@ -373,17 +413,20 @@ export class DispatchRegistry {
 
     const id = this.nextJobId();
     const label = firstLine(order);
-    // Tagged with the session's runTag so a job-001 from a previous session
-    // (same persistent captures dir) can never be overwritten or, worse, have
-    // its old completion sentinel read as this job's.
-    const captureFile = this.paths.captureFile(`${id}-${this.runTag}`);
+    // The capture/identity key is unique per DISPATCH: the job id (stable, for
+    // display) plus the session runTag plus a per-dispatch random nonce. The
+    // runTag alone stops a previous session's job-001.log from being overwritten
+    // (or, worse, its stale sentinel read as this job's); the nonce additionally
+    // stops two dispatches IN ONE SESSION — the same order re-run back-to-back —
+    // from ever sharing a capture file, a Stop-hook correlation, or a sentinel.
+    const captureFile = this.paths.captureFile(`${id}-${this.runTag}-${this.dispatchNonce()}`);
     const job: Job = {
       id,
       order,
       label,
       ...(agentName ? { agentName } : {}),
       ...(opts.feature ? { feature: opts.feature } : {}),
-      transport: this.activeTransport,
+      transport: "ghostty",
       status: "running",
       captureFile,
       startedAt: this.clock.now(),
@@ -391,8 +434,8 @@ export class DispatchRegistry {
     this.jobs.set(id, job);
 
     // Lazily confirm the designated anchor pane still exists before the first
-    // pane launch. If it was closed since `co pane` ran, drop to background for
-    // the rest of the session rather than failing every dispatch.
+    // pane launch. If it was closed since `co pane` ran, drop the layout so the
+    // failure below is clean and actionable rather than a raw AppleScript error.
     if (this.layout && !this.anchorChecked) {
       this.anchorChecked = true;
       const present = await anchorExists(this.config.anchor!.id);
@@ -401,8 +444,6 @@ export class DispatchRegistry {
         this.onAnchorLost?.();
       }
     }
-    // activeTransport may have just changed; reflect it on the job.
-    job.transport = this.activeTransport;
 
     // Reclaim any hook-completed pane whose agent has since been closed before
     // this job plans its placement, so a genuinely-free pane is reused now
@@ -410,6 +451,15 @@ export class DispatchRegistry {
     await this.releaseFinishedPanes();
 
     try {
+      // No visible pane can be placed — Ghostty isn't reachable, or no anchor has
+      // been designated (`co pane` not run), or the anchor pane was just found
+      // gone. There is NO background path: fail cleanly with an actionable
+      // message and launch nothing. This is the whole point of visible-only
+      // dispatch — an invisible run is what let two agents race the same tree.
+      if (!this.layout) {
+        throw new Error(this.paneUnavailableMessage());
+      }
+
       // Feature scoping happens inside the try so its failures ride the same
       // marked-failed-and-notified path as launch failures: a bad provision
       // (a half-state worktree, a missing repo) can't crash the session.
@@ -429,30 +479,25 @@ export class DispatchRegistry {
         const record = await this.ensureFeatureWorktree(job.feature);
         job.cwd = record.worktreePath;
       }
-      if (this.layout) {
-        try {
-          const launched = await this.launchOnPane(job);
-          if (!launched) {
-            // At the pane cap with nothing free: hold this job until one frees.
-            job.status = "queued";
-            job.startedAt = null;
-            this.queue.push(job.id);
-          }
-        } catch (e) {
-          if (!(e instanceof PaneUnavailableError)) throw e;
-          // The target pane is gone/stale (e.g. Ghostty -1719) — don't fail the
-          // dispatch, run it in the background with a note explaining why, so the
-          // capture is populated rather than an empty failed log. The anchor we
-          // just discovered dead is dropped for the rest of the session.
-          this.layout = null;
-          this.onAnchorLost?.();
-          job.transport = "fallback";
-          await this.runFallback(job, order, agentName, {
-            note: `target crew pane ${e.paneId} unavailable; ran in the background instead.`,
-          });
+
+      try {
+        const launched = await this.launchOnPane(job);
+        if (!launched) {
+          // At the pane cap with nothing free: hold this job until one frees.
+          // This is the ONLY non-launch outcome that isn't a failure — the queue
+          // never runs anything in the background, it just waits for a pane.
+          job.status = "queued";
+          job.startedAt = null;
+          this.queue.push(job.id);
         }
-      } else {
-        await this.runFallback(job, order, agentName);
+      } catch (e) {
+        if (!(e instanceof PaneUnavailableError)) throw e;
+        // The target pane is gone/stale (e.g. Ghostty -1719) or a paste went
+        // nowhere. There is no background path: drop the dead anchor for the
+        // session, tell the operator, and fail the dispatch. Nothing launched.
+        this.layout = null;
+        this.onAnchorLost?.();
+        throw new Error(this.paneUnavailableMessage());
       }
     } catch (e) {
       job.status = "failed";
@@ -465,6 +510,24 @@ export class DispatchRegistry {
 
     this.ensurePolling();
     return job;
+  }
+
+  /** The actionable message a pane-unavailable failure surfaces. Names the exact
+   *  fix depending on why no pane could be placed: open Ghostty, or designate the
+   *  crew pane. There is no background fallback to mention — a dispatch that can't
+   *  be seen doesn't run. */
+  private paneUnavailableMessage(): string {
+    if (!this.ghosttyAvailable) {
+      return (
+        "couldn't open a crew pane — dispatch needs a visible Ghostty pane and " +
+        "Ghostty isn't reachable here (macOS + Ghostty 1.3+ with automation access). " +
+        "Nothing was launched."
+      );
+    }
+    return (
+      "couldn't open a crew pane — relink the dispatch pane and try again " +
+      "(run `co pane` to designate the crew pane). Nothing was launched."
+    );
   }
 
   /**
@@ -525,28 +588,6 @@ export class DispatchRegistry {
       this.upsertFeature({ ...pending, provisionStatus: "failed" });
       throw e;
     }
-  }
-
-  /** Launch a job on the background transport, recording its pid on the job. A
-   *  `note` is written to the top of the capture when the fallback is standing in
-   *  for a failed pane launch, so the run is never a silently-empty log. */
-  private async runFallback(
-    job: Job,
-    order: string,
-    agentName: string | undefined,
-    opts: { note?: string } = {},
-  ): Promise<void> {
-    const res = await launchFallback({
-      paths: this.paths,
-      config: this.config,
-      jobId: job.id,
-      order,
-      captureFile: job.captureFile,
-      ...(agentName ? { agentName } : {}),
-      ...(job.cwd ? { cwd: job.cwd } : {}),
-      ...(opts.note ? { note: opts.note } : {}),
-    });
-    job.pid = res.pid;
   }
 
   /**
@@ -612,7 +653,9 @@ export class DispatchRegistry {
     if (timeoutSec && job.startedAt !== null) {
       const elapsed = (this.clock.now() - job.startedAt) / 1000;
       if (elapsed > timeoutSec) {
-        this.killJob(job);
+        // A pane job's agent lives in a Ghostty pane we don't own the process
+        // for, so there's nothing to kill — mark it failed and let finalize
+        // release the pane once its agent is gone. The human closes the pane.
         await this.finalize(job, "failed", { error: `timed out after ${timeoutSec}s` });
         return;
       }
@@ -661,17 +704,6 @@ export class DispatchRegistry {
     }
   }
 
-  /** Kill a fallback job's process group on timeout (no-op for pane jobs). */
-  private killJob(job: Job): void {
-    if (job.pid === undefined) return;
-    try {
-      // Negative pid targets the detached process group we created.
-      process.kill(-job.pid, "SIGTERM");
-    } catch {
-      // Already gone, or not permitted; nothing more we can safely do.
-    }
-  }
-
   /** Move a job to a terminal state, fire its review, and release its pane for
    *  reuse — but only once that pane no longer hosts a live agent. The queue
    *  drain is awaited so a released pane deterministically relaunches the next
@@ -691,7 +723,7 @@ export class DispatchRegistry {
     // Notify first so the review is enqueued before we relaunch anything; the
     // ordering keeps a completion callback ahead of the next job's launch notices.
     this.onComplete(job);
-    if (!job.paneId || !this.layout) return; // fallback path: no pane to release
+    if (!job.paneId || !this.layout) return; // failed before a pane was placed
     if (this.paneAgentGone(job)) {
       await this.releasePane(job);
     } else {
@@ -704,7 +736,8 @@ export class DispatchRegistry {
   /** Whether the crew PROCESS behind a pane job has exited, so its pane is back
    *  to an idle held shell and safe to reuse. True once the per-job launch script
    *  has removed itself (buildJobScript's last act) — or when there was never a
-   *  script (defensive; the fallback path has no pane and never reaches here). */
+   *  script (defensive; a job that failed before launch has no pane and never
+   *  reaches here). */
   private paneAgentGone(job: Job): boolean {
     return !fs.existsSync(jobScriptFile(job.captureFile));
   }
@@ -759,23 +792,15 @@ export class DispatchRegistry {
         launched = await this.launchOnPane(job);
       } catch (e) {
         if (e instanceof PaneUnavailableError) {
-          // The pane died while this job waited in the queue. Drop pane geometry
-          // for the session and run it in the background with a note, rather than
-          // failing it — same degrade path as a first-time dispatch.
+          // The pane died while this job waited in the queue. There is no
+          // background path: drop pane geometry for the session and fail this
+          // job cleanly — same as a first-time dispatch that can't place a pane.
           this.queue.shift();
           this.layout = null;
           this.onAnchorLost?.();
-          job.transport = "fallback";
-          try {
-            await this.runFallback(job, job.order, job.agentName, {
-              note: `target crew pane ${e.paneId} unavailable; ran in the background instead.`,
-            });
-            this.ensurePolling();
-          } catch (fe) {
-            job.status = "failed";
-            job.error = (fe as Error).message;
-            this.onComplete(job);
-          }
+          job.status = "failed";
+          job.error = this.paneUnavailableMessage();
+          this.onComplete(job);
           continue;
         }
         this.queue.shift();
