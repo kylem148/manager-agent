@@ -614,3 +614,35 @@ test("currentConfig re-reads disk on the fallback path so a mid-session re-link 
     await cleanup();
   }
 });
+
+test("feature records are additive bookkeeping that never touches the job flow", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    await withRegistry(
+      { paths, config, onComplete: () => {}, transportOverride: "fallback", pollIntervalMs: 10_000 },
+      async (reg) => {
+        assert.deepEqual(reg.listFeatures(), []);
+        const record = {
+          feature: "auth",
+          slug: "auth",
+          branch: "co/feat-auth",
+          worktreePath: "/wt/auth",
+          provisionStatus: "ready" as const,
+        };
+        reg.upsertFeature(record);
+        assert.equal(reg.getFeature("auth")?.branch, "co/feat-auth");
+        reg.upsertFeature({ ...record, provisionStatus: "removed" });
+        assert.equal(reg.listFeatures().length, 1, "upsert replaces, never duplicates");
+        assert.equal(reg.getFeature("auth")?.provisionStatus, "removed");
+        assert.equal(reg.removeFeature("auth"), true);
+        assert.equal(reg.removeFeature("auth"), false, "a second remove reports nothing was there");
+        // None of it created or altered a job.
+        assert.deepEqual(reg.list(), []);
+      },
+    );
+  } finally {
+    await cleanup();
+  }
+});

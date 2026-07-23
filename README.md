@@ -596,6 +596,7 @@ src/
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
   session/   session.ts prompt.ts tools.ts
              crewpanes.ts dispatchconfig.ts transport.ts registry.ts
+             worktrees.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
 ```
 
@@ -645,6 +646,17 @@ planner, and a detached-subprocess fallback — both sharing one capture-file +
 completion-sentinel contract. `registry.ts` owns in-flight jobs: it launches on
 the chosen transport, polls captures for the sentinel, enforces timeouts, drains
 the pane queue, and fires a completion callback, all non-blocking.
+
+`worktrees.ts` is the git-worktree lifecycle harness for the upcoming
+parallel-dispatch feature: ensure a `dev` integration branch exists (created
+off `main`, create-only), provision a per-feature worktree on a fresh
+`co/feat-<slug>` branch cut from `dev` (with `node_modules`/`dist` symlinked
+from the primary tree so it builds without an install), tear a finished
+feature down (branch deletion is guarded by a merge-base check, so unmerged
+work is never destroyed), and a reconcile sweep that cleans zombies left by a
+crashed run. Feature worktrees live outside the repo, by default in a sibling
+directory `<repo>-worktrees`. Deterministic plumbing only; it is not wired
+into the live dispatch flow yet.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, and ANSI-aware wrapping.

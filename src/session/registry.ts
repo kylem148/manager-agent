@@ -16,6 +16,7 @@ import {
 } from "./transport.js";
 import { installCrewStopHook, type InstallResult } from "./crewhook.js";
 import { stopCaptureFile, type StopCapture } from "./crewstophook.js";
+import type { FeatureRecord } from "./worktrees.js";
 
 /**
  * The dispatch job registry and capture watcher.
@@ -136,6 +137,9 @@ export class DispatchRegistry {
   private readonly skipAnchorCheck: boolean;
 
   private readonly jobs = new Map<string, Job>();
+  /** Per-feature worktree records (worktrees.ts), keyed by feature name. Not
+   *  yet read by the job flow — see the feature-record methods below. */
+  private readonly features = new Map<string, FeatureRecord>();
   /** Per-session tag mixed into capture/script FILE names (job ids stay short
    *  for display). Job ids restart at 001 every session while the captures dir
    *  persists, so an untagged job-001.log from a previous session would be
@@ -224,6 +228,32 @@ export class DispatchRegistry {
   /** Jobs currently running or queued. */
   activeCount(): number {
     return this.list().filter((j) => j.status === "running" || j.status === "queued").length;
+  }
+
+  // --- feature records (worktree layer) --------------------------------------
+  //
+  // Per-feature worktree state for the parallel-dispatch flow (worktrees.ts):
+  // which branch and isolated checkout a feature owns, and where its provision
+  // stands. Purely additive bookkeeping — nothing in the job flow reads these
+  // yet, so every existing registry consumer is untouched.
+
+  /** Record (or update) a feature's worktree state. */
+  upsertFeature(record: FeatureRecord): void {
+    this.features.set(record.feature, record);
+  }
+
+  getFeature(feature: string): FeatureRecord | undefined {
+    return this.features.get(feature);
+  }
+
+  /** Snapshot of all tracked features. */
+  listFeatures(): FeatureRecord[] {
+    return [...this.features.values()];
+  }
+
+  /** Drop a feature record (after teardown). Returns whether one existed. */
+  removeFeature(feature: string): boolean {
+    return this.features.delete(feature);
   }
 
   /**
