@@ -50,13 +50,22 @@ export interface LandingGateResult {
  * executeLanding refusal (e.g. a green gone stale because another feature
  * landed first) surfaces in the gate and comes back as outcome "failed"; the
  * cure is simply another reviewLanding for a fresh prepare.
+ *
+ * `prepared` lets a caller that has ALREADY run prepareLanding (the merge queue
+ * processes its head to decide ready/blocked before ever opening a gate) hand
+ * that exact result in, so the gate shows it without a second rebase +
+ * build+test. It changes nothing else: [m] still runs executeLanding pinned to
+ * the same featureSha, so the shas guard the merge exactly as a fresh prepare
+ * would (a branch that moved since is refused with "moved since prepare"). Omit
+ * it and the gate prepares itself, exactly as feature_land does.
  */
 export async function reviewLanding(
   host: LandingGateHost,
   opts: LandingOptions,
   feature: string,
+  prepared?: PrepareResult,
 ): Promise<LandingGateResult> {
-  const prepared = await prepareLanding(opts, feature);
+  const preparedResult = prepared ?? (await prepareLanding(opts, feature));
   const target = resolveWorktreeOptions(opts).devBranch;
   let landed: LandResult | undefined;
   let error: string | undefined;
@@ -64,14 +73,14 @@ export async function reviewLanding(
   const outcome = await host.openLandingReview({
     feature,
     target,
-    prepared: toView(prepared),
+    prepared: toView(preparedResult),
     execute: async () => {
       // Reached only from the overlay's [m] handler, and only on a green.
-      if (prepared.kind !== "green") {
-        throw new Error(`prepare was ${prepared.kind}, not green; nothing tested to merge`);
+      if (preparedResult.kind !== "green") {
+        throw new Error(`prepare was ${preparedResult.kind}, not green; nothing tested to merge`);
       }
       try {
-        landed = await executeLanding(opts, feature, { featureSha: prepared.featureSha });
+        landed = await executeLanding(opts, feature, { featureSha: preparedResult.featureSha });
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
         throw e;
@@ -79,7 +88,7 @@ export async function reviewLanding(
       return `landed ${feature}: ${landed.mergeSha.slice(0, 7)} on ${target}`;
     },
   });
-  return { prepared, outcome, landed, error };
+  return { prepared: preparedResult, outcome, landed, error };
 }
 
 /** Strip the engine's prepare result down to what the overlay shows. */

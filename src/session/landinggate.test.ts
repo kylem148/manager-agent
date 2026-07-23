@@ -242,6 +242,40 @@ test("a green gone stale under the open gate: execute refuses, outcome is failed
   }
 });
 
+test("a precomputed green is gated as-is, without a second prepare/build+test", async () => {
+  const { repo, base, cleanup } = await makeRepo();
+  try {
+    const rec = await provisionWorktree({ repoPath: repo, baseDir: base }, "prebaked");
+    await commitIn(rec.worktreePath, "p.txt", "p\n", "job: p");
+
+    // The merge queue prepares its head (a passing build+test) to decide it's
+    // ready, THEN opens the gate with that exact result.
+    const green = await prepareLanding(
+      { repoPath: repo, baseDir: base, buildTestCommand: "true" },
+      "prebaked",
+    );
+    assert.equal(green.kind, "green");
+    const seen: LandingReview[] = [];
+
+    // Pass the precomputed green AND a build+test that would fail if it ran. It
+    // must not run: the gate shows the handed-in green and [m] merges it.
+    const res = await reviewLanding(
+      approvingHost(seen),
+      { repoPath: repo, baseDir: base, buildTestCommand: "exit 1" },
+      "prebaked",
+      green,
+    );
+
+    assert.equal(res.outcome, "merged");
+    assert.equal(res.prepared, green, "the gate carried the handed-in prepare, unmodified");
+    assert.equal(seen[0]!.prepared.kind, "green", "no re-prepare turned it red");
+    assert.equal(sha(repo, "dev"), res.landed?.mergeSha);
+    assert.ok(!branchExists(repo, rec.branch), "teardown followed the merge");
+  } finally {
+    await cleanup();
+  }
+});
+
 // --- end to end through a real Tui -------------------------------------------
 
 interface TuiHarness {
