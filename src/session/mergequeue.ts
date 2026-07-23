@@ -42,8 +42,27 @@ import { resolveWorktreeOptions } from "./worktrees.js";
  * has been half-landed).
  */
 
-/** Where a queued feature stands. Only the head is ever anything but "queued". */
-export type QueueStatus = "queued" | "head-processing" | "ready" | "blocked";
+/**
+ * Where a queued feature stands. Only the head is ever anything but "queued".
+ *
+ * "resolving" (D-20260723-24) is the head while a FRESH crew agent we dispatched
+ * is fixing it in its own worktree (rebasing onto the dev tip, resolving the
+ * conflict, driving build+test green). It is a busy state: the head holds the
+ * queue and merges nothing until the agent finishes and the head is re-processed.
+ */
+export type QueueStatus = "queued" | "head-processing" | "ready" | "blocked" | "resolving";
+
+/**
+ * Why a blocked head is blocked, kept apart from the human-readable reason so the
+ * UI and the resolver path can branch on it. "conflict": the rebase onto the dev
+ * tip hit merge conflicts (a fresh agent can resolve these). "failed": the rebase
+ * was clean but the combined build+test came back red.
+ */
+export type BlockedKind = "conflict" | "failed";
+
+/** How many times the head may be handed to a fresh resolver agent before the
+ *  queue gives up and leaves it blocked for the captain (D-20260723-24). */
+export const MAX_RESOLVE_ATTEMPTS = 3;
 
 /** One feature's place in the queue. `prepared`/`blockedReason` are meaningful
  *  only for the head (the sole entry that is ever processed). */
@@ -54,6 +73,11 @@ interface QueueEntry {
   prepared?: PrepareResult;
   /** One-line reason the head is blocked (conflict paths, or a red exit). */
   blockedReason?: string;
+  /** Which flavour of blocked, when status is "blocked" — drives the resolver. */
+  blockedKind?: BlockedKind;
+  /** How many fresh resolver agents have been dispatched for this head so far.
+   *  Persists across re-processing; reset only when the head changes. */
+  resolveAttempts?: number;
 }
 
 /** A JSON-serializable snapshot of one entry, for tool output and feature views. */
@@ -68,6 +92,10 @@ export interface QueueEntryView {
   commitsReady?: number;
   /** Present when status is "blocked". */
   blockedReason?: string;
+  /** Present when status is "blocked": conflict vs red build+test. */
+  blockedKind?: BlockedKind;
+  /** Resolver attempts spent so far on this head (0 until the first dispatch). */
+  resolveAttempts?: number;
 }
 
 export interface QueueView {
@@ -218,7 +246,17 @@ export class MergeQueue {
       view.commitsReady = entry.prepared.commits.length;
     }
     if (entry.blockedReason) view.blockedReason = entry.blockedReason;
+    if (entry.blockedKind) view.blockedKind = entry.blockedKind;
+    if (entry.resolveAttempts) view.resolveAttempts = entry.resolveAttempts;
     return view;
+  }
+
+  /** The head's prepared green (commit list + diff) when it is ready to merge,
+   *  for the in-panel review body. Undefined unless the head is ready+green. */
+  headPrepared(): Extract<PrepareResult, { kind: "green" }> | undefined {
+    const head = this.entries[0];
+    if (head?.status === "ready" && head.prepared?.kind === "green") return head.prepared;
+    return undefined;
   }
 
   /**
@@ -281,17 +319,23 @@ export class MergeQueue {
     // Already green and waiting for the merge keystroke: nothing to redo.
     if (head.status === "ready") return head;
     // A live crew agent owns the worktree; we cannot rebase under it. Hold the
-    // head queued — a later enqueue/processHead (once the crew is done) advances it.
+    // head — a later enqueue/processHead (once the crew is done) advances it. If
+    // the busy agent is the resolver we dispatched, keep the head "resolving" so
+    // the queue/panel still reflect that; otherwise hold it plain "queued".
     if (this.host.isBusy(head.feature)) {
-      head.status = "queued";
-      delete head.prepared;
-      delete head.blockedReason;
+      if (head.status !== "resolving") {
+        head.status = "queued";
+        delete head.prepared;
+        delete head.blockedReason;
+        delete head.blockedKind;
+      }
       return head;
     }
 
     head.status = "head-processing";
     delete head.prepared;
     delete head.blockedReason;
+    delete head.blockedKind;
 
     let result: PrepareResult;
     try {
@@ -299,7 +343,8 @@ export class MergeQueue {
     } catch (e) {
       // prepareLanding throws on a lifecycle problem (no branch/worktree, a
       // dirty or detached worktree). That is not mergeable either — surface it
-      // as blocked rather than letting it crash the enqueue/merge tool.
+      // as blocked rather than letting it crash the enqueue/merge tool. This is
+      // NOT a conflict/red flavour a fresh agent can fix, so no blockedKind.
       head.status = "blocked";
       head.blockedReason = e instanceof Error ? e.message : String(e);
       return head;
@@ -317,16 +362,97 @@ export class MergeQueue {
         break;
       case "conflict":
         head.status = "blocked";
+        head.blockedKind = "conflict";
         head.blockedReason = `rebase conflict in ${
           result.conflictFiles.join(", ") || "the worktree"
         }`;
         break;
       case "failed":
         head.status = "blocked";
+        head.blockedKind = "failed";
         head.blockedReason = `build+test failed (exit ${result.exitCode})`;
         break;
     }
     return head;
+  }
+
+  /**
+   * Whether the head is a blocked feature a fresh resolver agent can be sent at:
+   * blocked by a rebase conflict or a red build+test (not a lifecycle problem,
+   * which has no blockedKind), and not already past the retry bound. This is the
+   * gate the resolve tool checks before arming a dispatch, so a doomed resolve is
+   * refused up front rather than after a wasted confirm.
+   */
+  canResolveHead(): { ok: true; feature: string; kind: BlockedKind; attempt: number } | { ok: false; reason: string } {
+    const head = this.entries[0];
+    if (!head) return { ok: false, reason: "the merge queue is empty; nothing to resolve." };
+    if (head.status === "resolving") {
+      return { ok: false, reason: `head '${head.feature}' already has a resolver agent working; let it finish.` };
+    }
+    if (head.status !== "blocked" || !head.blockedKind) {
+      return {
+        ok: false,
+        reason: `head '${head.feature}' is ${head.status}, not blocked by a conflict or a red build+test; nothing for a resolver to do.`,
+      };
+    }
+    const spent = head.resolveAttempts ?? 0;
+    if (spent >= MAX_RESOLVE_ATTEMPTS) {
+      return {
+        ok: false,
+        reason: `head '${head.feature}' has already had ${spent} resolver attempt(s) (limit ${MAX_RESOLVE_ATTEMPTS}); it stays blocked for you to resolve by hand or abandon.`,
+      };
+    }
+    return { ok: true, feature: head.feature, kind: head.blockedKind, attempt: spent + 1 };
+  }
+
+  /**
+   * Mark the head "resolving" and count the attempt, once the captain has
+   * confirmed a fresh resolver dispatch into the feature's worktree. The engine
+   * does NOT dispatch (that is the confirm-gated session path); it only records
+   * that a resolver is now in flight so the queue/panel show it and re-processing
+   * is deferred until the agent finishes. Returns the head view, or a refusal if
+   * the head is no longer resolvable (it changed under us).
+   */
+  beginResolve(): { started: true; head: QueueEntryView } | { started: false; reason: string } {
+    const gate = this.canResolveHead();
+    if (!gate.ok) return { started: false, reason: gate.reason };
+    const head = this.entries[0]!;
+    head.status = "resolving";
+    head.resolveAttempts = gate.attempt;
+    // Keep blockedReason/blockedKind as the record of WHAT is being resolved; the
+    // "resolving" status is what callers branch on.
+    return { started: true, head: this.toView(head, 0) };
+  }
+
+  /**
+   * Re-process the head after a resolver agent finished (its worktree is now on a
+   * rebased, hopefully-green state). Green -> ready; still conflicted/red ->
+   * blocked again (with its attempt count preserved, so the retry bound holds).
+   * A no-op if the head isn't the feature the resolver ran on, or isn't resolving
+   * (e.g. it was abandoned or already advanced while the agent ran).
+   */
+  async onResolveDone(feature: string): Promise<ProcessHeadResult> {
+    const head = this.entries[0];
+    if (!head || head.feature !== feature || head.status !== "resolving") {
+      return {
+        processed: false,
+        head: head ? this.toView(head, 0) : null,
+        queue: this.view(),
+        summary: `resolver for '${feature}' finished but it is no longer the resolving head; nothing to re-process.`,
+      };
+    }
+    // Drop the resolving marker so runProcessHead actually re-runs (it skips a
+    // "ready" head, and would treat "resolving" as a live-agent hold otherwise).
+    // resolveAttempts is preserved on the entry, so the bound still applies.
+    head.status = "queued";
+    const processed = await this.runProcessHead();
+    const h = this.entries[0]!;
+    return {
+      processed: Boolean(processed),
+      head: this.toView(h, 0),
+      queue: this.view(),
+      summary: this.summarize(h.feature, true),
+    };
   }
 
   /**
@@ -490,8 +616,19 @@ export class MergeQueue {
     switch (e.status) {
       case "ready":
         return `head '${feature}' is ready to merge (${e.prepared?.kind === "green" ? e.prepared.commits.length : 0} commit(s)); press [m] via feature_merge_head to land it`;
-      case "blocked":
-        return `head '${feature}' is BLOCKED: ${e.blockedReason ?? "not mergeable"}; it holds the queue until resolved or removed`;
+      case "blocked": {
+        const kind = e.blockedKind === "conflict" ? "rebase conflict" : e.blockedKind === "failed" ? "red build+test" : "not mergeable";
+        const spent = e.resolveAttempts ?? 0;
+        const resolveHint =
+          e.blockedKind && spent < MAX_RESOLVE_ATTEMPTS
+            ? `; dispatch a fresh resolver with feature_resolve_head (attempt ${spent + 1}/${MAX_RESOLVE_ATTEMPTS}) or fix it by hand`
+            : e.blockedKind
+              ? `; the ${spent}-attempt resolver limit is spent — resolve by hand or abandon`
+              : "";
+        return `head '${feature}' is BLOCKED (${kind}): ${e.blockedReason ?? "not mergeable"}; it holds the queue${resolveHint}`;
+      }
+      case "resolving":
+        return `head '${feature}' is being resolved by a fresh crew agent in its worktree (attempt ${e.resolveAttempts ?? 1}/${MAX_RESOLVE_ATTEMPTS}); it re-processes when the agent finishes`;
       case "queued":
         return this.host.isBusy(feature)
           ? `head '${feature}' is queued but a crew agent is still working it; it will process once free`

@@ -3,8 +3,10 @@ import { DEFAULT_BUILD_TEST_COMMAND, prepareLanding } from "./landing.js";
 import { reviewLanding, type LandingGateHost, type LandingGateResult } from "./landinggate.js";
 import {
   MergeQueue,
+  MAX_RESOLVE_ATTEMPTS,
   type EnqueueResult,
   type MergeHeadResult,
+  type ProcessHeadResult,
   type QueueEntryView,
   type QueueView,
 } from "./mergequeue.js";
@@ -104,6 +106,13 @@ export interface AbandonResult {
   /** Present when refused: why (uncommitted changes in the worktree). */
   reason?: string;
 }
+
+/** resolveHead's plan: the head is resolvable and here is the fresh-agent order
+ *  to arm (confirm-gated), or a refusal with the reason. The order is scoped to
+ *  the head's OWN worktree/branch — it never touches dev. */
+export type ResolveHeadPlan =
+  | { ok: true; feature: string; kind: "conflict" | "failed"; attempt: number; maxAttempts: number; order: string }
+  | { ok: false; reason: string };
 
 export interface LandResult {
   feature: string;
@@ -391,6 +400,66 @@ export class FeatureManager {
   }
 
   /**
+   * Plan a fresh-agent resolve of the blocked head (D-20260723-24). Checks the
+   * head is resolvable (blocked by a conflict or a red build+test, under the retry
+   * bound) and, if so, drafts the crew ORDER scoped to the feature's OWN worktree
+   * and branch: rebase onto the current dev tip, resolve the conflict, make the
+   * combined build+test pass, commit — never touching dev. Returns the plan (which
+   * the tool arms as a confirm-gated, feature-scoped dispatch) or a refusal. This
+   * does NOT dispatch or change queue state; beginResolveHead does that at fire.
+   */
+  planResolveHead(): ResolveHeadPlan {
+    const gate = this.queue.canResolveHead();
+    if (!gate.ok) return { ok: false, reason: gate.reason };
+    const record = this.findRecord(gate.feature);
+    const branch = record?.branch ?? featureBranch(gate.feature);
+    const target = resolveWorktreeOptions(this.worktreeOptions()).devBranch;
+    const order = buildResolveOrder({
+      feature: gate.feature,
+      branch,
+      target,
+      kind: gate.kind,
+      buildTestCommand: this.buildTestCommand,
+      reason: this.queue.viewFor(gate.feature)?.blockedReason ?? "",
+    });
+    return {
+      ok: true,
+      feature: gate.feature,
+      kind: gate.kind,
+      attempt: gate.attempt,
+      maxAttempts: MAX_RESOLVE_ATTEMPTS,
+      order,
+    };
+  }
+
+  /**
+   * Mark the head "resolving" once a resolver dispatch has actually fired (the
+   * captain confirmed). Counts the attempt against the retry bound. Called by the
+   * session's fire path, not at arm time, so a cancelled arm never burns an
+   * attempt. Returns the started head view or a refusal (the head changed under us).
+   */
+  beginResolveHead(): { started: true; head: QueueEntryView } | { started: false; reason: string } {
+    return this.queue.beginResolve();
+  }
+
+  /**
+   * Re-process the head after its resolver agent finished. Green -> ready; still
+   * blocked -> blocked (attempt count preserved for the bound). A no-op if the
+   * feature is no longer the resolving head. Called from the session's completion
+   * drain for a feature that was being resolved.
+   */
+  async onResolveDone(feature: string): Promise<ProcessHeadResult> {
+    return this.queue.onResolveDone(feature);
+  }
+
+  /** Whether a given feature is the current head AND being resolved — so the
+   *  session's completion handler knows to re-process it when its agent finishes. */
+  isResolvingHead(feature: string): boolean {
+    const head = this.queue.view().head;
+    return Boolean(head && head.status === "resolving" && head.feature === feature);
+  }
+
+  /**
    * Boot reconcile: rebuild feature records from the on-disk worktrees and seed
    * the registry, so a feature survives a session restart. Non-destructive —
    * anomalies (a branch with no worktree, a half-landed branch, a stray dir) are
@@ -412,4 +481,50 @@ function safeSlug(name: string): string {
   } catch {
     return "";
   }
+}
+
+/**
+ * The order handed to a fresh crew agent to unblock a merge-queue head, run in
+ * the feature's OWN worktree (the dispatch is feature-scoped, so cwd is already
+ * that checkout on its branch). The mandate is narrow and load-bearing: rebase
+ * the feature branch onto the current dev tip, resolve whatever blocked it, get
+ * the combined build+test green, and commit — all on the feature branch, NEVER
+ * touching dev. The queue re-processes the head after the agent finishes, so the
+ * agent doesn't merge anything; it only makes the branch mergeable.
+ */
+function buildResolveOrder(opts: {
+  feature: string;
+  branch: string;
+  target: string;
+  kind: "conflict" | "failed";
+  buildTestCommand: string;
+  reason: string;
+}): string {
+  const { feature, branch, target, kind, buildTestCommand, reason } = opts;
+  const diagnosis =
+    kind === "conflict"
+      ? `Rebasing ${branch} onto ${target} hit merge conflicts.`
+      : `${branch} rebases onto ${target} cleanly, but the combined build+test is failing.`;
+  const lines = [
+    `You are resolving a blocked merge-queue head for the feature "${feature}".`,
+    ``,
+    `You are already in this feature's isolated worktree, checked out on ${branch}. Work ONLY here.`,
+    ``,
+    `Situation: ${diagnosis}`,
+    ...(reason ? [`Queue diagnosis: ${reason}`] : []),
+    ``,
+    `Do this, in order:`,
+    `1. Rebase ${branch} onto the current ${target} tip: \`git fetch\` if needed, then \`git rebase ${target}\`.`,
+    `2. Resolve any conflicts so the rebase completes cleanly. Keep both sides' intent; do not drop work.`,
+    `3. Make the combined build+test pass: run \`${buildTestCommand}\` and fix whatever is red until it is green.`,
+    `4. Commit your resolution on ${branch} (the rebase's conflict resolutions plus any fixes). Leave the worktree clean.`,
+    ``,
+    `HARD RULES:`,
+    `- NEVER check out, merge into, or push ${target} (dev) or main. You only ever touch ${branch} in this worktree.`,
+    `- Do not merge the feature yourself. The captain merges it through the review gate after you finish.`,
+    `- Leave the worktree clean (no uncommitted changes) so the queue can re-process it.`,
+    ``,
+    `When \`${buildTestCommand}\` passes on the rebased branch and everything is committed, you are done.`,
+  ];
+  return lines.join("\n");
 }

@@ -539,6 +539,96 @@ test("a real rebase conflict blocks the head and mergeHead refuses to land it", 
   }
 });
 
+test("the resolve path: a conflict-blocked head is fixed by a fresh agent in its worktree, re-processes to ready, then merges", async () => {
+  const seen: LandingReview[] = [];
+  const fx = await makeFixture(approvingHost(seen));
+  try {
+    const a = await fx.features.create("base");
+    const b = await fx.features.create("follow");
+    await commitIn(a.feature.worktreePath, "file.txt", "from base\n", "job: base");
+    await commitIn(b.feature.worktreePath, "file.txt", "from follow\n", "job: follow");
+
+    // Land base so dev holds the conflicting change, then enqueue follow (blocks).
+    await fx.features.enqueue("base");
+    assert.equal((await fx.features.mergeHead()).merged, true);
+    const eb = await fx.features.enqueue("follow");
+    assert.equal(eb.enqueued, true);
+    if (!eb.enqueued) return;
+    assert.equal(eb.head?.status, "blocked");
+    assert.equal(eb.head?.blockedKind, "conflict", "distinguished as a conflict, not a red build");
+
+    // Plan the resolve: it must target follow's OWN branch, never dev.
+    const plan = fx.features.planResolveHead();
+    assert.equal(plan.ok, true);
+    if (!plan.ok) return;
+    assert.equal(plan.feature, "follow");
+    assert.equal(plan.kind, "conflict");
+    assert.equal(plan.attempt, 1);
+    assert.match(plan.order, /co\/feat-follow/, "the order names the feature branch");
+    assert.match(plan.order, /NEVER check out, merge into, or push/i, "the order forbids touching dev");
+    assert.match(plan.order, /do not merge the feature yourself/i, "the order forbids self-merge");
+
+    // Fire (the confirm-gated dispatch would have launched); mark it resolving.
+    const started = fx.features.beginResolveHead();
+    assert.equal(started.started, true);
+    assert.equal(fx.features.isResolvingHead("follow"), true);
+    assert.equal(fx.features.queueView().head?.status, "resolving");
+
+    // Simulate the fresh agent's work IN follow's worktree: rebase onto dev and
+    // resolve the conflict (keep both intents), commit — never touching dev.
+    const wt = b.feature.worktreePath;
+    const devBefore = run(fx.repo, ["rev-parse", "dev"]);
+    // A rebase onto dev conflicts; the agent resolves file.txt and continues.
+    const reb = spawnSync("git", ["rebase", "dev"], { cwd: wt, encoding: "utf8" });
+    assert.notEqual(reb.status, 0, "the rebase really conflicts (as the block reported)");
+    await fsp.writeFile(path.join(wt, "file.txt"), "from base\nfrom follow\n", "utf8");
+    run(wt, ["add", "file.txt"]);
+    const cont = spawnSync("git", ["rebase", "--continue"], {
+      cwd: wt,
+      encoding: "utf8",
+      env: { ...process.env, GIT_EDITOR: "true" },
+    });
+    assert.equal(cont.status, 0, "the agent completed the rebase");
+    assert.equal(run(wt, ["status", "--porcelain"]), "", "the agent left the worktree clean");
+    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devBefore, "the agent never moved dev");
+
+    // The agent finished: re-process the head. It rebases cleanly now and the
+    // build+test (`true`) is green, so it goes ready.
+    const done = await fx.features.onResolveDone("follow");
+    assert.equal(done.head?.feature, "follow");
+    assert.equal(done.head?.status, "ready", "the resolved head is ready to merge");
+
+    // And it merges through the gate like any ready head; dev advances.
+    const merge = await fx.features.mergeHead();
+    assert.equal(merge.merged, true);
+    assert.equal(merge.feature, "follow");
+    assert.notEqual(run(fx.repo, ["rev-parse", "dev"]), devBefore, "dev advanced on the merge");
+    assert.equal(run(fx.repo, ["show", "dev:file.txt"]), "from base\nfrom follow");
+    assert.ok(!branchExists(fx.repo, "co/feat-follow"), "teardown followed the merge");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("planResolveHead refuses when the head is not blocked by a fixable conflict/red", async () => {
+  const fx = await makeFixture();
+  try {
+    // A ready head has nothing for a resolver to do.
+    const a = await fx.features.create("ready-feat");
+    await commitIn(a.feature.worktreePath, "a.txt", "a\n", "job: a");
+    await fx.features.enqueue("ready-feat");
+    assert.equal(fx.features.queueView().head?.status, "ready");
+    const plan = fx.features.planResolveHead();
+    assert.equal(plan.ok, false, "a ready head can't be resolved");
+
+    // An empty queue likewise.
+    await fx.features.abandon("ready-feat");
+    assert.equal(fx.features.planResolveHead().ok, false);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
 test("feature_list and feature_status surface queue position and head state", async () => {
   const fx = await makeFixture();
   try {

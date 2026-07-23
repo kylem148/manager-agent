@@ -83,8 +83,10 @@ interface SessionState {
   features: FeatureManager | null;
   /** The order armed and awaiting a typed `confirm`, or null. Set by the arm
    *  callback; consumed by the confirm interlock in the input loop. `feature`
-   *  scopes the dispatch to a feature's worktree (undefined = bare main tree). */
-  armed: { order: string; feature?: string } | null;
+   *  scopes the dispatch to a feature's worktree (undefined = bare main tree).
+   *  `resolve` marks a merge-queue resolver dispatch: on fire the head is moved
+   *  to "resolving" and re-processed when the agent finishes. */
+  armed: { order: string; feature?: string; resolve?: boolean } | null;
   /** Completed jobs waiting for a review turn, drained on the next idle prompt. */
   reviewQueue: Job[];
 }
@@ -238,9 +240,26 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // The scroll/selection hint only applies to the interactive TUI; it would be
   // misleading in piped output where there's no scrolling, so it's TUI-only.
   const tui = Tui.capable();
-  const header = bannerText(paths.name, cfg, tui);
+  const header = bannerText(paths.name, cfg, tui, Boolean(dispatch));
   const io: SessionIO = tui
-    ? new Tui({ promptLabel: PROMPT_LABEL, header, docs: docSource(paths) })
+    ? new Tui({
+        promptLabel: PROMPT_LABEL,
+        header,
+        docs: docSource(paths),
+        // The merge-queue panel tab only exists when the instance is linked (a
+        // queue needs a repo). Read fresh at paint time via the FeatureManager,
+        // which is created below; the closure is never called before then.
+        ...(dispatch
+          ? {
+              queue: {
+                view: () =>
+                  state.features
+                    ? state.features.queueView()
+                    : { size: 0, head: null, entries: [] },
+              },
+            }
+          : {}),
+      })
     : new PlainIO(PROMPT_LABEL, header);
 
   const state: SessionState = {
@@ -388,7 +407,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
           state.armed = null;
           io.setConfirmBanner(null);
           await appendTranscript(state.transcript, "you", raw);
-          await fireDispatch(state, armed.order, confirm.agent, armed.feature);
+          await fireDispatch(state, armed.order, confirm.agent, armed.feature, armed.resolve);
           continue;
         }
         state.armed = null;
@@ -520,6 +539,7 @@ async function drive(
       ? { onArmDispatch: (order: string, feature?: string) => armDispatch(state, order, feature) }
       : {}),
     ...(state.features ? { features: state.features } : {}),
+    ...(state.dispatch && state.features ? { onArmResolve: () => armResolve(state) } : {}),
   });
 
   // Streaming render state. "mode" tracks whether the open transcript line is
@@ -675,6 +695,36 @@ async function armDispatch(
   };
 }
 
+/**
+ * Arm a fresh-agent resolver dispatch for the blocked merge-queue head
+ * (feature_resolve_head tool). Asks the FeatureManager to plan the resolve (is
+ * the head resolvable under the retry bound, and what is the feature-scoped
+ * order), then arms it through the SAME confirm-gated path as any dispatch,
+ * flagged `resolve` so the fire path marks the head "resolving" and the
+ * completion drain re-processes it. Launches nothing. Refuses cleanly when there
+ * is no resolvable head.
+ */
+async function armResolve(
+  state: SessionState,
+): Promise<{ armed: true; summary: string } | { armed: false; reason: string }> {
+  if (!state.features) return { armed: false, reason: "Feature levers are unavailable (not linked)." };
+  const plan = state.features.planResolveHead();
+  if (!plan.ok) return { armed: false, reason: plan.reason };
+  const res = await armDispatch(state, plan.order, plan.feature);
+  if (!res.armed) return res;
+  // Tag the armed order as a resolver so fireDispatch drives the queue's
+  // resolving/re-process transitions instead of a plain review-on-completion.
+  if (state.armed) state.armed.resolve = true;
+  const kindWord = plan.kind === "conflict" ? "a rebase conflict" : "a red build+test";
+  return {
+    armed: true,
+    summary:
+      `Resolver for head '${plan.feature}' (blocked by ${kindWord}, attempt ${plan.attempt}/${plan.maxAttempts}) armed. ` +
+      `It will run in that feature's own worktree on its branch and never touch dev. ` +
+      res.summary,
+  };
+}
+
 /** The human-readable dispatch target for the arm banner: a feature's worktree
  *  path when known, the branch/first-use note when the feature isn't provisioned
  *  yet, or the bare main tree. Deterministic and side-effect-free — it never
@@ -711,6 +761,7 @@ async function fireDispatch(
   order: string,
   agentName?: string,
   feature?: string,
+  resolve?: boolean,
 ): Promise<void> {
   const { io, registry } = state;
   if (!registry) {
@@ -723,14 +774,26 @@ async function fireDispatch(
       io.appendBlock(c.red(`  · dispatch failed to launch: ${job.error ?? "unknown error"}`));
       return;
     }
+    // A resolver dispatch that actually launched moves the merge-queue head to
+    // "resolving" (and counts the attempt). Done only on a real launch so a
+    // failed placement burns no attempt; the completion drain re-processes it.
+    if (resolve && feature && state.features) {
+      const started = state.features.beginResolveHead();
+      if (!started.started) {
+        io.appendBlock(c.yellow(`  · note: ${started.reason}`));
+      }
+    }
     const agentNote = job.agentName ? ` [${job.agentName}]` : "";
     const featureNote = job.feature ? ` in feature '${job.feature}'` : "";
     const where =
       job.status === "queued"
         ? "queued for a free crew pane"
         : `running in a Ghostty pane (${job.paneId ?? "?"})`;
+    const followup = resolve
+      ? "I'll re-process the head when it finishes."
+      : "I'll review it when it finishes.";
     io.appendBlock(
-      c.green(`  · dispatched ${job.id}${agentNote}${featureNote}: ${where}. I'll review it when it finishes.`),
+      c.green(`  · dispatched ${job.id}${agentNote}${featureNote}: ${where}. ${followup}`),
     );
   } catch (e) {
     io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));
@@ -758,6 +821,30 @@ async function fireDispatch(
 async function drainReviews(state: SessionState): Promise<void> {
   while (state.reviewQueue.length > 0) {
     const job = state.reviewQueue.shift()!;
+
+    // A resolver agent finishing on the current resolving head: re-process the
+    // head now (rebase + build+test on its just-fixed worktree) so it becomes
+    // ready if green or blocked again if not, and fold the outcome into the
+    // review turn so the co reports what the queue now shows. One agent per
+    // feature, so the resolving head's only in-flight agent is its resolver.
+    let resolveNote = "";
+    if (job.feature && state.features?.isResolvingHead(job.feature)) {
+      try {
+        const outcome = await state.features.onResolveDone(job.feature);
+        const h = outcome.head;
+        const headLine = h
+          ? `head '${h.feature}' is now ${h.status}${h.blockedReason ? ` (${h.blockedReason})` : ""}`
+          : "the queue is now empty";
+        resolveNote =
+          `\n\nThis dispatch was a merge-queue RESOLVER for '${job.feature}'. After it finished the ` +
+          `head was re-processed: ${headLine}. Tell the captain whether the head is ready to merge ` +
+          `(feature_merge_head), still blocked (they can resolve again with feature_resolve_head until ` +
+          `the attempt limit, or fix by hand / abandon), and factor that into your verdict.`;
+        state.io.appendBlock(c.dim(`  · resolver finished for '${job.feature}': ${headLine}`));
+      } catch (e) {
+        resolveNote = `\n\n(Re-processing the resolved head '${job.feature}' failed: ${(e as Error).message})`;
+      }
+    }
 
     let record = "";
     let source = "";
@@ -824,7 +911,8 @@ async function drainReviews(state: SessionState): Promise<void> {
         " record and what the exit code implies.\n\n" +
         `Job: ${job.id} (${job.label})\nStatus: ${job.status}` +
         (job.exitCode !== undefined ? ` (exit ${job.exitCode})` : "") +
-        `\n\n--- record of the run ---\n${record}`,
+        `\n\n--- record of the run ---\n${record}` +
+        resolveNote,
     });
     await drive(state);
   }
@@ -1051,7 +1139,7 @@ async function endOfSessionGuard(state: SessionState): Promise<void> {
   io.appendBlock(c.dim("bye."));
 }
 
-function bannerText(name: string, cfg: Config, tui: boolean): string {
+function bannerText(name: string, cfg: Config, tui: boolean, linked: boolean): string {
   const thinking = cfg.model.thinking === "adaptive";
 
   // Interactive terminal: try the fancy boxed pirate galleon. It carries the
@@ -1087,7 +1175,7 @@ function bannerText(name: string, cfg: Config, tui: boolean): string {
   if (tui) {
     lines.push(
       c.dim("scroll: wheel or PgUp/PgDn · ↑/↓ recalls your input · hold Option/Shift to select text"),
-      c.dim("Ctrl-O opens the doc viewer"),
+      c.dim(linked ? "Ctrl-O opens the panel (merge queue + docs)" : "Ctrl-O opens the doc viewer"),
     );
   }
   return lines.join("\n");

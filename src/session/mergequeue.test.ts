@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MergeQueue } from "./mergequeue.js";
+import { MergeQueue, MAX_RESOLVE_ATTEMPTS } from "./mergequeue.js";
 import type { LandingGateHost, LandingGateResult } from "./landinggate.js";
 import type {
   PrepareConflict,
@@ -363,4 +363,152 @@ test("with no interactive gate, mergeHead refuses cleanly and merges nothing", a
   assert.equal(merge.outcome, "no-gate");
   assert.equal(h.reviewCalls.length, 0);
   assert.equal(h.queue.headFeature(), "aaa", "the head is untouched");
+});
+
+// --- Part B: conflict vs red distinction + the resolve path ------------------
+
+test("a conflict-blocked head carries blockedKind 'conflict'; a red one carries 'failed'", async () => {
+  const hc = makeHarness();
+  hc.prepareFn.set("aaa", () => conflict("aaa"));
+  const c1 = await hc.queue.enqueue("aaa");
+  assert.equal(c1.head?.status, "blocked");
+  assert.equal(c1.head?.blockedKind, "conflict", "a rebase conflict is flagged as conflict");
+
+  const hf = makeHarness();
+  hf.prepareFn.set("aaa", () => failed("aaa"));
+  const f1 = await hf.queue.enqueue("aaa");
+  assert.equal(f1.head?.status, "blocked");
+  assert.equal(f1.head?.blockedKind, "failed", "a red build+test is flagged as failed");
+});
+
+test("a lifecycle-blocked head (thrown prepare) has NO blockedKind and can't be resolved", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => {
+    throw new Error("worktree gone; run reconcile");
+  });
+  await h.queue.enqueue("aaa");
+  const v = h.queue.view();
+  assert.equal(v.head?.status, "blocked");
+  assert.equal(v.head?.blockedKind, undefined, "a lifecycle failure isn't a fixable conflict/red");
+  const gate = h.queue.canResolveHead();
+  assert.equal(gate.ok, false, "a resolver has nothing to do on a lifecycle block");
+});
+
+test("canResolveHead gates on state: empty, not-blocked, and blocked-fixable", async () => {
+  const h = makeHarness();
+  assert.equal(h.queue.canResolveHead().ok, false, "empty queue: nothing to resolve");
+
+  await h.queue.enqueue("aaa"); // ready
+  assert.equal(h.queue.canResolveHead().ok, false, "a ready head is not resolvable");
+
+  const h2 = makeHarness();
+  h2.prepareFn.set("aaa", () => conflict("aaa"));
+  await h2.queue.enqueue("aaa");
+  const gate = h2.queue.canResolveHead();
+  assert.equal(gate.ok, true);
+  if (gate.ok) {
+    assert.equal(gate.feature, "aaa");
+    assert.equal(gate.kind, "conflict");
+    assert.equal(gate.attempt, 1, "the first resolve is attempt 1");
+  }
+});
+
+test("beginResolve marks the head 'resolving' and counts the attempt; a busy resolving head is held, not reset", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => conflict("aaa"));
+  await h.queue.enqueue("aaa");
+
+  const started = h.queue.beginResolve();
+  assert.equal(started.started, true);
+  const v = h.queue.view();
+  assert.equal(v.head?.status, "resolving");
+  assert.equal(v.head?.resolveAttempts, 1);
+  assert.equal(v.head?.blockedKind, "conflict", "it still records WHAT is being resolved");
+
+  // While the resolver agent owns the worktree, processHead must not reset the
+  // resolving head back to queued (that would lose the in-flight marker).
+  h.busy.add("aaa");
+  await h.queue.processHead();
+  assert.equal(h.queue.view().head?.status, "resolving", "a busy resolving head stays resolving");
+});
+
+test("resolving -> re-process -> ready when the agent's fix goes green", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => conflict("aaa"));
+  await h.queue.enqueue("aaa");
+  await h.queue.enqueue("bbb"); // a follower that must NOT be touched
+  h.queue.beginResolve();
+  assert.equal(h.queue.view().head?.status, "resolving");
+
+  // The resolver agent committed a fix; the next prepare goes green.
+  h.prepareFn.set("aaa", () => green("aaa"));
+  const done = await h.queue.onResolveDone("aaa");
+  assert.equal(done.head?.feature, "aaa");
+  assert.equal(done.head?.status, "ready", "a green re-process makes the head ready");
+  assertHeadOnly(h.queue);
+  // The follower was never speculatively prepared through any of this.
+  assert.deepEqual(h.prepareCalls, ["aaa", "aaa"], "only the head re-processed; bbb untouched");
+});
+
+test("resolving -> re-process -> blocked again keeps the attempt count (the bound holds)", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => conflict("aaa"));
+  await h.queue.enqueue("aaa");
+  h.queue.beginResolve();
+  assert.equal(h.queue.view().head?.resolveAttempts, 1);
+
+  // The agent didn't fix it: still conflicted.
+  const done = await h.queue.onResolveDone("aaa");
+  assert.equal(done.head?.status, "blocked");
+  assert.equal(done.head?.blockedKind, "conflict");
+  assert.equal(h.queue.view().head?.resolveAttempts, 1, "the spent attempt is preserved across the re-block");
+});
+
+test("the retry bound: after MAX_RESOLVE_ATTEMPTS the head stays blocked and canResolveHead refuses", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => conflict("aaa"));
+  await h.queue.enqueue("aaa");
+
+  for (let i = 1; i <= MAX_RESOLVE_ATTEMPTS; i++) {
+    const gate = h.queue.canResolveHead();
+    assert.equal(gate.ok, true, `attempt ${i} is allowed`);
+    if (gate.ok) assert.equal(gate.attempt, i);
+    const started = h.queue.beginResolve();
+    assert.equal(started.started, true);
+    await h.queue.onResolveDone("aaa"); // still conflicted each time
+  }
+
+  const after = h.queue.canResolveHead();
+  assert.equal(after.ok, false, "past the bound, no more resolvers");
+  if (!after.ok) assert.match(after.reason, /limit/);
+  assert.equal(h.queue.view().head?.status, "blocked", "the head stays blocked, holding the queue");
+  assert.equal(h.queue.headFeature(), "aaa");
+});
+
+test("onResolveDone is a no-op when the resolving head advanced or changed under it", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => conflict("aaa"));
+  await h.queue.enqueue("aaa");
+  h.queue.beginResolve();
+
+  // A stale completion for a feature that isn't the resolving head.
+  const stale = await h.queue.onResolveDone("bbb");
+  assert.equal(stale.processed, false);
+  assert.equal(h.queue.view().head?.status, "resolving", "the real head is untouched by a stale done");
+});
+
+test("a resolved-green head then merges through the gate and advances normally", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => conflict("aaa"));
+  await h.queue.enqueue("aaa");
+  await h.queue.enqueue("bbb");
+  h.queue.beginResolve();
+  h.prepareFn.set("aaa", () => green("aaa"));
+  await h.queue.onResolveDone("aaa");
+
+  const merge = await h.queue.mergeHead();
+  assert.equal(merge.merged, true, "a resolved head merges like any ready head");
+  assert.equal(merge.feature, "aaa");
+  assert.equal(merge.head?.feature, "bbb", "the queue advanced to the follower");
+  assert.deepEqual(h.forgotten, ["aaa"]);
 });

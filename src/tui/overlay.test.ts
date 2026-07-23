@@ -7,23 +7,26 @@ import {
   type InStream,
   type LandingReview,
   type OutStream,
+  type QueuePanelView,
 } from "./tui.js";
 import { stripAnsi } from "./wrap.js";
 
 /**
- * End-to-end tests for the in-session overlay (Ctrl-O): the doc viewer, and
- * the landing gate that shares its modality, paging, and paint frame. Raw
+ * End-to-end tests for the Ctrl-O panel: the doc surface, and the merge review
+ * that now lives INSIDE the panel and shares its paging and paint frame. Raw
  * bytes go in one end and we assert on the painted frames and on the calls the
- * overlay makes into its injected sources. The DocSource is faked so nothing
+ * panel makes into its injected sources. The DocSource is faked so nothing
  * touches the filesystem (the real docs/-only sandbox is proved in
  * memory/docs.test.ts); the LandingReview is faked so nothing touches git (the
  * real engine wiring is proved in session/landinggate.test.ts).
  *
- * The invariants that matter here: the overlay is modal (keys drive the viewer,
- * not the prompt), it renders through the shared markdown renderer, it refreshes
- * live off the write-queue subscription, Esc restores the conversation intact,
- * a long doc pages without any arrow key - and for the gate, execute() fires
- * exactly once, from [m] alone, only over a mergeable prepare.
+ * The invariants that matter here: the panel does NOT auto-pop (registering a
+ * review flashes a hint; the captain opens it with Ctrl-O), while open every key
+ * drives the panel and never the prompt, it renders through the shared markdown
+ * renderer, it refreshes live off the write-queue subscription, Esc restores the
+ * conversation intact, a long body pages without any arrow key - and for the
+ * review, execute() fires exactly once, from [m] alone, only over a mergeable
+ * prepare. A review with no queue/docs source opens straight to the diff.
  */
 
 process.setMaxListeners(0);
@@ -77,7 +80,12 @@ interface Harness {
   stop(): void;
 }
 
-function harness(docs?: DocSource, cols = 40, rows = 12): Harness {
+function harness(
+  docs?: DocSource,
+  cols = 40,
+  rows = 12,
+  queue?: { view(): QueuePanelView },
+): Harness {
   let listener: ((d: string) => void) | null = null;
   const writes: string[] = [];
   const out: OutStream = { write: (s) => writes.push(String(s)), columns: cols, rows };
@@ -90,7 +98,7 @@ function harness(docs?: DocSource, cols = 40, rows = 12): Harness {
     on: (_e, l) => (listener = l),
     removeListener: () => (listener = null),
   };
-  const tui = new Tui({ promptLabel: PROMPT, out, inp, docs });
+  const tui = new Tui({ promptLabel: PROMPT, out, inp, docs, ...(queue ? { queue } : {}) });
   tui.start();
   return {
     tui,
@@ -299,12 +307,12 @@ test("an empty docs/ shows a friendly message, not a crash", async () => {
   h.stop();
 });
 
-test("without a DocSource, Ctrl-O flashes a hint and never opens", async () => {
-  const h = harness(undefined); // no docs wired (the degraded path)
+test("with no docs, no queue and no review, Ctrl-O flashes a hint and never opens", async () => {
+  const h = harness(undefined); // nothing wired (the degraded path)
   const answer = h.tui.question();
   h.send(CTRL_O);
   await settle();
-  assert.match(stripAnsi(h.lastFrame()), /doc viewer unavailable/);
+  assert.match(stripAnsi(h.lastFrame()), /panel unavailable/);
   // Input still works normally — nothing became modal.
   h.send("still typing\r");
   assert.equal(await answer, "still typing");
@@ -358,12 +366,39 @@ const GREEN: LandingReview["prepared"] = {
   ].join("\n"),
 };
 
+/**
+ * Register a review and open the panel onto it. With no queue/docs wired (the
+ * default for these gate tests) the panel opens straight to the review diff.
+ * Returns the outcome promise. Registering first flashes a hint (no auto-pop),
+ * exactly as the session sees it.
+ */
+function openReview(h: Harness, review: LandingReview): Promise<"merged" | "rejected" | "failed"> {
+  const p = h.tui.openLandingReview(review);
+  assert.match(stripAnsi(h.lastFrame()), /press Ctrl-O/, "registering flashes a hint, does not auto-pop");
+  h.send(CTRL_O);
+  return p as Promise<"merged" | "rejected" | "failed">;
+}
+
+test("registering a review does not auto-pop; Ctrl-O opens it", async () => {
+  const h = harness(undefined, 60, 24);
+  const review = fakeReview(GREEN);
+  const p = h.tui.openLandingReview(review);
+  // The transcript/prompt is still what's painted — the panel did NOT open.
+  assert.ok(!h.lastFramePlain().includes("review · gate-ui"), "no auto-pop");
+  assert.match(stripAnsi(h.lastFrame()), /press Ctrl-O/, "a hint points at Ctrl-O");
+  h.send(CTRL_O);
+  assert.match(h.lastFramePlain(), /review · gate-ui → dev/, "Ctrl-O opens onto the review");
+  h.send("r");
+  assert.equal(await p, "rejected");
+  h.stop();
+});
+
 test("a green prepare shows header, summary, commits, diff, and the armed action bar", async () => {
   const h = harness(undefined, 60, 24); // tall enough that the whole body fits one screen
   const review = fakeReview(GREEN);
-  const p = h.tui.openLandingReview(review);
+  const p = openReview(h, review);
   const frame = h.lastFramePlain();
-  assert.match(frame, /landing · gate-ui → dev/, "header names the feature and target");
+  assert.match(frame, /review · gate-ui → dev/, "header names the feature and target");
   assert.match(frame, /2 commits · 1 file changed/, "summary counts commits and files");
   assert.match(frame, /job: first slice/, "commit list is shown");
   assert.match(frame, /\+hello from the feature/, "the diff body is shown");
@@ -378,7 +413,7 @@ test("[m] fires the merge exactly once, dismisses on success, and flashes the co
   const h = harness();
   h.tui.question();
   const review = fakeReview(GREEN);
-  const p = h.tui.openLandingReview(review);
+  const p = openReview(h, review);
   h.send("m");
   assert.equal(review.calls, 1, "the keystroke invoked execute");
   assert.match(h.lastFramePlain(), /merging into dev/, "the bar shows the merge in flight");
@@ -388,38 +423,56 @@ test("[m] fires the merge exactly once, dismisses on success, and flashes the co
   h.send("r");
   h.send(ESC);
   assert.equal(review.calls, 1);
-  assert.match(h.lastFramePlain(), /landing · gate-ui/, "still open mid-merge");
+  assert.match(h.lastFramePlain(), /review · gate-ui/, "still open mid-merge");
   review.resolveMerge("landed gate-ui: abc1234 on dev");
   await settle();
   assert.equal(await p, "merged");
   const frame = stripAnsi(h.lastFrame());
-  assert.ok(!frame.includes("landing · gate-ui"), "the review dismissed itself");
+  assert.ok(!frame.includes("review · gate-ui"), "the panel closed itself (nothing left to show)");
   assert.match(frame, /landed gate-ui/, "the confirmation flashed");
   assert.match(frame, /you > /, "the conversation is back");
   h.stop();
 });
 
-test("[r] and Esc dismiss without ever calling execute", async () => {
-  for (const key of ["r", ESC]) {
-    const h = harness();
-    h.tui.question();
-    const review = fakeReview(GREEN);
-    const p = h.tui.openLandingReview(review);
-    h.send(key);
-    assert.equal(await p, "rejected");
-    assert.equal(review.calls, 0, "no merge on reject");
-    assert.match(h.lastFrame(), /you > /, "the conversation is back");
-    h.stop();
-  }
+test("[r] rejects without ever calling execute", async () => {
+  const h = harness();
+  h.tui.question();
+  const review = fakeReview(GREEN);
+  const p = openReview(h, review);
+  h.send("r");
+  assert.equal(await p, "rejected");
+  assert.equal(review.calls, 0, "no merge on reject");
+  assert.match(h.lastFrame(), /you > /, "the conversation is back");
+  h.stop();
 });
 
-test("while the gate is open, keystrokes drive it and never the prompt", async () => {
+test("Esc closes the panel but leaves the review pending; reopening lands back on it", async () => {
+  const h = harness();
+  h.tui.question();
+  const review = fakeReview(GREEN);
+  const p = openReview(h, review);
+  let settled = false;
+  void p.then(() => (settled = true));
+  h.send(ESC); // closes the panel — but does NOT reject (non-modal)
+  await settle();
+  assert.equal(settled, false, "the review is still pending after Esc");
+  assert.match(h.lastFrame(), /you > /, "the conversation is back");
+  // Reopening lands straight back on the still-pending review.
+  h.send(CTRL_O);
+  assert.match(h.lastFramePlain(), /review · gate-ui/, "reopened onto the same review");
+  h.send("r");
+  assert.equal(await p, "rejected");
+  assert.equal(review.calls, 0);
+  h.stop();
+});
+
+test("while the panel is open, keystrokes drive it and never the prompt", async () => {
   const h = harness();
   const answer = h.tui.question();
   const review = fakeReview(GREEN);
-  const p = h.tui.openLandingReview(review);
-  h.send("hello"); // none of these letters are gate bindings
-  h.send(ESC);
+  const p = openReview(h, review);
+  h.send("hello"); // 'e','l','o' aren't bindings; must not leak into the buffer
+  h.send("r"); // reject to settle the promise
   assert.equal(await p, "rejected");
   h.send("real\r");
   assert.equal(await answer, "real", "nothing leaked into the input buffer");
@@ -433,7 +486,7 @@ test("a conflict prepare shows the paths and why, with [m] disabled", async () =
     conflictFiles: ["src/app.ts", "src/db.ts"],
     detail: "could not apply abc1234... job: right edit",
   });
-  const p = h.tui.openLandingReview(review);
+  const p = openReview(h, review);
   const frame = h.lastFramePlain();
   assert.match(frame, /hit conflicts/, "the state is named");
   assert.match(frame, /src\/app\.ts/);
@@ -442,7 +495,7 @@ test("a conflict prepare shows the paths and why, with [m] disabled", async () =
   assert.match(frame, /m disabled \(conflict\)/, "the bar says why m is off");
   h.send("m");
   assert.equal(review.calls, 0, "a disabled m never reaches execute");
-  assert.match(h.lastFramePlain(), /landing · /, "still open");
+  assert.match(h.lastFramePlain(), /review · /, "still open");
   h.send("r");
   assert.equal(await p, "rejected");
   h.stop();
@@ -451,14 +504,14 @@ test("a conflict prepare shows the paths and why, with [m] disabled", async () =
 test("a failed prepare shows the exit code and output, with [m] disabled", async () => {
   const h = harness(undefined, 60, 12);
   const review = fakeReview({ kind: "failed", exitCode: 3, output: "boom went the suite" });
-  const p = h.tui.openLandingReview(review);
+  const p = openReview(h, review);
   const frame = h.lastFramePlain();
   assert.match(frame, /build\+test failed on the rebased state \(exit 3\)/);
   assert.match(frame, /boom went the suite/, "the suite's own output is shown");
   assert.match(frame, /m disabled \(build\+test red\)/);
   h.send("m");
   assert.equal(review.calls, 0);
-  h.send(ESC);
+  h.send("r");
   assert.equal(await p, "rejected");
   h.stop();
 });
@@ -467,7 +520,7 @@ test("a refused merge surfaces the error in place; [m] stays off; dismissal repo
   const h = harness(undefined, 60, 12);
   h.tui.question();
   const review = fakeReview(GREEN);
-  const p = h.tui.openLandingReview(review);
+  const p = openReview(h, review);
   h.send("m");
   review.rejectMerge(
     new Error("'co/feat-x' is not rebased onto the current 'dev' tip; run prepareLanding again"),
@@ -476,7 +529,7 @@ test("a refused merge surfaces the error in place; [m] stays off; dismissal repo
   const frame = h.lastFramePlain();
   assert.match(frame, /merge failed:/, "the refusal banners in place");
   assert.match(frame, /not rebased/, "with the engine's own reason");
-  assert.match(frame, /landing · gate-ui/, "the gate survived the failure");
+  assert.match(frame, /review · gate-ui/, "the review survived the failure");
   h.send("m"); // the refusal disarms m: a stale green needs a fresh prepare
   assert.equal(review.calls, 1);
   h.send("r");
@@ -495,7 +548,7 @@ test("a long diff pages with space and jumps with g/G", async () => {
     commits: ["abc1234 j"],
     diff: ["diff --git a/f b/f", "@@ -0,0 +100 @@", ...lines].join("\n"),
   });
-  const p = h.tui.openLandingReview(review);
+  const p = openReview(h, review);
   assert.match(h.lastFramePlain(), /\+line 1(?!\d)/, "starts at the top");
   assert.match(h.lastFramePlain(), /more below/, "the bar shows there is more");
   h.send(" ");
@@ -516,7 +569,7 @@ test("a long diff pages with space and jumps with g/G", async () => {
 test("a green with no commits shows nothing-to-land and [m] is off", async () => {
   const h = harness();
   const review = fakeReview({ kind: "green", commits: [], diff: "" });
-  const p = h.tui.openLandingReview(review);
+  const p = openReview(h, review);
   const frame = h.lastFramePlain();
   assert.match(frame, /nothing to land/);
   assert.match(frame, /m disabled \(nothing to land\)/);
@@ -527,32 +580,215 @@ test("a green with no commits shows nothing-to-land and [m] is off", async () =>
   h.stop();
 });
 
-test("opening the gate over the doc viewer replaces it cleanly", async () => {
+test("a review registered while the docs tab is open coexists; Tab reaches it", async () => {
   const docs = fakeDocs({ "plan.md": "# Plan\n" });
   const h = harness(docs);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
   assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, "the doc list is up");
+  // Registering a review does NOT grab the screen (non-modal): docs stay up.
   const review = fakeReview(GREEN);
   const p = h.tui.openLandingReview(review);
-  assert.match(h.lastFramePlain(), /landing · gate-ui/, "the gate took the screen");
-  // The doc subscription was torn down with the viewer: a write signal now is
-  // a no-op, not a repaint back into doc mode.
-  docs.emit("plan.md");
   await settle();
-  assert.match(h.lastFramePlain(), /landing · gate-ui/, "the gate is undisturbed");
-  h.send(ESC);
+  assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, "docs still showing; the review didn't take over");
+  // Tab reaches the review (no queue is wired, so review is its own tab).
+  h.send("\t");
+  assert.match(h.lastFramePlain(), /review · gate-ui/, "Tab switched to the pending review");
+  // The doc subscription is still live: a write updates the cached list, and Tab
+  // back to docs shows it.
+  docs.set("fresh.md", "y\n");
+  docs.emit("fresh.md");
+  await settle();
+  h.send("\t"); // review -> docs
+  await settle();
+  assert.match(h.lastFramePlain(), /fresh\.md/, "docs refreshed underneath");
+  h.send("\t"); // docs -> review
+  h.send("r");
   assert.equal(await p, "rejected");
-  assert.match(h.lastFrame(), /you > /);
   h.stop();
 });
 
-test("stopping the Tui with the gate open settles the review as rejected", async () => {
+test("stopping the Tui with a review pending settles it as rejected", async () => {
   const h = harness();
   const review = fakeReview(GREEN);
-  const p = h.tui.openLandingReview(review);
+  const p = h.tui.openLandingReview(review); // pending, panel never opened
   h.stop();
   assert.equal(await p, "rejected", "teardown never strands the caller");
   assert.equal(review.calls, 0);
+});
+
+// --- the queue tab -----------------------------------------------------------
+
+/** A queue source whose snapshot the test swaps between paints, to prove the
+ *  panel reads the queue fresh (no cached view). */
+function fakeQueue(initial: QueuePanelView): { view(): QueuePanelView; set(v: QueuePanelView): void } {
+  let cur = initial;
+  return { view: () => cur, set: (v) => (cur = v) };
+}
+
+const emptyQueue: QueuePanelView = { size: 0, head: null, entries: [] };
+
+test("Ctrl-O opens the queue tab first when a queue is wired; an empty queue says so", async () => {
+  const q = fakeQueue(emptyQueue);
+  const h = harness(undefined, 60, 16, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /queue/, "the header names the queue tab");
+  assert.match(frame, /merge queue is empty/, "an empty queue is stated, not blank");
+  h.stop();
+});
+
+/** Open the panel over a one-shot queue snapshot and return the painted frame. */
+async function renderQueue(view: QueuePanelView): Promise<string> {
+  const h = harness(undefined, 72, 20, fakeQueue(view));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  h.stop();
+  return frame;
+}
+
+test("the queue tab renders queued + ready with head position and commit count", async () => {
+  const frame = await renderQueue({
+    size: 5,
+    head: null,
+    entries: [
+      { feature: "ready-one", position: 1, isHead: true, status: "ready", commitsReady: 2 },
+      { feature: "next-up", position: 2, isHead: false, status: "queued" },
+      { feature: "later", position: 3, isHead: false, status: "queued" },
+    ],
+  });
+  assert.match(frame, /1\.\s*ready-one\s+\[ready\]/, "the ready head with its position");
+  assert.match(frame, /2 commits ready to land/, "a ready head shows its commit count");
+  assert.match(frame, /2\.\s*next-up\s+\[queued\]/, "a follower is queued");
+});
+
+test("the queue tab renders a head being processed", async () => {
+  const frame = await renderQueue({
+    size: 1,
+    head: null,
+    entries: [{ feature: "proc", position: 1, isHead: true, status: "head-processing" }],
+  });
+  assert.match(frame, /proc\s+\[processing\]/, "a head being prepared shows processing");
+});
+
+test("the queue tab distinguishes a conflict block from a red build+test block", async () => {
+  const conflictFrame = await renderQueue({
+    size: 1,
+    head: null,
+    entries: [
+      {
+        feature: "cft",
+        position: 1,
+        isHead: true,
+        status: "blocked",
+        blockedKind: "conflict",
+        blockedReason: "rebase conflict in src/app.ts",
+      },
+    ],
+  });
+  assert.match(conflictFrame, /cft\s+\[blocked: conflict\]/, "a conflict block is labelled conflict");
+  assert.match(conflictFrame, /rebase conflict in src\/app\.ts/, "the reason is shown");
+  assert.match(conflictFrame, /feature_resolve_head/, "the resolver hint is offered for a fixable block");
+
+  const redFrame = await renderQueue({
+    size: 1,
+    head: null,
+    entries: [
+      {
+        feature: "red",
+        position: 1,
+        isHead: true,
+        status: "blocked",
+        blockedKind: "failed",
+        blockedReason: "build+test failed (exit 2)",
+        resolveAttempts: 1,
+      },
+    ],
+  });
+  assert.match(redFrame, /red\s+\[blocked: build\+test\]/, "a red block is labelled build+test, distinct from conflict");
+  assert.match(redFrame, /resolver attempts: 1/, "spent attempts are surfaced");
+});
+
+test("the queue tab shows a resolving head with its attempt", async () => {
+  const frame = await renderQueue({
+    size: 1,
+    head: null,
+    entries: [
+      { feature: "res", position: 1, isHead: true, status: "resolving", blockedKind: "conflict", resolveAttempts: 2 },
+    ],
+  });
+  assert.match(frame, /res\s+\[resolving\]/, "a resolving head is labelled resolving");
+  assert.match(frame, /attempt 2/, "the current attempt is shown");
+});
+
+test("an in-panel [m] on the ready head merges via the queue and the panel reflects the advance", async () => {
+  // The queue snapshot advances exactly when the review's execute() resolves —
+  // the same coupling the real engine has (mergeHead advances then re-processes).
+  const q = fakeQueue({
+    size: 2,
+    head: null,
+    entries: [
+      { feature: "head-a", position: 1, isHead: true, status: "ready", commitsReady: 1 },
+      { feature: "head-b", position: 2, isHead: false, status: "queued" },
+    ],
+  });
+  const h = harness(undefined, 72, 20, q);
+  h.tui.question();
+
+  const review = fakeReview({ ...GREEN, commits: ["abc job: a"] });
+  const p = h.tui.openLandingReview(review);
+  h.send(CTRL_O);
+  await settle();
+  // The queue tab shows the ready head and offers the in-place action bar.
+  let frame = h.lastFramePlain();
+  assert.match(frame, /head-a\s+\[ready\]/);
+  assert.match(frame, /m\s*merge · r\s*reject · d\s*drill/, "the ready head is actionable in-panel");
+
+  // [m] fires the merge. On success the queue snapshot advances to head-b.
+  h.send("m");
+  assert.equal(review.calls, 1, "the in-panel m drove the merge");
+  q.set({
+    size: 1,
+    head: null,
+    entries: [{ feature: "head-b", position: 1, isHead: true, status: "ready", commitsReady: 1 }],
+  });
+  review.resolveMerge("landed head-a: abc on dev");
+  await settle();
+  assert.equal(await p, "merged");
+  // The panel stayed open on the queue tab and now shows the advanced head.
+  frame = h.lastFramePlain();
+  assert.match(frame, /head-b\s+\[ready\]/, "the panel reflects the advanced queue");
+  assert.ok(!frame.includes("head-a"), "the merged head is gone from the view");
+  h.stop();
+});
+
+test("[d] drills the ready head into the full paged diff; Backspace returns to the queue tab", async () => {
+  const q = fakeQueue({
+    size: 1,
+    head: null,
+    entries: [{ feature: "drillme", position: 1, isHead: true, status: "ready", commitsReady: 1 }],
+  });
+  const h = harness(undefined, 72, 16, q);
+  h.tui.question();
+  const review = fakeReview({
+    kind: "green",
+    commits: ["abc job: a"],
+    diff: ["diff --git a/f b/f", "@@ -0,0 +1 @@", "+the drilled body line"].join("\n"),
+  });
+  const p = h.tui.openLandingReview(review);
+  h.send(CTRL_O);
+  await settle();
+  h.send("d"); // drill
+  assert.match(h.lastFramePlain(), /review · gate-ui/, "drilling shows the review header");
+  assert.match(h.lastFramePlain(), /\+the drilled body line/, "the full diff is shown");
+  h.send("\x7f"); // Backspace back to the queue tab
+  assert.match(h.lastFramePlain(), /drillme\s+\[ready\]/, "back on the queue tab");
+  h.send("r");
+  assert.equal(await p, "rejected");
+  h.stop();
 });

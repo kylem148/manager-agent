@@ -210,6 +210,47 @@ export interface DocSource {
 }
 
 /**
+ * One feature's place in the merge queue, as the panel shows it. Structurally a
+ * subset of the session's QueueEntryView — declared here (rather than imported)
+ * so the low-level Tui never depends on the session layer, the same way
+ * LandingPrepared mirrors the engine's prepare result. The session's real view
+ * is assignable to this.
+ */
+export interface QueuePanelEntry {
+  feature: string;
+  /** 1-based landing position (1 is the head). */
+  position: number;
+  isHead: boolean;
+  status: "queued" | "head-processing" | "ready" | "blocked" | "resolving";
+  /** Commits awaiting merge on a ready head. */
+  commitsReady?: number;
+  /** Present when blocked: the human-readable reason. */
+  blockedReason?: string;
+  /** Present when blocked: conflict vs red build+test. */
+  blockedKind?: "conflict" | "failed";
+  /** Resolver attempts spent so far on this head. */
+  resolveAttempts?: number;
+}
+
+/** The whole merge queue in landing order, for the panel's queue view. */
+export interface QueuePanelView {
+  size: number;
+  head: QueuePanelEntry | null;
+  entries: QueuePanelEntry[];
+}
+
+/**
+ * Backs the Ctrl-O panel's live merge-queue view. Read on demand at paint time
+ * (the queue is an in-memory snapshot, so re-reading is cheap and always fresh),
+ * so no subscription is needed: every tool turn and dispatch completion already
+ * triggers a repaint, which re-reads the queue. Injected like DocSource so the
+ * Tui never reaches into the engine.
+ */
+export interface QueuePanelSource {
+  view(): QueuePanelView;
+}
+
+/**
  * What the landing gate reviews and does - the Ctrl-O overlay's third mode,
  * opened programmatically via openLandingReview when a prepared feature awaits
  * the human's verdict. Injected like DocSource so the Tui never touches git
@@ -366,11 +407,17 @@ export interface TuiOptions {
   out?: OutStream;
   inp?: InStream;
   /**
-   * Backs the Ctrl-O doc viewer overlay. Omit to disable the feature (the
+   * Backs the Ctrl-O panel's doc surface. Omit to disable the feature (the
    * keybinding then flashes a hint instead of opening). session.ts always
    * supplies one bound to the instance's docs/.
    */
   docs?: DocSource;
+  /**
+   * Backs the Ctrl-O panel's live merge-queue view. Omit off the feature flow
+   * (unlinked, or PlainIO); the panel then shows only docs. session.ts supplies
+   * one bound to the FeatureManager's queue when linked.
+   */
+  queue?: QueuePanelSource;
 }
 
 /**
@@ -448,44 +495,70 @@ const PAINT_INTERVAL_MS = 16;
 const OVERLAY_LABELS = "123456789abcdefghijklmnopqrstuvwxyz";
 
 /**
- * The doc viewer overlay's state. `list` offers the docs/ files for selection;
- * `doc` shows one rendered document with its own scroll offset. `content` is
- * kept raw alongside the rendered `rows` so a resize can re-lay the doc out
- * (tables included) without word-wrapping already-drawn output.
+ * The persistent Ctrl-O panel (D-20260723-25): the non-modal home for BOTH the
+ * user-facing docs AND the live merge queue. Unlike the old modal doc overlay it
+ * does NOT auto-pop — the captain opens and closes it with Ctrl-O — and it hosts
+ * the merge review in-place rather than through a separate modal surface.
+ *
+ * It has two tabs, switched with Tab, so the two key spaces never collide: the
+ * `queue` tab (m/r/d act on the ready head's review), and the `docs` tab (1-9/a-z
+ * open a doc). Opening a doc drops into a `doc` view; [d] on a ready head drops
+ * into a `review` view (the full paged diff). Backspace/Esc walk back out.
+ *
+ * `docs` + its loading/error are kept on the panel (not per-view) so switching
+ * tabs never reloads them; the live queue is read fresh from the QueuePanelSource
+ * at paint time (cheap in-memory snapshot), so it needs no cached copy.
  */
-type Overlay =
-  | { mode: "list"; docs: string[]; loading: boolean; error: string | null }
-  | { mode: "doc"; name: string; content: string; rows: string[]; scroll: number; error: string | null }
-  | {
-      mode: "landing";
-      review: LandingReview;
-      /** Rendered summary + diff body. Rebuilt on resize and on state change. */
-      rows: string[];
-      scroll: number;
-      /** "review": [m] can fire (green prepare only). "merging": execute() is in
-       *  flight and every gate key is ignored - the fire-once interlock.
-       *  "failed": the merge was refused; [m] stays off (a stale green needs a
-       *  fresh prepare, not a retry) and dismissing is the only exit. */
-      status: "review" | "merging" | "failed";
-      /** The execute() refusal/failure message when status is "failed". */
-      error: string | null;
-      /** Resolve openLandingReview's promise. Idempotent: first call wins. */
-      settle: (outcome: LandingGateOutcome) => void;
-    };
+type PanelView =
+  | { kind: "queue" }
+  | { kind: "docs" }
+  | { kind: "doc"; name: string; content: string; rows: string[]; scroll: number; error: string | null }
+  /** The ready head's full paged diff, drilled into with [d] from the queue tab.
+   *  Its rows/scroll live on `pendingReview` (mutated in place), so this carries
+   *  no state of its own. */
+  | { kind: "review" };
+
+interface PanelState {
+  view: PanelView;
+  /** The docs/ filenames, sorted; loaded on open and on a write signal. */
+  docs: string[];
+  docsLoading: boolean;
+  docsError: string | null;
+}
 
 /**
- * The landing overlay state. Unlike the doc overlay (replaced wholesale on
- * scroll), this one object is MUTATED in place for its whole life: the [m]
- * handler's async continuation holds a reference and checks it against
- * this.overlay to know whether the gate is still on screen, so its identity
- * must survive scrolling and status changes.
+ * A merge review awaiting the captain's verdict, tracked INDEPENDENTLY of whether
+ * the panel is open (openLandingReview sets it and flashes a hint; the captain
+ * opens the panel to act). At most one exists at a time — the queue is serial, and
+ * feature_land is refused for a queued feature — so a second openLandingReview
+ * settles the first as rejected before replacing it.
+ *
+ * Mutated in place for its whole life: the [m] handler's async continuation holds
+ * a reference and checks it against this.pendingReview to know whether the gate is
+ * still live, so its identity must survive scrolling and status changes (the same
+ * contract the old LandingOverlay had).
  */
-type LandingOverlay = Extract<Overlay, { mode: "landing" }>;
+interface PendingReview {
+  review: LandingReview;
+  /** "review": [m] can fire (green prepare only). "merging": execute() is in
+   *  flight and every gate key is ignored - the fire-once interlock. "failed":
+   *  the merge was refused; [m] stays off (a stale green needs a fresh prepare)
+   *  and dismissing is the only exit. */
+  status: "review" | "merging" | "failed";
+  /** The execute() refusal/failure message when status is "failed". */
+  error: string | null;
+  /** Rendered summary + full diff for the [d] drill view. Rebuilt on resize/state. */
+  rows: string[];
+  scroll: number;
+  /** Resolve openLandingReview's promise. Idempotent: first call wins. */
+  settle: (outcome: LandingGateOutcome) => void;
+}
 
 /**
- * A decoded overlay keystroke: either a printable char (a doc-list selector or
- * a paging letter) or a named navigation intent. Kept separate from the editor's
- * `Action` so the two input modes never share a binding by accident.
+ * A decoded panel keystroke: either a printable char (a doc-list selector, a
+ * paging letter, or a review action m/r/d) or a named navigation intent. Kept
+ * separate from the editor's `Action` so the two input modes never share a
+ * binding by accident.
  */
 type OverlayInput =
   | { ch: string }
@@ -493,6 +566,7 @@ type OverlayInput =
       nav:
         | "escape"
         | "back"
+        | "tab"
         | "up"
         | "down"
         | "pageup"
@@ -599,20 +673,28 @@ export class Tui implements SessionIO {
   // (matches Claude Code's esc-esc). Any other key disarms it.
   private escPending = false;
 
-  // The doc viewer overlay (Ctrl-O). While `overlay` is non-null it is modal:
-  // every keystroke drives the viewer, not the prompt, and paint() draws the
-  // overlay over the whole screen instead of the transcript+editor. The model
-  // keeps streaming into the transcript underneath (committed/open are still
-  // updated); closing the overlay repaints it intact. `docs` is the injected
-  // sandboxed source; `unsubscribeDocs` tears down the live-refresh listener.
+  // The persistent Ctrl-O panel: the shared home for docs AND the live merge
+  // queue. While `panel` is non-null it takes the whole screen and drives every
+  // keystroke (a single keyboard can't feed the panel and the prompt at once),
+  // but it is NON-MODAL in the sense that matters: it never auto-pops, the
+  // captain opens/closes it with Ctrl-O, and Ctrl-O/Esc always returns to the
+  // prompt with the draft intact. The model keeps streaming into the transcript
+  // underneath (committed/open are still updated); closing the panel repaints it
+  // intact. `docs`/`queue` are the injected sandboxed sources; `unsubscribeDocs`
+  // tears down the live doc-refresh listener.
   private readonly docs?: DocSource;
-  private overlay: Overlay | null = null;
+  private readonly queue?: QueuePanelSource;
+  private panel: PanelState | null = null;
   private unsubscribeDocs: (() => void) | null = null;
+  // A merge review awaiting the captain's [m]/[r]/[d], tracked apart from the
+  // panel's open/closed state: openLandingReview sets it and flashes a hint (it
+  // never force-opens the panel), and the captain opens the panel to act on it.
+  private pendingReview: PendingReview | null = null;
 
   private onResize = (): void => {
     this.measure();
     this.rewrap();
-    this.reflowOverlay();
+    this.reflowPanel();
     this.paint();
   };
 
@@ -622,6 +704,7 @@ export class Tui implements SessionIO {
     this.out = opts.out ?? process.stdout;
     this.inp = opts.inp ?? process.stdin;
     this.docs = opts.docs;
+    this.queue = opts.queue;
   }
 
   // --- lifecycle -------------------------------------------------------------
@@ -675,13 +758,14 @@ export class Tui implements SessionIO {
     // Drop the doc-viewer live-refresh subscription so the write queue doesn't
     // keep calling into a torn-down Tui.
     if (this.unsubscribeDocs) { this.unsubscribeDocs(); this.unsubscribeDocs = null; }
-    // A landing gate open at teardown settles as a non-merge so its caller
+    // A pending merge review at teardown settles as a non-merge so its caller
     // never hangs; mid-merge, the execute continuation delivers the real
     // outcome (see approveLanding).
-    if (this.overlay?.mode === "landing" && this.overlay.status !== "merging") {
-      this.overlay.settle(this.overlay.status === "failed" ? "failed" : "rejected");
+    if (this.pendingReview && this.pendingReview.status !== "merging") {
+      this.pendingReview.settle(this.pendingReview.status === "failed" ? "failed" : "rejected");
     }
-    this.overlay = null;
+    this.pendingReview = null;
+    this.panel = null;
     if (this.statusTimer) { clearTimeout(this.statusTimer); this.statusTimer = null; }
     if (this.busyTimer) { clearInterval(this.busyTimer); this.busyTimer = null; }
     // Drop any queued frame: we're about to leave the alt screen, so painting
@@ -1017,10 +1101,10 @@ export class Tui implements SessionIO {
     // A synchronous paint satisfies any queued one; leaving the timer armed
     // would just write an identical frame a few milliseconds later.
     if (this.paintTimer) { clearTimeout(this.paintTimer); this.paintTimer = null; }
-    // The doc viewer is modal: when it's open it owns the whole screen. The
-    // transcript underneath keeps updating (streamed output still lands in the
-    // model); closing the overlay repaints it.
-    if (this.overlay) { this.paintOverlay(); return; }
+    // The Ctrl-O panel owns the whole screen while open. The transcript
+    // underneath keeps updating (streamed output still lands in the model);
+    // closing the panel repaints it.
+    if (this.panel) { this.paintPanel(); return; }
     // The input region height is dynamic (it grows as the buffer wraps), so the
     // transcript viewport height changes as the user types. Re-pin to the bottom
     // when following, so a growing input never leaves the transcript showing
@@ -1220,6 +1304,14 @@ export class Tui implements SessionIO {
     // Don't keep the process alive just to clear a cosmetic notice.
     this.statusTimer.unref?.();
     this.paint();
+  }
+
+  /** Drop any flashed status immediately (no repaint). Used when the panel opens
+   *  or closes so a stale hint (e.g. "review ready — Ctrl-O") doesn't outlive the
+   *  action it prompted. */
+  private clearStatus(): void {
+    this.status = null;
+    if (this.statusTimer) { clearTimeout(this.statusTimer); this.statusTimer = null; }
   }
 
   /** The busy indicator as it appears in the separator's right-hand slot. */
@@ -1443,11 +1535,11 @@ export class Tui implements SessionIO {
 
   /** Parse one key/sequence starting at `data[i]`. Returns bytes consumed. */
   private consume(data: string, i: number): number {
-    // The doc viewer is modal: while it's open every key drives the viewer, not
-    // the prompt. Delegate before any editor parsing so a keystroke can't leak
-    // into the buffer underneath. (The model keeps streaming into the transcript
-    // beneath the overlay; closing it repaints that intact — see closeOverlay.)
-    if (this.overlay) return this.consumeOverlay(data, i);
+    // While the Ctrl-O panel is open every key drives the panel, not the prompt.
+    // Delegate before any editor parsing so a keystroke can't leak into the
+    // buffer underneath. (The model keeps streaming into the transcript beneath
+    // the panel; closing it repaints that intact — see closePanel.)
+    if (this.panel) return this.consumeOverlay(data, i);
 
     // Inside a bracketed paste, bytes are opaque content: accumulate them until
     // the end marker and never parse CSI/keys within (a paste can contain
@@ -1597,7 +1689,7 @@ export class Tui implements SessionIO {
         return;
 
       case "open-docs":
-        this.openOverlay();
+        this.togglePanel();
         return;
 
       case "none":
@@ -1896,17 +1988,22 @@ export class Tui implements SessionIO {
     this.setStatus(`copied ${n} line${n === 1 ? "" : "s"}`);
   }
 
-  // --- doc viewer overlay -----------------------------------------------------
+  // --- the Ctrl-O panel -------------------------------------------------------
   //
-  // A modal, in-process viewer for the instance's user-facing docs (Ctrl-O). It
-  // lists docs/, renders a selected doc through the SAME markdown renderer the
-  // transcript uses, and refreshes live when an agent writes the doc on screen.
-  // It reads only through the injected DocSource, which is the sandboxed doc
-  // tool — so the `.memory/` substrate is never listed or reachable here. No
-  // step requires an arrow key: selection is a letter/number, paging is
-  // less-style (space/b, j/k, d/u, g/G).
+  // The persistent, non-modal home for the instance's user-facing docs AND the
+  // live merge queue (D-20260723-25). The captain opens/closes it with Ctrl-O;
+  // it never auto-pops. Two tabs (Tab switches): the QUEUE tab shows the ordered
+  // features and their state, with the ready head's review actioned in-place
+  // ([m] merge / [r] reject / [d] drill the full diff); the DOCS tab lists docs/
+  // (selectable by letter) and opens one rendered through the SAME markdown
+  // renderer the transcript uses, refreshing live when an agent writes it. The
+  // docs read only through the injected DocSource (the sandboxed doc tool — the
+  // `.memory/` substrate is never listed or reachable here); the queue reads a
+  // fresh in-memory snapshot from the QueuePanelSource at paint time. No step
+  // needs an arrow key: tab-switch is Tab, selection is a letter/number, paging
+  // is less-style (space/b, j/k, d/u, g/G).
 
-  /** Visible content rows in the overlay: full screen minus header + footer. */
+  /** Visible content rows in the panel: full screen minus header + footer. */
   private overlayViewport(): number {
     return Math.max(1, this.rows - 2);
   }
@@ -1916,34 +2013,69 @@ export class Tui implements SessionIO {
     return Math.max(1, this.overlayViewport() - 1);
   }
 
-  /**
-   * Open the doc viewer. No-op (with a hint) when no DocSource was wired, so a
-   * PlainIO/degraded session never crashes on the keybind. Subscribes to the
-   * write queue for live refresh; loads the list asynchronously.
-   */
-  private openOverlay(): void {
-    if (!this.docs) {
-      this.setStatus("doc viewer unavailable");
-      return;
-    }
-    if (this.overlay) return;
-    this.clearSelection();
-    this.overlay = { mode: "list", docs: [], loading: true, error: null };
-    this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
-    this.paint();
-    void this.loadList();
+  /** Ctrl-O: open the panel if closed, close it if open. This is the ONLY way
+   *  the panel opens — nothing auto-pops it. */
+  private togglePanel(): void {
+    if (this.panel) this.closePanel();
+    else this.openPanel();
   }
 
-  /** Close the overlay and repaint the transcript+editor beneath it, intact. */
-  private closeOverlay(): void {
-    if (!this.overlay) return;
-    this.overlay = null;
+  /**
+   * Open the panel. With no DocSource, no queue AND no pending review there is
+   * nothing to show, so flash a hint instead (PlainIO/degraded never crashes on
+   * the keybind). Otherwise the opening view is: the pending review's diff when
+   * one is waiting (the captain almost certainly opened to act on it), else the
+   * QUEUE tab when a queue is wired (the merge flow is the reason the panel
+   * exists), else the DOCS tab. Subscribes to the doc write queue for live
+   * refresh and loads the doc list asynchronously.
+   */
+  private openPanel(): void {
+    if (!this.docs && !this.queue && !this.pendingReview) {
+      this.setStatus("panel unavailable");
+      return;
+    }
+    if (this.panel) return;
+    this.clearSelection();
+    this.clearStatus();
+    let view: PanelView;
+    if (this.pendingReview) {
+      // Land where the captain can act: the queue tab (which shows the ready
+      // head + action bar) when a queue exists, else the review diff directly.
+      view = this.queue ? { kind: "queue" } : { kind: "review" };
+      if (this.queue) this.pendingReview.scroll = 0;
+      else {
+        this.pendingReview.rows = renderLandingBody(
+          this.pendingReview.review,
+          this.pendingReview.status,
+          this.pendingReview.error,
+          this.cols,
+        );
+        this.pendingReview.scroll = 0;
+      }
+    } else {
+      view = this.queue ? { kind: "queue" } : { kind: "docs" };
+    }
+    this.panel = { view, docs: [], docsLoading: Boolean(this.docs), docsError: null };
+    if (this.docs) {
+      this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
+      void this.loadList();
+    }
+    this.paint();
+  }
+
+  /** Close the panel and repaint the transcript+editor beneath it, intact. A
+   *  pending merge review is NOT settled — it survives closing the panel, so the
+   *  captain can reopen and act on it later. */
+  private closePanel(): void {
+    if (!this.panel) return;
+    this.panel = null;
+    this.clearStatus();
     if (this.unsubscribeDocs) {
       this.unsubscribeDocs();
       this.unsubscribeDocs = null;
     }
-    // Any model output that streamed in while the overlay was up is already in
-    // the transcript model; this paint reveals it.
+    // Any model output that streamed in while the panel was up is already in the
+    // transcript model; this paint reveals it.
     this.paint();
   }
 
@@ -1951,26 +2083,30 @@ export class Tui implements SessionIO {
     if (!this.docs) return;
     try {
       const docs = await this.docs.list();
-      if (this.overlay?.mode === "list") {
-        this.overlay = { mode: "list", docs, loading: false, error: null };
+      if (this.panel) {
+        this.panel.docs = docs;
+        this.panel.docsLoading = false;
+        this.panel.docsError = null;
         this.paint();
       }
     } catch (e) {
-      if (this.overlay?.mode === "list") {
-        this.overlay = { mode: "list", docs: [], loading: false, error: (e as Error).message };
+      if (this.panel) {
+        this.panel.docs = [];
+        this.panel.docsLoading = false;
+        this.panel.docsError = (e as Error).message;
         this.paint();
       }
     }
   }
 
-  /** Load a doc and switch the overlay to showing it, scrolled to the top. */
+  /** Load a doc and switch the panel to showing it, scrolled to the top. */
   private async openDoc(name: string): Promise<void> {
-    if (!this.docs) return;
+    if (!this.docs || !this.panel) return;
     try {
       const content = await this.docs.read(name);
-      if (!this.overlay) return; // closed while loading
-      this.overlay = {
-        mode: "doc",
+      if (!this.panel) return; // closed while loading
+      this.panel.view = {
+        kind: "doc",
         name,
         content,
         rows: renderMarkdownDoc(content, this.cols),
@@ -1979,21 +2115,55 @@ export class Tui implements SessionIO {
       };
       this.paint();
     } catch (e) {
-      if (!this.overlay) return;
-      this.overlay = { mode: "doc", name, content: "", rows: [], scroll: 0, error: (e as Error).message };
+      if (!this.panel) return;
+      this.panel.view = { kind: "doc", name, content: "", rows: [], scroll: 0, error: (e as Error).message };
       this.paint();
     }
   }
 
-  /** Return from a doc to the (re-loaded) list. */
+  /** Return from a doc to the docs tab (list re-loaded). */
   private backToList(): void {
-    if (!this.docs) {
-      this.closeOverlay();
-      return;
-    }
-    this.overlay = { mode: "list", docs: [], loading: true, error: null };
+    if (!this.panel) return;
+    this.panel.view = { kind: "docs" };
     this.paint();
     void this.loadList();
+  }
+
+  /** The panel's home tabs, in order, given what's wired and pending: the queue
+   *  (when a queue source exists), docs (when a doc source exists), and a
+   *  standalone review (only when there's a pending review AND no queue to host
+   *  it — a feature_land review that isn't in the queue). Tab cycles these. */
+  private panelTabs(): PanelView["kind"][] {
+    const tabs: PanelView["kind"][] = [];
+    if (this.queue) tabs.push("queue");
+    if (this.docs) tabs.push("docs");
+    if (this.pendingReview && !this.queue) tabs.push("review");
+    return tabs;
+  }
+
+  /** Tab cycles the home tabs. From a doc sub-view it first pops back to the docs
+   *  tab. A no-op when there's only one tab. */
+  private switchTab(): void {
+    if (!this.panel) return;
+    const v = this.panel.view;
+    if (v.kind === "doc") { this.panel.view = { kind: "docs" }; this.paint(); return; }
+    const tabs = this.panelTabs();
+    if (tabs.length < 2) return;
+    const cur = tabs.indexOf(v.kind);
+    const next = tabs[(cur + 1) % tabs.length]!;
+    this.panel.view = next === "review" ? { kind: "review" } : next === "docs" ? { kind: "docs" } : { kind: "queue" };
+    if (next === "review" && this.pendingReview) {
+      this.pendingReview.rows = renderLandingBody(
+        this.pendingReview.review,
+        this.pendingReview.status,
+        this.pendingReview.error,
+        this.cols,
+      );
+    }
+    this.paint();
+    // Landing on docs re-lists so any writes that arrived while it was off screen
+    // are picked up (onDocWrite skips the reload when docs aren't showing).
+    if (next === "docs") void this.loadList();
   }
 
   /**
@@ -2002,71 +2172,87 @@ export class Tui implements SessionIO {
    * the list). This is the live-refresh path the feature is built around.
    */
   private onDocWrite(name: string): void {
-    const ov = this.overlay;
-    if (!ov) return;
-    if (ov.mode === "doc") {
-      if (ov.name === name) void this.refreshDoc();
-    } else {
+    if (!this.panel) return;
+    const v = this.panel.view;
+    if (v.kind === "doc") {
+      if (v.name === name) void this.refreshDoc();
+    } else if (v.kind === "docs") {
       void this.loadList();
     }
+    // On the queue/review tab a doc write just updates the cached list silently;
+    // it re-lists when the captain switches to the docs tab.
   }
 
   /** Re-read the open doc, preserving the scroll position where it still fits. */
   private async refreshDoc(): Promise<void> {
-    const ov = this.overlay;
-    if (!this.docs || !ov || ov.mode !== "doc") return;
-    const name = ov.name;
+    if (!this.docs || !this.panel || this.panel.view.kind !== "doc") return;
+    const name = this.panel.view.name;
     try {
       const content = await this.docs.read(name);
-      const cur = this.overlay;
-      if (!cur || cur.mode !== "doc" || cur.name !== name) return; // moved on
+      if (!this.panel || this.panel.view.kind !== "doc" || this.panel.view.name !== name) return; // moved on
       const rows = renderMarkdownDoc(content, this.cols);
-      const scroll = Math.min(cur.scroll, Math.max(0, rows.length - this.overlayViewport()));
-      this.overlay = { mode: "doc", name, content, rows, scroll, error: null };
+      const scroll = Math.min(this.panel.view.scroll, Math.max(0, rows.length - this.overlayViewport()));
+      this.panel.view = { kind: "doc", name, content, rows, scroll, error: null };
       this.paint();
     } catch {
       // Deleted out from under us: drop back to the list rather than show stale.
-      const cur = this.overlay;
-      if (cur && cur.mode === "doc" && cur.name === name) this.backToList();
+      if (this.panel && this.panel.view.kind === "doc" && this.panel.view.name === name) this.backToList();
     }
   }
 
-  /** Re-lay the open doc or landing review out at the current width (resize). */
-  private reflowOverlay(): void {
-    const ov = this.overlay;
-    if (!ov || ov.mode === "list") return;
-    const rows =
-      ov.mode === "doc"
-        ? renderMarkdownDoc(ov.content, this.cols)
-        : renderLandingBody(ov.review, ov.status, ov.error, this.cols);
-    const scroll = Math.min(ov.scroll, Math.max(0, rows.length - this.overlayViewport()));
-    if (ov.mode === "doc") this.overlay = { ...ov, rows, scroll };
-    else { ov.rows = rows; ov.scroll = scroll; } // mutated in place; see LandingOverlay
+  /** Re-lay the open doc or the drilled review body out at the current width
+   *  (resize). The queue/docs tabs re-render from source each paint, so only the
+   *  scroll-bearing views need reflowing. */
+  private reflowPanel(): void {
+    if (!this.panel) return;
+    const v = this.panel.view;
+    if (v.kind === "doc") {
+      const rows = renderMarkdownDoc(v.content, this.cols);
+      const scroll = Math.min(v.scroll, Math.max(0, rows.length - this.overlayViewport()));
+      this.panel.view = { ...v, rows, scroll };
+    } else if (v.kind === "review" && this.pendingReview) {
+      const pr = this.pendingReview;
+      pr.rows = renderLandingBody(pr.review, pr.status, pr.error, this.cols);
+      pr.scroll = Math.min(pr.scroll, Math.max(0, pr.rows.length - this.overlayViewport()));
+    }
+  }
+
+  /** The scroll offset + row count of whichever scroll-bearing view is showing,
+   *  or null for the non-scrolling queue/docs tabs. */
+  private scrollTarget(): { get(): number; set(n: number): void; rows: number } | null {
+    if (!this.panel) return null;
+    const v = this.panel.view;
+    if (v.kind === "doc") {
+      return { get: () => v.scroll, set: (n) => { this.panel!.view = { ...v, scroll: n }; }, rows: v.rows.length };
+    }
+    if (v.kind === "review" && this.pendingReview) {
+      const pr = this.pendingReview;
+      return { get: () => pr.scroll, set: (n) => { pr.scroll = n; }, rows: pr.rows.length };
+    }
+    return null;
   }
 
   private overlayScrollBy(delta: number): void {
-    const ov = this.overlay;
-    if (!ov || ov.mode === "list") return;
-    const max = Math.max(0, ov.rows.length - this.overlayViewport());
-    const next = Math.max(0, Math.min(max, ov.scroll + delta));
-    if (next === ov.scroll) return;
-    if (ov.mode === "doc") this.overlay = { ...ov, scroll: next };
-    else ov.scroll = next; // mutated in place; see LandingOverlay
+    const t = this.scrollTarget();
+    if (!t) return;
+    const max = Math.max(0, t.rows - this.overlayViewport());
+    const next = Math.max(0, Math.min(max, t.get() + delta));
+    if (next === t.get()) return;
+    t.set(next);
     this.paint();
   }
 
   private overlayScrollTo(pos: number): void {
-    const ov = this.overlay;
-    if (!ov || ov.mode === "list") return;
-    const max = Math.max(0, ov.rows.length - this.overlayViewport());
+    const t = this.scrollTarget();
+    if (!t) return;
+    const max = Math.max(0, t.rows - this.overlayViewport());
     const next = Math.max(0, Math.min(max, pos));
-    if (next === ov.scroll) return;
-    if (ov.mode === "doc") this.overlay = { ...ov, scroll: next };
-    else ov.scroll = next; // mutated in place; see LandingOverlay
+    if (next === t.get()) return;
+    t.set(next);
     this.paint();
   }
 
-  /** Parse one key/sequence while the overlay is open. Returns bytes consumed. */
+  /** Parse one key/sequence while the panel is open. Returns bytes consumed. */
   private consumeOverlay(data: string, i: number): number {
     const ch = data[i]!;
     if (ch === ESC && data[i + 1] === "[") return this.consumeOverlayCsi(data, i);
@@ -2076,16 +2262,22 @@ export class Tui implements SessionIO {
       this.dispatchOverlay({ nav: "escape" });
       return 1;
     }
+    if (ch === "\t") {
+      this.dispatchOverlay({ nav: "tab" });
+      return 1;
+    }
     const input = this.overlayByte(ch);
     if (input) this.dispatchOverlay(input);
     return 1;
   }
 
-  /** Translate a legacy byte into an overlay input, or null to ignore it. */
+  /** Translate a legacy byte into a panel input, or null to ignore it. */
   private overlayByte(ch: string): OverlayInput | null {
     const code = ch.codePointAt(0) ?? 0;
     if (code >= 32 && code !== 127) return { ch }; // printable
     switch (code) {
+      case 9:
+        return { nav: "tab" }; // Tab switches tabs
       case 8:
       case 127:
         return { nav: "back" }; // Backspace
@@ -2098,7 +2290,7 @@ export class Tui implements SessionIO {
       case 21:
         return { nav: "halfup" }; // Ctrl-U
     }
-    return null; // Enter, Tab, other control bytes: nothing to do in the viewer
+    return null; // Enter, other control bytes: nothing to do in the panel
   }
 
   private consumeOverlayCsi(data: string, i: number): number {
@@ -2124,6 +2316,7 @@ export class Tui implements SessionIO {
         const ev = parseCsiU(params);
         if (ev) {
           if (ev.code === 27) this.dispatchOverlay({ nav: "escape" });
+          else if (ev.code === 9) this.dispatchOverlay({ nav: "tab" });
           else {
             // Fold a Kitty-encoded key back onto the legacy byte its raw form
             // would have been, so Ctrl-F/B/D/U page identically either way.
@@ -2157,44 +2350,81 @@ export class Tui implements SessionIO {
   }
 
   private dispatchOverlay(input: OverlayInput): void {
-    const ov = this.overlay;
-    if (!ov) return;
-    if (ov.mode === "list") this.overlayListInput(input, ov);
-    else if (ov.mode === "doc") this.overlayDocInput(input);
-    else this.overlayLandingInput(input, ov);
+    if (!this.panel) return;
+    // Tab switches tabs from any view.
+    if ("nav" in input && input.nav === "tab") { this.switchTab(); return; }
+    switch (this.panel.view.kind) {
+      case "queue": this.queueTabInput(input); return;
+      case "docs": this.docsTabInput(input, this.panel); return;
+      case "doc": this.overlayDocInput(input); return;
+      case "review": this.reviewViewInput(input); return;
+    }
   }
 
-  private overlayListInput(input: OverlayInput, ov: Extract<Overlay, { mode: "list" }>): void {
+  /** The queue tab: [m]/[r]/[d] act on the ready head's review; Esc closes. */
+  private queueTabInput(input: OverlayInput): void {
     if ("nav" in input) {
-      if (input.nav === "escape" || input.nav === "back") this.closeOverlay();
+      if (input.nav === "escape" || input.nav === "back") this.closePanel();
+      return; // the queue list itself doesn't scroll (it fits; entries are terse)
+    }
+    switch (input.ch) {
+      case "q": case "Q": this.closePanel(); return;
+      case "m": this.approveLanding(); return;
+      case "r": this.rejectReview(); return;
+      case "d": this.drillReview(); return;
+    }
+  }
+
+  private docsTabInput(input: OverlayInput, panel: PanelState): void {
+    if ("nav" in input) {
+      if (input.nav === "escape" || input.nav === "back") this.closePanel();
       return; // a labelled list has no line/page navigation
     }
     const ch = input.ch;
-    if (ch === "q" || ch === "Q") {
-      this.closeOverlay();
-      return;
-    }
+    if (ch === "q" || ch === "Q") { this.closePanel(); return; }
     const idx = OVERLAY_LABELS.indexOf(ch.toLowerCase());
-    if (idx >= 0 && idx < ov.docs.length) void this.openDoc(ov.docs[idx]!);
+    if (idx >= 0 && idx < panel.docs.length) void this.openDoc(panel.docs[idx]!);
   }
 
   private overlayDocInput(input: OverlayInput): void {
     if ("nav" in input) {
-      if (input.nav === "escape") { this.closeOverlay(); return; }
+      if (input.nav === "escape") { this.closePanel(); return; }
       if (input.nav === "back") { this.backToList(); return; }
       this.overlayScrollInput(input);
       return;
     }
-    if (input.ch === "q") { this.closeOverlay(); return; }
+    if (input.ch === "q") { this.closePanel(); return; }
+    this.overlayScrollInput(input);
+  }
+
+  /** The drilled review view (full paged diff): m/r act, Backspace returns to the
+   *  queue tab, Esc closes the panel (the review stays pending — only [r] rejects
+   *  it); everything else pages. A merge in flight locks out m/r/Esc/back: it
+   *  can't be cancelled or left, so only paging is live until it settles. */
+  private reviewViewInput(input: OverlayInput): void {
+    const merging = this.pendingReview?.status === "merging";
+    if ("nav" in input) {
+      if (!merging && input.nav === "escape") { this.closePanel(); return; }
+      if (!merging && input.nav === "back") {
+        if (this.panel) { this.panel.view = this.queue ? { kind: "queue" } : { kind: "review" }; this.paint(); }
+        return;
+      }
+      this.overlayScrollInput(input);
+      return;
+    }
+    if (!merging) {
+      if (input.ch === "m") { this.approveLanding(); return; }
+      if (input.ch === "r") { this.rejectReview(); return; }
+    }
     this.overlayScrollInput(input);
   }
 
   /**
-   * The less-style paging shared by every scrollable overlay body (a doc, the
-   * landing diff): space/f/b page, d/u half, j/k line, g/G ends, plus the nav
-   * keys. Escape/back are NOT here - each mode owns its exits, so a paging key
-   * can never dismiss a gate by accident. Returns false for keys that aren't
-   * paging so callers can tell an ignored key from a scrolled one.
+   * The less-style paging shared by every scrollable panel body (a doc, the
+   * drilled diff): space/f/b page, d/u half, j/k line, g/G ends, plus the nav
+   * keys. Escape/back are NOT here - each view owns its exits, so a paging key
+   * can never dismiss the panel or a review by accident. Returns false for keys
+   * that aren't paging so callers can tell an ignored key from a scrolled one.
    */
   private overlayScrollInput(input: OverlayInput): boolean {
     const half = Math.max(1, Math.floor(this.overlayPage() / 2));
@@ -2225,161 +2455,260 @@ export class Tui implements SessionIO {
     }
   }
 
-  // --- the landing gate (Ctrl-O overlay, landing mode) ------------------------
+  // --- the merge review (in-panel) --------------------------------------------
   //
-  // The human approval surface between prepareLanding and executeLanding: a
-  // prepared feature is shown as a summary + paged diff with an action bar, and
-  // the merge fires ONLY from the [m] keystroke here. It reuses the doc
-  // viewer's modality, paging, and paint frame; it is opened programmatically
-  // (by the session layer) rather than by the Ctrl-O keybinding, which keeps
-  // opening the doc list exactly as before.
+  // The human approval surface between prepareLanding and executeLanding, now
+  // hosted INSIDE the panel rather than as a separate modal overlay. A prepared
+  // feature is registered as `pendingReview` (tracked apart from the panel's
+  // open/closed state); the panel's queue tab shows its summary + action bar, and
+  // [d] drills into the full paged diff. The merge fires ONLY from the [m]
+  // keystroke here — review.execute() is called nowhere else, never on a timer,
+  // never on close. openLandingReview no longer force-opens the screen: it flashes
+  // a hint and lets the captain open the panel (D-20260723-25).
 
   /**
-   * Open the landing gate for a prepared feature and wait for the human's
-   * verdict. Resolves "merged" after review.execute() succeeds, "rejected"
-   * when dismissed with no merge ([r]/q/Esc, or session teardown), and
-   * "failed" when a merge attempt was refused and the review then dismissed.
-   * Modal like the doc viewer; a doc view that happens to be open yields to
-   * it. review.execute() is called only from the [m] keystroke - never here,
-   * never on a timer, never on close.
+   * Register a prepared feature for the captain's verdict and wait for it.
+   * Resolves "merged" after review.execute() succeeds, "rejected" when dismissed
+   * with no merge ([r] or session teardown), and "failed" when a merge attempt
+   * was refused and then dismissed. Does NOT open the panel — it flashes a hint;
+   * the captain opens the panel (Ctrl-O) to act. A second review settles any
+   * prior one as rejected first (serial queue: there is only ever one at a time).
    */
   openLandingReview(review: LandingReview): Promise<LandingGateOutcome> {
     return new Promise((resolve) => {
-      this.dismissOverlay();
-      this.clearSelection();
+      // Displace any prior pending review (shouldn't happen in the serial flow,
+      // but never strand a caller): settle it as rejected unless mid-merge.
+      const prior = this.pendingReview;
+      if (prior && prior.status !== "merging") prior.settle("rejected");
       let settled = false;
-      const ov: LandingOverlay = {
-        mode: "landing",
+      const pr: PendingReview = {
         review,
-        rows: [],
-        scroll: 0,
         status: "review",
         error: null,
+        rows: [],
+        scroll: 0,
         settle: (outcome) => {
           if (settled) return;
           settled = true;
           resolve(outcome);
         },
       };
-      ov.rows = renderLandingBody(review, ov.status, ov.error, this.cols);
-      this.overlay = ov;
-      this.paint();
+      pr.rows = renderLandingBody(review, pr.status, pr.error, this.cols);
+      this.pendingReview = pr;
+      // If the panel is open on the queue tab, the new review shows immediately;
+      // otherwise flash a hint so the captain knows to open it. Never auto-pop.
+      if (this.panel) this.paint();
+      else this.setStatus(`review ready for ${review.feature} — press Ctrl-O to review & merge`);
     });
   }
 
-  /**
-   * Clear whatever overlay is up through its own teardown path, so a landing
-   * review can take the screen without leaking a doc subscription or hanging
-   * a gate promise. A gate mid-merge only loses its screen: its execute
-   * continuation still settles the real outcome (see approveLanding).
-   */
-  private dismissOverlay(): void {
-    const ov = this.overlay;
-    if (!ov) return;
-    if (ov.mode === "landing") {
-      if (ov.status !== "merging") ov.settle(ov.status === "failed" ? "failed" : "rejected");
-      this.overlay = null;
-      return;
-    }
-    this.closeOverlay(); // list/doc: drops the docs subscription
-  }
-
-  private overlayLandingInput(input: OverlayInput, ov: LandingOverlay): void {
-    if ("nav" in input) {
-      if (input.nav === "escape") { this.dismissLanding(ov); return; }
-      if (input.nav === "back") return; // there is no list behind the gate
-      this.overlayScrollInput(input);
-      return;
-    }
-    switch (input.ch) {
-      case "m": this.approveLanding(ov); return;
-      case "r":
-      case "q": this.dismissLanding(ov); return;
-      default: this.overlayScrollInput(input);
-    }
-  }
-
-  /**
-   * The [m] keystroke - the ONE call site of review.execute(), and therefore
-   * the only way a merge can happen. Fire-once: flipping to "merging"
-   * synchronously makes a repeat press a no-op before the promise ever
-   * settles. Success settles "merged" and dismisses with the confirmation
-   * flashed; refusal/failure keeps the gate up with the error rendered in
-   * place and [m] off - the cure for a stale green is a fresh prepare, not a
-   * retry from here.
-   */
-  private approveLanding(ov: LandingOverlay): void {
-    const p = ov.review.prepared;
-    if (ov.status !== "review" || p.kind !== "green" || p.commits.length === 0) return;
-    ov.status = "merging";
+  /** [d] on a ready head: drill into the full paged diff. No-op without a
+   *  reviewable pending review. */
+  private drillReview(): void {
+    if (!this.panel || !this.pendingReview) return;
+    this.pendingReview.rows = renderLandingBody(
+      this.pendingReview.review,
+      this.pendingReview.status,
+      this.pendingReview.error,
+      this.cols,
+    );
+    this.pendingReview.scroll = 0;
+    this.panel.view = { kind: "review" };
     this.paint();
-    void ov.review.execute().then(
+  }
+
+  /**
+   * The [m] keystroke - the ONE call site of review.execute(), and therefore the
+   * only way a merge can happen. Fire-once: flipping to "merging" synchronously
+   * makes a repeat press a no-op before the promise ever settles. Success settles
+   * "merged" and clears the review with the confirmation flashed; refusal/failure
+   * keeps the review with the error rendered in place and [m] off — the cure for a
+   * stale green is a fresh prepare, not a retry from here.
+   */
+  private approveLanding(): void {
+    const pr = this.pendingReview;
+    if (!pr) return;
+    const p = pr.review.prepared;
+    if (pr.status !== "review" || p.kind !== "green" || p.commits.length === 0) return;
+    pr.status = "merging";
+    pr.rows = renderLandingBody(pr.review, pr.status, pr.error, this.cols);
+    this.paint();
+    void pr.review.execute().then(
       (confirmation) => {
-        ov.settle("merged");
-        if (this.overlay !== ov) return; // the screen moved on (teardown)
-        this.overlay = null;
+        pr.settle("merged");
+        if (this.pendingReview !== pr) return; // displaced since (shouldn't happen)
+        this.pendingReview = null;
+        this.leaveSettledReview();
         this.paint();
         this.setStatus(confirmation);
       },
       (e: unknown) => {
-        ov.status = "failed";
-        ov.error = e instanceof Error ? e.message : String(e);
-        ov.rows = renderLandingBody(ov.review, ov.status, ov.error, this.cols);
-        ov.scroll = 0; // the error banners at the top; make sure it's seen
-        if (this.overlay === ov) this.paint();
+        pr.status = "failed";
+        pr.error = e instanceof Error ? e.message : String(e);
+        pr.rows = renderLandingBody(pr.review, pr.status, pr.error, this.cols);
+        pr.scroll = 0; // the error banners at the top; make sure it's seen
+        if (this.pendingReview === pr) this.paint();
       },
     );
   }
 
-  /** [r]/q/Esc: dismiss with no merge. From "review" this is a rejection (the
-   *  feature's branch and worktree stay intact); from "failed" it closes a
-   *  review whose merge attempt was refused. Ignored mid-merge: a merge in
-   *  flight can't be cancelled, so the gate waits for its outcome. */
-  private dismissLanding(ov: LandingOverlay): void {
-    if (ov.status === "merging") return;
-    ov.settle(ov.status === "failed" ? "failed" : "rejected");
-    this.overlay = null;
+  /** [r]: dismiss the review with no merge. From "review" this is a rejection
+   *  (the feature's branch and worktree stay intact); from "failed" it closes a
+   *  review whose merge attempt was refused. Ignored mid-merge: a merge in flight
+   *  can't be cancelled, so it waits for its outcome. Returns to the queue tab. */
+  private rejectReview(): void {
+    const pr = this.pendingReview;
+    if (!pr || pr.status === "merging") return;
+    pr.settle(pr.status === "failed" ? "failed" : "rejected");
+    this.pendingReview = null;
+    this.leaveSettledReview();
     this.paint();
   }
 
-  /** Paint the full-screen overlay: header bar, content viewport, footer hints. */
-  private paintOverlay(): void {
-    const ov = this.overlay;
-    if (!ov) return;
+  /** After a review is settled (merged/rejected), leave the review view. Fall
+   *  back to the queue tab if a queue is wired (it now reflects the advance),
+   *  else the docs tab if docs exist, else close the panel — a review-only panel
+   *  (no queue, no docs, e.g. feature_land on PlainIO-adjacent flows) has nothing
+   *  left to show. */
+  private leaveSettledReview(): void {
+    if (!this.panel) return;
+    if (this.panel.view.kind !== "review" && this.panel.view.kind !== "queue") return;
+    if (this.queue) this.panel.view = { kind: "queue" };
+    else if (this.docs) this.panel.view = { kind: "docs" };
+    else this.closePanel();
+  }
+
+  /** Paint the full-screen panel: header/tab bar, content viewport, footer. */
+  private paintPanel(): void {
+    const panel = this.panel;
+    if (!panel) return;
     const w = this.cols;
     const vp = this.overlayViewport();
-    const title =
-      ov.mode === "list" ? "docs"
-      : ov.mode === "doc" ? `docs · ${ov.name}`
-      : `landing · ${ov.review.feature} → ${ov.review.target}`;
+    const v = panel.view;
 
-    const body = ov.mode === "list" ? this.overlayListRows() : ov.rows;
-    const start = ov.mode === "list" ? 0 : ov.scroll;
+    let title: string;
+    let body: string[];
+    let start = 0;
+    if (v.kind === "queue") {
+      title = "queue";
+      body = this.queueTabRows();
+    } else if (v.kind === "docs") {
+      title = "docs";
+      body = this.docsTabRows(panel);
+    } else if (v.kind === "doc") {
+      title = `docs · ${v.name}`;
+      body = v.rows;
+      start = v.scroll;
+    } else {
+      const pr = this.pendingReview;
+      title = pr ? `review · ${pr.review.feature} → ${pr.review.target}` : "review";
+      body = pr ? pr.rows : ["", "  " + c.dim("no review is pending.")];
+      start = pr ? pr.scroll : 0;
+    }
 
     const frame: string[] = [term.moveTo(1, 1) + term.clearLine + this.overlayHeader(title)];
     for (let r = 0; r < vp; r++) {
       const lineText = body[start + r] ?? "";
       frame.push(term.moveTo(2 + r, 1) + term.clearLine + this.clip(lineText, w));
     }
-    frame.push(term.moveTo(this.rows, 1) + term.clearLine + this.overlayFooter(ov, body.length, start, vp));
-    // The viewer has no text cursor; hide the hardware caret while it's up.
+    frame.push(term.moveTo(this.rows, 1) + term.clearLine + this.panelFooter(body.length, start, vp));
+    // The panel has no text cursor; hide the hardware caret while it's up.
     frame.push(term.hideCursor);
     this.out.write(frame.join(""));
   }
 
+  /** The tab bar as a header: the two tabs with the active one reversed, so the
+   *  captain sees both spaces and which is live. Sub-views (doc/review) get a
+   *  plain title instead. */
   private overlayHeader(title: string): string {
     const w = this.cols;
     const bar = this.clip(` ${title} `, w).padEnd(w, " ");
     return colorEnabled ? `${ESC}[7m${bar}${ESC}[27m` : bar;
   }
 
-  /** The doc list as selectable rows: "a) plan.md". */
-  private overlayListRows(): string[] {
-    const ov = this.overlay;
-    if (!ov || ov.mode !== "list") return [];
-    if (ov.loading) return ["", "  " + c.dim("loading…")];
-    if (ov.error) return ["", "  " + c.yellow(ov.error)];
-    if (ov.docs.length === 0) {
+  /**
+   * The live merge queue as rows: the head first with its state, then the rest in
+   * landing order. A ready head shows its commit count and the in-place action
+   * bar hint; a blocked head shows conflict-vs-red and the resolver hint; a
+   * resolving head shows the attempt. Read fresh from the QueuePanelSource.
+   */
+  private queueTabRows(): string[] {
+    if (!this.queue) {
+      return ["", "  " + c.dim("The merge queue isn't available in this session.")];
+    }
+    const view = this.queue.view();
+    const rows: string[] = [""];
+    if (view.size === 0) {
+      rows.push("  " + c.dim("The merge queue is empty."));
+      rows.push("  " + c.dim("Enqueue a finished feature (feature_enqueue) to line it up to land."));
+      return rows;
+    }
+    for (const e of view.entries) {
+      rows.push(...this.queueEntryRows(e));
+    }
+    // A ready head with a live pending review: name the actions right under it.
+    // The head is position 1 (head-only invariant); derive it from entries so a
+    // source that leaves `head` unset still drives the hint.
+    const head = view.head ?? view.entries[0] ?? null;
+    if (head && head.isHead && head.status === "ready" && this.pendingReview?.status === "review") {
+      rows.push("");
+      rows.push("  " + c.dim("this head is ready to merge — ") +
+        c.cyan("m") + c.dim(" merge · ") + c.cyan("r") + c.dim(" reject · ") + c.cyan("d") + c.dim(" drill the diff"));
+    } else if (head && head.isHead && head.status === "ready" && !this.pendingReview) {
+      rows.push("");
+      rows.push("  " + c.dim("head is green; run feature_merge_head to open its review here."));
+    }
+    return rows;
+  }
+
+  /** One queue entry as one or two rows: the position/feature/state line, plus a
+   *  detail line for a blocked/ready/resolving head. */
+  private queueEntryRows(e: QueuePanelEntry): string[] {
+    const marker = e.isHead ? c.cyan("▸") : " ";
+    const pos = c.dim(`${e.position}.`);
+    const state = this.queueStateLabel(e);
+    const line = `${marker} ${pos} ${e.feature}  ${state}`;
+    const rows = ["  " + line];
+    if (e.isHead) {
+      if (e.status === "ready" && e.commitsReady !== undefined) {
+        rows.push("      " + c.dim(`${e.commitsReady} commit${e.commitsReady === 1 ? "" : "s"} ready to land`));
+      } else if (e.status === "blocked" && e.blockedReason) {
+        rows.push("      " + c.red(e.blockedReason));
+        if (e.blockedKind) {
+          const spent = e.resolveAttempts ?? 0;
+          rows.push(
+            "      " +
+              c.dim(
+                spent > 0
+                  ? `resolver attempts: ${spent} — feature_resolve_head to try again, or fix by hand`
+                  : `feature_resolve_head dispatches a fresh agent to fix it in its worktree`,
+              ),
+          );
+        }
+      } else if (e.status === "resolving") {
+        rows.push("      " + c.yellow(`a fresh crew agent is resolving this in its worktree (attempt ${e.resolveAttempts ?? 1})`));
+      }
+    }
+    return rows;
+  }
+
+  /** The coloured one-word state chip for a queue entry. */
+  private queueStateLabel(e: QueuePanelEntry): string {
+    switch (e.status) {
+      case "ready": return c.green("[ready]");
+      case "head-processing": return c.cyan("[processing]");
+      case "resolving": return c.yellow("[resolving]");
+      case "blocked": return c.red(`[blocked${e.blockedKind ? `: ${e.blockedKind === "conflict" ? "conflict" : "build+test"}` : ""}]`);
+      case "queued": return c.dim("[queued]");
+    }
+  }
+
+  /** The docs tab as selectable rows: "a) plan.md". */
+  private docsTabRows(panel: PanelState): string[] {
+    if (!this.docs) return ["", "  " + c.dim("No doc surface in this session.")];
+    if (panel.docsLoading) return ["", "  " + c.dim("loading…")];
+    if (panel.docsError) return ["", "  " + c.yellow(panel.docsError)];
+    if (panel.docs.length === 0) {
       return [
         "",
         "  " + c.dim("No documents yet."),
@@ -2387,70 +2716,87 @@ export class Tui implements SessionIO {
       ];
     }
     const rows: string[] = [""];
-    ov.docs.forEach((name, idx) => {
+    panel.docs.forEach((name, idx) => {
       const label = OVERLAY_LABELS[idx];
       if (label === undefined) return; // beyond the label alphabet; noted below
       rows.push("  " + c.cyan(`${label})`) + " " + name);
     });
-    if (ov.docs.length > OVERLAY_LABELS.length) {
-      rows.push("", "  " + c.dim(`(${ov.docs.length - OVERLAY_LABELS.length} more not shown)`));
+    if (panel.docs.length > OVERLAY_LABELS.length) {
+      rows.push("", "  " + c.dim(`(${panel.docs.length - OVERLAY_LABELS.length} more not shown)`));
     }
     return rows;
   }
 
-  private overlayFooter(ov: Overlay, total: number, start: number, vp: number): string {
-    if (ov.mode === "landing") return this.landingFooter(ov, total, start, vp);
-    const w = this.cols;
-    const hint =
-      ov.mode === "list"
-        ? "1-9/a-z open · Esc close"
-        : "space/b page · j/k line · g/G ends · Backspace list · Esc close";
-    let right = "";
-    if (ov.mode === "doc" && total > vp) {
-      const below = total - (start + vp);
-      right = below > 0 ? `${below} more below ` : "end ";
-    }
-    const left = ` ${hint} `;
-    const fill = Math.max(0, w - visibleWidth(left) - visibleWidth(right));
-    return c.dim(this.clip(left + "─".repeat(fill) + right, w));
-  }
-
   /**
-   * The gate's action bar. Built piecewise rather than dimmed wholesale so the
-   * m/r action keys can stand out (an inner colour reset would cancel a
-   * blanket dim). [m] appears armed only for a mergeable prepare still under
-   * review; every other state names why it's off.
+   * The panel footer: the active view's key hints on the left, a scroll position
+   * indicator on the right. The queue tab's hints depend on whether a review is
+   * live; a review view carries the merge action bar, built piecewise so the
+   * action keys stand out (an inner colour reset would cancel a blanket dim).
    */
-  private landingFooter(ov: LandingOverlay, total: number, start: number, vp: number): string {
+  private panelFooter(total: number, start: number, vp: number): string {
     const w = this.cols;
+    const v = this.panel?.view;
+    const hasOther = (v?.kind === "queue" && this.docs) || (v?.kind === "docs" && this.queue);
+    const tabHint = hasOther ? "Tab switch · " : "";
+
     let left: string;
-    if (ov.status === "merging") {
-      left = " " + c.cyan(`merging into ${ov.review.target}…`) + " ";
-    } else {
-      const p = ov.review.prepared;
-      const mergeable = ov.status === "review" && p.kind === "green" && p.commits.length > 0;
-      if (mergeable) {
-        left =
-          " " + c.cyan("m") + c.dim(" merge · ") + c.cyan("r") +
-          c.dim(" reject · space/b page · Esc close") + " ";
+    if (v?.kind === "review") {
+      left = " " + this.reviewActionBar() + " ";
+    } else if (v?.kind === "queue") {
+      const pr = this.pendingReview;
+      if (pr && pr.status === "review" && this.queueHeadReady()) {
+        left = " " + c.cyan("m") + c.dim(" merge · ") + c.cyan("r") + c.dim(" reject · ") +
+          c.cyan("d") + c.dim(" drill · ") + c.dim(`${tabHint}Esc close`) + " ";
+      } else if (pr && pr.status === "failed") {
+        left = " " + c.dim("merge failed — ") + c.cyan("r") + c.dim(" dismiss · ") +
+          c.cyan("d") + c.dim(" details · ") + c.dim(`${tabHint}Esc close`) + " ";
+      } else if (pr && pr.status === "merging") {
+        left = " " + c.cyan(`merging into ${pr.review.target}…`) + " ";
       } else {
-        const why =
-          ov.status === "failed" ? "merge failed"
-          : p.kind === "conflict" ? "conflict"
-          : p.kind === "failed" ? "build+test red"
-          : "nothing to land";
-        left =
-          " " + c.dim(`m disabled (${why}) · `) + c.cyan("r") +
-          c.dim(" close · space/b page · Esc close") + " ";
+        left = ` ${tabHint}Esc close `;
       }
+    } else if (v?.kind === "docs") {
+      left = ` 1-9/a-z open · ${tabHint}Esc close `;
+    } else {
+      // doc view
+      left = " space/b page · j/k line · g/G ends · Backspace back · Esc close ";
     }
+
     let right = "";
     if (total > vp) {
       const below = total - (start + vp);
-      right = c.dim(below > 0 ? `${below} more below ` : "end ");
+      right = below > 0 ? `${below} more below ` : "end ";
     }
     const fill = Math.max(0, w - visibleWidth(left) - visibleWidth(right));
-    return this.clip(left + c.dim("─".repeat(fill)) + right, w);
+    return this.clip(left + c.dim("─".repeat(fill)) + c.dim(right), w);
+  }
+
+  /** Whether the head is the ready feature the pending review is for. */
+  private queueHeadReady(): boolean {
+    const view = this.queue?.view();
+    const head = view?.head ?? view?.entries[0] ?? null;
+    return Boolean(head && head.isHead && head.status === "ready");
+  }
+
+  /** The drilled review view's action bar: [m] armed only for a mergeable prepare
+   *  still under review; every other state names why it's off. */
+  private reviewActionBar(): string {
+    const pr = this.pendingReview;
+    if (!pr) return c.dim("no review pending · Backspace back · Esc close");
+    if (pr.status === "merging") return c.cyan(`merging into ${pr.review.target}…`);
+    const p = pr.review.prepared;
+    const mergeable = pr.status === "review" && p.kind === "green" && p.commits.length > 0;
+    if (mergeable) {
+      return c.cyan("m") + c.dim(" merge · ") + c.cyan("r") +
+        c.dim(" reject · space/b page · Esc close");
+    }
+    const why =
+      pr.status === "failed" ? "merge failed"
+      : p.kind === "conflict" ? "conflict"
+      : p.kind === "failed" ? "build+test red"
+      : "nothing to land";
+    return c.dim(`m disabled (${why}) · `) + c.cyan("r") +
+      c.dim(" close · space/b page · Esc close");
   }
 
   // --- input history ---------------------------------------------------------
