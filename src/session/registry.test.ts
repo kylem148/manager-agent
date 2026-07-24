@@ -119,12 +119,59 @@ function stubGhostty(): () => void {
   let split = 0;
   setGhosttyAvailableForTest(true);
   setOsaRunnerForTest(async (s) => {
+    // The registry's liveness sweep probes each tracked pane with `exists`
+    // before planning. Keep every tracked pane alive by default so placement
+    // behaves exactly as before; tests that simulate a closed pane install their
+    // own runner (see stubGhosttyWithDeaths).
+    if (s.includes("exists (first terminal")) return "true";
     await touchCaptureFromScript(s);
     return s.includes("split ") ? `pane-${++split}` : "anchor-1";
   });
   return () => {
     setGhosttyAvailableForTest(null);
     setOsaRunnerForTest(null);
+  };
+}
+
+/**
+ * A Ghostty stub whose `dead` set marks panes the captain has closed since they
+ * were created. The liveness probe reports them gone, and any split/takeover/
+ * reuse that targets one fails with Ghostty's real -1719 — exactly what a stale
+ * terminal id does live. `launches()` returns the placement AppleScripts (split/
+ * takeover/reuse), excluding the `exists` liveness probes, so a test can assert
+ * which pane a split actually grew from.
+ */
+function stubGhosttyWithDeaths(): {
+  dead: Set<string>;
+  launches: () => string[];
+  teardown: () => void;
+} {
+  const dead = new Set<string>();
+  const launches: string[] = [];
+  let split = 0;
+  setGhosttyAvailableForTest(true);
+  setOsaRunnerForTest(async (s) => {
+    const em = s.match(/exists \(first terminal whose id = "([^"]+)"/);
+    if (em) return dead.has(em[1]!) ? "false" : "true";
+    // A placement targets a terminal by id; a closed one -1719s, just like live.
+    const tm = s.match(/first terminal whose id = "([^"]+)"/);
+    if (tm && dead.has(tm[1]!)) {
+      throw new Error(
+        `Ghostty got an error: Can't get terminal 1 whose id = "${tm[1]}". Invalid index. (-1719)`,
+      );
+    }
+    launches.push(s);
+    await touchCaptureFromScript(s);
+    if (s.includes("split ")) return `pane-${++split}`;
+    return tm ? tm[1]! : "anchor-1";
+  });
+  return {
+    dead,
+    launches: () => launches,
+    teardown: () => {
+      setGhosttyAvailableForTest(null);
+      setOsaRunnerForTest(null);
+    },
   };
 }
 
@@ -985,6 +1032,271 @@ function runGit(cwd: string, args: string[]): string {
   }
   return res.stdout.trim();
 }
+
+// --- link durability: closing worker panes never breaks the link -----------
+//
+// The confirmed bug: deleting any tracked worker pane left a stale id in the
+// in-memory layout, the next dispatch targeted the dead id, Ghostty -1719'd, and
+// the registry nulled the WHOLE layout — the transport link died until `co pane`
+// was re-run. These prove the fix end-to-end through the registry (with a stubbed
+// osascript that reports closed panes gone and -1719s a placement onto one, just
+// like live Ghostty): one dead worker prunes exactly one id and the link lives on.
+
+test("closing a finished worker pane prunes only that id; the link survives and the next dispatch spawns a worker", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  const { dead, launches, teardown } = stubGhosttyWithDeaths();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    config.pane = { directionSequence: ["right", "down"], cap: 4 };
+    config.agents = [{ name: "fake", command: `sh -c 'echo HI'` }];
+    config.defaultAgent = "fake";
+
+    let anchorLost = 0;
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000, // keep the fake jobs "running" for the whole test
+        onAnchorLost: () => anchorLost++,
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one"); // takeover anchor-1
+        const j2 = await reg.dispatch("two"); // split anchor-1 → pane-1
+        const j3 = await reg.dispatch("three"); // split pane-1 → pane-2
+        assert.equal(j1.paneId, "anchor-1");
+        assert.equal(j2.paneId, "pane-1");
+        assert.equal(j3.paneId, "pane-2");
+
+        // The captain closes the newest worker pane (pane-2).
+        dead.add("pane-2");
+
+        // The next dispatch prunes ONLY pane-2, splits the newest LIVING pane
+        // (pane-1), and spawns a fresh worker. The link is untouched.
+        const j4 = await reg.dispatch("four");
+        assert.equal(j4.status, "running", "the dispatch launches normally, not a failure");
+        assert.equal(j4.paneId, "pane-3", "a fresh worker was spawned");
+        assert.equal(reg.paneReady, true, "the link survived a single closed pane");
+        assert.equal(anchorLost, 0, "the anchor was never reported lost for a mere worker close");
+
+        // The split for j4 grew from the newest LIVING pane, never the dead one.
+        // (The order text never rides the AppleScript, so assert on the target id.)
+        const lastSplit = launches().filter((s) => s.includes("split target direction")).pop()!;
+        assert.ok(
+          lastSplit.includes('first terminal whose id = "pane-1"'),
+          `j4 must split the newest living pane (pane-1), got:\n${lastSplit}`,
+        );
+        assert.ok(!lastSplit.includes('"pane-2"'), "it must not target the closed pane");
+      },
+    );
+  } finally {
+    teardown();
+    await cleanup();
+  }
+});
+
+test("the layout is never nulled by a single dead worker pane, dispatch after dispatch", async () => {
+  // "Go forever": spawn a worker, close it, dispatch again — repeatedly. Each
+  // close prunes exactly one id and the link stays alive the whole time. Before
+  // the fix, the first close-then-dispatch nulled the layout and every later
+  // dispatch failed with "couldn't open a crew pane".
+  const { paths, cleanup } = await tmpInstance();
+  const { dead, teardown } = stubGhosttyWithDeaths();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    config.pane = { directionSequence: ["right", "down"], cap: 4 };
+    config.agents = [{ name: "fake", command: `sh -c 'echo HI'` }];
+    config.defaultAgent = "fake";
+
+    let anchorLost = 0;
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        onAnchorLost: () => anchorLost++,
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("first"); // takeover anchor-1 (kept open)
+        assert.equal(j1.paneId, "anchor-1");
+
+        // Ten rounds of: spawn a worker, then close it. The anchor pane stays
+        // open throughout, so each round finds no living child and grows a fresh
+        // worker by splitting the anchor. Every dispatch launches; nothing is
+        // ever nulled.
+        const spawned: string[] = [];
+        for (let i = 0; i < 10; i++) {
+          const job = await reg.dispatch(`round ${i}`);
+          assert.equal(job.status, "running", `round ${i}: dispatch must launch, not fail`);
+          assert.ok(job.paneId, `round ${i}: a pane was placed`);
+          assert.notEqual(job.paneId, "anchor-1", `round ${i}: a worker, not the anchor, ran the job`);
+          assert.equal(reg.paneReady, true, `round ${i}: the link is still alive`);
+          spawned.push(job.paneId!);
+          // The captain closes the finished worker before the next round.
+          dead.add(job.paneId!);
+        }
+        assert.equal(new Set(spawned).size, spawned.length, "each round spawned a distinct fresh pane");
+        assert.equal(anchorLost, 0, "the anchor was never lost across the whole run");
+      },
+    );
+  } finally {
+    teardown();
+    await cleanup();
+  }
+});
+
+test("a pane that dies between the liveness sweep and the split is pruned reactively and the dispatch still lands", async () => {
+  // The TOCTOU backstop: reconcilePaneLiveness reports a pane alive, but it is
+  // closed before the split reaches it, so the split -1719s. launchResilient must
+  // prune that one id and re-plan against the survivors — not null the layout.
+  const { paths, cleanup } = await tmpInstance();
+  const launches: string[] = [];
+  const toctouDead = new Set<string>();
+  let split = 0;
+  setGhosttyAvailableForTest(true);
+  setOsaRunnerForTest(async (s) => {
+    // Every pane probes ALIVE — the death is invisible to the sweep.
+    if (s.includes("exists (first terminal")) return "true";
+    const tm = s.match(/first terminal whose id = "([^"]+)"/);
+    if (tm && toctouDead.has(tm[1]!)) {
+      throw new Error(`Ghostty got an error: Can't get terminal 1 whose id = "${tm[1]}". (-1719)`);
+    }
+    launches.push(s);
+    await touchCaptureFromScript(s);
+    if (s.includes("split ")) return `pane-${++split}`;
+    return tm ? tm[1]! : "anchor-1";
+  });
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    config.pane = { directionSequence: ["right", "down"], cap: 4 };
+    config.agents = [{ name: "fake", command: `sh -c 'echo HI'` }];
+    config.defaultAgent = "fake";
+
+    let anchorLost = 0;
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        onAnchorLost: () => anchorLost++,
+      },
+      async (reg) => {
+        await reg.dispatch("one"); // takeover anchor-1
+        await reg.dispatch("two"); // split anchor-1 → pane-1
+        const j3 = await reg.dispatch("three"); // split pane-1 → pane-2
+        assert.equal(j3.paneId, "pane-2");
+
+        // pane-2 still probes alive, but the split onto it will -1719 (closed in
+        // the instant between the sweep and the AppleScript split).
+        toctouDead.add("pane-2");
+
+        const j4 = await reg.dispatch("four");
+        assert.equal(j4.status, "running", "the retry landed the dispatch");
+        assert.equal(j4.paneId, "pane-3", "it grew from the newest surviving pane (pane-1)");
+        assert.equal(reg.paneReady, true, "the layout survived a reactively-pruned pane");
+        assert.equal(anchorLost, 0, "no anchor loss for a dead worker");
+        const lastSplit = launches.filter((s) => s.includes("split target direction")).pop()!;
+        assert.ok(lastSplit.includes('first terminal whose id = "pane-1"'), "the successful split targeted pane-1");
+      },
+    );
+  } finally {
+    setGhosttyAvailableForTest(null);
+    setOsaRunnerForTest(null);
+    await cleanup();
+  }
+});
+
+test("when no living children remain, the next worker splits from the anchor", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  const { dead, launches, teardown } = stubGhosttyWithDeaths();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    config.pane = { directionSequence: ["right", "down"], cap: 4 };
+    config.agents = [{ name: "fake", command: `sh -c 'echo HI'` }];
+    config.defaultAgent = "fake";
+
+    await withRegistry(
+      { paths, config, onComplete: () => {}, skipAnchorCheck: true, pollIntervalMs: 10_000 },
+      async (reg) => {
+        const j1 = await reg.dispatch("one"); // takeover anchor-1
+        const j2 = await reg.dispatch("two"); // split anchor-1 → pane-1
+        assert.equal(j2.paneId, "pane-1");
+
+        // Close the only worker child; the anchor pane is still open.
+        dead.add("pane-1");
+
+        const j3 = await reg.dispatch("three");
+        assert.equal(j3.status, "running");
+        assert.equal(j3.paneId, "pane-2", "a fresh worker grew from the anchor");
+        const lastSplit = launches().filter((s) => s.includes("split target direction")).pop()!;
+        assert.ok(
+          lastSplit.includes('first terminal whose id = "anchor-1"'),
+          `with no living children the split must target the anchor, got:\n${lastSplit}`,
+        );
+      },
+    );
+  } finally {
+    teardown();
+    await cleanup();
+  }
+});
+
+test("when the anchor pane itself is gone and no worker survives, the dispatch fails with a re-run message (never a cryptic error)", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  const { dead, teardown } = stubGhosttyWithDeaths();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    config.pane = { directionSequence: ["right", "down"], cap: 4 };
+    config.agents = [{ name: "fake", command: `sh -c 'echo HI'` }];
+    config.defaultAgent = "fake";
+
+    let anchorLost = 0;
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        onAnchorLost: () => anchorLost++,
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one"); // takeover anchor-1
+        assert.equal(j1.paneId, "anchor-1");
+
+        // The captain closes the anchor pane itself; there are no worker children
+        // to fall back to.
+        dead.add("anchor-1");
+
+        const j2 = await reg.dispatch("two");
+        assert.equal(j2.status, "failed", "no living surface: the dispatch fails cleanly");
+        assert.match(j2.error ?? "", /couldn't open a crew pane/);
+        assert.match(j2.error ?? "", /co pane/, "the message names the fix — re-run `co pane`");
+        assert.equal(j2.paneId, undefined, "nothing was placed");
+        assert.equal(anchorLost, 1, "the dead anchor is reported lost exactly once");
+        assert.equal(reg.paneReady, false, "the anchor is dropped for the session");
+      },
+    );
+  } finally {
+    teardown();
+    await cleanup();
+  }
+});
 
 test("feature dispatch end-to-end: real provision, crew cwd = worktree on co/feat-*, reuse on the second dispatch", async () => {
   // The whole provision → dispatch-isolated loop against a real git repo: the

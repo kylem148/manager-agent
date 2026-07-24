@@ -13,11 +13,16 @@
  *      id so it can be found on every dispatch and rebuilt across restarts.
  *   2. The FIRST dispatch takes over the anchor pane directly — it runs the crew
  *      there, with no split.
- *   3. Each SUBSEQUENT dispatch splits the most-recently-created crew pane,
- *      alternating direction by a configurable sequence (default beside/below,
- *      i.e. Ghostty `right` then `down`). The pane id the split returns is
- *      tracked so the next split targets it in turn — the region subdivides in
- *      place and never touches the co-manager or terminal panes.
+ *   3. Each SUBSEQUENT dispatch splits the most-recently-created LIVING crew
+ *      pane, alternating direction by a configurable sequence (default
+ *      beside/below, i.e. Ghostty `right` then `down`). The pane id the split
+ *      returns is tracked so the next split targets it in turn — the region
+ *      subdivides in place and never touches the co-manager or terminal panes.
+ *      A pane the captain has since closed is dropped from the tracked list
+ *      (prune), so the split origin is always the newest pane that still exists;
+ *      once every worker child is gone, the split falls back to the persisted
+ *      anchor, the spiral's root. This is what lets the session spawn and delete
+ *      crew panes indefinitely without ever breaking the transport link.
  *   4. Crew panes are capped (default 4, configurable). At the cap we stop
  *      splitting — a further split would be unreadable — and instead reuse the
  *      OLDEST FINISHED crew pane. If none is free, the dispatch QUEUES until one
@@ -207,6 +212,14 @@ export class CrewPaneLayout {
     return this.panes.length;
   }
 
+  /** The ids of every tracked crew pane, oldest first (the anchor if it has been
+   *  taken over, then each split). The registry probes these for existence
+   *  before planning and prunes any the captain has closed, so placement only
+   *  ever targets a pane that still lives. */
+  get trackedPaneIds(): string[] {
+    return this.panes.map((p) => p.id);
+  }
+
   /**
    * Decide placement for the next dispatch, without mutating (a query). The
    * decision is stashed as pending; commit() applies it once the transport knows
@@ -225,21 +238,38 @@ export class CrewPaneLayout {
   }
 
   private decide(): PlacementDecision {
-    // First dispatch of all: take over the anchor, no split.
+    // Nothing tracked. Two cases, told apart by whether any pane has EVER been
+    // created (nextSeq):
+    //  - the genuine first dispatch takes over the anchor, no split;
+    //  - an emptied worker box (every pane the captain closed, pruned by the
+    //    registry's liveness sweep) grows a fresh child by SPLITTING the anchor.
+    //    The spiral's root outlives its children, so "go forever" never stalls
+    //    just because the panes it once split from are gone. If the anchor pane
+    //    is itself gone the split fails cleanly and the registry surfaces a
+    //    re-run-`co pane` message — it does not crash.
     if (this.panes.length === 0) {
-      return { kind: "takeover", paneId: this.anchorId };
+      if (this.nextSeq === 0) {
+        return { kind: "takeover", paneId: this.anchorId };
+      }
+      return { kind: "split", target: this.anchorId, direction: this.nextDirection() };
     }
-    // Below the cap: split the most-recently-created crew pane.
+    // Below the cap: split the most-recently-created LIVING crew pane. Dead panes
+    // are pruned before we plan (registry liveness sweep) and on a failed split
+    // (reactive retry), so the newest tracked pane is the newest living one — the
+    // fibonacci origin.
     if (this.panes.length < this.config.cap) {
       const newest = this.panes[this.panes.length - 1]!;
-      const direction = this.config.directionSequence[
-        this.splitCount % this.config.directionSequence.length
-      ]!;
-      return { kind: "split", target: newest.id, direction };
+      return { kind: "split", target: newest.id, direction: this.nextDirection() };
     }
     // At the cap: reuse the oldest finished pane, else queue.
     const oldestFinished = this.panes.find((p) => p.status === "finished");
     return oldestFinished ? { kind: "reuse", paneId: oldestFinished.id } : { kind: "queue" };
+  }
+
+  /** The split direction for the next split, indexed by how many splits have
+   *  happened (not dispatches), so reuse never consumes a sequence step. */
+  private nextDirection(): SplitDirection {
+    return this.config.directionSequence[this.splitCount % this.config.directionSequence.length]!;
   }
 
   /**
@@ -297,5 +327,26 @@ export class CrewPaneLayout {
     if (!pane || pane.status === "finished") return false;
     pane.status = "finished";
     return true;
+  }
+
+  /**
+   * Drop a tracked pane the captain has closed, so it is never chosen as a split
+   * origin or reuse target again. Returns true if a pane was removed; tolerant of
+   * an unknown id (already pruned, or never tracked). This is the whole of "one
+   * dead pane never breaks the link": pruning the newest pane hands the next
+   * split to the previous one, and pruning them all hands it to the anchor (see
+   * decide) — so any number of closed workers leaves the rest of the layout
+   * intact.
+   *
+   * Deliberately leaves splitCount and nextSeq untouched: the direction sequence
+   * keeps advancing so the spiral stays consistent across a closed pane, and
+   * creation seqs stay monotonic and unique. `finished` panes are unaffected too
+   * — only an actually-gone pane is pruned, never a merely-idle one, which stays
+   * reusable at the cap.
+   */
+  prune(paneId: string): boolean {
+    const before = this.panes.length;
+    this.panes = this.panes.filter((p) => p.id !== paneId);
+    return this.panes.length < before;
   }
 }

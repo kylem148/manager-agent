@@ -7,6 +7,7 @@ import { CrewPaneLayout } from "./crewpanes.js";
 import { readDispatchConfig, resolveAgentCommand, type DispatchConfig } from "./dispatchconfig.js";
 import {
   anchorExists,
+  paneExists,
   dispatchCorrelation,
   isGhosttyAvailable,
   jobScriptFile,
@@ -45,6 +46,20 @@ import {
  * dispatch run invisibly, the operator assumed it had failed and re-dispatched,
  * and two agents raced on the same checkout and corrupted the tree. An invisible
  * run is exactly the failure mode this design forecloses.
+ *
+ * LINK DURABILITY. The transport link has two layers: a persisted anchor (one
+ * terminal id in .dispatch/config.json, which survives any pane deletion) and
+ * this registry's in-memory pane layout (CrewPaneLayout), which tracks every
+ * crew pane so a new worker splits from the newest one — the fibonacci spiral.
+ * The layout is the fragile layer: a worker pane the captain closes leaves a
+ * stale id behind, and a split targeting it would fail. So the registry keeps
+ * the layout honest against a session where panes come and go forever, two ways:
+ * PROACTIVELY, reconcilePaneLiveness() probes every tracked pane's existence
+ * before planning and prunes the closed ones; and REACTIVELY, launchResilient()
+ * prunes a pane that dies between the sweep and the split and re-plans against
+ * the survivors. A single dead worker never nulls the whole layout — only a dead
+ * ANCHOR (no living surface left to grow from) fails a dispatch, and then with a
+ * clear re-run-`co pane` message, never a cryptic error.
  *
  * COMPLETION is detected from the capture file, which carries two kinds of
  * marker sharing one sentinel contract (sentinel.ts):
@@ -480,8 +495,13 @@ export class DispatchRegistry {
         job.cwd = record.worktreePath;
       }
 
+      // Proactively drop any worker pane the captain has closed since it was
+      // created, so the common "delete a finished worker, dispatch again" path
+      // plans against living panes only and never even hits a dead-pane error.
+      await this.reconcilePaneLiveness();
+
       try {
-        const launched = await this.launchOnPane(job);
+        const launched = await this.launchResilient(job);
         if (!launched) {
           // At the pane cap with nothing free: hold this job until one frees.
           // This is the ONLY non-launch outcome that isn't a failure — the queue
@@ -492,9 +512,11 @@ export class DispatchRegistry {
         }
       } catch (e) {
         if (!(e instanceof PaneUnavailableError)) throw e;
-        // The target pane is gone/stale (e.g. Ghostty -1719) or a paste went
-        // nowhere. There is no background path: drop the dead anchor for the
-        // session, tell the operator, and fail the dispatch. Nothing launched.
+        // Only a dead ANCHOR reaches here: launchResilient prunes-and-retries a
+        // dead worker pane, so a single closed worker never gets this far. The
+        // anchor is the growth root with no living surface behind it — there is
+        // no background path, so drop the layout for the session, tell the
+        // operator to re-run `co pane`, and fail the dispatch. Nothing launched.
         this.layout = null;
         this.onAnchorLost?.();
         throw new Error(this.paneUnavailableMessage());
@@ -587,6 +609,63 @@ export class DispatchRegistry {
     } catch (e) {
       this.upsertFeature({ ...pending, provisionStatus: "failed" });
       throw e;
+    }
+  }
+
+  /**
+   * Prune every tracked crew pane the captain has closed since it was created, so
+   * the very next placement targets living panes only. Probes Ghostty's `exists`
+   * for each tracked pane id (in parallel) and drops the dead ones from the
+   * layout. This is the PROACTIVE half of link durability: the common
+   * delete-a-worker-then-dispatch path never even reaches a dead-pane error,
+   * because the dead id is gone before plan() runs. launchResilient is the
+   * reactive backstop for a pane that dies between this sweep and the split.
+   *
+   * Never nulls the layout: a dead anchor is pruned from the tracked list here
+   * too (so a surviving child can still be split from), and the anchor-loss
+   * decision is deferred to the moment a dispatch actually needs the anchor and
+   * finds it gone (launchResilient → dispatch's catch). Best-effort — a probe
+   * failure degrades to "gone", which at worst orphans a live pane from tracking,
+   * never a link break.
+   */
+  private async reconcilePaneLiveness(): Promise<void> {
+    if (!this.layout) return;
+    const ids = this.layout.trackedPaneIds;
+    if (ids.length === 0) return;
+    const alive = await Promise.all(ids.map((id) => paneExists(id)));
+    ids.forEach((id, i) => {
+      if (!alive[i]) this.layout?.prune(id);
+    });
+  }
+
+  /**
+   * Launch a job on a pane, surviving the captain closing a worker pane. On a
+   * PaneUnavailableError for a tracked WORKER pane, prune just that dead id and
+   * re-plan against the survivors (the next newest living child, else the
+   * anchor), leaving the rest of the link intact — one dead pane never destroys
+   * the layout.
+   *
+   * Only a dead ANCHOR (the growth root) — or an id we don't track and so can't
+   * prune — escapes as a PaneUnavailableError, which dispatch()/drainQueue turn
+   * into a clean "re-run `co pane`" failure. The loop is bounded: each retry
+   * prunes exactly one tracked pane, and an emptied list falls back to the
+   * anchor, which escapes rather than looping.
+   */
+  private async launchResilient(job: Job): Promise<boolean> {
+    for (;;) {
+      try {
+        return await this.launchOnPane(job);
+      } catch (e) {
+        if (!(e instanceof PaneUnavailableError)) throw e;
+        const deadId = e.paneId;
+        // The anchor itself is gone, or the failed id isn't a tracked worker we
+        // can prune: there is no living surface to grow from. Surface it to the
+        // anchor-loss path rather than looping.
+        if (!this.layout || deadId === this.config.anchor?.id || !this.layout.prune(deadId)) {
+          throw e;
+        }
+        // Pruned a dead worker pane; loop to re-plan against the survivors.
+      }
     }
   }
 
@@ -776,7 +855,12 @@ export class DispatchRegistry {
    */
   private async drainQueue(): Promise<void> {
     if (!this.layout) return;
+    // A pane the captain closed while jobs waited must not be planned against, so
+    // sweep liveness once before draining — the freed slot then re-plans over
+    // living panes only.
+    await this.reconcilePaneLiveness();
     while (this.queue.length > 0) {
+      if (!this.layout) return; // the anchor died mid-drain; stop cleanly
       const nextId = this.queue[0]!;
       const job = this.jobs.get(nextId);
       if (!job || job.status !== "queued") {
@@ -789,12 +873,13 @@ export class DispatchRegistry {
       job.startedAt = this.clock.now();
       let launched = false;
       try {
-        launched = await this.launchOnPane(job);
+        launched = await this.launchResilient(job);
       } catch (e) {
         if (e instanceof PaneUnavailableError) {
-          // The pane died while this job waited in the queue. There is no
-          // background path: drop pane geometry for the session and fail this
-          // job cleanly — same as a first-time dispatch that can't place a pane.
+          // launchResilient already pruned any dead worker pane and retried; only
+          // a dead ANCHOR reaches here. There is no background path: drop pane
+          // geometry for the session and fail this job cleanly — same as a
+          // first-time dispatch that can't place a pane.
           this.queue.shift();
           this.layout = null;
           this.onAnchorLost?.();

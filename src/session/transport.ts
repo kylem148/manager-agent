@@ -148,6 +148,16 @@ export async function anchorExists(id: string): Promise<boolean> {
 }
 
 /**
+ * Whether a Ghostty terminal with `id` still exists — the general liveness probe
+ * the registry runs over every tracked crew pane before planning a split, so a
+ * pane the captain has closed is pruned from the layout before placement ever
+ * targets it. Identical probe to anchorExists (the anchor is just one such pane,
+ * and both collapse a probe failure to "gone"); named for the general use so the
+ * pruning call site reads for what it is.
+ */
+export const paneExists = anchorExists;
+
+/**
  * Build the shell command line for a job's agent from the config. Picks the crew
  * agent (the confirm-time override `agentName`, else the config default) and
  * resolves its template's placeholders into a runnable command line, shell-quoting

@@ -192,3 +192,96 @@ test("crewPaneTitle namespaces by instance for discovery", () => {
   assert.equal(crewPaneTitle("my-saas"), "co-crew:my-saas");
   assert.notEqual(crewPaneTitle("a"), crewPaneTitle("b"));
 });
+
+// --- link durability: pruning closed panes ----------------------------------
+//
+// The captain can close a finished worker pane at any time; its id then goes
+// stale in the tracked list. These exercise the pure selection logic that keeps
+// the link alive across that — pruning a dead id, picking the newest LIVING pane
+// as the split origin, and falling back to the anchor when every child is gone —
+// with no Ghostty involved (the registry does the real liveness probing).
+
+test("prune drops a tracked pane and is tolerant of unknown ids", () => {
+  const layout = new CrewPaneLayout(ANCHOR);
+  const tx = splitTransport();
+  dispatch(layout, tx); // takeover anchor
+  dispatch(layout, tx); // split → pane-1
+  assert.deepEqual(layout.trackedPaneIds, ["pane-anchor", "pane-1"]);
+
+  assert.equal(layout.prune("nope"), false, "an untracked id is a no-op");
+  assert.equal(layout.prune("pane-1"), true, "a tracked id is removed");
+  assert.equal(layout.prune("pane-1"), false, "pruning again is a no-op");
+  assert.deepEqual(layout.trackedPaneIds, ["pane-anchor"]);
+  assert.equal(layout.paneCount, 1);
+});
+
+test("after the newest pane is closed, the next split targets the newest LIVING pane (fibonacci preserved)", () => {
+  const layout = new CrewPaneLayout(ANCHOR); // seq ["right","down"], cap 4
+  const tx = splitTransport();
+  dispatch(layout, tx); // takeover anchor
+  dispatch(layout, tx); // split anchor → pane-1 (dir right)
+  dispatch(layout, tx); // split pane-1 → pane-2 (dir down)
+  assert.deepEqual(layout.trackedPaneIds, ["pane-anchor", "pane-1", "pane-2"]);
+
+  // The captain closes the newest worker pane. The registry would prune it:
+  layout.prune("pane-2");
+
+  // The next dispatch splits the newest LIVING pane — pane-1 — not the dead one.
+  const d = layout.plan();
+  assert.deepEqual(d, { kind: "split", target: "pane-1", direction: "right" });
+});
+
+test("when every worker child is closed, the next split falls back to the anchor", () => {
+  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"], cap: 4 });
+  const tx = splitTransport();
+  dispatch(layout, tx); // takeover anchor (seq 0)
+  dispatch(layout, tx); // split → pane-1 (seq 1, splitCount 1)
+  dispatch(layout, tx); // split → pane-2 (seq 2, splitCount 2)
+
+  // The captain closes EVERY tracked pane, the anchor's own included.
+  layout.prune("pane-2");
+  layout.prune("pane-1");
+  layout.prune("pane-anchor");
+  assert.deepEqual(layout.trackedPaneIds, [], "the worker box is empty");
+
+  // The link is not dead: the next worker grows by SPLITTING the persisted
+  // anchor (the spiral's root), continuing the direction sequence (2 splits so
+  // far → index 2 % 2 → "right").
+  const d = layout.plan();
+  assert.deepEqual(d, { kind: "split", target: "pane-anchor", direction: "right" });
+});
+
+test("splitting from the anchor fallback registers a fresh child the next split grows from", () => {
+  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"], cap: 4 });
+  const tx = splitTransport();
+  dispatch(layout, tx); // takeover anchor
+  dispatch(layout, tx); // split → pane-1
+  layout.prune("pane-1");
+  layout.prune("pane-anchor"); // worker box empty
+
+  // Fallback: split the anchor (2nd direction, "down"), transport returns a
+  // fresh id.
+  const d1 = layout.plan();
+  assert.deepEqual(d1, { kind: "split", target: "pane-anchor", direction: "down" });
+  layout.commit("pane-99");
+  assert.deepEqual(layout.trackedPaneIds, ["pane-99"], "the regrown child is tracked");
+
+  // The next split grows from that regrown child, not the anchor — the spiral
+  // continues from where it left off (3rd split → index 0 → "right").
+  const d2 = layout.plan();
+  assert.deepEqual(d2, { kind: "split", target: "pane-99", direction: "right" });
+});
+
+test("pruning does not disturb the direction sequence", () => {
+  // A closed pane must not skip or repeat a split direction, or the spiral bends.
+  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"], cap: 4 });
+  const tx = splitTransport();
+  dispatch(layout, tx); // takeover
+  dispatch(layout, tx); // split → pane-1 (dir right, splitCount 1)
+  layout.prune("pane-1"); // captain closes it before the next dispatch
+
+  // panes = [anchor]; next split targets the anchor and uses the SECOND
+  // direction ("down"), proving prune left splitCount alone.
+  const d = layout.plan();
+  assert.deepEqual(d, { kind: "split", target: "pane-anchor", direction: "down" });
+});
