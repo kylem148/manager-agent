@@ -252,6 +252,38 @@ export interface QueuePanelSource {
 }
 
 /**
+ * One filed crew review, as the panel's Inbox tab shows it. Structurally a subset
+ * of the session's ReviewRecord — declared here rather than imported, like
+ * QueuePanelEntry, so the low-level Tui never depends on the session layer. The
+ * session's real record is assignable to this.
+ */
+export interface InboxPanelEntry {
+  /** How loudly it landed in the chat when filed: L1 needs a decision, L2 got a
+   *  pointer line, L3 was silent. */
+  level: "L1" | "L2" | "L3";
+  verdict: "accept" | "fix-commit" | "rework";
+  /** The one-line summary the list row shows. */
+  headline: string;
+  /** The full review, shown only in the drill-in. */
+  body: string;
+  /** ISO 8601 filing time. */
+  timestamp: string;
+  jobId: string;
+  feature?: string;
+}
+
+/**
+ * Backs the Ctrl-O panel's Inbox tab. Read on demand at paint time, exactly like
+ * QueuePanelSource: the store is an in-memory capped list behind a JSON file, so
+ * re-reading is cheap and always current, and every filing already triggers a
+ * repaint. Injected so the Tui never touches the store or the filesystem.
+ */
+export interface InboxPanelSource {
+  /** The stored reviews, newest first. */
+  list(): InboxPanelEntry[];
+}
+
+/**
  * What the landing gate reviews and does - the Ctrl-O overlay's third mode,
  * opened programmatically via openLandingReview when a prepared feature awaits
  * the human's verdict. Injected like DocSource so the Tui never touches git
@@ -303,6 +335,46 @@ export function renderMarkdownDoc(content: string, width: number): string[] {
   }
   for (const e of md.flushBlock(width)) push(e);
   return out;
+}
+
+/** The coloured level chip for a filed review: L1 wants a decision, L2 is a
+ *  pointer, L3 was clean. Fixed width, so the list columns line up. */
+function levelChip(level: InboxPanelEntry["level"]): string {
+  switch (level) {
+    case "L1": return c.yellow("[L1]");
+    case "L2": return c.cyan("[L2]");
+    case "L3": return c.green("[L3]");
+  }
+}
+
+/** The date part of an ISO timestamp, minute precision, for the review header.
+ *  Falls back to the raw string so a hand-written record still shows something. */
+function shortStamp(iso: string): string {
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/.exec(iso);
+  return m ? `${m[1]} ${m[2]}` : iso;
+}
+
+/**
+ * One filed review as visual rows: headline, a metadata line (level, verdict,
+ * job, feature, when), then the full body through the SAME markdown renderer the
+ * transcript and the doc viewer use — the body is prose the co wrote, so it reads
+ * identically wherever it appears.
+ */
+export function renderInboxItem(entry: InboxPanelEntry, width: number): string[] {
+  const wrap = (s: string): string[] => (s === "" ? [""] : wrapLine(s, width));
+  const meta = [
+    entry.verdict,
+    entry.jobId,
+    ...(entry.feature ? [`feature ${entry.feature}`] : []),
+    ...(entry.timestamp ? [shortStamp(entry.timestamp)] : []),
+  ].join(" · ");
+  return [
+    "",
+    ...wrap("  " + c.bold(entry.headline)),
+    ...wrap("  " + levelChip(entry.level) + " " + c.dim(meta)),
+    "",
+    ...renderMarkdownDoc(entry.body, width),
+  ];
 }
 
 /** Style one raw patch line the way git colours a diff. The file-header lines
@@ -419,6 +491,13 @@ export interface TuiOptions {
    * one bound to the FeatureManager's queue when linked.
    */
   queue?: QueuePanelSource;
+  /**
+   * Backs the Ctrl-O panel's Inbox tab (the rolling crew-review record). Omit to
+   * drop the tab. session.ts always supplies one bound to the instance's review
+   * inbox, linked or not: reviews outlive a link and a filed review must still be
+   * readable afterwards.
+   */
+  inbox?: InboxPanelSource;
 }
 
 /**
@@ -506,19 +585,28 @@ const OVERLAY_LABELS = "123456789abcdefghjklmnopqrstuvwxyz";
  * does NOT auto-pop — the captain opens and closes it with Ctrl-O — and it hosts
  * the merge review in-place rather than through a separate modal surface.
  *
- * It has two tabs, switched with Tab (or `i`), so the two key spaces never
- * collide: the `queue` tab (m/r/d act on the ready head's review), and the
- * `docs` tab (1-9/a-z open a doc). Opening a doc drops into a `doc` view; [d] on a ready head drops
- * into a `review` view (the full paged diff). Backspace/Esc walk back out.
+ * It has three home tabs, switched with Tab (or `i`), so their key spaces never
+ * collide: the `queue` tab (m/r/d act on the ready head's review), the `docs`
+ * tab (1-9/a-z open a doc), and the `inbox` tab (1-9/a-z open a filed crew
+ * review). Opening a doc drops into a `doc` view; selecting a review drops into
+ * an `inboxItem` view; [d] on a ready head drops into a `review` view (the full
+ * paged diff). All three page identically. Backspace/Esc walk back out.
  *
  * `docs` + its loading/error are kept on the panel (not per-view) so switching
- * tabs never reloads them; the live queue is read fresh from the QueuePanelSource
- * at paint time (cheap in-memory snapshot), so it needs no cached copy.
+ * tabs never reloads them; the live queue and the review inbox are read fresh
+ * from their sources at paint time (cheap in-memory snapshots), so they need no
+ * cached copy.
  */
 type PanelView =
   | { kind: "queue" }
   | { kind: "docs" }
   | { kind: "doc"; name: string; content: string; rows: string[]; scroll: number; error: string | null }
+  | { kind: "inbox" }
+  /** One filed review's full body, drilled into from the inbox list. It carries
+   *  the record itself rather than a list index: a review filed while the captain
+   *  is reading shifts every index by one, and a resize must never swap the text
+   *  under them. */
+  | { kind: "inboxItem"; entry: InboxPanelEntry; rows: string[]; scroll: number }
   /** The ready head's full paged diff, drilled into with [d] from the queue tab.
    *  Its rows/scroll live on `pendingReview` (mutated in place), so this carries
    *  no state of its own. */
@@ -692,6 +780,7 @@ export class Tui implements SessionIO {
   // tears down the live doc-refresh listener.
   private readonly docs?: DocSource;
   private readonly queue?: QueuePanelSource;
+  private readonly inbox?: InboxPanelSource;
   private panel: PanelState | null = null;
   private unsubscribeDocs: (() => void) | null = null;
   // A merge review awaiting the captain's [m]/[r]/[d], tracked apart from the
@@ -713,6 +802,7 @@ export class Tui implements SessionIO {
     this.inp = opts.inp ?? process.stdin;
     this.docs = opts.docs;
     this.queue = opts.queue;
+    this.inbox = opts.inbox;
   }
 
   // --- lifecycle -------------------------------------------------------------
@@ -2001,14 +2091,16 @@ export class Tui implements SessionIO {
   // The persistent, non-modal home for the instance's user-facing docs AND the
   // live merge queue (D-20260723-25). The captain opens/closes it with Ctrl-O
   // (the same key both ways — see togglePanel and the "close" panel input); it
-  // never auto-pops. Two tabs (Tab or `i` switches): the QUEUE tab shows the ordered
-  // features and their state, with the ready head's review actioned in-place
-  // ([m] merge / [r] reject / [d] drill the full diff); the DOCS tab lists docs/
-  // (selectable by letter) and opens one rendered through the SAME markdown
-  // renderer the transcript uses, refreshing live when an agent writes it. The
-  // docs read only through the injected DocSource (the sandboxed doc tool — the
-  // `.memory/` substrate is never listed or reachable here); the queue reads a
-  // fresh in-memory snapshot from the QueuePanelSource at paint time. No step
+  // never auto-pops. Three tabs (Tab or `i` switches): the QUEUE tab shows the
+  // ordered features and their state, with the ready head's review actioned
+  // in-place ([m] merge / [r] reject / [d] drill the full diff); the DOCS tab
+  // lists docs/ (selectable by letter) and opens one rendered through the SAME
+  // markdown renderer the transcript uses, refreshing live when an agent writes
+  // it; the INBOX tab lists the filed crew reviews and opens one's full body on
+  // that same surface. The docs read only through the injected DocSource (the
+  // sandboxed doc tool — the `.memory/` substrate is never listed or reachable
+  // here); the queue and the inbox read a fresh in-memory snapshot from their
+  // sources at paint time. No step
   // needs an arrow key: tab-switch is Tab, selection is a letter/number, paging
   // is less-style (space/b, j/k, d/u, g/G).
 
@@ -2039,7 +2131,7 @@ export class Tui implements SessionIO {
    * refresh and loads the doc list asynchronously.
    */
   private openPanel(): void {
-    if (!this.docs && !this.queue && !this.pendingReview) {
+    if (!this.docs && !this.queue && !this.inbox && !this.pendingReview) {
       this.setStatus("panel unavailable");
       return;
     }
@@ -2062,7 +2154,7 @@ export class Tui implements SessionIO {
         this.pendingReview.scroll = 0;
       }
     } else {
-      view = this.queue ? { kind: "queue" } : { kind: "docs" };
+      view = this.homeView(this.panelTabs()[0] ?? "docs");
     }
     this.panel = { view, docs: [], docsLoading: Boolean(this.docs), docsError: null };
     if (this.docs) {
@@ -2139,28 +2231,43 @@ export class Tui implements SessionIO {
   }
 
   /** The panel's home tabs, in order, given what's wired and pending: the queue
-   *  (when a queue source exists), docs (when a doc source exists), and a
-   *  standalone review (only when there's a pending review AND no queue to host
-   *  it — a feature_land review that isn't in the queue). Tab cycles these. */
+   *  (when a queue source exists), docs (when a doc source exists), the review
+   *  inbox (when an inbox source exists), and a standalone review (only when
+   *  there's a pending review AND no queue to host it — a feature_land review
+   *  that isn't in the queue). Tab cycles these. */
   private panelTabs(): PanelView["kind"][] {
     const tabs: PanelView["kind"][] = [];
     if (this.queue) tabs.push("queue");
     if (this.docs) tabs.push("docs");
+    if (this.inbox) tabs.push("inbox");
     if (this.pendingReview && !this.queue) tabs.push("review");
     return tabs;
   }
 
-  /** Tab (or `i`, its panel-only twin) cycles the home tabs. From a doc sub-view
-   *  it first pops back to the docs tab. A no-op when there's only one tab. */
+  /** A home tab's view state. Sub-views (doc, inboxItem) are never home tabs, so
+   *  anything unrecognised falls back to the queue. */
+  private homeView(kind: PanelView["kind"]): PanelView {
+    switch (kind) {
+      case "docs": return { kind: "docs" };
+      case "inbox": return { kind: "inbox" };
+      case "review": return { kind: "review" };
+      default: return { kind: "queue" };
+    }
+  }
+
+  /** Tab (or `i`, its panel-only twin) cycles the home tabs. From a sub-view (a
+   *  doc, a filed review) it first pops back to that sub-view's own tab. A no-op
+   *  when there's only one tab. */
   private switchTab(): void {
     if (!this.panel) return;
     const v = this.panel.view;
     if (v.kind === "doc") { this.panel.view = { kind: "docs" }; this.paint(); return; }
+    if (v.kind === "inboxItem") { this.panel.view = { kind: "inbox" }; this.paint(); return; }
     const tabs = this.panelTabs();
     if (tabs.length < 2) return;
     const cur = tabs.indexOf(v.kind);
     const next = tabs[(cur + 1) % tabs.length]!;
-    this.panel.view = next === "review" ? { kind: "review" } : next === "docs" ? { kind: "docs" } : { kind: "queue" };
+    this.panel.view = this.homeView(next);
     if (next === "review" && this.pendingReview) {
       this.pendingReview.rows = renderLandingBody(
         this.pendingReview.review,
@@ -2209,14 +2316,18 @@ export class Tui implements SessionIO {
     }
   }
 
-  /** Re-lay the open doc or the drilled review body out at the current width
-   *  (resize). The queue/docs tabs re-render from source each paint, so only the
-   *  scroll-bearing views need reflowing. */
+  /** Re-lay the open doc, the drilled review body, or a filed review out at the
+   *  current width (resize). The queue/docs/inbox tabs re-render from source each
+   *  paint, so only the scroll-bearing views need reflowing. */
   private reflowPanel(): void {
     if (!this.panel) return;
     const v = this.panel.view;
     if (v.kind === "doc") {
       const rows = renderMarkdownDoc(v.content, this.cols);
+      const scroll = Math.min(v.scroll, Math.max(0, rows.length - this.overlayViewport()));
+      this.panel.view = { ...v, rows, scroll };
+    } else if (v.kind === "inboxItem") {
+      const rows = renderInboxItem(v.entry, this.cols);
       const scroll = Math.min(v.scroll, Math.max(0, rows.length - this.overlayViewport()));
       this.panel.view = { ...v, rows, scroll };
     } else if (v.kind === "review" && this.pendingReview) {
@@ -2231,7 +2342,7 @@ export class Tui implements SessionIO {
   private scrollTarget(): { get(): number; set(n: number): void; rows: number } | null {
     if (!this.panel) return null;
     const v = this.panel.view;
-    if (v.kind === "doc") {
+    if (v.kind === "doc" || v.kind === "inboxItem") {
       return { get: () => v.scroll, set: (n) => { this.panel!.view = { ...v, scroll: n }; }, rows: v.rows.length };
     }
     if (v.kind === "review" && this.pendingReview) {
@@ -2392,6 +2503,8 @@ export class Tui implements SessionIO {
       case "queue": this.queueTabInput(ev); return;
       case "docs": this.docsTabInput(ev, this.panel); return;
       case "doc": this.overlayDocInput(ev); return;
+      case "inbox": this.inboxTabInput(ev); return;
+      case "inboxItem": this.inboxItemInput(ev); return;
       case "review": this.reviewViewInput(ev); return;
     }
   }
@@ -2419,6 +2532,51 @@ export class Tui implements SessionIO {
     if (ch === "q" || ch === "Q") { this.closePanel(); return; }
     const idx = OVERLAY_LABELS.indexOf(ch.toLowerCase());
     if (idx >= 0 && idx < panel.docs.length) void this.openDoc(panel.docs[idx]!);
+  }
+
+  /** The inbox tab: a labelled list, exactly like docs — 1-9/a-z opens that
+   *  review's full body. Nothing here can act on the queue or a merge. */
+  private inboxTabInput(input: OverlayInput): void {
+    if ("nav" in input) {
+      if (input.nav === "escape" || input.nav === "back") this.closePanel();
+      return; // a labelled list has no line/page navigation
+    }
+    const ch = input.ch;
+    if (ch === "q" || ch === "Q") { this.closePanel(); return; }
+    const idx = OVERLAY_LABELS.indexOf(ch.toLowerCase());
+    const entries = this.inbox?.list() ?? [];
+    if (idx >= 0 && idx < entries.length) this.openInboxItem(idx);
+  }
+
+  /** Open one filed review's full body, scrolled to the top. Same paging surface
+   *  as a doc and the drilled diff. */
+  private openInboxItem(index: number): void {
+    if (!this.panel) return;
+    const entry = this.inbox?.list()[index];
+    if (!entry) return;
+    this.panel.view = { kind: "inboxItem", entry, rows: renderInboxItem(entry, this.cols), scroll: 0 };
+    this.paint();
+  }
+
+  /** A filed review's body: Backspace returns to the inbox list, Esc closes,
+   *  everything else pages. There are no actions on a filed review — it is a
+   *  record, not a gate. */
+  private inboxItemInput(input: OverlayInput): void {
+    if ("nav" in input) {
+      if (input.nav === "escape") { this.closePanel(); return; }
+      if (input.nav === "back") { this.backToInbox(); return; }
+      this.overlayScrollInput(input);
+      return;
+    }
+    if (input.ch === "q") { this.closePanel(); return; }
+    this.overlayScrollInput(input);
+  }
+
+  /** Return from a filed review to the inbox list. */
+  private backToInbox(): void {
+    if (!this.panel) return;
+    this.panel.view = { kind: "inbox" };
+    this.paint();
   }
 
   private overlayDocInput(input: OverlayInput): void {
@@ -2601,15 +2759,15 @@ export class Tui implements SessionIO {
   }
 
   /** After a review is settled (merged/rejected), leave the review view. Fall
-   *  back to the queue tab if a queue is wired (it now reflects the advance),
-   *  else the docs tab if docs exist, else close the panel — a review-only panel
-   *  (no queue, no docs, e.g. feature_land on PlainIO-adjacent flows) has nothing
-   *  left to show. */
+   *  back to the first remaining home tab — the queue if one is wired (it now
+   *  reflects the advance), else docs, else the inbox — and close the panel when
+   *  nothing else is left to show (a review-only panel, e.g. feature_land on
+   *  PlainIO-adjacent flows). */
   private leaveSettledReview(): void {
     if (!this.panel) return;
     if (this.panel.view.kind !== "review" && this.panel.view.kind !== "queue") return;
-    if (this.queue) this.panel.view = { kind: "queue" };
-    else if (this.docs) this.panel.view = { kind: "docs" };
+    const next = this.panelTabs().find((t) => t !== "review");
+    if (next) this.panel.view = this.homeView(next);
     else this.closePanel();
   }
 
@@ -2634,6 +2792,13 @@ export class Tui implements SessionIO {
       title = `docs · ${v.name}`;
       body = v.rows;
       start = v.scroll;
+    } else if (v.kind === "inbox") {
+      title = "inbox";
+      body = this.inboxTabRows();
+    } else if (v.kind === "inboxItem") {
+      title = `inbox · ${v.entry.level} ${v.entry.verdict}`;
+      body = v.rows;
+      start = v.scroll;
     } else {
       const pr = this.pendingReview;
       title = pr ? `review · ${pr.review.feature} → ${pr.review.target}` : "review";
@@ -2652,9 +2817,9 @@ export class Tui implements SessionIO {
     this.out.write(frame.join(""));
   }
 
-  /** The tab bar as a header: the two tabs with the active one reversed, so the
-   *  captain sees both spaces and which is live. Sub-views (doc/review) get a
-   *  plain title instead. */
+  /** The tab bar as a header: the home tabs with the active one reversed, so the
+   *  captain sees every space and which is live. Sub-views (doc/inboxItem/review)
+   *  get a plain title instead. */
   private overlayHeader(title: string): string {
     const w = this.cols;
     const bar = this.clip(` ${title} `, w).padEnd(w, " ");
@@ -2738,6 +2903,34 @@ export class Tui implements SessionIO {
     }
   }
 
+  /**
+   * The inbox tab as selectable rows, newest first: "1) [L2] fix-commit  the
+   * headline". Level and verdict lead because they're what the captain scans for;
+   * the body is one keypress away. Read fresh from the InboxPanelSource, so a
+   * review filed while the panel is open shows on the next paint.
+   */
+  private inboxTabRows(): string[] {
+    if (!this.inbox) return ["", "  " + c.dim("No review inbox in this session.")];
+    const entries = this.inbox.list();
+    if (entries.length === 0) {
+      return [
+        "",
+        "  " + c.dim("No reviews filed yet."),
+        "  " + c.dim("Every crew run the co reviews lands here — the last 20, newest first."),
+      ];
+    }
+    const rows: string[] = [""];
+    entries.forEach((e, idx) => {
+      const label = OVERLAY_LABELS[idx];
+      if (label === undefined) return; // beyond the label alphabet (cap keeps us inside it)
+      rows.push(
+        "  " + c.cyan(`${label})`) + " " + levelChip(e.level) + " " +
+          c.dim(e.verdict.padEnd(10)) + " " + e.headline,
+      );
+    });
+    return rows;
+  }
+
   /** The docs tab as selectable rows: "a) plan.md". */
   private docsTabRows(panel: PanelState): string[] {
     if (!this.docs) return ["", "  " + c.dim("No doc surface in this session.")];
@@ -2771,8 +2964,9 @@ export class Tui implements SessionIO {
   private panelFooter(total: number, start: number, vp: number): string {
     const w = this.cols;
     const v = this.panel?.view;
-    const hasOther = (v?.kind === "queue" && this.docs) || (v?.kind === "docs" && this.queue);
-    const tabHint = hasOther ? "Tab/i switch · " : "";
+    // Home tabs offer the switch hint whenever there's somewhere to switch to.
+    const onHomeTab = v?.kind === "queue" || v?.kind === "docs" || v?.kind === "inbox";
+    const tabHint = onHomeTab && this.panelTabs().length > 1 ? "Tab/i switch · " : "";
 
     let left: string;
     if (v?.kind === "review") {
@@ -2790,10 +2984,10 @@ export class Tui implements SessionIO {
       } else {
         left = ` ${tabHint}Esc close `;
       }
-    } else if (v?.kind === "docs") {
+    } else if (v?.kind === "docs" || v?.kind === "inbox") {
       left = ` 1-9/a-z open · ${tabHint}Esc close `;
     } else {
-      // doc view
+      // a doc or a filed review: the shared paging surface
       left = " space/b page · j/k line · g/G ends · Backspace back · Esc close ";
     }
 

@@ -292,7 +292,33 @@ const REVIEW_PROTOCOL = `## Reviewing implementation reports
 - Close with a verdict: accept / fix-commit / rework. If there are escalations,
   state the decision you need from the captain.
 - Think like a co-manager filtering signal from noise, not an eager engineer
-  seeking sign-off on every choice.`;
+  seeking sign-off on every choice.
+
+### File it, don't broadcast it
+
+Every completion gets ONE \`file_review\` call, and that call IS the review. The
+chat is not where the review lives: the captain reads it in the panel (Ctrl-O,
+Inbox tab), which keeps the last 20, newest first, across restarts. On each
+completion:
+
+1. Review the run as above and settle on the verdict.
+2. Map the verdict to a level:
+   - **L1** - \`rework\`, or a genuine escalation/fork only the captain can
+     resolve.
+   - **L2** - \`fix-commit\`, or an \`accept\` that still carries notes worth
+     having.
+   - **L3** - a clean \`accept\` with nothing to flag.
+3. Call \`file_review\` with {level, verdict, headline, body}. The headline is one
+   scannable line; the body is the full three-part review.
+4. Then, in the chat, and only this much:
+   - **L1** - state ONLY the core decision the captain has to make, in a line or
+     two. Not the body, not the three parts, not a summary of the run.
+   - **L2** - nothing. Filing already printed a single dim pointer line.
+   - **L3** - nothing at all.
+
+Never paste the review body into the chat, at any level. A clean run should cost
+the captain no attention; a run that needs them should cost them exactly one
+decision.`;
 
 const TASK_TABLE_PROTOCOL = `## Task table
 
