@@ -241,14 +241,77 @@ export interface QueuePanelView {
 }
 
 /**
+ * The head's inline body on the queue tab: what pressing [m] would land, or why
+ * there is no [m] (D-20260724-12). Structurally the session's QueueHeadDetail —
+ * declared here, like QueuePanelEntry, so the Tui never depends on the session
+ * layer.
+ */
+export type QueueHeadDetail =
+  | {
+      kind: "ready";
+      feature: string;
+      /** The integration branch the merge writes (e.g. "dev"). */
+      target: string;
+      /** The per-job commits the merge preserves, oldest first. */
+      commits: string[];
+      /** The full patch against the target — shown inline, under the list. */
+      diff: string;
+      /** The build+test that passed on the rebased state: the merge's evidence. */
+      buildTest?: { command: string; ms: number };
+    }
+  | {
+      kind: "blocked";
+      feature: string;
+      target: string;
+      blockedKind?: "conflict" | "failed";
+      reason: string;
+      /** conflict: the unmerged paths and git's own account of the failing step. */
+      conflictFiles?: string[];
+      detail?: string;
+      /** failed: the red build+test's exit code and captured output. */
+      exitCode?: number;
+      output?: string;
+      buildTest?: { command: string; ms: number };
+      resolveAttempts?: number;
+      maxResolveAttempts?: number;
+    };
+
+/** What a panel-driven merge did, for the flash line. Rejection of the promise
+ *  is handled too, so a thrown callback can't wedge the panel mid-merge. */
+export interface QueueMergeResult {
+  merged: boolean;
+  /** One line to flash on the separator when it settles. */
+  summary: string;
+  /** Present when nothing merged: why. */
+  error?: string;
+}
+
+/**
  * Backs the Ctrl-O panel's live merge-queue view. Read on demand at paint time
  * (the queue is an in-memory snapshot, so re-reading is cheap and always fresh),
  * so no subscription is needed: every tool turn and dispatch completion already
  * triggers a repaint, which re-reads the queue. Injected like DocSource so the
  * Tui never reaches into the engine.
+ *
+ * `headDetail` + `merge` are what make the queue tab PANEL-NATIVE: the tab shows
+ * the ready head's diff and build+test inline and offers a live [m] that merges
+ * it directly through `merge`, with no co tool call anywhere in the loop and
+ * nothing blocked waiting on the keystroke. Both are optional so a bare list
+ * source (and every existing test that injects one) still works — without
+ * `merge` the tab is read-only and no [m] is ever offered.
  */
 export interface QueuePanelSource {
   view(): QueuePanelView;
+  /** The head's inline body, or null when the head has none (empty queue, or a
+   *  head still processing / being resolved). */
+  headDetail?(): QueueHeadDetail | null;
+  /**
+   * Merge the ready head. Called ONLY from the [m] keystroke over a head the
+   * source itself reports `ready`, at most once at a time (the panel holds a
+   * fire-once interlock while it is in flight). Resolves when the merge has
+   * landed AND the queue has advanced, so the next paint shows the new head.
+   */
+  merge?(): Promise<QueueMergeResult>;
 }
 
 /**
@@ -460,6 +523,83 @@ function renderLandingBody(
   return rows;
 }
 
+/** A build+test run as one phrase: "green · npm test · 12.4s". */
+function buildTestPhrase(bt: { command: string; ms: number } | undefined, ok: boolean): string {
+  const verdict = ok ? "build+test green" : "build+test RED";
+  if (!bt) return verdict;
+  const secs = bt.ms >= 1000 ? `${(bt.ms / 1000).toFixed(1)}s` : `${bt.ms}ms`;
+  return `${verdict} · ${bt.command} · ${secs}`;
+}
+
+/**
+ * The queue head's inline body (D-20260724-12): everything the captain needs to
+ * decide the [m] that sits right there in the same view.
+ *
+ * A READY head renders its evidence — commit count + files changed + the
+ * build+test that passed, the per-job commit list, then the full patch against
+ * the target. A BLOCKED head renders why it cannot merge (and offers no [m]
+ * anywhere): the conflicted paths and git's account, or the red build+test's
+ * exit code and output. Every line is wrapped, so nothing is clipped out of a
+ * merge decision.
+ */
+export function renderQueueHeadDetail(detail: QueueHeadDetail, width: number): string[] {
+  const wrap = (s: string): string[] => (s === "" ? [""] : wrapLine(s, width));
+  const rows: string[] = [""];
+  rows.push(...wrap(c.dim(`── head · ${detail.feature} → ${detail.target} ──`)));
+  rows.push("");
+
+  if (detail.kind === "blocked") {
+    const kind =
+      detail.blockedKind === "conflict"
+        ? "rebase conflict"
+        : detail.blockedKind === "failed"
+          ? "red build+test"
+          : "not mergeable";
+    rows.push(...wrap("  " + c.red(c.bold(`BLOCKED (${kind})`)) + " " + c.dim("— no [m] on this head")));
+    rows.push(...wrap("  " + c.red(detail.reason)));
+    if (detail.conflictFiles && detail.conflictFiles.length > 0) {
+      rows.push("");
+      rows.push(...wrap("  conflicted paths:"));
+      for (const f of detail.conflictFiles) rows.push(...wrap("    " + c.red(f)));
+    }
+    if (detail.exitCode !== undefined) {
+      rows.push("");
+      rows.push(...wrap("  " + c.dim(buildTestPhrase(detail.buildTest, false) + ` · exit ${detail.exitCode}`)));
+    }
+    const body = detail.detail ?? detail.output;
+    if (body) {
+      rows.push("");
+      for (const l of body.split("\n")) rows.push(...wrap("  " + c.dim(l)));
+    }
+    return rows;
+  }
+
+  const files = diffFileCount(detail.diff);
+  rows.push(
+    ...wrap(
+      "  " +
+        c.bold(
+          `${detail.commits.length} commit${detail.commits.length === 1 ? "" : "s"} · ` +
+            `${files} file${files === 1 ? "" : "s"} changed`,
+        ),
+    ),
+  );
+  rows.push(...wrap("  " + c.green(buildTestPhrase(detail.buildTest, true))));
+  rows.push("");
+  for (const cl of detail.commits) {
+    const sp = cl.indexOf(" ");
+    const styled = sp === -1 ? c.dim(cl) : c.dim(cl.slice(0, sp)) + " " + cl.slice(sp + 1);
+    rows.push(...wrap("  " + styled));
+  }
+  if (detail.diff !== "") {
+    rows.push("");
+    rows.push(...wrap(c.dim(`── diff vs ${detail.target} ──`)));
+    rows.push("");
+    for (const l of detail.diff.split("\n")) rows.push(...wrap(colorDiffLine(l)));
+  }
+  return rows;
+}
+
 /** The subset of a readable TTY stream the Tui needs. */
 export interface InStream {
   isTTY?: boolean;
@@ -586,16 +726,25 @@ const OVERLAY_LABELS = "123456789abcdefghjklmnopqrstuvwxyz";
  * the merge review in-place rather than through a separate modal surface.
  *
  * It has three home tabs, switched with Tab (or `i`), so their key spaces never
- * collide: the `queue` tab (m/r/d act on the ready head's review), the `docs`
- * tab (1-9/a-z open a doc), and the `inbox` tab (1-9/a-z open a filed crew
- * review). Opening a doc drops into a `doc` view; selecting a review drops into
- * an `inboxItem` view; [d] on a ready head drops into a `review` view (the full
- * paged diff). All three page identically. Backspace/Esc walk back out.
+ * collide: the `queue` tab ([m] merges the ready head, and the rest pages its
+ * inline diff), the `docs` tab (1-9/a-z open a doc), and the `inbox` tab
+ * (1-9/a-z open a filed crew review). Opening a doc drops into a `doc` view;
+ * selecting a review drops into an `inboxItem` view. A pending feature_land
+ * review adds a fourth `review` tab for as long as it is pending. All the
+ * body views page identically. Backspace/Esc walk back out.
+ *
+ * THE QUEUE TAB IS THE MERGE (D-20260724-12). A green head renders its own diff,
+ * commits and build+test result right there and carries a live [m] that merges
+ * it — no co tool call, no gate, nothing waiting on the keystroke. The [m] is a
+ * STATE, not a prompt: it is present because the head is green, it stays present
+ * until pressed, and it disappears when the head changes. A blocked head renders
+ * why instead and offers no [m] at all.
  *
  * `docs` + its loading/error are kept on the panel (not per-view) so switching
- * tabs never reloads them; the live queue and the review inbox are read fresh
- * from their sources at paint time (cheap in-memory snapshots), so they need no
- * cached copy.
+ * tabs never reloads them; the review inbox is read fresh from its source at
+ * paint time (a cheap in-memory snapshot). The queue is read fresh too, but its
+ * ROWS are memoized against a signature (queueSignature) because a ready head's
+ * inline diff is expensive to wrap and a paint can happen every frame.
  */
 type PanelView =
   | { kind: "queue" }
@@ -618,6 +767,16 @@ interface PanelState {
   docs: string[];
   docsLoading: boolean;
   docsError: string | null;
+  /** Scroll offset of the queue tab. The tab is scroll-bearing now: a ready
+   *  head's whole diff renders inline beneath the list (D-20260724-12). */
+  queueScroll: number;
+  /** Memoized queue rows and the signature they were built for. The tab is
+   *  re-rendered from its source every paint, and a paint can happen 60x a
+   *  second while the model streams underneath — re-wrapping a large diff that
+   *  often would be pure waste, so rows are rebuilt only when something they
+   *  depend on actually changed (see queueSignature). */
+  queueRows: string[];
+  queueSig: string;
 }
 
 /**
@@ -783,6 +942,16 @@ export class Tui implements SessionIO {
   private readonly inbox?: InboxPanelSource;
   private panel: PanelState | null = null;
   private unsubscribeDocs: (() => void) | null = null;
+  // The panel-native merge (D-20260724-12). `queueMerging` names the feature
+  // whose merge is in flight and is the fire-once interlock: while it is set,
+  // [m] is a no-op and the tab says what is happening instead of offering the
+  // key again. `queueMergeError` holds the last refusal so it banners in place
+  // rather than vanishing with a flash the captain may have missed. Neither is
+  // an "armed" state — there is nothing to settle, nothing waiting on a human,
+  // and no promise held open anywhere: the [m] is just a property of a ready
+  // head, present until pressed or until the head's state changes.
+  private queueMerging: string | null = null;
+  private queueMergeError: string | null = null;
   // A merge review awaiting the captain's [m]/[r]/[d], tracked apart from the
   // panel's open/closed state: openLandingReview sets it and flashes a hint (it
   // never force-opens the panel), and the captain opens the panel to act on it.
@@ -2124,11 +2293,11 @@ export class Tui implements SessionIO {
   /**
    * Open the panel. With no DocSource, no queue AND no pending review there is
    * nothing to show, so flash a hint instead (PlainIO/degraded never crashes on
-   * the keybind). Otherwise the opening view is: the pending review's diff when
-   * one is waiting (the captain almost certainly opened to act on it), else the
-   * QUEUE tab when a queue is wired (the merge flow is the reason the panel
-   * exists), else the DOCS tab. Subscribes to the doc write queue for live
-   * refresh and loads the doc list asynchronously.
+   * the keybind). Otherwise the opening view is: the pending feature_land review
+   * when one is waiting (that one IS a gate — it holds a caller open, so it wins
+   * the landing spot), else the QUEUE tab when a queue is wired (the merge flow
+   * is the reason the panel exists), else the DOCS tab. Subscribes to the doc
+   * write queue for live refresh and loads the doc list asynchronously.
    */
   private openPanel(): void {
     if (!this.docs && !this.queue && !this.inbox && !this.pendingReview) {
@@ -2140,23 +2309,29 @@ export class Tui implements SessionIO {
     this.clearStatus();
     let view: PanelView;
     if (this.pendingReview) {
-      // Land where the captain can act: the queue tab (which shows the ready
-      // head + action bar) when a queue exists, else the review diff directly.
-      view = this.queue ? { kind: "queue" } : { kind: "review" };
-      if (this.queue) this.pendingReview.scroll = 0;
-      else {
-        this.pendingReview.rows = renderLandingBody(
-          this.pendingReview.review,
-          this.pendingReview.status,
-          this.pendingReview.error,
-          this.cols,
-        );
-        this.pendingReview.scroll = 0;
-      }
+      // A pending feature_land review lives on its OWN tab now: the queue tab's
+      // [m] belongs to the panel-native queue merge, so the two can never share
+      // a key space (D-20260724-12).
+      view = { kind: "review" };
+      this.pendingReview.rows = renderLandingBody(
+        this.pendingReview.review,
+        this.pendingReview.status,
+        this.pendingReview.error,
+        this.cols,
+      );
+      this.pendingReview.scroll = 0;
     } else {
       view = this.homeView(this.panelTabs()[0] ?? "docs");
     }
-    this.panel = { view, docs: [], docsLoading: Boolean(this.docs), docsError: null };
+    this.panel = {
+      view,
+      docs: [],
+      docsLoading: Boolean(this.docs),
+      docsError: null,
+      queueScroll: 0,
+      queueRows: [],
+      queueSig: "",
+    };
     if (this.docs) {
       this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
       void this.loadList();
@@ -2232,15 +2407,16 @@ export class Tui implements SessionIO {
 
   /** The panel's home tabs, in order, given what's wired and pending: the queue
    *  (when a queue source exists), docs (when a doc source exists), the review
-   *  inbox (when an inbox source exists), and a standalone review (only when
-   *  there's a pending review AND no queue to host it — a feature_land review
-   *  that isn't in the queue). Tab cycles these. */
+   *  inbox (when an inbox source exists), and a feature_land review whenever one
+   *  is pending. The review gets its own tab even alongside a queue: the queue
+   *  tab's [m] is the panel-native queue merge, and two different merges must
+   *  never share one key (D-20260724-12). Tab cycles these. */
   private panelTabs(): PanelView["kind"][] {
     const tabs: PanelView["kind"][] = [];
     if (this.queue) tabs.push("queue");
     if (this.docs) tabs.push("docs");
     if (this.inbox) tabs.push("inbox");
-    if (this.pendingReview && !this.queue) tabs.push("review");
+    if (this.pendingReview) tabs.push("review");
     return tabs;
   }
 
@@ -2316,9 +2492,9 @@ export class Tui implements SessionIO {
     }
   }
 
-  /** Re-lay the open doc, the drilled review body, or a filed review out at the
-   *  current width (resize). The queue/docs/inbox tabs re-render from source each
-   *  paint, so only the scroll-bearing views need reflowing. */
+  /** Re-lay the open doc, the pending review body, or a filed review out at the
+   *  current width (resize). The docs/inbox tabs re-render from source each paint;
+   *  the queue tab re-renders itself because its cache key carries the width. */
   private reflowPanel(): void {
     if (!this.panel) return;
     const v = this.panel.view;
@@ -2338,10 +2514,18 @@ export class Tui implements SessionIO {
   }
 
   /** The scroll offset + row count of whichever scroll-bearing view is showing,
-   *  or null for the non-scrolling queue/docs tabs. */
+   *  or null for the non-scrolling docs/inbox list tabs. */
   private scrollTarget(): { get(): number; set(n: number): void; rows: number } | null {
     if (!this.panel) return null;
     const v = this.panel.view;
+    if (v.kind === "queue") {
+      const panel = this.panel;
+      return {
+        get: () => panel.queueScroll,
+        set: (n) => { panel.queueScroll = n; },
+        rows: this.queueBody().length,
+      };
+    }
     if (v.kind === "doc" || v.kind === "inboxItem") {
       return { get: () => v.scroll, set: (n) => { this.panel!.view = { ...v, scroll: n }; }, rows: v.rows.length };
     }
@@ -2509,18 +2693,29 @@ export class Tui implements SessionIO {
     }
   }
 
-  /** The queue tab: [m]/[r]/[d] act on the ready head's review; Esc closes. */
+  /**
+   * The queue tab (D-20260724-12). [m] merges the ready head, directly — it is
+   * live whenever the head is green and it is simply absent otherwise, so there
+   * is no modal state to enter or leave. Everything else pages the body (the
+   * ready head's diff renders inline, so this tab scrolls like a doc), and
+   * Esc/Backspace/q close the panel.
+   *
+   * The paging surface is checked BEFORE the exits so `d`/`u` keep their
+   * less-style half-page meaning here, and [m] is checked first of all so a
+   * merge can never be shadowed by a paging key.
+   */
   private queueTabInput(input: OverlayInput): void {
+    if ("ch" in input && input.ch === "m") {
+      this.mergeReadyHead();
+      return;
+    }
     if ("nav" in input) {
+      if (this.overlayScrollInput(input)) return;
       if (input.nav === "escape" || input.nav === "back") this.closePanel();
-      return; // the queue list itself doesn't scroll (it fits; entries are terse)
+      return;
     }
-    switch (input.ch) {
-      case "q": case "Q": this.closePanel(); return;
-      case "m": this.approveLanding(); return;
-      case "r": this.rejectReview(); return;
-      case "d": this.drillReview(); return;
-    }
+    if (this.overlayScrollInput(input)) return;
+    if (input.ch === "q" || input.ch === "Q") this.closePanel();
   }
 
   private docsTabInput(input: OverlayInput, panel: PanelState): void {
@@ -2695,19 +2890,45 @@ export class Tui implements SessionIO {
     });
   }
 
-  /** [d] on a ready head: drill into the full paged diff. No-op without a
-   *  reviewable pending review. */
-  private drillReview(): void {
-    if (!this.panel || !this.pendingReview) return;
-    this.pendingReview.rows = renderLandingBody(
-      this.pendingReview.review,
-      this.pendingReview.status,
-      this.pendingReview.error,
-      this.cols,
-    );
-    this.pendingReview.scroll = 0;
-    this.panel.view = { kind: "review" };
+  /**
+   * The queue tab's [m] (D-20260724-12): merge the ready head, now. This is the
+   * whole happy path — no gate is opened, no promise is armed, no tool call is
+   * made, and nothing anywhere is parked waiting on this keystroke; the co is
+   * free the entire time and finds out only if the NEXT head comes back blocked.
+   *
+   * It is a strict no-op unless the source itself reports a ready head with
+   * commits: a blocked, processing or resolving head has no [m] at all, so a
+   * stray press does nothing. Fire-once while in flight (queueMerging), for the
+   * same reason the gate's [m] was: a double-tap must not mint two merges.
+   */
+  private mergeReadyHead(): void {
+    const merge = this.queue?.merge;
+    if (!this.queue || !merge || this.queueMerging) return;
+    const head = this.mergeableHead();
+    if (!head) return;
+
+    this.queueMerging = head.feature;
+    this.queueMergeError = null;
     this.paint();
+    const done = (): void => {
+      this.queueMerging = null;
+      // The body is a different head now (or gone): start it at the top rather
+      // than stranding the captain deep in the previous head's diff.
+      if (this.panel) this.panel.queueScroll = 0;
+    };
+    void merge.call(this.queue).then(
+      (res) => {
+        done();
+        if (!res.merged) this.queueMergeError = res.error ?? res.summary;
+        this.paint();
+        this.setStatus(res.summary);
+      },
+      (e: unknown) => {
+        done();
+        this.queueMergeError = e instanceof Error ? e.message : String(e);
+        this.paint();
+      },
+    );
   }
 
   /**
@@ -2758,14 +2979,13 @@ export class Tui implements SessionIO {
     this.paint();
   }
 
-  /** After a review is settled (merged/rejected), leave the review view. Fall
-   *  back to the first remaining home tab — the queue if one is wired (it now
-   *  reflects the advance), else docs, else the inbox — and close the panel when
-   *  nothing else is left to show (a review-only panel, e.g. feature_land on
-   *  PlainIO-adjacent flows). */
+  /** After a feature_land review is settled (merged/rejected), leave its view.
+   *  Fall back to the first remaining home tab — the queue if one is wired, else
+   *  docs, else the inbox — and close the panel when nothing else is left to show
+   *  (a review-only panel). */
   private leaveSettledReview(): void {
     if (!this.panel) return;
-    if (this.panel.view.kind !== "review" && this.panel.view.kind !== "queue") return;
+    if (this.panel.view.kind !== "review") return;
     const next = this.panelTabs().find((t) => t !== "review");
     if (next) this.panel.view = this.homeView(next);
     else this.closePanel();
@@ -2784,7 +3004,8 @@ export class Tui implements SessionIO {
     let start = 0;
     if (v.kind === "queue") {
       title = "queue";
-      body = this.queueTabRows();
+      body = this.queueBody();
+      start = panel.queueScroll;
     } else if (v.kind === "docs") {
       title = "docs";
       body = this.docsTabRows(panel);
@@ -2827,10 +3048,52 @@ export class Tui implements SessionIO {
   }
 
   /**
+   * The queue tab's body, memoized. Rebuilt only when something it depends on
+   * changed — the queue snapshot, the head's detail, the merge state, or the
+   * width. Without this, streaming model output underneath would re-wrap a
+   * possibly-huge inline diff on every 60fps frame for no reason.
+   *
+   * Also clamps the tab's scroll to the fresh row count, so a body that shrank
+   * (the head merged and the next one is smaller) can't leave the view stranded
+   * past its end.
+   */
+  private queueBody(): string[] {
+    const panel = this.panel;
+    if (!panel) return this.queueTabRows();
+    const sig = this.queueSignature();
+    if (sig !== panel.queueSig) {
+      panel.queueRows = this.queueTabRows();
+      panel.queueSig = sig;
+    }
+    const max = Math.max(0, panel.queueRows.length - this.overlayViewport());
+    if (panel.queueScroll > max) panel.queueScroll = max;
+    return panel.queueRows;
+  }
+
+  /** A cheap identity for everything the queue tab renders from. The detail's
+   *  body is identified by its sizes rather than its content: a diff that
+   *  changed at all changed the head, which changes the rest of the key. */
+  private queueSignature(): string {
+    if (!this.queue) return "none";
+    const view = this.queue.view();
+    const d = this.queue.headDetail?.() ?? null;
+    const detailKey = !d
+      ? "-"
+      : d.kind === "ready"
+        ? `r:${d.feature}:${d.commits.length}:${d.diff.length}:${d.buildTest?.ms ?? -1}`
+        : `b:${d.feature}:${d.blockedKind ?? "-"}:${d.reason.length}:${(d.detail ?? d.output ?? "").length}`;
+    const entries = view.entries
+      .map((e) => `${e.feature}/${e.status}/${e.commitsReady ?? ""}/${e.blockedKind ?? ""}/${e.resolveAttempts ?? ""}`)
+      .join(",");
+    return `${this.cols}|${this.queueMerging ?? ""}|${this.queueMergeError ?? ""}|${entries}|${detailKey}`;
+  }
+
+  /**
    * The live merge queue as rows: the head first with its state, then the rest in
-   * landing order. A ready head shows its commit count and the in-place action
-   * bar hint; a blocked head shows conflict-vs-red and the resolver hint; a
-   * resolving head shows the attempt. Read fresh from the QueuePanelSource.
+   * landing order, then the head's INLINE body — a ready head's commits, diff and
+   * build+test evidence, or a blocked head's reason (D-20260724-12). Everything
+   * needed to decide the merge, in the same view as the key that performs it.
+   * Read fresh from the QueuePanelSource.
    */
   private queueTabRows(): string[] {
     if (!this.queue) {
@@ -2838,6 +3101,10 @@ export class Tui implements SessionIO {
     }
     const view = this.queue.view();
     const rows: string[] = [""];
+    if (this.queueMergeError) {
+      rows.push("  " + c.red(`merge failed: ${this.queueMergeError}`));
+      rows.push("");
+    }
     if (view.size === 0) {
       rows.push("  " + c.dim("The merge queue is empty."));
       rows.push("  " + c.dim("Enqueue a finished feature (feature_enqueue) to line it up to land."));
@@ -2846,17 +3113,22 @@ export class Tui implements SessionIO {
     for (const e of view.entries) {
       rows.push(...this.queueEntryRows(e));
     }
-    // A ready head with a live pending review: name the actions right under it.
     // The head is position 1 (head-only invariant); derive it from entries so a
-    // source that leaves `head` unset still drives the hint.
-    const head = view.head ?? view.entries[0] ?? null;
-    if (head && head.isHead && head.status === "ready" && this.pendingReview?.status === "review") {
+    // source that leaves `head` unset still drives the affordance.
+    const detail = this.queue.headDetail?.() ?? null;
+    const mergeable = this.mergeableHead();
+    if (this.queueMerging) {
       rows.push("");
-      rows.push("  " + c.dim("this head is ready to merge — ") +
-        c.cyan("m") + c.dim(" merge · ") + c.cyan("r") + c.dim(" reject · ") + c.cyan("d") + c.dim(" drill the diff"));
-    } else if (head && head.isHead && head.status === "ready" && !this.pendingReview) {
+      rows.push("  " + c.cyan(`merging ${this.queueMerging}…`));
+    } else if (mergeable) {
       rows.push("");
-      rows.push("  " + c.dim("head is green; run feature_merge_head to open its review here."));
+      rows.push(
+        "  " + c.dim("this head is ready — press ") + c.cyan("m") +
+          c.dim(mergeable.target ? ` to merge it onto ${mergeable.target}` : " to merge it"),
+      );
+    }
+    if (detail) {
+      rows.push(...renderQueueHeadDetail(detail, this.cols));
     }
     return rows;
   }
@@ -2880,8 +3152,8 @@ export class Tui implements SessionIO {
             "      " +
               c.dim(
                 spent > 0
-                  ? `resolver attempts: ${spent} — feature_resolve_head to try again, or fix by hand`
-                  : `feature_resolve_head dispatches a fresh agent to fix it in its worktree`,
+                  ? `resolver attempts: ${spent} — the co can send a fresh agent again, or fix by hand`
+                  : `the co can dispatch a fresh agent to fix it in its worktree (you confirm it)`,
               ),
           );
         }
@@ -2972,17 +3244,16 @@ export class Tui implements SessionIO {
     if (v?.kind === "review") {
       left = " " + this.reviewActionBar() + " ";
     } else if (v?.kind === "queue") {
-      const pr = this.pendingReview;
-      if (pr && pr.status === "review" && this.queueHeadReady()) {
-        left = " " + c.cyan("m") + c.dim(" merge · ") + c.cyan("r") + c.dim(" reject · ") +
-          c.cyan("d") + c.dim(" drill · ") + c.dim(`${tabHint}Esc close`) + " ";
-      } else if (pr && pr.status === "failed") {
-        left = " " + c.dim("merge failed — ") + c.cyan("r") + c.dim(" dismiss · ") +
-          c.cyan("d") + c.dim(" details · ") + c.dim(`${tabHint}Esc close`) + " ";
-      } else if (pr && pr.status === "merging") {
-        left = " " + c.cyan(`merging into ${pr.review.target}…`) + " ";
+      // The [m] hint is a plain function of the head's state — it appears when
+      // the head goes green and stays until it is pressed or the head changes.
+      // Nothing here is armed or awaited (D-20260724-12).
+      if (this.queueMerging) {
+        left = " " + c.cyan(`merging ${this.queueMerging}…`) + " ";
+      } else if (this.mergeableHead()) {
+        left = " " + c.cyan("m") + c.dim(" merge · space/b page · ") +
+          c.dim(`${tabHint}Esc close`) + " ";
       } else {
-        left = ` ${tabHint}Esc close `;
+        left = ` ${c.dim("space/b page · " + tabHint + "Esc close")} `;
       }
     } else if (v?.kind === "docs" || v?.kind === "inbox") {
       left = ` 1-9/a-z open · ${tabHint}Esc close `;
@@ -3000,11 +3271,27 @@ export class Tui implements SessionIO {
     return this.clip(left + c.dim("─".repeat(fill)) + c.dim(right), w);
   }
 
-  /** Whether the head is the ready feature the pending review is for. */
-  private queueHeadReady(): boolean {
-    const view = this.queue?.view();
-    const head = view?.head ?? view?.entries[0] ?? null;
-    return Boolean(head && head.isHead && head.status === "ready");
+  /**
+   * Whether [m] is live right now, and on what. ONE predicate, used by the
+   * handler, the in-body hint and the footer alike, so the key can never be
+   * advertised somewhere it wouldn't fire (or fire where it isn't offered).
+   *
+   * Live means: the source reports a ready head, it exposes a merge, and — when
+   * it also exposes a head body — that body is a ready one with something to
+   * land. A source with no `headDetail` at all is trusted on its view, so a
+   * minimal list source still works; one that HAS a body must agree with it.
+   */
+  private mergeableHead(): { feature: string; target?: string } | null {
+    if (!this.queue?.merge) return null;
+    const view = this.queue.view();
+    const head = view.head ?? view.entries[0] ?? null;
+    if (!head || !head.isHead || head.status !== "ready") return null;
+    // No body source: trust the view, and say nothing about a target we were
+    // never told (the integration branch is the session's to name, not ours).
+    if (!this.queue.headDetail) return { feature: head.feature };
+    const detail = this.queue.headDetail();
+    if (!detail || detail.kind !== "ready" || detail.commits.length === 0) return null;
+    return { feature: detail.feature, target: detail.target };
   }
 
   /** The drilled review view's action bar: [m] armed only for a mergeable prepare

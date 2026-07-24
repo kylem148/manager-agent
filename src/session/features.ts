@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { DEFAULT_BUILD_TEST_COMMAND, prepareLanding } from "./landing.js";
+import { DEFAULT_BUILD_TEST_COMMAND, executeLanding, prepareLanding } from "./landing.js";
 import { reviewLanding, type LandingGateHost, type LandingGateResult } from "./landinggate.js";
 import {
   MergeQueue,
@@ -8,6 +8,7 @@ import {
   type MergeHeadResult,
   type ProcessHeadResult,
   type QueueEntryView,
+  type QueueHeadDetail,
   type QueueView,
 } from "./mergequeue.js";
 import type { DispatchRegistry } from "./registry.js";
@@ -41,10 +42,11 @@ import {
  * back as tool output.
  *
  * Safety posture is inherited, not re-implemented: create is idempotent and
- * throws with a reconcile pointer on a half-state (provisionWorktree); land only
- * ever merges through the gate's [m] keystroke (reviewLanding is the single live
- * call site of executeLanding); abandon refuses a worktree with uncommitted
- * changes and never force-deletes an unmerged branch (teardownWorktree's guards).
+ * throws with a reconcile pointer on a half-state (provisionWorktree); every
+ * merge in an interactive session is a human keystroke (feature_land through the
+ * gate's [m], a queue head through the panel's [m] — the co calls neither);
+ * abandon refuses a worktree with uncommitted changes and never force-deletes an
+ * unmerged branch (teardownWorktree's guards).
  * The boot reconcile is READ-ONLY over feature state — it rebuilds records and
  * surfaces anomalies, and destroys nothing.
  */
@@ -56,7 +58,12 @@ export interface FeatureManagerDeps {
   teardown: typeof teardownWorktree;
   reconcile: typeof reconcileFeatures;
   prepare: typeof prepareLanding;
+  /** The feature_land human gate (still gated, still the only path that route
+   *  takes to a merge). The QUEUE does not use it — its merge is the panel's. */
   review: typeof reviewLanding;
+  /** The queue's merge: the panel's [m] and the non-TTY fallback both land
+   *  through this. Injectable so the levers can be tested without a real merge. */
+  execute: typeof executeLanding;
 }
 
 export interface FeatureManagerOptions {
@@ -153,11 +160,11 @@ export class FeatureManager {
       reconcile: opts.deps?.reconcile ?? reconcileFeatures,
       prepare: opts.deps?.prepare ?? prepareLanding,
       review: opts.deps?.review ?? reviewLanding,
+      execute: opts.deps?.execute ?? executeLanding,
     };
     this.queue = new MergeQueue({
       repoPath: this.repoPath,
       buildTestCommand: this.buildTestCommand,
-      ...(this.gateHost ? { gateHost: this.gateHost } : {}),
       host: {
         isBusy: (feature) => this.isBusy(feature),
         forget: (feature) => {
@@ -165,7 +172,7 @@ export class FeatureManager {
           this.intents.delete(safeSlug(feature));
         },
       },
-      deps: { prepare: this.deps.prepare, review: this.deps.review },
+      deps: { prepare: this.deps.prepare, execute: this.deps.execute },
     });
   }
 
@@ -273,8 +280,8 @@ export class FeatureManager {
         feature,
         outcome: "rejected",
         prepared: "failed",
-        summary: `'${feature}' is in the merge queue; land it via the queue (feature_merge_head) when it is the head, not directly.`,
-        error: "feature is enqueued; merge it as the queue head",
+        summary: `'${feature}' is in the merge queue; it lands as the queue head, when the captain presses [m] on it in the Ctrl-O panel — not through a direct land.`,
+        error: "feature is enqueued; it merges as the queue head",
       };
     }
     if (this.isBusy(feature)) {
@@ -357,16 +364,19 @@ export class FeatureManager {
   //
   // The "mark done" flow (D-20260723-14/-21/-23): features the captain declares
   // done join an ordered queue; only the head is processed at a time (rebase +
-  // build+test via the EXISTING landing prepare); a green head is offered for the
-  // captain's merge keystroke via the EXISTING gate; on merge the queue advances
-  // and the next feature is processed against the new dev tip. See mergequeue.ts.
+  // build+test via the EXISTING landing prepare); a green head simply CARRIES a
+  // live [m] in the Ctrl-O panel (D-20260724-12) until the captain presses it; on
+  // merge the queue advances and the next feature is processed against the new
+  // dev tip. The co is not in that loop — it engages only on a blocked head.
+  // See mergequeue.ts.
 
   /**
    * Enqueue a feature as "done" (mark-done). No confirm gate — enqueue is the
    * trigger, and the only gate in the flow is the merge keystroke on the head.
    * When the feature becomes the head, it is processed immediately (rebase onto
-   * the current dev tip + combined build+test); re-enqueuing a blocked head is
-   * the retry lever. Reports not-found for a feature that was never created.
+   * the current dev tip + combined build+test); a green head then simply carries
+   * a live [m] in the panel until the captain presses it. Re-enqueuing a blocked
+   * head is the retry lever. Reports not-found for a feature never created.
    */
   async enqueue(name: string): Promise<
     ({ enqueued: true } & EnqueueResult) | { enqueued: false; feature: string; reason: string }
@@ -384,19 +394,63 @@ export class FeatureManager {
   }
 
   /**
-   * Merge the current queue head through the EXISTING [m]/[r] gate. Only a ready
-   * (green) head merges; on [m] it lands to dev, tears down, and the queue
-   * advances (the new head is processed against the new dev tip). Refuses cleanly
-   * — never throws — when there is no head, no interactive gate, the head is busy,
-   * or the head is not ready.
+   * MERGE THE READY HEAD — the panel's [m] (D-20260724-12). Lands the head on
+   * dev, tears its worktree/branch down, advances the queue, and processes the
+   * new head against the new dev tip, all in one call and with nothing waiting on
+   * a human: the keystroke that got here IS the authorisation. Only a `ready`
+   * (green) head merges; anything else is refused cleanly with the reason and
+   * writes nothing. Never throws.
+   *
+   * The session wires this behind the Tui's queue-panel `merge` callback, so the
+   * ONLY thing that reaches it in an interactive session is that keystroke. The
+   * co never calls it; feature_merge_head below is deliberately not this.
+   */
+  async mergeReadyHead(): Promise<MergeHeadResult> {
+    return this.queue.mergeReadyHead();
+  }
+
+  /**
+   * feature_merge_head — the co-facing verb, kept ONLY as a non-interactive
+   * fallback (D-20260724-12). It is no longer the merge path and it never blocks
+   * the co's loop on a keystroke:
+   *
+   *  - Interactive session (a panel exists): merges NOTHING and returns at once,
+   *    reporting the head's state and that the live `[m]` in the Ctrl-O queue tab
+   *    is the captain's to press. The co is free; there is nothing to wait for.
+   *  - No panel (piped/non-TTY): there is no key to press, so the ready head is
+   *    merged directly — same guards, same executeLanding, still local-only.
    */
   async mergeHead(): Promise<MergeHeadResult> {
-    return this.queue.mergeHead();
+    if (!this.gateHost) return this.queue.mergeReadyHead();
+    const view = this.queue.view();
+    const head = view.head;
+    const summary = !head
+      ? "the merge queue is empty; nothing to merge."
+      : head.status === "ready"
+        ? `head '${head.feature}' is ready and its [m] is already live in the captain's Ctrl-O queue tab (with the diff and the build+test result). Merging is their keystroke, not a tool call — say it's ready and move on; do NOT wait for it.`
+        : `head '${head.feature}' is ${head.status}${
+            head.blockedReason ? ` (${head.blockedReason})` : ""
+          }; there is no [m] to press until it is green.`;
+    return {
+      merged: false,
+      outcome: "panel",
+      feature: head?.feature ?? "",
+      summary,
+      head,
+      queue: view,
+    };
   }
 
   /** The full merge-queue snapshot (order + head + per-entry status). */
   queueView(): QueueView {
     return this.queue.view();
+  }
+
+  /** The head's inline body for the panel's queue tab: a ready head's commits +
+   *  diff + build+test evidence, or a blocked head's reason. Null for anything
+   *  else. Read fresh at paint time by the Tui's injected queue source. */
+  headDetail(): QueueHeadDetail | null {
+    return this.queue.headDetail();
   }
 
   /**

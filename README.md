@@ -484,6 +484,35 @@ inbox. So a clean chore costs you no attention, a mixed result costs you one
 line, and only a run that genuinely needs a decision interrupts you, with the
 decision and nothing else.
 
+### Landing work: one keystroke, `[m]`
+
+Finished features land on a local `dev` branch through a strictly serial merge
+queue, and the queue does the work itself. Only the front of the line is ever
+touched: it rebases onto the current `dev` tip and runs your build+test on that
+combined state (feature A green and feature B green does not make A+B green).
+When that comes back green, the **Ctrl-O queue tab** shows the head's diff, its
+commits and the build+test result, with a live `[m]` beside them.
+
+`[m]` is a state, not a prompt. It appears because the head is green, it stays
+there until you press it, and pressing it merges — the merge commit lands on
+`dev`, the feature's worktree and branch are torn down, the queue advances, and
+the next feature rebases and tests itself against the `dev` you just moved, so
+its own `[m]` lights up when it goes green. Nothing is armed, nothing expires,
+and the co-manager is not involved in any of it: it never opens the merge, never
+waits on your keypress, and its agent loop is free the whole time.
+
+The co-manager is pulled in for exactly one case: a head that comes back
+**blocked** — a rebase conflict, or a red build+test. That head shows the block
+instead of an `[m]` and holds the queue, and the co is told automatically, so
+you don't re-explain it. It can send a fresh crew agent into that feature's own
+worktree to rebase and fix it (never `dev`) — confirm-gated like every dispatch,
+and bounded to three attempts, after which it stays blocked for you to fix by
+hand or abandon.
+
+All of this is local. The merges are ordinary local commits on a local `dev`;
+nothing is fetched, pushed, or turned into a PR at any point, and `main` is
+never written by anything here.
+
 The job — the `cd` into the repo, the agent command, the (possibly multi-line)
 order text, completion bookkeeping — is written to a **per-job script file**
 under `.dispatch/captures/` (named with the job id plus a per-session tag plus a
@@ -620,7 +649,7 @@ src/
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
   session/   session.ts prompt.ts tools.ts reviewinbox.ts
              crewpanes.ts dispatchconfig.ts transport.ts registry.ts
-             worktrees.ts landing.ts landinggate.ts features.ts
+             worktrees.ts landing.ts landinggate.ts mergequeue.ts features.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
 ```
 
@@ -711,33 +740,58 @@ rebased state, because feature A green and feature B green does not make A+B
 green. It reports green (with the diff the gate will show), conflict (the
 rebase is aborted, the branch restored byte-for-byte), or failed (the branch
 is left rebased so a fix dispatch lands in the exact red state); dev is never
-written. `executeLanding` is the separate gated callable: a `--no-ff` merge
-commit built with plumbing (commit-tree plus a compare-and-swap update-ref,
-so no checkout of dev ever exists and a concurrent move fails loudly),
-per-job commits preserved, then teardown through the existing guards. It
-refuses a stale green (dev moved since the prepare) and can be pinned to the
-exact tested sha. A `LandingQueue` keeps the ordered awaiting-landing record.
+written. `executeLanding` is the separate callable that does the merge: a
+`--no-ff` merge commit built with plumbing (commit-tree plus a compare-and-swap
+update-ref, so no checkout of dev ever exists and a concurrent move fails
+loudly), per-job commits preserved, then teardown through the existing guards.
+It refuses a stale green (dev moved since the prepare) and is pinned to the
+exact tested sha. Everything is local: the only ref it writes is `dev`, and no
+step anywhere fetches, pushes, or opens a PR.
 
-`landinggate.ts` is the human gate between those two phases: `reviewLanding`
-prepares a feature and presents the result in the session's overlay (the same
-modal surface as the Ctrl-O doc viewer, with its paging) as a summary
-(commits, changed-file count), the full paged diff, and an action bar.
-Pressing `m` there is the only live call site of `executeLanding`, pinned to
-the exact sha the review covered, so approval can never merge more than what
-was shown; `r`/Esc dismisses with no merge, leaving the branch and worktree
-intact. A conflict or failed prepare opens the gate too, showing why the
-feature is not mergeable with `m` disabled, and a refused merge (a green gone
-stale under the open gate) surfaces its error in place without touching
-anything. `main` stays human-only throughout.
+`landinggate.ts` is the human gate for the direct `feature_land` route:
+`reviewLanding` prepares a feature and presents the result in the panel as a
+summary (commits, changed-file count), the full paged diff, and an action bar.
+Pressing `m` there runs `executeLanding` pinned to the exact sha the review
+covered, so approval can never merge more than what was shown; `r`/Esc dismisses
+with no merge, leaving the branch and worktree intact. A conflict or failed
+prepare opens the gate too, showing why the feature is not mergeable with `m`
+disabled. `main` stays human-only throughout.
+
+`mergequeue.ts` is the serial merge queue, and the normal route onto `dev`.
+Features the captain marks done join an ordered queue; only the HEAD is ever
+worked, and it works itself out — `prepareLanding` rebases it onto the current
+dev tip and build+tests it on that combined state, leaving it `ready`,
+`blocked` (a rebase conflict or a red build+test), or `resolving`. Everything
+behind the head sits untouched, so nothing is ever speculatively tested.
+
+**The merge is panel-native, not a co tool call.** A `ready` head simply
+*carries* an `[m]` in the Ctrl-O queue tab, alongside its own diff, commit list
+and build+test result. Pressing it calls `mergeReadyHead` directly: the merge
+lands, the worktree and branch are torn down, the queue advances, and the new
+head is processed against the dev tip that merge just moved — so the next `[m]`
+is live (or the next block is on screen) by the time the key finishes. The
+co-manager is not in that loop at any point: it opens nothing, waits on
+nothing, and is not blocked on the keystroke. It is engaged again only when a
+head comes back **blocked**, which reaches it automatically so it can offer the
+resolver without you re-explaining anything. This replaced an earlier shape
+where a co tool call opened a gate and held the model's turn open until you
+pressed a key — coupling the agent loop to a human keypress.
 
 `features.ts` is the co-facing lever layer: the small verb set the model
 calls to drive the harness end to end. `feature_create` provisions a feature's
 worktree off dev and registers it (idempotent, no confirm gate — it writes
 nothing to dev or main); a dispatch can target a feature so the crew runs in
 its worktree (provisioned on first use), and the arm banner names the target
-worktree or says plainly it targets the bare main tree. `feature_land` runs
-the landing prepare and opens the Ctrl-O gate — the gate is the confirmation,
-there is no separate prompt, and the merge fires only on `m` over a green.
+worktree or says plainly it targets the bare main tree. `feature_enqueue` marks
+a feature done and puts it in the merge queue, which is where landing normally
+happens; `feature_land` is the direct route for a feature that was never
+enqueued, and opens the gate above. `feature_merge_head` is **not** the merge:
+in an interactive session it merges nothing and just reports that the `[m]` is
+live, and it only performs a merge itself in a session with no panel at all
+(piped/non-TTY), where there is no key to press. `feature_resolve_head` arms a
+fresh crew agent, in the blocked feature's own worktree and never on dev, to
+rebase and fix it — confirm-gated like every dispatch and bounded to three
+attempts, after which the head stays blocked for you.
 `feature_list`/`feature_status` read the registry; `feature_abandon` tears a
 clean worktree down but refuses one with uncommitted changes and never
 force-deletes an unmerged branch. At session start a non-destructive reconcile
@@ -750,10 +804,13 @@ promote path.
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,
 and the Ctrl-O panel. The panel has three home tabs, cycled with Tab — the merge
-queue (which also hosts the landing gate's review screen), the doc viewer, and
-the review inbox — each reading a small injected source, so the Tui never
-reaches into git, the filesystem, or the session layer itself. A doc and a filed
-review both drill into the same paged body view the diff uses.
+queue, the doc viewer, and the review inbox — each reading a small injected
+source, so the Tui never reaches into git, the filesystem, or the session layer
+itself. The queue tab renders the ready head's diff and build+test inline and
+owns the `[m]` that merges it, through an injected `merge` callback that is the
+only thing the keystroke can reach; a pending `feature_land` review gets a
+fourth tab of its own for as long as it is pending, so the two merges never
+share a key. A doc and a filed review drill into the same paged body view.
 `keys.ts` is the pure decode table that maps both legacy control bytes and
 enhanced-protocol CSI-u sequences onto one set of bindings. `tui.ts` is
 deliberately one large file: the render loop, input handling, and scroll state

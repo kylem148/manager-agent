@@ -31,7 +31,13 @@ import {
 import { listDocs, readDoc } from "../memory/docs.js";
 import { onWrite } from "../memory/writequeue.js";
 import { c, line, write } from "../ui.js";
-import { Tui, WAKE_SENTINEL, type SessionIO, type DocSource } from "../tui/tui.js";
+import {
+  Tui,
+  WAKE_SENTINEL,
+  type SessionIO,
+  type DocSource,
+  type QueueMergeResult,
+} from "../tui/tui.js";
 import { SLASH_COMMANDS } from "../tui/commands.js";
 import { pirateBanner } from "../tui/banner.js";
 import { LOG_NAMES, type LogName } from "../paths.js";
@@ -44,6 +50,7 @@ import {
 } from "./dispatchconfig.js";
 import { DispatchRegistry, readFileTail, type Job } from "./registry.js";
 import { FeatureManager } from "./features.js";
+import type { MergeHeadResult } from "./mergequeue.js";
 import { defaultWorktreeBase, featureSlug } from "./worktrees.js";
 import { scrubCapture } from "./transport.js";
 import { findCrewTranscript, renderTranscriptForReview } from "./crewtranscript.js";
@@ -95,6 +102,16 @@ interface SessionState {
   armed: { order: string; feature?: string; resolve?: boolean } | null;
   /** Completed jobs waiting for a review turn, drained on the next idle prompt. */
   reviewQueue: Job[];
+  /**
+   * Out-of-band turns the co owes the captain, drained on the next idle prompt
+   * exactly like reviewQueue. The merge queue is the only producer today: the
+   * captain's panel-native [m] runs entirely outside the agent loop, so when it
+   * leaves the NEW head blocked (or the merge itself is refused) this is how that
+   * reaches the co — it wakes, reads what happened, and can arm the resolver
+   * without the captain having to re-explain any of it (D-20260724-12). A merge
+   * that lands cleanly queues NOTHING: co is deliberately not in that loop.
+   */
+  queueNotices: string[];
   /** The rolling record of filed crew reviews (the Ctrl-O Inbox tab). Loaded at
    *  session start, so it carries the previous sessions' reviews. */
   inbox: ReviewInbox;
@@ -270,6 +287,12 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
         // The merge-queue panel tab only exists when the instance is linked (a
         // queue needs a repo). Read fresh at paint time via the FeatureManager,
         // which is created below; the closure is never called before then.
+        //
+        // `merge` is what makes the tab panel-native (D-20260724-12): the
+        // captain's [m] on a ready head calls straight into the engine here, so
+        // the merge never routes through a tool call and the co's loop is never
+        // parked on the keystroke. It is the ONLY caller of mergeReadyHead in an
+        // interactive session.
         ...(dispatch
           ? {
               queue: {
@@ -277,6 +300,8 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
                   state.features
                     ? state.features.queueView()
                     : { size: 0, head: null, entries: [] },
+                headDetail: () => state.features?.headDetail() ?? null,
+                merge: () => panelMergeHead(state),
               },
             }
           : {}),
@@ -298,6 +323,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     features: null,
     armed: null,
     reviewQueue: [],
+    queueNotices: [],
     inbox,
     reviewingJob: null,
   };
@@ -391,6 +417,10 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
       // draining anywhere later than the top of the loop leaves queued reviews
       // parked until an unrelated event. Every path re-enters here.
       await drainReviews(state);
+      // Same contract for anything the panel-native merge left the co to handle
+      // (a blocked new head, a refused merge). Drained after the reviews so a
+      // completion that arrived first still reports first.
+      await drainQueueNotices(state);
 
       const input = await io.question();
       if (input === null) break; // EOF → clean exit, run the guard below
@@ -842,6 +872,131 @@ async function fireDispatch(
     );
   } catch (e) {
     io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));
+  }
+}
+
+/**
+ * The panel's [m] (D-20260724-12): merge the ready queue head, from the keystroke,
+ * with the co nowhere in the loop.
+ *
+ * This runs OUTSIDE the agent loop — it is called by the Tui while the session is
+ * idling on question() — and that is the entire point: no tool call is made, no
+ * turn is held open, and the co is free the whole time. What it owes the session
+ * afterwards is only what the captain can't see for themselves:
+ *
+ *  - a merge that lands and leaves a ready/queued/empty queue: one dim transcript
+ *    line and nothing else. The co is not told and not woken; the captain is
+ *    looking right at the result.
+ *  - a merge that lands and leaves the NEW head BLOCKED, or a merge the engine
+ *    refused: a system turn is queued and the loop woken, so the co picks it up
+ *    on the next idle prompt and can offer the (confirm-gated, attempt-bounded)
+ *    resolver without the captain re-explaining anything.
+ *
+ * Never throws into the Tui: a failure comes back as a result the panel banners.
+ */
+async function panelMergeHead(state: SessionState): Promise<QueueMergeResult> {
+  const { io } = state;
+  if (!state.features) {
+    return { merged: false, summary: "the merge queue is unavailable in this session." };
+  }
+  let res: Awaited<ReturnType<FeatureManager["mergeReadyHead"]>>;
+  try {
+    res = await state.features.mergeReadyHead();
+  } catch (e) {
+    const error = (e as Error).message;
+    io.appendBlock(c.red(`  · merge failed: ${error}`));
+    state.queueNotices.push(
+      `SYSTEM: The captain pressed [m] on the merge-queue head in the panel and the merge THREW: ${error}. ` +
+        `Nothing was merged. Tell them plainly what failed and what you'd do about it. Do not retry it yourself.`,
+    );
+    io.wake("queue-merge-error");
+    return { merged: false, summary: `merge failed: ${error}`, error };
+  }
+
+  const head = res.head;
+  if (res.merged) {
+    io.appendBlock(
+      c.green(
+        `  · merged ${res.feature} → ${res.target} (${res.mergeSha?.slice(0, 7) ?? "?"})` +
+          (head ? `; next head '${head.feature}' is ${head.status}` : "; the queue is now empty"),
+      ),
+    );
+  } else {
+    io.appendBlock(c.yellow(`  · [m] merged nothing: ${res.summary}`));
+  }
+
+  // The co is engaged for exactly one reason: a head that needs a decision.
+  const notice = queueMergeNotice(res);
+  if (notice) {
+    state.queueNotices.push(notice);
+    io.wake("queue-merge");
+  }
+
+  return {
+    merged: res.merged,
+    summary: res.summary,
+    ...(res.error ? { error: res.error } : {}),
+  };
+}
+
+/**
+ * What (if anything) the co owes the captain after a panel-native merge — the
+ * ONE decision that determines whether the co is engaged at all, so it is pure
+ * and unit-tested rather than buried in the keystroke path (same reasoning as
+ * parseConfirm below).
+ *
+ * Null means silence, and silence is the happy path: a merge that landed and
+ * left a ready/queued/empty queue needs no model turn at all — the captain is
+ * looking straight at the result, and waking the co would be pure noise plus a
+ * round trip. A notice is returned only when something needs a decision the
+ * panel can't offer: the new head came back BLOCKED (the resolver is the co's
+ * to arm, confirm-gated), or the merge itself was refused.
+ */
+export function queueMergeNotice(res: MergeHeadResult): string | null {
+  const head = res.head;
+  if (head && head.status === "blocked") {
+    const kind =
+      head.blockedKind === "conflict"
+        ? "a rebase conflict"
+        : head.blockedKind === "failed"
+          ? "a red build+test"
+          : "a lifecycle problem (not a conflict or a red suite)";
+    const merged = res.merged
+      ? `The captain merged the merge-queue head '${res.feature}' themselves, with [m] in the Ctrl-O panel. ` +
+        `You were not involved and nothing is waiting on you. The queue advanced and the new head`
+      : `The merge-queue head`;
+    return (
+      `SYSTEM: ${merged} '${head.feature}' is BLOCKED by ${kind}: ${head.blockedReason ?? "not mergeable"}. ` +
+      `It holds the queue and has no [m] until it is green again.\n\n` +
+      `Tell the captain in one line what is blocked and why. If it is a conflict or a red build+test, offer ` +
+      `feature_resolve_head — it ARMS a fresh crew agent in that feature's own worktree and runs only when ` +
+      `they type \`confirm\`; it is bounded to a few attempts. If it is neither, say what you'd do instead ` +
+      `(fix by hand, or feature_abandon). Do not try to merge anything yourself, and never tell them to press ` +
+      `[m] on a blocked head — there is no [m] there.`
+    );
+  }
+  if (!res.merged && res.outcome === "failed") {
+    return (
+      `SYSTEM: The captain pressed [m] on the merge-queue head '${res.feature}' in the panel and the merge was ` +
+      `REFUSED: ${res.error ?? "the merge could not proceed"}. Nothing was written to dev. The head was ` +
+      `re-processed and is now ${head?.status ?? "unknown"}. Explain in one line what happened and what it ` +
+      `takes to make it mergeable again. Do not attempt the merge yourself.`
+    );
+  }
+  return null;
+}
+
+/**
+ * Drain the out-of-band queue notices into turns, same shape as drainReviews:
+ * one system turn each, in order, at the top of the input loop. These exist only
+ * because the panel's [m] runs outside the agent loop (see panelMergeHead).
+ */
+async function drainQueueNotices(state: SessionState): Promise<void> {
+  while (state.queueNotices.length > 0) {
+    const note = state.queueNotices.shift()!;
+    state.userTurns++;
+    state.messages.push({ role: "user", content: note });
+    await drive(state);
   }
 }
 

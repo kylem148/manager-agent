@@ -31,9 +31,12 @@ import {
  *  feature into dev as a --no-ff merge commit — the per-job atomic commits
  *  are preserved, never squashed (decision D-20260723-9) — then tear the
  *  worktree + branch down via teardownWorktree's existing guards. This is a
- *  separate callable precisely so the gate (next slice) can arm on a green
- *  prepare and fire the merge only on approval. Nothing in this module (or
- *  anywhere else yet) invokes it from a live path.
+ *  separate callable precisely so a human keystroke can sit in front of it.
+ *  Two live call sites, both a keystroke: landinggate's [m] over a feature_land
+ *  review, and MergeQueue.mergeReadyHead, which the Ctrl-O panel's [m] fires on
+ *  a ready queue head (D-20260724-12). The only path that reaches it with no
+ *  keystroke at all is feature_merge_head in a session that HAS no panel
+ *  (piped/non-TTY), where there is no key to press.
  *
  * WHY build+test runs on the combined state: feature A green and feature B
  * green does not make A+B green — B may compile against code A just changed.
@@ -72,6 +75,17 @@ export interface LandingOptions extends WorktreeOptions {
   buildTestCommand?: string;
 }
 
+/** What the combined build+test did, carried on a prepare result so a review
+ *  surface can STATE the evidence ("green · npm run typecheck && npm test ·
+ *  12.4s") instead of implying it. Optional on the results so a hand-built
+ *  PrepareResult (tests, fakes) stays valid. */
+export interface BuildTestSummary {
+  /** The exact command that ran, in the rebased worktree. */
+  command: string;
+  /** Wall-clock duration of the run, in milliseconds. */
+  ms: number;
+}
+
 /** Prepare succeeded: the feature is rebased onto devSha and build+test is
  *  green on that combined state. Everything the gate needs to show is here;
  *  executeLanding pins to featureSha so approval covers exactly this state. */
@@ -88,6 +102,8 @@ export interface PrepareGreen {
   /** The per-job atomic commits awaiting merge, oldest first (`<sha> <subject>`).
    *  Empty means the feature holds no commits beyond dev — nothing to land. */
   commits: string[];
+  /** The build+test that passed on the combined state — the merge's evidence. */
+  buildTest?: BuildTestSummary;
 }
 
 /** The rebase hit a conflict. It was aborted: the feature branch and its
@@ -123,6 +139,8 @@ export interface PrepareFailed {
   exitCode: number;
   /** Combined stdout+stderr tail of the build+test run. */
   output: string;
+  /** The build+test that went red, so a review surface can name the command. */
+  buildTest?: BuildTestSummary;
 }
 
 export type PrepareResult = PrepareGreen | PrepareConflict | PrepareFailed;
@@ -214,7 +232,10 @@ export async function prepareLanding(opts: LandingOptions, feature: string): Pro
   }
 
   const featureSha = (await git(r.repoPath, ["rev-parse", branch])).trim();
-  const buildTest = await runBuildTest(opts.buildTestCommand ?? DEFAULT_BUILD_TEST_COMMAND, worktreePath);
+  const command = opts.buildTestCommand ?? DEFAULT_BUILD_TEST_COMMAND;
+  const startedAt = Date.now();
+  const buildTest = await runBuildTest(command, worktreePath);
+  const summary: BuildTestSummary = { command, ms: Date.now() - startedAt };
   if (buildTest.code !== 0) {
     return {
       kind: "failed",
@@ -224,13 +245,14 @@ export async function prepareLanding(opts: LandingOptions, feature: string): Pro
       featureSha,
       exitCode: buildTest.code,
       output: buildTest.output,
+      buildTest: summary,
     };
   }
 
   const diff = await git(r.repoPath, ["diff", `${devSha}..${featureSha}`]);
   const log = await git(r.repoPath, ["log", "--reverse", "--format=%h %s", `${devSha}..${featureSha}`]);
   const commits = log.split("\n").map((l) => l.trim()).filter(Boolean);
-  return { kind: "green", feature, branch, devSha, featureSha, diff, commits };
+  return { kind: "green", feature, branch, devSha, featureSha, diff, commits, buildTest: summary };
 }
 
 /**
