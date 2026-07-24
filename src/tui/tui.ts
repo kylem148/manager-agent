@@ -40,6 +40,7 @@ import {
   parseCsiU,
   parseModifyOtherKeys,
   type Action,
+  type KeyEvent,
 } from "./keys.js";
 
 const ESC = "\x1b";
@@ -491,8 +492,13 @@ const PAINT_INTERVAL_MS = 16;
  * obvious "press 3"), then letters for a longer list. No arrow key is ever
  * required — pressing the label beside a doc opens it. Doc-mode paging commands
  * (f/b/d/u/j/k/g/G) don't appear as list labels, so nothing collides.
+ *
+ * `i` is deliberately absent: it is the second spelling of Tab (D-20260724-9)
+ * and cycles the panel's tabs from every view, so a doc labelled `i` could never
+ * be opened. Dropping it from the alphabet keeps every doc reachable — the docs
+ * after the 17th just shift one letter along — instead of leaving a dead label.
  */
-const OVERLAY_LABELS = "123456789abcdefghijklmnopqrstuvwxyz";
+const OVERLAY_LABELS = "123456789abcdefghjklmnopqrstuvwxyz";
 
 /**
  * The persistent Ctrl-O panel (D-20260723-25): the non-modal home for BOTH the
@@ -500,9 +506,9 @@ const OVERLAY_LABELS = "123456789abcdefghijklmnopqrstuvwxyz";
  * does NOT auto-pop — the captain opens and closes it with Ctrl-O — and it hosts
  * the merge review in-place rather than through a separate modal surface.
  *
- * It has two tabs, switched with Tab, so the two key spaces never collide: the
- * `queue` tab (m/r/d act on the ready head's review), and the `docs` tab (1-9/a-z
- * open a doc). Opening a doc drops into a `doc` view; [d] on a ready head drops
+ * It has two tabs, switched with Tab (or `i`), so the two key spaces never
+ * collide: the `queue` tab (m/r/d act on the ready head's review), and the
+ * `docs` tab (1-9/a-z open a doc). Opening a doc drops into a `doc` view; [d] on a ready head drops
  * into a `review` view (the full paged diff). Backspace/Esc walk back out.
  *
  * `docs` + its loading/error are kept on the panel (not per-view) so switching
@@ -565,6 +571,8 @@ type OverlayInput =
   | {
       nav:
         | "escape"
+        /** Ctrl-O pressed while the panel is up: toggle it shut. */
+        | "close"
         | "back"
         | "tab"
         | "up"
@@ -1991,8 +1999,9 @@ export class Tui implements SessionIO {
   // --- the Ctrl-O panel -------------------------------------------------------
   //
   // The persistent, non-modal home for the instance's user-facing docs AND the
-  // live merge queue (D-20260723-25). The captain opens/closes it with Ctrl-O;
-  // it never auto-pops. Two tabs (Tab switches): the QUEUE tab shows the ordered
+  // live merge queue (D-20260723-25). The captain opens/closes it with Ctrl-O
+  // (the same key both ways — see togglePanel and the "close" panel input); it
+  // never auto-pops. Two tabs (Tab or `i` switches): the QUEUE tab shows the ordered
   // features and their state, with the ready head's review actioned in-place
   // ([m] merge / [r] reject / [d] drill the full diff); the DOCS tab lists docs/
   // (selectable by letter) and opens one rendered through the SAME markdown
@@ -2141,8 +2150,8 @@ export class Tui implements SessionIO {
     return tabs;
   }
 
-  /** Tab cycles the home tabs. From a doc sub-view it first pops back to the docs
-   *  tab. A no-op when there's only one tab. */
+  /** Tab (or `i`, its panel-only twin) cycles the home tabs. From a doc sub-view
+   *  it first pops back to the docs tab. A no-op when there's only one tab. */
   private switchTab(): void {
     if (!this.panel) return;
     const v = this.panel.view;
@@ -2278,6 +2287,8 @@ export class Tui implements SessionIO {
     switch (code) {
       case 9:
         return { nav: "tab" }; // Tab switches tabs
+      case 15:
+        return { nav: "close" }; // Ctrl-O — the key that opened the panel closes it
       case 8:
       case 127:
         return { nav: "back" }; // Backspace
@@ -2314,20 +2325,7 @@ export class Tui implements SessionIO {
     switch (final) {
       case "u": {
         const ev = parseCsiU(params);
-        if (ev) {
-          if (ev.code === 27) this.dispatchOverlay({ nav: "escape" });
-          else if (ev.code === 9) this.dispatchOverlay({ nav: "tab" });
-          else {
-            // Fold a Kitty-encoded key back onto the legacy byte its raw form
-            // would have been, so Ctrl-F/B/D/U page identically either way.
-            const raw =
-              ev.mods.ctrl && ev.code >= 97 && ev.code <= 122
-                ? String.fromCharCode(ev.code - 96)
-                : String.fromCodePoint(ev.code);
-            const input = this.overlayByte(raw);
-            if (input) this.dispatchOverlay(input);
-          }
-        }
+        if (ev) this.dispatchOverlayKey(ev);
         return consumed;
       }
       case "A": this.dispatchOverlay({ nav: "up" }); return consumed;
@@ -2337,6 +2335,16 @@ export class Tui implements SessionIO {
       case "H": this.dispatchOverlay({ nav: "top" }); return consumed;
       case "F": this.dispatchOverlay({ nav: "bottom" }); return consumed;
       case "~": {
+        // xterm's modifyOtherKeys spelling of an ordinary key (`CSI 27;mods;code ~`),
+        // decoded here for the same reason the editor path decodes it: on a terminal
+        // running that mode Ctrl-O would otherwise open the panel and then be unable
+        // to close it. Plain CSI ~ keys (PgUp/PgDn/Home/End) parse as null and fall
+        // through untouched.
+        const other = parseModifyOtherKeys(params);
+        if (other) {
+          this.dispatchOverlayKey(other);
+          return consumed;
+        }
         const n = Number.parseInt(params, 10);
         if (n === 5) this.dispatchOverlay({ nav: "pageup" });
         else if (n === 6) this.dispatchOverlay({ nav: "pagedown" });
@@ -2349,15 +2357,42 @@ export class Tui implements SessionIO {
     }
   }
 
+  /**
+   * Route a key decoded from an enhanced protocol (Kitty CSI-u or xterm's
+   * modifyOtherKeys) into the panel. Everything but Escape/Tab is folded back
+   * onto the legacy byte its raw form would have been, so Ctrl-O closes and
+   * Ctrl-F/B/D/U page identically however the terminal spelled them.
+   */
+  private dispatchOverlayKey(ev: KeyEvent): void {
+    if (ev.code === 27) { this.dispatchOverlay({ nav: "escape" }); return; }
+    if (ev.code === 9) { this.dispatchOverlay({ nav: "tab" }); return; }
+    const raw =
+      ev.mods.ctrl && ev.code >= 97 && ev.code <= 122
+        ? String.fromCharCode(ev.code - 96)
+        : String.fromCodePoint(ev.code);
+    const input = this.overlayByte(raw);
+    if (input) this.dispatchOverlay(input);
+  }
+
   private dispatchOverlay(input: OverlayInput): void {
     if (!this.panel) return;
-    // Tab switches tabs from any view.
-    if ("nav" in input && input.nav === "tab") { this.switchTab(); return; }
+    // Ctrl-O toggles the panel shut from any view — the same key that opened it.
+    // It takes each view's OWN escape exit rather than a second, divergent close
+    // path, so it inherits their rules (notably the review view's mid-merge
+    // lockout: a merge in flight can't be walked away from by any key).
+    const ev: OverlayInput = "nav" in input && input.nav === "close" ? { nav: "escape" } : input;
+    // Tab switches tabs from any view, and `i` is its second spelling
+    // (D-20260724-9). Both live HERE, on the panel's own input path, which is
+    // reached only while the panel owns the keyboard — a bare `i` typed at the
+    // input line never gets this far and stays the literal character it always
+    // was (see consume(): the panel branch is taken before any editor parsing).
+    if ("nav" in ev && ev.nav === "tab") { this.switchTab(); return; }
+    if ("ch" in ev && ev.ch === "i") { this.switchTab(); return; }
     switch (this.panel.view.kind) {
-      case "queue": this.queueTabInput(input); return;
-      case "docs": this.docsTabInput(input, this.panel); return;
-      case "doc": this.overlayDocInput(input); return;
-      case "review": this.reviewViewInput(input); return;
+      case "queue": this.queueTabInput(ev); return;
+      case "docs": this.docsTabInput(ev, this.panel); return;
+      case "doc": this.overlayDocInput(ev); return;
+      case "review": this.reviewViewInput(ev); return;
     }
   }
 
@@ -2737,7 +2772,7 @@ export class Tui implements SessionIO {
     const w = this.cols;
     const v = this.panel?.view;
     const hasOther = (v?.kind === "queue" && this.docs) || (v?.kind === "docs" && this.queue);
-    const tabHint = hasOther ? "Tab switch · " : "";
+    const tabHint = hasOther ? "Tab/i switch · " : "";
 
     let left: string;
     if (v?.kind === "review") {

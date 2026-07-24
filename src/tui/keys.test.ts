@@ -115,6 +115,18 @@ test("Ctrl-O opens the doc viewer in both encodings, and doesn't collide", () =>
   assert.deepEqual(classifyByte("\x0b"), { kind: "kill-to-end" }); // Ctrl-K
 });
 
+test("`i` stays a literal character at the editor layer; the tab-cycle bind is panel-only", () => {
+  // The panel's `i` (cycle tabs) is decided in tui.ts's overlay dispatch, which is
+  // reached only while the panel owns the keyboard. The editor's decode table must
+  // never learn about it, or every typed `i` would be eaten.
+  assert.deepEqual(classifyByte("i"), { kind: "insert", text: "i" });
+  assert.deepEqual(classify({ code: 105, mods: NO_MODS }), { kind: "insert", text: "i" });
+  assert.deepEqual(classify(parseCsiU("105")!), { kind: "insert", text: "i" });
+  // Ctrl-I is still Tab, and Ctrl-O still the panel key — neither moved.
+  assert.deepEqual(classify(parseCsiU("105;5")!), { kind: "tab" });
+  assert.deepEqual(classifyByte("\x0f"), { kind: "open-docs" });
+});
+
 test("printable input is inserted, unknown combos are swallowed", () => {
   assert.deepEqual(classifyByte("a"), { kind: "insert", text: "a" });
   assert.deepEqual(classifyByte(" "), { kind: "insert", text: " " });
