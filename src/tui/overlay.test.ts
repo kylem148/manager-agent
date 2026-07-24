@@ -792,3 +792,158 @@ test("[d] drills the ready head into the full paged diff; Backspace returns to t
   assert.equal(await p, "rejected");
   h.stop();
 });
+
+// --- the panel keybinds: Ctrl-O toggles, `i` mirrors Tab (D-20260724-9) -------
+//
+// The context split is the whole point of these: the panel's key space is live
+// ONLY while the panel owns the keyboard, so `i` cycles tabs there and stays an
+// ordinary typed letter at the input line. Ctrl-O is now one key for both
+// directions, in every spelling a terminal can send it.
+
+test("Ctrl-O toggles: the key that opened the panel closes it, and reopens it", async () => {
+  const docs = fakeDocs({ "plan.md": "# Plan\n" });
+  const h = harness(docs);
+  const answer = h.tui.question();
+
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, "open");
+
+  h.send(CTRL_O); // the same key closes it
+  await settle();
+  let frame = h.lastFramePlain();
+  assert.ok(!frame.includes("1) plan.md"), "the panel is gone");
+  assert.match(frame, /you > /, "the conversation is back");
+
+  h.send(CTRL_O); // and opens it again
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, "reopened");
+
+  // Neither the open nor the close leaked a keystroke into the input buffer.
+  h.send(CTRL_O);
+  await settle();
+  h.send("typed\r");
+  assert.equal(await answer, "typed");
+  h.stop();
+});
+
+test("Ctrl-O closes the panel in its enhanced-protocol spellings too", async () => {
+  const docs = fakeDocs({ "plan.md": "# Plan\n" });
+  for (const [name, seq] of [
+    ["Kitty CSI-u", "\x1b[111;5u"],
+    ["xterm modifyOtherKeys", "\x1b[27;5;111~"],
+  ] as const) {
+    const h = harness(docs);
+    h.tui.question();
+    h.send(CTRL_O);
+    await settle();
+    assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, `${name}: open`);
+    h.send(seq);
+    await settle();
+    assert.match(h.lastFramePlain(), /you > /, `${name}: closed`);
+    h.stop();
+  }
+});
+
+test("Ctrl-O leaves a merge in flight alone, exactly as Esc does", async () => {
+  const h = harness(); // no docs/queue: the panel opens straight onto the review
+  h.tui.question();
+  const review = fakeReview(GREEN);
+  const p = openReview(h, review);
+  h.send("m");
+  assert.equal(review.calls, 1);
+  h.send(CTRL_O); // the mid-merge lockout wins over the toggle
+  assert.match(h.lastFramePlain(), /review · gate-ui/, "still open mid-merge");
+  review.resolveMerge("landed gate-ui: abc1234 on dev");
+  await settle();
+  assert.equal(await p, "merged");
+  h.stop();
+});
+
+test("`i` cycles the panel's tabs identically to Tab", async () => {
+  const docs = fakeDocs({ "plan.md": "# Plan\n" });
+  const h = harness(docs, 60, 16, fakeQueue(emptyQueue));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /merge queue is empty/, "opens on the queue tab");
+
+  h.send("i"); // queue -> docs
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, "`i` reached the docs tab");
+
+  h.send("i"); // docs -> queue (cycles, doesn't dead-end)
+  await settle();
+  assert.match(h.lastFramePlain(), /merge queue is empty/, "`i` cycled back");
+
+  // Tab from the same state lands in the same place: one binding, two spellings.
+  h.send("\t");
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, "Tab does what `i` did");
+  h.stop();
+});
+
+test("`i` cycles tabs in the protocol's CSI-u spelling too", async () => {
+  const docs = fakeDocs({ "plan.md": "# Plan\n" });
+  const h = harness(docs, 60, 16, fakeQueue(emptyQueue));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("\x1b[105u"); // a bare `i` reported as CSI 105 u
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, "the CSI-u `i` switched tabs");
+  h.stop();
+});
+
+test("`i` in an open doc pops back to the docs tab, mirroring Tab", async () => {
+  const docs = fakeDocs({ "plan.md": "# Plan\n" });
+  const h = harness(docs);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  assert.match(h.lastFramePlain(), /docs · plan\.md/, "in the doc");
+  h.send("i");
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, "`i` popped back to the list");
+  h.stop();
+});
+
+test("with the panel closed, `i` is a literal typed character and never a tab switch", async () => {
+  const docs = fakeDocs({ "plan.md": "# Plan\n" });
+  const h = harness(docs);
+  const answer = h.tui.question();
+  // Straight typing: every `i` lands in the buffer.
+  h.send("indistinguishable inis");
+  await settle();
+  assert.match(h.lastFramePlain(), /indistinguishable inis/, "the input line shows what was typed");
+  // And after the panel has been opened and toggled shut, the editor still owns `i`.
+  h.send(CTRL_O);
+  await settle();
+  h.send(CTRL_O);
+  await settle();
+  h.send(" i\r");
+  assert.equal(await answer, "indistinguishable inis i", "nothing intercepted the i's");
+  h.stop();
+});
+
+test("no doc is ever labelled `i`, so the tab key can't shadow a selector", async () => {
+  const many: Record<string, string> = {};
+  for (let n = 1; n <= 18; n++) many[`doc-${String(n).padStart(2, "0")}.md`] = `# ${n}\n`;
+  const docs = fakeDocs(many);
+  const h = harness(docs, 40, 30);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /9\)\s*doc-09\.md/, "digits label the first nine");
+  assert.match(frame, /h\)\s*doc-17\.md/, "letters carry on to h");
+  assert.match(frame, /j\)\s*doc-18\.md/, "and skip straight to j");
+  assert.ok(!/\bi\)/.test(frame), "no `i)` label exists to be shadowed");
+  // Pressing it with only one tab wired switches nothing and opens nothing.
+  h.send("i");
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("docs · doc-"), "`i` opened no doc");
+  h.stop();
+});
