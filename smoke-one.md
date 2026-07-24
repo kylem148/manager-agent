@@ -1,2 +1,2 @@
-smoke one
+clash one wins
 second pass
