@@ -1,23 +1,26 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MergeQueue, MAX_RESOLVE_ATTEMPTS } from "./mergequeue.js";
-import type { LandingGateHost, LandingGateResult } from "./landinggate.js";
 import type {
+  executeLanding,
   PrepareConflict,
   PrepareFailed,
   PrepareGreen,
   PrepareResult,
   prepareLanding,
-  reviewLanding,
 } from "./landing.js";
 
 /**
  * State-machine tests for the serial merge queue. These use FAKE landing deps —
- * a scripted prepare and a scripted gate — so every transition (ready, blocked,
- * advance, retry, busy, empty) is driven deterministically without a git repo or
- * a live terminal. The real prepare/gate/merge integration (a green head through
- * a real repo and scripted gate, then advancing onto the new dev tip) is proved
- * against actual git in features.test.ts.
+ * a scripted prepare and a scripted merge — so every transition (ready, blocked,
+ * advance, retry, busy, empty) is driven deterministically without a git repo.
+ * The real prepare/merge integration (a green head through a real repo, then
+ * advancing onto the new dev tip) is proved against actual git in features.test.ts.
+ *
+ * Since D-20260724-12 the merge is PANEL-NATIVE: mergeReadyHead just does the
+ * merge, because the keystroke that reached it was the authorisation. There is no
+ * gate host here, nothing is awaited on a human, and the queue has no idea a
+ * terminal exists — which is exactly what these tests pin down.
  */
 
 function green(feature: string, commits = 1): PrepareGreen {
@@ -59,21 +62,24 @@ interface Harness {
    *  function to model a retry that flips blocked -> green. */
   prepareFn: Map<string, () => PrepareResult>;
   prepareCalls: string[];
-  reviewCalls: string[];
-  /** What the scripted gate does on the next mergeHead. */
-  gate: { outcome: "merged" | "rejected" | "failed"; error?: string };
+  /** Every executeLanding the queue drove: `<feature>@<pinned featureSha>`. The
+   *  pin is recorded because it is the safety property — a merge may only ever
+   *  cover the exact state the head was tested at. */
+  mergeCalls: string[];
+  /** Set to make the next executeLanding throw, the way a stale green does. */
+  executeError: string | null;
   busy: Set<string>;
   forgotten: string[];
 }
 
-function makeHarness(opts: { gate?: boolean } = {}): Harness {
+function makeHarness(): Harness {
   const prepareFn = new Map<string, () => PrepareResult>();
   const prepareCalls: string[] = [];
-  const reviewCalls: string[] = [];
+  const mergeCalls: string[] = [];
   const busy = new Set<string>();
   const forgotten: string[] = [];
-  const h = { prepareFn, prepareCalls, reviewCalls, busy, forgotten } as Harness;
-  h.gate = { outcome: "merged" };
+  const h = { prepareFn, prepareCalls, mergeCalls, busy, forgotten } as Harness;
+  h.executeError = null;
 
   const fakePrepare: typeof prepareLanding = async (_opts, feature) => {
     prepareCalls.push(feature);
@@ -81,31 +87,23 @@ function makeHarness(opts: { gate?: boolean } = {}): Harness {
     return fn();
   };
 
-  const fakeReview: typeof reviewLanding = async (_host, _opts, feature, prepared) => {
-    reviewCalls.push(feature);
-    const g = h.gate;
-    const result: LandingGateResult = { prepared: prepared!, outcome: g.outcome };
-    if (g.outcome === "merged") {
-      result.landed = {
-        feature,
-        branch: `co/feat-${feature}`,
-        mergeSha: `merge-${feature}`,
-        previousDevSha: "dev0",
-        teardown: { branch: `co/feat-${feature}`, worktreeRemoved: true, branchDeleted: true },
-      };
-    } else if (g.outcome === "failed") {
-      result.error = g.error ?? "the merge could not proceed";
-    }
-    return result;
+  const fakeExecute: typeof executeLanding = async (_opts, feature, expect) => {
+    mergeCalls.push(`${feature}@${expect?.featureSha ?? "-"}`);
+    if (h.executeError) throw new Error(h.executeError);
+    return {
+      feature,
+      branch: `co/feat-${feature}`,
+      mergeSha: `merge-${feature}`,
+      previousDevSha: "dev0",
+      teardown: { branch: `co/feat-${feature}`, worktreeRemoved: true, branchDeleted: true },
+    };
   };
 
-  const gateHost: LandingGateHost = { openLandingReview: async () => "rejected" };
   h.queue = new MergeQueue({
     repoPath: "/fake/repo",
     buildTestCommand: "true",
-    ...(opts.gate === false ? {} : { gateHost }),
     host: { isBusy: (f) => busy.has(f), forget: (f) => forgotten.push(f) },
-    deps: { prepare: fakePrepare, review: fakeReview },
+    deps: { prepare: fakePrepare, execute: fakeExecute },
   });
   return h;
 }
@@ -122,20 +120,21 @@ function assertHeadOnly(q: MergeQueue): void {
   if (active.length === 1) assert.ok(active[0]!.isHead, "the only active entry is the head");
 }
 
-test("empty queue: mergeHead and processHead are clean no-ops", async () => {
+test("empty queue: mergeReadyHead and processHead are clean no-ops", async () => {
   const h = makeHarness();
   assert.equal(h.queue.view().size, 0);
   assert.equal(h.queue.view().head, null);
+  assert.equal(h.queue.headDetail(), null, "an empty queue has no head body to render");
 
   const proc = await h.queue.processHead();
   assert.equal(proc.processed, false);
   assert.equal(proc.head, null);
 
-  const merge = await h.queue.mergeHead();
+  const merge = await h.queue.mergeReadyHead();
   assert.equal(merge.merged, false);
   assert.equal(merge.outcome, "empty");
   assert.equal(h.prepareCalls.length, 0);
-  assert.equal(h.reviewCalls.length, 0);
+  assert.equal(h.mergeCalls.length, 0);
 });
 
 test("enqueue processes the head to ready; later features stay queued (head-only, no speculation)", async () => {
@@ -189,10 +188,10 @@ test("a rebase conflict blocks the head and it holds the queue", async () => {
   );
 
   // Merging is refused while the head is blocked — nothing merges, nothing advances.
-  const merge = await h.queue.mergeHead();
+  const merge = await h.queue.mergeReadyHead();
   assert.equal(merge.merged, false);
   assert.equal(merge.outcome, "not-ready");
-  assert.equal(h.reviewCalls.length, 0, "the gate never opened for a blocked head");
+  assert.equal(h.mergeCalls.length, 0, "no merge was even attempted on a blocked head");
   assert.equal(h.forgotten.length, 0);
   assert.equal(h.queue.headFeature(), "aaa", "the blocked head still holds the queue");
 });
@@ -223,13 +222,13 @@ test("a prepare precondition failure (thrown) becomes a blocked head, not a cras
   assert.match(a.head?.blockedReason ?? "", /worktree gone/);
 });
 
-test("advance on merge: the head merges via the gate, the queue advances, the new head is processed against the new dev", async () => {
+test("advance on merge: the head merges, the queue advances, the new head is processed against the new dev", async () => {
   const h = makeHarness();
   await h.queue.enqueue("aaa");
   await h.queue.enqueue("bbb");
   assert.deepEqual(h.prepareCalls, ["aaa"], "only the head was processed so far");
 
-  const merge = await h.queue.mergeHead();
+  const merge = await h.queue.mergeReadyHead();
   assert.equal(merge.merged, true);
   assert.equal(merge.outcome, "merged");
   assert.equal(merge.feature, "aaa");
@@ -238,15 +237,16 @@ test("advance on merge: the head merges via the gate, the queue advances, the ne
   assert.deepEqual(h.forgotten, ["aaa"], "the merged feature's record was dropped");
 
   // The queue advanced and processed the NEW head — bbb was prepared only now,
-  // AFTER aaa landed and moved dev (advance-processes-against-new-dev).
-  assert.deepEqual(h.reviewCalls, ["aaa"], "the gate opened once, for aaa");
+  // AFTER aaa landed and moved dev (advance-processes-against-new-dev). This is
+  // what makes the next [m] live by the time the keystroke's merge resolves.
+  assert.deepEqual(h.mergeCalls, ["aaa@feat-aaa"], "one merge, pinned to the tested sha");
   assert.deepEqual(h.prepareCalls, ["aaa", "bbb"], "bbb processed only after aaa merged");
   assert.equal(merge.head?.feature, "bbb");
   assert.equal(merge.head?.status, "ready");
   assertHeadOnly(h.queue);
 
   // Merge the second: the queue empties.
-  const merge2 = await h.queue.mergeHead();
+  const merge2 = await h.queue.mergeReadyHead();
   assert.equal(merge2.merged, true);
   assert.equal(merge2.feature, "bbb");
   assert.equal(merge2.head, null);
@@ -254,46 +254,31 @@ test("advance on merge: the head merges via the gate, the queue advances, the ne
   assert.deepEqual(h.forgotten, ["aaa", "bbb"]);
 });
 
-test("mergeHead reuses the head's already-computed green: exactly one prepare, one gate", async () => {
+test("mergeReadyHead reuses the head's already-computed green: exactly one prepare, one merge", async () => {
   const h = makeHarness();
   await h.queue.enqueue("solo"); // one prepare (to ready)
-  const merge = await h.queue.mergeHead();
+  const merge = await h.queue.mergeReadyHead();
   assert.equal(merge.merged, true);
-  // The gate ran once, and prepare was NOT called a second time before it — the
-  // ready head's green was handed straight to the gate.
-  assert.deepEqual(h.reviewCalls, ["solo"]);
+  // The merge ran once, pinned to the prepared sha, and prepare was NOT re-run:
+  // the panel's [m] must not pay for a second build+test.
+  assert.deepEqual(h.mergeCalls, ["solo@feat-solo"]);
   assert.deepEqual(h.prepareCalls, ["solo"], "no redundant re-prepare at merge time");
 });
 
-test("a declined merge ([r]) leaves the head in place, ready, and merges nothing", async () => {
+test("an executeLanding refusal re-processes the head so its state stays honest", async () => {
   const h = makeHarness();
-  h.gate = { outcome: "rejected" };
-  await h.queue.enqueue("aaa");
-  await h.queue.enqueue("bbb");
-
-  const merge = await h.queue.mergeHead();
-  assert.equal(merge.merged, false);
-  assert.equal(merge.outcome, "rejected");
-  assert.equal(merge.head?.feature, "aaa");
-  assert.equal(merge.head?.status, "ready");
-  assert.equal(h.forgotten.length, 0);
-  assert.equal(h.queue.headFeature(), "aaa", "the head still holds the queue");
-  assert.deepEqual(h.prepareCalls, ["aaa"], "a rejection does not re-process");
-});
-
-test("an executeLanding refusal (failed gate) re-processes the head so its state stays honest", async () => {
-  const h = makeHarness();
-  h.gate = { outcome: "failed", error: "not rebased onto the current 'dev' tip" };
+  h.executeError = "not rebased onto the current 'dev' tip";
   await h.queue.enqueue("aaa");
 
-  const merge = await h.queue.mergeHead();
+  const merge = await h.queue.mergeReadyHead();
   assert.equal(merge.merged, false);
   assert.equal(merge.outcome, "failed");
   assert.match(merge.error ?? "", /not rebased/);
-  // Re-processed after the refusal: prepare ran a second time.
+  // Re-processed after the refusal: prepare ran a second time, so what the panel
+  // paints next is the truth rather than the green that just failed.
   assert.deepEqual(h.prepareCalls, ["aaa", "aaa"]);
   assert.equal(merge.head?.status, "ready", "the fresh prepare put it back to ready");
-  assert.equal(h.forgotten.length, 0);
+  assert.equal(h.forgotten.length, 0, "nothing was torn down by a refused merge");
 });
 
 test("remove drops a queued feature; removing the head advances and processes the next", async () => {
@@ -343,10 +328,10 @@ test("a busy head is not processed until the crew frees it; merge is refused mea
   assert.equal(enq.head?.status, "queued", "a busy head is not rebased under a live agent");
   assert.equal(h.prepareCalls.length, 0);
 
-  const merge = await h.queue.mergeHead();
+  const merge = await h.queue.mergeReadyHead();
   assert.equal(merge.merged, false);
   assert.equal(merge.outcome, "busy");
-  assert.equal(h.reviewCalls.length, 0);
+  assert.equal(h.mergeCalls.length, 0);
 
   // Crew finishes; the next enqueue processes it.
   h.busy.delete("aaa");
@@ -355,14 +340,68 @@ test("a busy head is not processed until the crew frees it; merge is refused mea
   assert.deepEqual(h.prepareCalls, ["aaa"]);
 });
 
-test("with no interactive gate, mergeHead refuses cleanly and merges nothing", async () => {
-  const h = makeHarness({ gate: false });
+// --- what the panel reads and presses (D-20260724-12) ------------------------
+
+test("headDetail carries a ready head's commits, diff and build+test evidence", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => ({
+    ...green("aaa", 2),
+    buildTest: { command: "npm test", ms: 1500 },
+  }));
   await h.queue.enqueue("aaa");
-  const merge = await h.queue.mergeHead();
-  assert.equal(merge.merged, false);
-  assert.equal(merge.outcome, "no-gate");
-  assert.equal(h.reviewCalls.length, 0);
-  assert.equal(h.queue.headFeature(), "aaa", "the head is untouched");
+
+  const d = h.queue.headDetail();
+  assert.ok(d, "a ready head has a body to render");
+  assert.equal(d?.kind, "ready");
+  if (d?.kind !== "ready") return;
+  assert.equal(d.feature, "aaa");
+  assert.equal(d.target, "dev");
+  assert.equal(d.commits.length, 2, "the per-job commits the merge preserves");
+  assert.equal(d.diff, "+work\n", "the patch the [m] would land");
+  assert.deepEqual(d.buildTest, { command: "npm test", ms: 1500 }, "the evidence, stated not implied");
+});
+
+test("headDetail carries a blocked head's kind and detail, and no ready body", async () => {
+  const hc = makeHarness();
+  hc.prepareFn.set("aaa", () => conflict("aaa"));
+  await hc.queue.enqueue("aaa");
+  const dc = hc.queue.headDetail();
+  assert.equal(dc?.kind, "blocked");
+  if (dc?.kind !== "blocked") return;
+  assert.equal(dc.blockedKind, "conflict");
+  assert.deepEqual(dc.conflictFiles, ["file.txt"]);
+  assert.equal(dc.detail, "could not apply");
+  assert.equal(dc.maxResolveAttempts, MAX_RESOLVE_ATTEMPTS, "the panel can state the bound");
+
+  const hf = makeHarness();
+  hf.prepareFn.set("aaa", () => failed("aaa"));
+  await hf.queue.enqueue("aaa");
+  const df = hf.queue.headDetail();
+  assert.equal(df?.kind, "blocked");
+  if (df?.kind !== "blocked") return;
+  assert.equal(df.blockedKind, "failed");
+  assert.equal(df.exitCode, 2);
+  assert.match(df.output ?? "", /boom went the suite/);
+});
+
+test("headDetail is null for a head that is merely processing or being resolved", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => conflict("aaa"));
+  await h.queue.enqueue("aaa");
+  h.queue.beginResolve();
+  assert.equal(h.queue.view().head?.status, "resolving");
+  assert.equal(h.queue.headDetail(), null, "a resolving head has no mergeable/blocked body");
+});
+
+test("mergeReadyHead needs no gate host and never waits on anything but git", async () => {
+  // The whole point of the panel-native shape: the queue has no terminal, no
+  // host and no promise held open for a human — the keystroke already happened.
+  const h = makeHarness();
+  await h.queue.enqueue("aaa");
+  const merge = await h.queue.mergeReadyHead();
+  assert.equal(merge.merged, true, "a ready head merges outright");
+  assert.deepEqual(h.mergeCalls, ["aaa@feat-aaa"]);
+  assert.equal(h.queue.view().size, 0);
 });
 
 // --- Part B: conflict vs red distinction + the resolve path ------------------
@@ -497,7 +536,7 @@ test("onResolveDone is a no-op when the resolving head advanced or changed under
   assert.equal(h.queue.view().head?.status, "resolving", "the real head is untouched by a stale done");
 });
 
-test("a resolved-green head then merges through the gate and advances normally", async () => {
+test("a resolved-green head then merges from the panel and advances normally", async () => {
   const h = makeHarness();
   h.prepareFn.set("aaa", () => conflict("aaa"));
   await h.queue.enqueue("aaa");
@@ -506,7 +545,7 @@ test("a resolved-green head then merges through the gate and advances normally",
   h.prepareFn.set("aaa", () => green("aaa"));
   await h.queue.onResolveDone("aaa");
 
-  const merge = await h.queue.mergeHead();
+  const merge = await h.queue.mergeReadyHead();
   assert.equal(merge.merged, true, "a resolved head merges like any ready head");
   assert.equal(merge.feature, "aaa");
   assert.equal(merge.head?.feature, "bbb", "the queue advanced to the follower");

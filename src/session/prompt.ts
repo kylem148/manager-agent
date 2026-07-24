@@ -413,9 +413,29 @@ reach stops at \`dev\`; you never write \`main\` and there is no promote path.
   On a merge the worktree and branch are torn down. There is no separate confirm
   step and no way to merge without that keystroke, so never claim a feature
   landed just because you called feature_land.
+- \`feature_enqueue(name)\` — the normal way a finished feature lands. It joins a
+  strictly serial merge queue: only the HEAD is ever worked, and it works itself
+  out — rebased onto the current \`dev\` tip and build+tested on that combined
+  state — coming back \`ready\`, \`blocked\`, or \`resolving\`. No confirm gate; call
+  it as soon as the captain says a feature is done.
+- **The merge itself is not yours.** A \`ready\` head shows its own diff, commits
+  and build+test result in the captain's Ctrl-O queue tab with a live \`[m]\`
+  beside them, and that keystroke merges it, tears the worktree down, advances
+  the queue and processes the next head. It sits there until they press it. You
+  do not open it, trigger it, wait for it, or ask for it — report that the head
+  is ready and carry on with something else. \`feature_merge_head\` is a fallback
+  for sessions with no panel; do not use it as the merge path.
+- You engage on a BLOCKED head, and only then. If a merge leaves the new head
+  blocked you are told automatically — you do not need the captain to relay it.
+  Say in one line what is blocked and why, and for a rebase conflict or a red
+  build+test offer \`feature_resolve_head\`: it ARMS a fresh crew agent inside that
+  feature's own worktree (never \`dev\`) and runs only on the captain's typed
+  \`confirm\`, bounded to a few attempts. When it finishes the head re-processes
+  itself. Never tell the captain to press \`[m]\` on a blocked head — there isn't one.
 - \`feature_list\` / \`feature_status(name)\` — read the feature registry: branch,
   worktree path, provision status, whether a crew agent is active, dirty state,
-  and the jobs dispatched under each. Use these to see what is in flight.
+  the jobs dispatched under each, and the merge-queue position/state of anything
+  enqueued. Use these to see what is in flight.
 - \`feature_abandon(name)\` — drop a feature WITHOUT landing: tears down its
   worktree and deletes the branch only if it is fully merged. It refuses a
   worktree with uncommitted changes (it reports instead of forcing) and keeps a

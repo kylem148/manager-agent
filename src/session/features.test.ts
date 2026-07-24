@@ -391,7 +391,9 @@ test("reconcileFeatures rebuilds a record AND surfaces an anomaly side by side",
 
 // --- serial merge queue (end to end, real git + scripted gate) ---------------
 
-test("merge queue: enqueue two, head processes to ready, [m] merges and the second advances onto the NEW dev", async () => {
+test("merge queue: enqueue two, head processes to ready, the panel's [m] merges and the second advances onto the NEW dev", async () => {
+  // A gate host is wired but must never be touched: since D-20260724-12 a queue
+  // head merges through the PANEL, not through the feature_land review gate.
   const seen: LandingReview[] = [];
   const fx = await makeFixture(approvingHost(seen));
   try {
@@ -417,8 +419,8 @@ test("merge queue: enqueue two, head processes to ready, [m] merges and the seco
     assert.equal(eB.entry.status, "queued");
     assert.equal(run(fx.repo, ["rev-parse", "dev"]), devStart, "dev has not moved yet");
 
-    // Merge the head (alpha) through the gate -> [m].
-    const m1 = await fx.features.mergeHead();
+    // The captain presses [m] on the ready head in the panel.
+    const m1 = await fx.features.mergeReadyHead();
     assert.equal(m1.merged, true);
     assert.equal(m1.feature, "alpha");
     const devAfterA = run(fx.repo, ["rev-parse", "dev"]);
@@ -432,7 +434,7 @@ test("merge queue: enqueue two, head processes to ready, [m] merges and the seco
     assert.equal(m1.head?.status, "ready");
 
     // Merge beta: it lands on top of alpha's dev, and the queue empties.
-    const m2 = await fx.features.mergeHead();
+    const m2 = await fx.features.mergeReadyHead();
     assert.equal(m2.merged, true);
     assert.equal(m2.feature, "beta");
     assert.equal(m2.head, null, "the queue is now empty");
@@ -445,6 +447,7 @@ test("merge queue: enqueue two, head processes to ready, [m] merges and the seco
     assert.equal(run(fx.repo, ["show", "dev:b.txt"]), "b");
     assert.equal(run(fx.repo, ["rev-list", "--merges", "--count", "dev"]), "2");
     assert.equal(run(fx.repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert.equal(seen.length, 0, "no review gate was ever opened: the merge is panel-native");
   } finally {
     await fx.cleanup();
   }
@@ -457,6 +460,80 @@ test("enqueue refuses a feature that was never created", async () => {
     assert.equal(res.enqueued, false);
     if (res.enqueued) return;
     assert.match(res.reason, /no feature 'ghost'/);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("feature_merge_head merges NOTHING in a session that has a panel: [m] is the captain's", async () => {
+  // The retired blocking path (D-20260724-12). With a panel wired, the co's tool
+  // must return at once, merge nothing, and point at the live [m] — never park
+  // the agent loop on a keystroke.
+  const seen: LandingReview[] = [];
+  const fx = await makeFixture(approvingHost(seen));
+  try {
+    const a = await fx.features.create("panel-owned");
+    await commitIn(a.feature.worktreePath, "p.txt", "p\n", "job: p");
+    const enq = await fx.features.enqueue("panel-owned");
+    assert.equal(enq.enqueued, true);
+    if (!enq.enqueued) return;
+    assert.equal(enq.head?.status, "ready");
+    const devBefore = run(fx.repo, ["rev-parse", "dev"]);
+
+    const res = await fx.features.mergeHead();
+    assert.equal(res.merged, false, "the co's tool never merges when a panel exists");
+    assert.equal(res.outcome, "panel");
+    assert.match(res.summary, /\[m\]/, "it points the co at the panel affordance");
+    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devBefore, "dev did not move");
+    assert.equal(seen.length, 0, "and no gate was opened to wait on");
+    assert.equal(fx.features.queueView().head?.status, "ready", "the head is untouched and still ready");
+
+    // The panel path still merges it, as the captain's keystroke would.
+    const m = await fx.features.mergeReadyHead();
+    assert.equal(m.merged, true);
+    assert.notEqual(run(fx.repo, ["rev-parse", "dev"]), devBefore);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("feature_merge_head IS the merge in a session with no panel (the non-interactive fallback)", async () => {
+  // No gateHost: a piped/non-TTY session, where there is no [m] to press at all.
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("headless");
+    await commitIn(a.feature.worktreePath, "h.txt", "h\n", "job: h");
+    await fx.features.enqueue("headless");
+    const devBefore = run(fx.repo, ["rev-parse", "dev"]);
+
+    const res = await fx.features.mergeHead();
+    assert.equal(res.merged, true, "with no panel the fallback merges directly");
+    assert.equal(res.outcome, "merged");
+    assert.equal(run(fx.repo, ["rev-parse", "dev"]), res.mergeSha);
+    assert.notEqual(run(fx.repo, ["rev-parse", "dev"]), devBefore);
+    assert.ok(!branchExists(fx.repo, "co/feat-headless"), "teardown followed the merge");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("headDetail feeds the panel the ready head's diff and build+test, then the blocked head's reason", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("detailed");
+    await commitIn(a.feature.worktreePath, "d.txt", "detail\n", "job: detail");
+    await fx.features.enqueue("detailed");
+
+    const ready = fx.features.headDetail();
+    assert.equal(ready?.kind, "ready");
+    if (ready?.kind !== "ready") return;
+    assert.equal(ready.feature, "detailed");
+    assert.equal(ready.target, "dev");
+    assert.equal(ready.commits.length, 1);
+    assert.match(ready.commits[0] ?? "", /job: detail/);
+    assert.match(ready.diff, /\+detail/, "the real patch the [m] would land");
+    assert.equal(ready.buildTest?.command, "true", "the build+test that passed is named");
+    assert.ok((ready.buildTest?.ms ?? -1) >= 0, "and timed");
   } finally {
     await fx.cleanup();
   }
@@ -503,7 +580,7 @@ test("abandoning the head removes it from the queue and advances to the next", a
   }
 });
 
-test("a real rebase conflict blocks the head and mergeHead refuses to land it", async () => {
+test("a real rebase conflict blocks the head and the panel merge refuses to land it", async () => {
   const seen: LandingReview[] = [];
   const fx = await makeFixture(approvingHost(seen));
   try {
@@ -514,7 +591,7 @@ test("a real rebase conflict blocks the head and mergeHead refuses to land it", 
 
     // Land left first so dev holds the conflicting change.
     await fx.features.enqueue("left");
-    assert.equal((await fx.features.mergeHead()).merged, true);
+    assert.equal((await fx.features.mergeReadyHead()).merged, true);
 
     // Enqueue right: rebasing its file.txt edit onto the left-updated dev conflicts.
     const eb = await fx.features.enqueue("right");
@@ -524,9 +601,9 @@ test("a real rebase conflict blocks the head and mergeHead refuses to land it", 
     assert.equal(eb.head?.status, "blocked");
     assert.match(eb.head?.blockedReason ?? "", /conflict/);
 
-    // The blocked head holds the queue; mergeHead refuses and writes nothing.
+    // The blocked head holds the queue; the merge refuses and writes nothing.
     const devBefore = run(fx.repo, ["rev-parse", "dev"]);
-    const mr = await fx.features.mergeHead();
+    const mr = await fx.features.mergeReadyHead();
     assert.equal(mr.merged, false);
     assert.equal(mr.outcome, "not-ready");
     assert.equal(run(fx.repo, ["rev-parse", "dev"]), devBefore, "a blocked head merges nothing");
@@ -550,7 +627,7 @@ test("the resolve path: a conflict-blocked head is fixed by a fresh agent in its
 
     // Land base so dev holds the conflicting change, then enqueue follow (blocks).
     await fx.features.enqueue("base");
-    assert.equal((await fx.features.mergeHead()).merged, true);
+    assert.equal((await fx.features.mergeReadyHead()).merged, true);
     const eb = await fx.features.enqueue("follow");
     assert.equal(eb.enqueued, true);
     if (!eb.enqueued) return;
@@ -598,8 +675,8 @@ test("the resolve path: a conflict-blocked head is fixed by a fresh agent in its
     assert.equal(done.head?.feature, "follow");
     assert.equal(done.head?.status, "ready", "the resolved head is ready to merge");
 
-    // And it merges through the gate like any ready head; dev advances.
-    const merge = await fx.features.mergeHead();
+    // And it merges from the panel like any ready head; dev advances.
+    const merge = await fx.features.mergeReadyHead();
     assert.equal(merge.merged, true);
     assert.equal(merge.feature, "follow");
     assert.notEqual(run(fx.repo, ["rev-parse", "dev"]), devBefore, "dev advanced on the merge");

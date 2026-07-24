@@ -346,7 +346,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "feature_enqueue",
       description:
-        "Mark a feature done and add it to the serial merge queue. This is how a finished feature gets in line to land on `dev`. There is NO confirm gate on enqueue — call it as soon as the captain says a feature is done. Features land ONE AT A TIME in queue order: only the head is processed (rebased onto the current `dev` tip and build+tested on that combined state), and only the head can merge. When the enqueued feature becomes the head it is processed immediately, so the result tells you whether the head is `ready` (green, press the merge gate via feature_merge_head), `blocked` (a rebase conflict OR a red build+test — the result's `blockedKind` says which; it holds the queue until resolved or removed), `resolving` (a fresh crew agent is fixing it in its worktree), or still `queued`. On a blocked head you can dispatch a fresh resolver agent with feature_resolve_head, re-call feature_enqueue to retry after a manual fix, or feature_abandon it. Idempotent: enqueuing an already-queued feature keeps its position.",
+        "Mark a feature done and add it to the serial merge queue. This is how a finished feature gets in line to land on `dev`. There is NO confirm gate on enqueue — call it as soon as the captain says a feature is done. Features land ONE AT A TIME in queue order: only the head is processed (rebased onto the current `dev` tip and build+tested on that combined state), and only the head can merge. When the enqueued feature becomes the head it is processed immediately, so the result tells you whether the head is `ready`, `blocked` (a rebase conflict OR a red build+test — the result's `blockedKind` says which; it holds the queue until resolved or removed), `resolving` (a fresh crew agent is fixing it in its worktree), or still `queued`. A `ready` head needs NOTHING from you: its diff, build+test result and a live [m] are already showing in the captain's Ctrl-O queue tab, and they merge it with that keystroke whenever they choose. Say it is ready and move on — never call a tool to merge it and never wait for the keypress. On a blocked head you can dispatch a fresh resolver agent with feature_resolve_head, re-call feature_enqueue to retry after a manual fix, or feature_abandon it. Idempotent: enqueuing an already-queued feature keeps its position.",
       input_schema: {
         type: "object",
         properties: {
@@ -359,7 +359,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "feature_merge_head",
       description:
-        "Open the merge review gate on the current merge-queue HEAD (the front of the line). Only a `ready` (green) head can merge. This opens the same Ctrl-O gate feature_land uses, showing the diff and build+test result; the merge happens ONLY if the captain presses [m]. On merge the head lands on `dev` (a merge commit, per-job commits kept), its worktree and branch are torn down, the queue advances, and the NEW head is processed against the new `dev` tip — the result reports the next head's state. Refuses cleanly (nothing merged) if the queue is empty, the head is not ready, a crew agent is still working the head, or there is no interactive terminal. Call feature_enqueue first to put features in the queue.",
+        "DO NOT reach for this to merge a ready head — merging is not yours to do. When the queue head is `ready`, the captain's Ctrl-O queue tab is already showing its diff and build+test result with a live [m], and pressing it merges the head, tears down its worktree, advances the queue and processes the next head, none of which involves you. In an interactive session this tool merges NOTHING: it returns the head's current state immediately and tells you the [m] is live. It exists only as a fallback for a session with no panel at all (piped/non-TTY), where there is no key to press and a ready head is merged directly. Use feature_list/feature_status to report queue state instead. Never say a feature landed because you called this, and never wait on the captain's keystroke — you are not in that loop.",
       input_schema: { type: "object", properties: {}, additionalProperties: false },
     });
     tools.push({
@@ -659,6 +659,10 @@ export function makeExecutor(ctx: ExecutorContext) {
         }
         case "feature_merge_head": {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
+          // Non-blocking by construction: in an interactive session this reports
+          // state and merges nothing (the panel's [m] owns the merge); with no
+          // panel it merges directly and returns. Either way it never waits on a
+          // human, so the co's turn is never held open (D-20260724-12).
           const res = await ctx.features.mergeHead();
           if (res.merged) ctx.onNotice?.(`merged ${res.feature} onto ${res.target}`);
           return ok(id, res);

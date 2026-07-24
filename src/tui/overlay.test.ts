@@ -8,6 +8,9 @@ import {
   type InStream,
   type LandingReview,
   type OutStream,
+  type QueueHeadDetail,
+  type QueueMergeResult,
+  type QueuePanelSource,
   type QueuePanelView,
 } from "./tui.js";
 import { stripAnsi } from "./wrap.js";
@@ -85,7 +88,7 @@ function harness(
   docs?: DocSource,
   cols = 40,
   rows = 12,
-  queue?: { view(): QueuePanelView },
+  queue?: QueuePanelSource,
   inbox?: { list(): InboxPanelEntry[] },
 ): Harness {
   let listener: ((d: string) => void) | null = null;
@@ -634,12 +637,82 @@ test("stopping the Tui with a review pending settles it as rejected", async () =
 
 /** A queue source whose snapshot the test swaps between paints, to prove the
  *  panel reads the queue fresh (no cached view). */
-function fakeQueue(initial: QueuePanelView): { view(): QueuePanelView; set(v: QueuePanelView): void } {
+function fakeQueue(initial: QueuePanelView): QueuePanelSource & { set(v: QueuePanelView): void } {
   let cur = initial;
   return { view: () => cur, set: (v) => (cur = v) };
 }
 
 const emptyQueue: QueuePanelView = { size: 0, head: null, entries: [] };
+
+/**
+ * A full panel-native queue source: a snapshot, the head's inline body, and a
+ * merge the test resolves by hand so the in-flight window is observable. Counts
+ * merge calls to prove [m] fires once and fires only over a ready head — the two
+ * properties that matter now the merge has no gate in front of it.
+ */
+function mergeableQueue(
+  view: QueuePanelView,
+  detail: QueueHeadDetail | null,
+): QueuePanelSource & {
+  calls: number;
+  set(v: QueuePanelView, d?: QueueHeadDetail | null): void;
+  resolveMerge(res: QueueMergeResult): void;
+  rejectMerge(e: Error): void;
+} {
+  let curView = view;
+  let curDetail = detail;
+  let res: ((r: QueueMergeResult) => void) | null = null;
+  let rej: ((e: Error) => void) | null = null;
+  const api = {
+    calls: 0,
+    view: () => curView,
+    headDetail: () => curDetail,
+    merge(): Promise<QueueMergeResult> {
+      api.calls++;
+      return new Promise<QueueMergeResult>((resolve, reject) => {
+        res = resolve;
+        rej = reject;
+      });
+    },
+    set(v: QueuePanelView, d?: QueueHeadDetail | null): void {
+      curView = v;
+      if (d !== undefined) curDetail = d;
+    },
+    resolveMerge(r: QueueMergeResult): void {
+      res?.(r);
+    },
+    rejectMerge(e: Error): void {
+      rej?.(e);
+    },
+  };
+  return api;
+}
+
+/** The canonical ready head: one entry, green, with a real patch to show. */
+const READY_VIEW: QueuePanelView = {
+  size: 2,
+  head: null,
+  entries: [
+    { feature: "head-a", position: 1, isHead: true, status: "ready", commitsReady: 1 },
+    { feature: "head-b", position: 2, isHead: false, status: "queued" },
+  ],
+};
+
+const READY_DETAIL: QueueHeadDetail = {
+  kind: "ready",
+  feature: "head-a",
+  target: "dev",
+  commits: ["abc1234 job: the only slice"],
+  diff: [
+    "diff --git a/one.txt b/one.txt",
+    "index 0000000..1111111 100644",
+    "--- a/one.txt",
+    "+++ b/one.txt",
+    "@@ -0,0 +1 @@",
+    "+hello from the feature",
+  ].join("\n"),
+  buildTest: { command: "npm run typecheck && npm test", ms: 12_400 },
+};
 
 test("Ctrl-O opens the queue tab first when a queue is wired; an empty queue says so", async () => {
   const q = fakeQueue(emptyQueue);
@@ -705,7 +778,7 @@ test("the queue tab distinguishes a conflict block from a red build+test block",
   });
   assert.match(conflictFrame, /cft\s+\[blocked: conflict\]/, "a conflict block is labelled conflict");
   assert.match(conflictFrame, /rebase conflict in src\/app\.ts/, "the reason is shown");
-  assert.match(conflictFrame, /feature_resolve_head/, "the resolver hint is offered for a fixable block");
+  assert.match(conflictFrame, /fresh agent/, "the resolver route is offered for a fixable block");
 
   const redFrame = await renderQueue({
     size: 1,
@@ -738,68 +811,262 @@ test("the queue tab shows a resolving head with its attempt", async () => {
   assert.match(frame, /attempt 2/, "the current attempt is shown");
 });
 
-test("an in-panel [m] on the ready head merges via the queue and the panel reflects the advance", async () => {
-  // The queue snapshot advances exactly when the review's execute() resolves —
-  // the same coupling the real engine has (mergeHead advances then re-processes).
-  const q = fakeQueue({
-    size: 2,
-    head: null,
-    entries: [
-      { feature: "head-a", position: 1, isHead: true, status: "ready", commitsReady: 1 },
-      { feature: "head-b", position: 2, isHead: false, status: "queued" },
-    ],
-  });
-  const h = harness(undefined, 72, 20, q);
-  h.tui.question();
+// --- the panel-native merge (D-20260724-12) ----------------------------------
+//
+// The head figures itself out and then simply CARRIES an [m]. These tests pin
+// the properties that replaced the old blocking gate: the ready head's evidence
+// renders in the same view as the key; the key merges directly, once; it is a
+// dead no-op on anything that isn't green; and nothing anywhere is awaiting the
+// keystroke — there is no promise to settle and no review to reject.
 
-  const review = fakeReview({ ...GREEN, commits: ["abc job: a"] });
-  const p = h.tui.openLandingReview(review);
+test("a ready head renders its diff and build+test inline, with a live [m]", async () => {
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(undefined, 72, 30, q);
+  h.tui.question();
   h.send(CTRL_O);
   await settle();
-  // The queue tab shows the ready head and offers the in-place action bar.
-  let frame = h.lastFramePlain();
-  assert.match(frame, /head-a\s+\[ready\]/);
-  assert.match(frame, /m\s*merge · r\s*reject · d\s*drill/, "the ready head is actionable in-panel");
-
-  // [m] fires the merge. On success the queue snapshot advances to head-b.
-  h.send("m");
-  assert.equal(review.calls, 1, "the in-panel m drove the merge");
-  q.set({
-    size: 1,
-    head: null,
-    entries: [{ feature: "head-b", position: 1, isHead: true, status: "ready", commitsReady: 1 }],
-  });
-  review.resolveMerge("landed head-a: abc on dev");
-  await settle();
-  assert.equal(await p, "merged");
-  // The panel stayed open on the queue tab and now shows the advanced head.
-  frame = h.lastFramePlain();
-  assert.match(frame, /head-b\s+\[ready\]/, "the panel reflects the advanced queue");
-  assert.ok(!frame.includes("head-a"), "the merged head is gone from the view");
+  const frame = h.lastFramePlain();
+  assert.match(frame, /head-a\s+\[ready\]/, "the head's list row");
+  assert.match(frame, /press m to merge it onto dev/, "the affordance names what it does");
+  assert.match(frame, /1 commit · 1 file changed/, "the summary counts the merge");
+  assert.match(frame, /build\+test green · npm run typecheck && npm test · 12\.4s/, "the evidence is stated");
+  assert.match(frame, /abc1234 job: the only slice/, "the commit list is inline");
+  assert.match(frame, /\+hello from the feature/, "and so is the diff — no drill needed");
+  assert.match(frame, /m\s*merge/, "the footer offers the key");
+  assert.equal(q.calls, 0, "showing the head merges nothing");
   h.stop();
 });
 
-test("[d] drills the ready head into the full paged diff; Backspace returns to the queue tab", async () => {
+test("[m] merges the ready head directly, once, and the panel shows the advance", async () => {
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(undefined, 72, 20, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+
+  h.send("m");
+  assert.equal(q.calls, 1, "the keystroke merged, with no tool call and no gate");
+  assert.match(h.lastFramePlain(), /merging head-a/, "the tab says what is in flight");
+  // Fire-once: repeats during the merge are no-ops.
+  h.send("m");
+  h.send("m");
+  assert.equal(q.calls, 1);
+
+  // The engine advances the queue before resolving, exactly as mergeReadyHead
+  // does (merge, teardown, advance, process the next head).
+  q.set(
+    { size: 1, head: null, entries: [{ feature: "head-b", position: 1, isHead: true, status: "ready", commitsReady: 2 }] },
+    { kind: "ready", feature: "head-b", target: "dev", commits: ["def job: b"], diff: "+b\n" },
+  );
+  q.resolveMerge({ merged: true, summary: "merged head-a: abc1234 on dev" });
+  await settle();
+
+  const frame = h.lastFramePlain();
+  assert.match(frame, /head-b\s+\[ready\]/, "the panel reflects the advanced queue");
+  assert.ok(!frame.includes("head-a"), "the merged head is gone from the view");
+  assert.match(frame, /press m to merge it onto dev/, "the NEXT head's [m] is live now");
+  h.stop();
+});
+
+test("[m] is a no-op on a blocked head, and the block is shown instead", async () => {
+  const q = mergeableQueue(
+    {
+      size: 1,
+      head: null,
+      entries: [
+        {
+          feature: "stuck",
+          position: 1,
+          isHead: true,
+          status: "blocked",
+          blockedKind: "conflict",
+          blockedReason: "rebase conflict in src/app.ts",
+        },
+      ],
+    },
+    {
+      kind: "blocked",
+      feature: "stuck",
+      target: "dev",
+      blockedKind: "conflict",
+      reason: "rebase conflict in src/app.ts",
+      conflictFiles: ["src/app.ts"],
+      detail: "could not apply 1234567",
+      resolveAttempts: 0,
+      maxResolveAttempts: 3,
+    },
+  );
+  const h = harness(undefined, 72, 24, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+
+  const frame = h.lastFramePlain();
+  assert.match(frame, /stuck\s+\[blocked: conflict\]/);
+  assert.match(frame, /BLOCKED \(rebase conflict\)/, "the block leads the body");
+  assert.match(frame, /no \[m\] on this head/, "and says plainly there is no merge here");
+  assert.match(frame, /src\/app\.ts/, "the conflicted path is named");
+  assert.match(frame, /could not apply/, "git's own account is shown");
+  assert.ok(!/m\s+merge/.test(frame), "the footer offers no merge key");
+
+  h.send("m");
+  h.send("m");
+  assert.equal(q.calls, 0, "[m] on a blocked head does nothing at all");
+  h.stop();
+});
+
+test("[m] is a no-op on a head that is still processing", async () => {
+  const q = mergeableQueue(
+    { size: 1, head: null, entries: [{ feature: "proc", position: 1, isHead: true, status: "head-processing" }] },
+    null,
+  );
+  const h = harness(undefined, 72, 16, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /proc\s+\[processing\]/);
+  h.send("m");
+  assert.equal(q.calls, 0, "there is nothing green to merge yet");
+  h.stop();
+});
+
+test("a refused merge banners in place and leaves the head where it is", async () => {
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(undefined, 72, 24, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+
+  h.send("m");
+  assert.equal(q.calls, 1);
+  q.resolveMerge({
+    merged: false,
+    summary: "merging head-a was refused",
+    error: "'co/feat-head-a' has moved since prepare",
+  });
+  await settle();
+
+  const frame = h.lastFramePlain();
+  assert.match(frame, /merge failed: 'co\/feat-head-a' has moved since prepare/, "the refusal is visible, not a flash");
+  assert.match(frame, /head-a\s+\[ready\]/, "the head is still there");
+  // And the key still works afterwards: nothing latched shut.
+  h.send("m");
+  assert.equal(q.calls, 2, "[m] is live again after a refusal");
+  h.stop();
+});
+
+test("a merge callback that throws is caught and reported, never wedging the panel", async () => {
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(undefined, 72, 24, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("m");
+  q.rejectMerge(new Error("git exploded"));
+  await settle();
+  assert.match(h.lastFramePlain(), /merge failed: git exploded/);
+  h.send("m");
+  assert.equal(q.calls, 2, "the in-flight interlock released");
+  h.stop();
+});
+
+test("the queue tab pages its inline diff with space/b and jumps with g/G", async () => {
+  const long = Array.from({ length: 60 }, (_, i) => `+queue diff line ${i}`).join("\n");
+  const q = mergeableQueue(READY_VIEW, { ...READY_DETAIL, diff: `diff --git a/f b/f\n${long}` });
+  const h = harness(undefined, 60, 12, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const first = h.lastFramePlain();
+  assert.match(first, /head-a\s+\[ready\]/, "the list is at the top");
+
+  h.send(" "); // page down into the diff
+  const paged = h.lastFramePlain();
+  assert.notEqual(paged, first, "space scrolled the tab");
+  assert.match(paged, /queue diff line/, "paging reaches the inline diff");
+
+  h.send("G");
+  assert.match(h.lastFramePlain(), /queue diff line 59/, "G jumps to the end");
+  h.send("g");
+  assert.match(h.lastFramePlain(), /head-a\s+\[ready\]/, "g returns to the top");
+  // A merge is still one keystroke away from anywhere in the body.
+  h.send("m");
+  assert.equal(q.calls, 1, "[m] is not shadowed by the paging keys");
+  h.stop();
+});
+
+test("a queue source with no merge callback offers no [m] and stays read-only", async () => {
   const q = fakeQueue({
     size: 1,
     head: null,
-    entries: [{ feature: "drillme", position: 1, isHead: true, status: "ready", commitsReady: 1 }],
+    entries: [{ feature: "readonly", position: 1, isHead: true, status: "ready", commitsReady: 1 }],
   });
   const h = harness(undefined, 72, 16, q);
   h.tui.question();
-  const review = fakeReview({
-    kind: "green",
-    commits: ["abc job: a"],
-    diff: ["diff --git a/f b/f", "@@ -0,0 +1 @@", "+the drilled body line"].join("\n"),
-  });
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /readonly\s+\[ready\]/);
+  assert.ok(!/press m to merge/.test(frame), "no affordance without a merge callback");
+  h.send("m"); // must not throw
+  await settle();
+  assert.match(h.lastFramePlain(), /readonly\s+\[ready\]/, "still fine");
+  h.stop();
+});
+
+test("a source with a merge but no head body still offers [m], without naming a target it wasn't told", async () => {
+  // The tolerant branch of the one [m]-is-live predicate: trust the view when
+  // there is no body source, but never invent an integration branch name.
+  let calls = 0;
+  const q: QueuePanelSource = {
+    view: () => ({
+      size: 1,
+      head: null,
+      entries: [{ feature: "bodyless", position: 1, isHead: true, status: "ready", commitsReady: 1 }],
+    }),
+    merge: async () => {
+      calls++;
+      return { merged: true, summary: "merged bodyless" };
+    },
+  };
+  const h = harness(undefined, 72, 16, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /press m to merge it$|press m to merge it\s/, "the hint omits the unknown target");
+  assert.ok(!frame.includes("merge it onto"), "and does not guess one");
+  h.send("m");
+  assert.equal(calls, 1, "the key still merges");
+  h.stop();
+});
+
+test("a feature_land review keeps its own tab and its own [m] alongside the queue", async () => {
+  // The two merges must never share a key: the queue tab's [m] is the queue's,
+  // and a pending feature_land review lives on its own tab with m/r as before.
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(undefined, 72, 24, q);
+  h.tui.question();
+  const review = fakeReview(GREEN);
   const p = h.tui.openLandingReview(review);
   h.send(CTRL_O);
   await settle();
-  h.send("d"); // drill
-  assert.match(h.lastFramePlain(), /review · gate-ui/, "drilling shows the review header");
-  assert.match(h.lastFramePlain(), /\+the drilled body line/, "the full diff is shown");
-  h.send("\x7f"); // Backspace back to the queue tab
-  assert.match(h.lastFramePlain(), /drillme\s+\[ready\]/, "back on the queue tab");
+  // A pending review wins the landing spot, since it is a caller held open.
+  assert.match(h.lastFramePlain(), /review · gate-ui → dev/, "opens onto the review");
+
+  h.send("\t"); // review -> queue (tabs cycle round)
+  await settle();
+  assert.match(h.lastFramePlain(), /head-a\s+\[ready\]/, "Tab reaches the queue tab");
+  h.send("m");
+  assert.equal(q.calls, 1, "the queue tab's [m] merged the queue head");
+  assert.equal(review.calls, 0, "and never touched the feature_land review");
+  q.resolveMerge({ merged: true, summary: "merged head-a" });
+  await settle();
+
+  // The review is still pending on its own tab, with its own keys.
+  h.send("\t");
+  await settle();
+  assert.match(h.lastFramePlain(), /review · gate-ui/, "the review tab survived the queue merge");
   h.send("r");
   assert.equal(await p, "rejected");
   h.stop();
