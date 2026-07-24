@@ -34,10 +34,22 @@ import { c, line, write } from "../ui.js";
 import {
   Tui,
   WAKE_SENTINEL,
+  NO_ANIMATION,
+  type AnimationHandle,
+  type AnimationSpec,
   type SessionIO,
   type DocSource,
   type QueueMergeResult,
 } from "../tui/tui.js";
+import {
+  currentVisuals,
+  dispatchFlourish,
+  dispatchLabel,
+  exitVoyage,
+  savingLabel,
+  type DispatchTarget,
+  type EffectiveVisuals,
+} from "../tui/visuals.js";
 import { SLASH_COMMANDS } from "../tui/commands.js";
 import { pirateBanner } from "../tui/banner.js";
 import { LOG_NAMES, type LogName } from "../paths.js";
@@ -51,7 +63,7 @@ import {
 import { DispatchRegistry, readFileTail, type Job } from "./registry.js";
 import { FeatureManager } from "./features.js";
 import type { MergeHeadResult } from "./mergequeue.js";
-import { defaultWorktreeBase, featureSlug } from "./worktrees.js";
+import { FEATURE_BRANCH_PREFIX, defaultWorktreeBase, featureSlug } from "./worktrees.js";
 import { scrubCapture } from "./transport.js";
 import { findCrewTranscript, renderTranscriptForReview } from "./crewtranscript.js";
 
@@ -825,11 +837,46 @@ function safeFeatureSlug(feature: string): string {
 }
 
 /**
+ * The visuals in force for this session's IO. PlainIO (piped / non-TTY) is a
+ * degraded context by definition — it has no addressable screen to animate on —
+ * and stdout can't tell us that, so it's the one thing we pass in. Resolved per
+ * use, not cached: the terminal width is live, so a window narrowed mid-session
+ * degrades on the next dispatch rather than drawing into a screen that shrank.
+ */
+function visualsFor(io: SessionIO): EffectiveVisuals {
+  return currentVisuals({ plainIO: !(io instanceof Tui) });
+}
+
+/**
+ * Where a confirmed dispatch is headed, as the flourish and its static label
+ * show it: a feature's own branch, or the bare main tree. Prefers the branch the
+ * feature record already carries and falls back to projecting the name a
+ * provision would mint, so a first-use dispatch (nothing provisioned yet) still
+ * names the branch the crew will actually be on. Pure display — it provisions
+ * nothing, exactly like describeTarget above it.
+ */
+function dispatchTarget(state: SessionState, feature?: string): DispatchTarget {
+  if (!feature) return { kind: "main" };
+  const record = state.features?.list().find((f) => f.feature === feature || f.slug === feature);
+  return {
+    kind: "feature",
+    branch: record?.branch ?? FEATURE_BRANCH_PREFIX + safeFeatureSlug(feature),
+  };
+}
+
+/**
  * Fire a confirmed dispatch: hand the order to the registry, which launches it
  * into a visible Ghostty pane and watches for completion. Non-blocking — we
  * report where it landed and return immediately; the review lands later via the
  * completion callback. A dispatch that can't place a pane comes back failed (no
  * background path); we surface that cleanly. Never throws into the loop.
+ *
+ * This is also where the dispatch flourish plays. The destination line is
+ * committed to the transcript first and unconditionally, so the record of where
+ * an order went is identical at every visuals level; the waves are then scenery
+ * over the launch itself — an idle wait the captain already had — and are
+ * settled before the result is reported. Nothing about the dispatch depends on
+ * them.
  */
 async function fireDispatch(
   state: SessionState,
@@ -843,8 +890,27 @@ async function fireDispatch(
     io.appendBlock(c.yellow("  · dispatch unavailable (not linked)."));
     return;
   }
+
+  const visuals = visualsFor(io);
+  const target = dispatchTarget(state, feature);
+  io.appendBlock(dispatchLabel(target, visuals));
+  const flourish = visuals.animate
+    ? io.playAnimation(
+        dispatchFlourish({ target, glyphs: visuals.glyphs, color: visuals.color }),
+      )
+    : NO_ANIMATION;
+
+  let job: Job;
   try {
-    const job = await registry.dispatch(order, agentName, feature ? { feature } : {});
+    job = await registry.dispatch(order, agentName, feature ? { feature } : {});
+  } catch (e) {
+    await flourish.settle();
+    io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));
+    return;
+  }
+  await flourish.settle();
+
+  try {
     if (job.status === "failed") {
       io.appendBlock(c.red(`  · dispatch failed to launch: ${job.error ?? "unknown error"}`));
       return;
@@ -871,7 +937,9 @@ async function fireDispatch(
       c.green(`  · dispatched ${job.id}${agentNote}${featureNote}: ${where}. ${followup}`),
     );
   } catch (e) {
-    io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));
+    // The launch itself is handled above; this covers the bookkeeping after it
+    // (the resolver-head transition), so it must not read as "nothing ran".
+    io.appendBlock(c.red(`  · dispatch launched but post-launch bookkeeping failed: ${(e as Error).message}`));
   }
 }
 
@@ -1338,16 +1406,41 @@ async function endOfSessionGuard(state: SessionState): Promise<void> {
     return;
   }
 
-  // Distil the session into live state, quietly. This is the co-manager's own
-  // bookkeeping; it is never narrated to the captain.
-  await syncActiveContext(state, /*force*/ true, /*quiet*/ true);
+  // The save below is a model call: several seconds of a terminal that has
+  // already been told to quit. The line says why we're still here (at every
+  // visuals level); the ship, where it can sail, fills that wait and nothing
+  // else — it is started AFTER the label, stopped in a finally, and never
+  // waited on.
+  const visuals = visualsFor(io);
+  io.appendBlock("");
+  io.appendBlock(savingLabel(visuals));
+  const voyage = visuals.animate
+    ? io.playAnimation(
+        exitVoyage({
+          cols: process.stdout.columns || 80,
+          glyphs: visuals.glyphs,
+          color: visuals.color,
+        }),
+      )
+    : NO_ANIMATION;
 
-  // Keep the chatty logs from growing without bound. This is off the cold-start
-  // read path, so it never affects context size — it just keeps on-demand
-  // search fast. decisions.md is deliberately never auto-archived (see
-  // autoArchiveLargeLogs). Best-effort; failures never block exit. Silent, like
-  // the rest of memory maintenance.
-  await autoArchiveLargeLogs(state.paths);
+  try {
+    // Distil the session into live state, quietly. This is the co-manager's own
+    // bookkeeping; it is never narrated to the captain.
+    await syncActiveContext(state, /*force*/ true, /*quiet*/ true);
+
+    // Keep the chatty logs from growing without bound. This is off the cold-start
+    // read path, so it never affects context size — it just keeps on-demand
+    // search fast. decisions.md is deliberately never auto-archived (see
+    // autoArchiveLargeLogs). Best-effort; failures never block exit. Silent, like
+    // the rest of memory maintenance.
+    await autoArchiveLargeLogs(state.paths);
+  } finally {
+    // stop(), never settle(): the save is the point and the voyage is scenery
+    // over it. A ship still mid-crossing when the save lands is cut short — exit
+    // never waits on an animation, and never on the error path either.
+    voyage.stop();
+  }
 
   io.appendBlock(c.dim("bye."));
 }
@@ -1517,4 +1610,12 @@ class PlainIO implements SessionIO {
   // No banner off the TTY: the armed order + command are printed inline by the
   // session loop instead, so a pipe/script sees them as ordinary output.
   setConfirmBanner(_lines: string[] | null): void {}
+
+  // Nothing animates on a pipe: there is no addressable screen, and a stream of
+  // redrawn frames would corrupt the deterministic output scripts and tests
+  // depend on. The caller's static line has already been printed either way —
+  // visualsFor() resolves PlainIO to `off`, so it printed the ASCII form.
+  playAnimation(_spec: AnimationSpec): AnimationHandle {
+    return NO_ANIMATION;
+  }
 }

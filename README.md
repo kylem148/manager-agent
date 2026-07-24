@@ -313,6 +313,35 @@ The session is a scrollable terminal UI, not a plain read-out:
   lines]` instead of flooding the input, and the full text is sent when you
   submit (backspace deletes the whole chip). One-liners paste inline. This uses
   bracketed paste; set `CO_PASTE=off` to disable it if your terminal misbehaves.
+- **Two small nautical moments** mark the two points where the session is doing
+  something and would otherwise sit still. Firing a confirmed dispatch runs the
+  order out to sea above the input bar, over the branch it's headed for
+  (`≈≈▸ dispatching → co/feat-auth`); `/exit` sails a ship across the width once
+  while memory saves. Both are described below.
+
+### Terminal visuals (`CO_VISUALS`)
+
+The animations play **only during an idle wait** — the crew launch, and the
+save-on-exit distill — and never while the model is streaming. They are
+decoration over information that is printed either way: the destination line and
+the saving line go into the transcript at every level, so nothing is ever
+communicated by motion alone.
+
+```bash
+CO_VISUALS=full      # default: animated
+CO_VISUALS=minimal   # the same lines and glyphs, but nothing moves
+CO_VISUALS=off       # a plain ASCII line
+```
+
+The setting is a ceiling, not a promise: the environment can only lower it.
+`NO_COLOR`, piped/non-TTY output, the plain-session fallback, `TERM=dumb`, a
+terminal narrower than 40 columns, or a reduced-motion signal
+(`CO_REDUCED_MOTION`, `REDUCED_MOTION`, `PREFERS_REDUCED_MOTION`, `NO_MOTION`)
+each degrade it to the same single static ASCII line — `~~> dispatching ->
+co/feat-auth`, `~~ saving... fair winds`. Every glyph is one column of ASCII or
+box drawing with a plain-ASCII twin, there are no emoji, and the one colour
+accent always sits on a glyph or on text, never alone. A dispatch that targets
+the bare main tree says so in words rather than naming a branch.
 
 The full UI never engages when output is piped or redirected — that falls back
 to a plain line-oriented session so scripts and pipelines behave predictably.
@@ -647,6 +676,7 @@ src/
   index.ts config.ts paths.ts ui.ts model.ts research.ts
   cli/       auth.ts doctor.ts modelsdoctor.ts link.ts
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
+             visuals.ts
   session/   session.ts prompt.ts tools.ts reviewinbox.ts
              crewpanes.ts dispatchconfig.ts transport.ts registry.ts
              worktrees.ts landing.ts landinggate.ts mergequeue.ts features.ts
@@ -816,6 +846,19 @@ enhanced-protocol CSI-u sequences onto one set of bindings. `tui.ts` is
 deliberately one large file: the render loop, input handling, and scroll state
 share mutable state, and splitting them across modules would mean exporting
 that state rather than encapsulating it.
+
+`visuals.ts` holds the two nautical animations and, more importantly, the
+predicate that decides whether a terminal may have them at all (`CO_VISUALS` as
+a ceiling, every environment signal as a one-way ratchet down to a static ASCII
+line). The split is deliberate: `visuals.ts` decides WHAT is drawn — frames,
+glyph set, the one accent, and the static line that carries the same
+information; `tui.ts` decides WHEN, owning a fixed-height region above the input
+bar with its own ~11fps timer. That region is re-rendered at the current width
+on every frame, so a resize re-lays it instead of tearing, and it refuses to
+open at all while a stream is in flight, while the Ctrl-O panel is up, or on a
+screen too small to spare the rows — with `appendStream` killing a running
+animation from the other direction, so "never during token streaming" holds
+whichever happens first.
 
 **`src/cli/`** — `doctor.ts` and `modelsdoctor.ts` diagnostics, `auth.ts` for
 writing the Bedrock token, and `link.ts` for `co link` (register repo + agent
