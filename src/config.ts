@@ -57,6 +57,42 @@ export function parseEffort(raw: string | undefined): Effort | null {
     : null;
 }
 
+/** Accepted terminal-visual levels, richest to plainest. */
+export const VISUALS_LEVELS = ["full", "minimal", "off"] as const;
+export type VisualsLevel = (typeof VISUALS_LEVELS)[number];
+
+/**
+ * Validate a `CO_VISUALS` value. Returns null for anything unrecognised so the
+ * caller decides the fallback (the same contract as parseEffort).
+ *
+ * `full` animates, `minimal` keeps the glyphs but never moves, `off` is a plain
+ * static line. The on/off aliases exist because this reads as a switch to most
+ * people — `CO_VISUALS=off` is the CO_KEYS=off spelling the rest of the UI
+ * toggles use, and `0`/`false`/`none` are what someone reaches for when they
+ * mean the same thing. The RESOLVED level is not this value: the environment can
+ * only ever degrade it (see resolveVisuals in tui/visuals.ts).
+ */
+export function parseVisualsLevel(raw: string | undefined): VisualsLevel | null {
+  const lower = raw?.trim().toLowerCase();
+  if (lower === undefined || lower === "") return null;
+  if ((VISUALS_LEVELS as readonly string[]).includes(lower)) return lower as VisualsLevel;
+  if (["on", "true", "1", "yes"].includes(lower)) return "full";
+  if (["0", "false", "none", "no"].includes(lower)) return "off";
+  return null;
+}
+
+/**
+ * The configured visuals level, straight from the environment. Read lazily at
+ * the point of use (rather than plumbed through Config) so it picks up
+ * `~/co-managers/.env` — loadConfig() runs before any session opens, and the
+ * TUI's sibling toggles (CO_MOUSE, CO_PASTE, CO_KEYS) resolve the same way.
+ * Anything unrecognised falls back to `full`: the visuals are opt-in-by-default
+ * and every degradation path below them is safe.
+ */
+export function visualsLevel(): VisualsLevel {
+  return parseVisualsLevel(process.env.CO_VISUALS) ?? "full";
+}
+
 export interface ModelConfig {
   region: string;
   /**

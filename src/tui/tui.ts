@@ -641,6 +641,53 @@ export interface TuiOptions {
 }
 
 /**
+ * A bounded, ephemeral animation played in its own fixed-height region just
+ * above the input bar — the mechanism behind the dispatch flourish and the exit
+ * ship. The Tui owns WHEN it draws; visuals.ts owns WHAT it draws.
+ *
+ * `render` is called with the CURRENT width on every frame (and on every repaint
+ * in between), which is what makes the region resize-safe: a SIGWINCH mid-flight
+ * simply re-renders at the new width instead of leaving a torn frame. It must
+ * always return exactly `rows` rows, because the region's height is subtracted
+ * from the transcript viewport and a wobbling height would make the whole screen
+ * jump.
+ */
+export interface AnimationSpec {
+  /** Rows for frame `n` at `cols` columns. Must return exactly `rows` entries. */
+  render(frame: number, cols: number): string[];
+  /** Fixed height of the region, in screen rows. */
+  rows: number;
+  /** Total frames; the animation ends itself after the last one. Omit to run
+   *  until the caller stops it (used by the open-ended dispatch flourish). */
+  frames?: number;
+  /** Frame budget. ~10-12fps is the house speed: enough to read as motion,
+   *  cheap enough that it never competes with a repaint. */
+  intervalMs?: number;
+  /** Floor on how long the region stays up, honored by settle() only. Keeps a
+   *  flourish from flickering past when the work it covers finishes instantly. */
+  minDurationMs?: number;
+}
+
+/** A running animation. Every method is safe to call more than once. */
+export interface AnimationHandle {
+  /** False when nothing is animating (degraded context, or the Tui refused).
+   *  Callers use it to skip any wait they'd otherwise do for the animation. */
+  readonly animating: boolean;
+  /** End it now and clear the region. Use where a wait would delay real work. */
+  stop(): void;
+  /** End it, but not before `minDurationMs` has elapsed. Resolves once cleared;
+   *  resolves immediately when nothing is animating. */
+  settle(): Promise<void>;
+}
+
+/** The handle handed back when there is nothing to animate. */
+export const NO_ANIMATION: AnimationHandle = {
+  animating: false,
+  stop: () => {},
+  settle: () => Promise.resolve(),
+};
+
+/**
  * The interface the interactive session drives. The rich implementation is the
  * Tui below; a plain readline implementation (session.ts) satisfies the same
  * contract for piped/non-TTY use so scripts and tests keep working.
@@ -679,6 +726,14 @@ export interface SessionIO {
    * plain non-TTY path this is a no-op — the banner is printed inline instead.
    */
   setConfirmBanner(lines: string[] | null): void;
+  /**
+   * Play a bounded animation in an ephemeral region above the input bar. Returns
+   * a live handle, or NO_ANIMATION when this IO can't animate (PlainIO always;
+   * the Tui while a stream is open, the panel is up, or the screen is too small)
+   * — so a caller never has to ask permission first, it just checks `animating`.
+   * Purely decorative: the caller always writes its own static line as well.
+   */
+  playAnimation(spec: AnimationSpec): AnimationHandle;
 }
 
 /**
@@ -705,6 +760,24 @@ const BUSY_TICK_MS = 120;
  * instant.
  */
 const PAINT_INTERVAL_MS = 16;
+
+/**
+ * Default frame budget for the decorative visual region: ~11fps. Deliberately an
+ * order of magnitude slower than the repaint budget — the region is scenery
+ * played during an idle wait, and a full frame per tick is the cost. Anything
+ * faster buys no legibility on wave/ship motion and just competes with the work
+ * the animation is covering for.
+ */
+const VISUAL_TICK_MS = 90;
+
+/** Below this width the region can't hold a legible band and a branch label, so
+ *  the animation is refused and the caller's static line stands alone. */
+const VISUAL_MIN_COLS = 40;
+
+/** Screen rows that must survive OUTSIDE the region (transcript + rule + input)
+ *  for it to be worth drawing. A tall region on a short terminal would squeeze
+ *  the conversation to nothing, which is a worse trade than no animation. */
+const VISUAL_MIN_FREE_ROWS = 8;
 
 /**
  * Single-key selectors for the doc list, in press order: digits first (the
@@ -916,6 +989,19 @@ export class Tui implements SessionIO {
   private busyFrame = 0;
   private busyTimer: ReturnType<typeof setInterval> | null = null;
 
+  // The visual region: a fixed-height band of decorative rows between the
+  // confirm banner and the busy line, driven by its own slow timer (see
+  // playAnimation). Like `busy` it is ephemeral — nothing here ever reaches the
+  // transcript, so the durable record of a dispatch or an exit is the static
+  // line the caller committed, identical at every visuals level.
+  private visual: AnimationSpec | null = null;
+  private visualFrame = 0;
+  private visualTimer: ReturnType<typeof setInterval> | null = null;
+  /** Resolvers waiting on the running animation to clear (settle/stop). */
+  private visualWaiters: Array<() => void> = [];
+  /** Wall-clock start of the running animation, for settle()'s minimum. */
+  private visualStartedAt = 0;
+
   // Pending single-line resolver when awaiting input.
   private pendingResolve: ((line: string | null) => void) | null = null;
   private sigintCount = 0;
@@ -1035,6 +1121,10 @@ export class Tui implements SessionIO {
     this.panel = null;
     if (this.statusTimer) { clearTimeout(this.statusTimer); this.statusTimer = null; }
     if (this.busyTimer) { clearInterval(this.busyTimer); this.busyTimer = null; }
+    // A voyage still under way at teardown ends here: its timer is dropped and
+    // anything awaiting it is released, so an exit animation can never outlive
+    // the screen it was drawn on or hold the closing sequence up.
+    this.stopVisual();
     // Drop any queued frame: we're about to leave the alt screen, so painting
     // it would write into a buffer that's being torn down.
     if (this.paintTimer) { clearTimeout(this.paintTimer); this.paintTimer = null; }
@@ -1086,14 +1176,20 @@ export class Tui implements SessionIO {
 
   /** Number of screen rows reserved for the input editor + separator. */
   private inputRows(): number {
-    // confirm banner (when armed) + busy line (when working) + separator +
-    // wrapped input text rows
-    return this.confirmRows() + this.busyRows() + 1 + this.inputTextRows();
+    // confirm banner (when armed) + visual region (while animating) + busy line
+    // (when working) + separator + wrapped input text rows
+    return this.confirmRows() + this.visualRows() + this.busyRows() + 1 + this.inputTextRows();
   }
 
   /** Rows the armed-dispatch confirm banner occupies (0 when nothing armed). */
   private confirmRows(): number {
     return this.confirmBanner ? this.confirmBanner.length : 0;
+  }
+
+  /** Rows the decorative visual region occupies (0 when nothing is playing).
+   *  Fixed for the life of an animation, so the screen never jumps mid-flight. */
+  private visualRows(): number {
+    return this.visual ? this.visual.rows : 0;
   }
 
   /**
@@ -1273,6 +1369,11 @@ export class Tui implements SessionIO {
    * markdown; the open (partial) line is rendered live but non-committally.
    */
   appendStream(chunk: string, opts?: { markdown?: boolean }): void {
+    // Model tokens are landing: scenery yields immediately. playAnimation
+    // already refuses to start over an open stream; this is the other direction
+    // — a stream that starts while something is playing kills it — so the
+    // "never animate during streaming" rule holds no matter the ordering.
+    if (this.visual) this.stopVisual();
     if (this.open === null) this.open = "";
     this.openMarkdown = Boolean(opts?.markdown);
     const text = this.open + chunk;
@@ -1401,12 +1502,30 @@ export class Tui implements SessionIO {
       }
     }
 
+    // Visual region: the decorative band (dispatch waves, the exit ship). Its
+    // rows are re-rendered at the CURRENT width every frame, so a resize
+    // mid-animation re-lays it out instead of tearing; each row is clipped, so a
+    // generator that overshoots can never wrap into the row below and garble the
+    // frame. A generator that returns too few rows leaves blanks — the region's
+    // height is fixed at play time either way.
+    const visualRows = this.visualRows();
+    if (this.visual) {
+      const art = this.visual.render(this.visualFrame, this.cols);
+      for (let ar = 0; ar < visualRows; ar++) {
+        frame.push(
+          term.moveTo(vp + confirmRows + 1 + ar, 1) +
+            term.clearLine +
+            this.clip(art[ar] ?? "", this.cols),
+        );
+      }
+    }
+
     // Busy line: the spinner + chore, hard against the left margin on its own
     // row directly above the rule. Only painted while working.
     const busyRows = this.busyRows();
     if (busyRows) {
       frame.push(
-        term.moveTo(vp + confirmRows + 1, 1) +
+        term.moveTo(vp + confirmRows + visualRows + 1, 1) +
           term.clearLine +
           c.cyan(this.clip(this.busyText(), this.cols)),
       );
@@ -1418,7 +1537,7 @@ export class Tui implements SessionIO {
     const below = rowsAll.length - (start + vp);
     const scrollHint =
       this.atBottom || below <= 0 ? "" : `more below · ${below} line(s)`;
-    const sepRow = vp + confirmRows + busyRows + 1;
+    const sepRow = vp + confirmRows + visualRows + busyRows + 1;
     frame.push(term.moveTo(sepRow, 1) + term.clearLine + this.renderSeparator(scrollHint));
 
     // Input region: one or more wrapped rows below the separator. The prompt
@@ -1613,6 +1732,96 @@ export class Tui implements SessionIO {
       this.busyTimer.unref?.();
     }
     this.paint();
+  }
+
+  /**
+   * Play a bounded animation in the visual region (see AnimationSpec). Returns
+   * NO_ANIMATION — a live-looking handle that does nothing — whenever animating
+   * would be wrong, so the caller never has to branch before asking:
+   *
+   *  - a stream is OPEN: model tokens are landing right now, and scenery must
+   *    never compete with them for the frame. This is the structural half of the
+   *    "animate only during idle waits" rule; appendStream() is the other half
+   *    (it kills a running animation if output starts anyway).
+   *  - the Ctrl-O panel is up: it owns the whole screen, so the region isn't
+   *    painted at all and the timer would be pure waste.
+   *  - the screen is too small: the region is subtracted from the transcript
+   *    viewport, and eating the conversation to show scenery is a bad trade.
+   *
+   * The environment-level decision (CO_VISUALS, NO_COLOR, reduced motion…) is
+   * NOT made here — that is visuals.ts's resolveVisuals, which the caller
+   * consults to build the spec and its static fallback line. This method only
+   * guards what the Tui itself knows: its own state and its own dimensions.
+   */
+  playAnimation(spec: AnimationSpec): AnimationHandle {
+    if (
+      !this.active ||
+      this.open !== null ||
+      this.panel !== null ||
+      spec.rows <= 0 ||
+      this.cols < VISUAL_MIN_COLS ||
+      this.rows - spec.rows < VISUAL_MIN_FREE_ROWS
+    ) {
+      return NO_ANIMATION;
+    }
+    // There is one region: a second animation replaces the first (settling its
+    // waiters) rather than stacking two bands above the input bar.
+    this.stopVisual();
+
+    this.visual = spec;
+    this.visualFrame = 0;
+    this.visualStartedAt = Date.now();
+    const total = spec.frames;
+    this.visualTimer = setInterval(
+      () => {
+        this.visualFrame++;
+        // A spec with a frame count ends itself — the ship finishes its voyage
+        // and the region clears without the caller doing anything.
+        if (total !== undefined && this.visualFrame >= total) {
+          this.stopVisual();
+          return;
+        }
+        this.paint();
+      },
+      Math.max(PAINT_INTERVAL_MS, spec.intervalMs ?? VISUAL_TICK_MS),
+    );
+    // Scenery never holds the event loop open (same rule as the busy spinner).
+    this.visualTimer.unref?.();
+    this.paint();
+
+    const mine = spec;
+    const cleared = new Promise<void>((resolve) => this.visualWaiters.push(resolve));
+    return {
+      animating: true,
+      stop: () => {
+        if (this.visual === mine) this.stopVisual();
+      },
+      settle: async () => {
+        // Already gone (frames exhausted, replaced, or torn down): it had its
+        // time on screen, so there is nothing left to wait out.
+        if (this.visual !== mine) return cleared;
+        const remaining = (spec.minDurationMs ?? 0) - (Date.now() - this.visualStartedAt);
+        if (remaining > 0) await new Promise((r) => setTimeout(r, remaining));
+        if (this.visual === mine) this.stopVisual();
+        return cleared;
+      },
+    };
+  }
+
+  /** End whatever is playing in the visual region and release its waiters.
+   *  Idempotent, and safe during teardown (it only repaints while active). */
+  private stopVisual(): void {
+    if (this.visualTimer) {
+      clearInterval(this.visualTimer);
+      this.visualTimer = null;
+    }
+    const had = this.visual !== null;
+    this.visual = null;
+    this.visualFrame = 0;
+    const waiters = this.visualWaiters;
+    this.visualWaiters = [];
+    for (const w of waiters) w();
+    if (had && this.active) this.paint();
   }
 
   /** Drop any active selection and repaint if it was showing. */
@@ -2307,6 +2516,9 @@ export class Tui implements SessionIO {
     if (this.panel) return;
     this.clearSelection();
     this.clearStatus();
+    // The panel takes the whole screen, so anything in the visual region is
+    // about to be invisible; end it rather than tick a timer nobody can see.
+    this.stopVisual();
     let view: PanelView;
     if (this.pendingReview) {
       // A pending feature_land review lives on its OWN tab now: the queue tab's
