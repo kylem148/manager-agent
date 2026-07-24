@@ -13,6 +13,12 @@ import {
   type ToolSideEffects,
 } from "./tools.js";
 import {
+  fileReviewInto,
+  ReviewInbox,
+  type FileReviewInput,
+  type FileReviewResult,
+} from "./reviewinbox.js";
+import {
   detectStaleActiveContext,
   readLiveMemory,
   archiveLog,
@@ -89,6 +95,13 @@ interface SessionState {
   armed: { order: string; feature?: string; resolve?: boolean } | null;
   /** Completed jobs waiting for a review turn, drained on the next idle prompt. */
   reviewQueue: Job[];
+  /** The rolling record of filed crew reviews (the Ctrl-O Inbox tab). Loaded at
+   *  session start, so it carries the previous sessions' reviews. */
+  inbox: ReviewInbox;
+  /** The job whose review turn is running right now, or null. Lets file_review
+   *  default its jobId/feature to the run the co was just handed, so the co only
+   *  has to name them when it files a review for something else. */
+  reviewingJob: Job | null;
 }
 
 const PROMPT_LABEL = c.cyan("you › ");
@@ -223,6 +236,11 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // co-manager writes plain-text orders exactly as before.
   const dispatch = await readDispatchConfig(paths);
 
+  // The rolling review inbox is instance state, not dispatch state, so it loads
+  // whether or not this instance is linked: reviews survive a re-link, and a
+  // report the captain relayed by hand is filed the same way a dispatched one is.
+  const inbox = await ReviewInbox.load(paths);
+
   const system = await buildSystemPrompt(paths, cfg.research, {
     excludeTranscript: transcript.file,
     dispatch: dispatch
@@ -246,6 +264,9 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
         promptLabel: PROMPT_LABEL,
         header,
         docs: docSource(paths),
+        // The Inbox tab reads the in-memory store fresh at paint time, so a
+        // review filed mid-session shows without any subscription.
+        inbox: { list: () => inbox.list() },
         // The merge-queue panel tab only exists when the instance is linked (a
         // queue needs a repo). Read fresh at paint time via the FeatureManager,
         // which is created below; the closure is never called before then.
@@ -277,6 +298,8 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     features: null,
     armed: null,
     reviewQueue: [],
+    inbox,
+    reviewingJob: null,
   };
 
   // Wire the job registry when linked. On completion a job is queued for review
@@ -540,6 +563,9 @@ async function drive(
       : {}),
     ...(state.features ? { features: state.features } : {}),
     ...(state.dispatch && state.features ? { onArmResolve: () => armResolve(state) } : {}),
+    // Filing a review persists the record and owns the level-gated chat output.
+    // Always wired: a review is filed whether the run was dispatched or relayed.
+    onFileReview: (input) => fileReview(state, input),
   });
 
   // Streaming render state. "mode" tracks whether the open transcript line is
@@ -620,6 +646,25 @@ async function drive(
 
   // Persist the co's turn as soon as it lands — the "save along the way" path.
   await appendTranscript(state.transcript, "co", answer);
+}
+
+// --- the review inbox --------------------------------------------------------
+
+/**
+ * File a structured review (the file_review tool). The rules live in
+ * reviewinbox.ts — persist the record, then emit only what its level allows (one
+ * dim pointer line at L2, nothing at L1/L3, and the body never) — so this is just
+ * the wiring: which inbox, which run is under review, where a line goes.
+ */
+async function fileReview(state: SessionState, input: FileReviewInput): Promise<FileReviewResult> {
+  const { result } = await fileReviewInto({
+    inbox: state.inbox,
+    input,
+    job: state.reviewingJob,
+    now: new Date().toISOString(),
+    emit: (line) => state.io.appendBlock(line),
+  });
+  return result;
 }
 
 // --- dispatch (arm → confirm → launch → review) ------------------------------
@@ -909,12 +954,25 @@ async function drainReviews(state: SessionState): Promise<void> {
         " anything; you already have the record. Separate verified from claimed. If the record is" +
         " only a completion marker with no content, say plainly that the run left no reviewable" +
         " record and what the exit code implies.\n\n" +
+        "FILE THE REVIEW: your review IS the file_review call. Decide the verdict, map it to a level" +
+        " (rework or a genuine escalation/fork → L1; fix-commit or accept-with-notes → L2; a clean" +
+        " accept → L3), and call file_review with {level, verdict, headline, body} — the body is the" +
+        " full three-part review. Then, in the chat: on L1 state ONLY the core decision the captain" +
+        " has to make; on L2 and L3 say nothing further. The captain reads the full review in the" +
+        " panel (Ctrl-O, Inbox tab), so never paste the body into the chat.\n\n" +
         `Job: ${job.id} (${job.label})\nStatus: ${job.status}` +
         (job.exitCode !== undefined ? ` (exit ${job.exitCode})` : "") +
         `\n\n--- record of the run ---\n${record}` +
         resolveNote,
     });
-    await drive(state);
+    // Name the run under review so file_review can default its jobId/feature to
+    // it; cleared on the way out so a later filing can't be misattributed.
+    state.reviewingJob = job;
+    try {
+      await drive(state);
+    } finally {
+      state.reviewingJob = null;
+    }
   }
 }
 
@@ -1175,7 +1233,11 @@ function bannerText(name: string, cfg: Config, tui: boolean, linked: boolean): s
   if (tui) {
     lines.push(
       c.dim("scroll: wheel or PgUp/PgDn · ↑/↓ recalls your input · hold Option/Shift to select text"),
-      c.dim(linked ? "Ctrl-O opens the panel (merge queue + docs)" : "Ctrl-O opens the doc viewer"),
+      c.dim(
+        linked
+          ? "Ctrl-O opens the panel (merge queue + docs + review inbox)"
+          : "Ctrl-O opens the panel (docs + review inbox)",
+      ),
     );
   }
   return lines.join("\n");

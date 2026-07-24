@@ -70,6 +70,10 @@ export interface InstancePaths {
   dispatch: string;
   /** The per-instance dispatch config file (co link). */
   dispatchConfig: string;
+  /** The rolling review inbox: the last N crew-completion reviews, newest first.
+   *  Lives beside the dispatch config because a review is the tail end of a
+   *  dispatch; never written into the user's repo. */
+  reviewInbox: string;
   /** Directory holding per-job capture files. */
   captures: string;
   /** Resolve a per-job capture file under .dispatch/captures/. */
@@ -103,6 +107,7 @@ export function instancePaths(home: string, name: string): InstancePaths {
     sessions,
     dispatch,
     dispatchConfig: path.join(dispatch, "config.json"),
+    reviewInbox: path.join(dispatch, "inbox.json"),
     captures,
     captureFile: (jobId) => path.join(captures, `${jobId}.log`),
     liveFile: (f) => path.join(memory, f),

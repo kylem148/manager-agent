@@ -4,6 +4,7 @@ import {
   Tui,
   renderMarkdownDoc,
   type DocSource,
+  type InboxPanelEntry,
   type InStream,
   type LandingReview,
   type OutStream,
@@ -85,6 +86,7 @@ function harness(
   cols = 40,
   rows = 12,
   queue?: { view(): QueuePanelView },
+  inbox?: { list(): InboxPanelEntry[] },
 ): Harness {
   let listener: ((d: string) => void) | null = null;
   const writes: string[] = [];
@@ -98,7 +100,14 @@ function harness(
     on: (_e, l) => (listener = l),
     removeListener: () => (listener = null),
   };
-  const tui = new Tui({ promptLabel: PROMPT, out, inp, docs, ...(queue ? { queue } : {}) });
+  const tui = new Tui({
+    promptLabel: PROMPT,
+    out,
+    inp,
+    docs,
+    ...(queue ? { queue } : {}),
+    ...(inbox ? { inbox } : {}),
+  });
   tui.start();
   return {
     tui,
@@ -111,6 +120,9 @@ function harness(
 
 /** Let the overlay's async list/read settle (microtask flush). */
 const settle = (): Promise<void> => new Promise((r) => setImmediate(r));
+
+/** Let a coalesced repaint land (the ~60fps frame budget, plus slack). */
+const frame = (): Promise<void> => new Promise((r) => setTimeout(r, 40));
 
 // --- renderMarkdownDoc (the shared-renderer reuse) --------------------------
 
@@ -945,5 +957,257 @@ test("no doc is ever labelled `i`, so the tab key can't shadow a selector", asyn
   h.send("i");
   await settle();
   assert.ok(!h.lastFramePlain().includes("docs · doc-"), "`i` opened no doc");
+  h.stop();
+});
+
+// --- the inbox tab -------------------------------------------------------------
+//
+// The rolling record of filed crew reviews (D-20260724-8). It is a READ surface:
+// a list of what the co filed, newest first, each drilling into its full body.
+// Nothing here can merge, reject, or act on anything — that's the queue tab's
+// job, and keeping the two key spaces apart is why they're separate tabs.
+
+/** An inbox source whose snapshot the test swaps between paints, to prove the
+ *  panel reads it fresh (no cached list) — the same contract as fakeQueue. */
+function fakeInbox(initial: InboxPanelEntry[]): {
+  list(): InboxPanelEntry[];
+  set(v: InboxPanelEntry[]): void;
+} {
+  let cur = initial;
+  return { list: () => cur, set: (v) => (cur = v) };
+}
+
+const REVIEWS: InboxPanelEntry[] = [
+  {
+    level: "L1",
+    verdict: "rework",
+    headline: "auth middleware never ran",
+    body: "Went wrong: the middleware is registered after the route.\n\nVerdict: rework.",
+    timestamp: "2026-07-24T11:05:00.000Z",
+    jobId: "job-003",
+    feature: "auth",
+  },
+  {
+    level: "L2",
+    verdict: "fix-commit",
+    headline: "shipped, migration untested",
+    body: "Went right: endpoint ships.\n\nVerdict: fix-commit.",
+    timestamp: "2026-07-24T10:40:00.000Z",
+    jobId: "job-002",
+  },
+  {
+    level: "L3",
+    verdict: "accept",
+    headline: "rename landed clean",
+    body: "All criteria met.\n\nVerdict: accept.",
+    timestamp: "2026-07-24T09:12:00.000Z",
+    jobId: "job-001",
+  },
+];
+
+test("the inbox tab lists filed reviews newest-first with level, verdict and headline", async () => {
+  const h = harness(undefined, 72, 16, undefined, fakeInbox(REVIEWS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /inbox/, "the header names the inbox tab");
+  assert.match(frame, /1\)\s*\[L1\]\s*rework\s+auth middleware never ran/, "newest is first, label 1");
+  assert.match(frame, /2\)\s*\[L2\]\s*fix-commit\s+shipped, migration untested/);
+  assert.match(frame, /3\)\s*\[L3\]\s*accept\s+rename landed clean/);
+  // A list row is a summary: the body stays out of it until you open one.
+  assert.ok(!frame.includes("middleware is registered"), "bodies aren't in the list");
+  h.stop();
+});
+
+test("selecting a review drills into its full body and pages; Backspace returns to the list", async () => {
+  const long = Array.from({ length: 60 }, (_, i) => `body line ${i + 1}`).join("\n");
+  const entries: InboxPanelEntry[] = [
+    { ...REVIEWS[0]!, body: long },
+    ...REVIEWS.slice(1),
+  ];
+  const h = harness(undefined, 72, 16, undefined, fakeInbox(entries));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  const opened = h.lastFramePlain();
+  assert.match(opened, /inbox · L1 rework/, "the header names the open review");
+  assert.match(opened, /auth middleware never ran/, "the headline leads the body view");
+  assert.match(opened, /job-003/, "the metadata line names the job");
+  // Painted rows abut in the frame, so the first two lines prove the top.
+  assert.match(opened, /body line 1body line 2/);
+  assert.ok(!opened.includes("body line 60"), "a long body starts at the top");
+
+  h.send(" "); // page down, the same less-style paging docs and diffs use
+  assert.ok(!h.lastFramePlain().includes("body line 1body line 2"), "paged past the start");
+  h.send("G");
+  assert.match(h.lastFramePlain(), /body line 60/, "G jumps to the end");
+
+  h.send("\x7f"); // Backspace
+  assert.match(h.lastFramePlain(), /2\)\s*\[L2\]/, "back on the inbox list");
+  h.send(ESC);
+  h.stop();
+});
+
+test("an empty inbox says so rather than showing a blank tab", async () => {
+  const h = harness(undefined, 60, 12, undefined, fakeInbox([]));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /No reviews filed yet/);
+  h.send("1"); // a stray selector on an empty list is a no-op, not a crash
+  await settle();
+  h.send(ESC);
+  h.stop();
+});
+
+test("the inbox reads its source fresh: a review filed while the panel is open shows up", async () => {
+  const src = fakeInbox([REVIEWS[2]!]);
+  const h = harness(undefined, 72, 16, undefined, src);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*\[L3\]/);
+  // The co files a new one mid-session; the next paint picks it up. Transcript
+  // output coalesces its frame (~60fps), so wait for it rather than the tick.
+  src.set([REVIEWS[0]!, REVIEWS[2]!]);
+  h.tui.appendBlock("something happened");
+  await frame();
+  assert.match(h.lastFramePlain(), /1\)\s*\[L1\]\s*rework/, "the new review is now first");
+  h.stop();
+});
+
+test("Tab cycles queue → docs → inbox and back, and each tab keeps its own keys", async () => {
+  const docs = fakeDocs({ "plan.md": "# Plan\n" });
+  const q = fakeQueue({
+    size: 1,
+    head: null,
+    entries: [{ feature: "headfeat", position: 1, isHead: true, status: "queued" }],
+  });
+  const h = harness(docs, 72, 16, q, fakeInbox(REVIEWS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /headfeat/, "opens on the queue tab, as before");
+  h.send("\t");
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, "Tab reaches docs");
+  h.send("\t");
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*\[L1\]\s*rework/, "Tab reaches the inbox");
+  h.send("\t");
+  await settle();
+  assert.match(h.lastFramePlain(), /headfeat/, "and wraps back to the queue");
+
+  // Sub-view → its own tab: open a review, Tab pops back to the inbox list.
+  h.send("\t");
+  h.send("\t");
+  await settle();
+  h.send("2");
+  await settle();
+  assert.match(h.lastFramePlain(), /inbox · L2 fix-commit/);
+  h.send("\t");
+  assert.match(h.lastFramePlain(), /3\)\s*\[L3\]/, "Tab from an open review returns to the list");
+  h.stop();
+});
+
+test("with only an inbox wired, Ctrl-O opens it and keystrokes never reach the prompt", async () => {
+  const h = harness(undefined, 72, 16, undefined, fakeInbox(REVIEWS));
+  const answer = h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /rename landed clean/);
+  h.send("hello"); // would otherwise land in the input buffer
+  await settle();
+  h.send(ESC);
+  h.send("real\r");
+  assert.equal(await answer, "real");
+  h.stop();
+});
+
+// --- the panel keybinds meet the inbox tab -----------------------------------
+//
+// `i`/Ctrl-O (D-20260724-9) and the inbox tab (D-20260724-8) were built against
+// a two-tab panel and a queue/docs panel respectively; these pin the behaviour
+// where they meet. `i` is safe as the inbox's tab key for the same reason it is
+// safe as the docs': it isn't in OVERLAY_LABELS, so it can't shadow a row.
+
+test("`i` cycles the third tab too, and pops back out of an open review", async () => {
+  const docs = fakeDocs({ "plan.md": "# Plan\n" });
+  const h = harness(docs, 72, 16, fakeQueue(emptyQueue), fakeInbox(REVIEWS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /merge queue is empty/, "opens on the queue tab");
+
+  h.send("i"); // queue -> docs
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, "`i` reached docs");
+
+  h.send("i"); // docs -> inbox, the tab that didn't exist when `i` was bound
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*\[L1\]\s*rework/, "`i` reached the inbox");
+
+  h.send("i"); // inbox -> queue, all three cycled
+  await settle();
+  assert.match(h.lastFramePlain(), /merge queue is empty/, "`i` wrapped back round");
+
+  // From a filed review's body `i` pops back to the list, exactly as it does
+  // from an open doc — the sub-view returns to its own tab, not the next one.
+  h.send("i");
+  h.send("i");
+  await settle();
+  h.send("2");
+  await settle();
+  assert.match(h.lastFramePlain(), /inbox · L2 fix-commit/, "in the review body");
+  h.send("i");
+  await settle();
+  assert.match(h.lastFramePlain(), /3\)\s*\[L3\]/, "`i` returned to the inbox list");
+  h.stop();
+});
+
+test("no filed review is ever labelled `i`, so its tab key can't shadow a row", async () => {
+  // The inbox caps at 20; 20 rows exhaust the digits and run well past where
+  // `i` used to sit, which is exactly where a dead label would show up.
+  const many: InboxPanelEntry[] = Array.from({ length: 20 }, (_, n) => ({
+    ...REVIEWS[2]!,
+    headline: `review ${String(n + 1).padStart(2, "0")}`,
+    jobId: `job-${String(n + 1).padStart(3, "0")}`,
+  }));
+  const h = harness(undefined, 72, 30, undefined, fakeInbox(many));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /h\)\s*\[L3\]\s*accept\s+review 17/, "letters run up to h");
+  assert.match(frame, /j\)\s*\[L3\]\s*accept\s+review 18/, "and skip `i` for j");
+  assert.ok(!/\bi\)/.test(frame), "no `i)` label exists to be shadowed");
+  h.stop();
+});
+
+test("Ctrl-O closes the panel from the inbox tab and from an open review", async () => {
+  const h = harness(undefined, 72, 16, undefined, fakeInbox(REVIEWS));
+  const answer = h.tui.question();
+
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*\[L1\]\s*rework/, "on the inbox tab");
+  h.send(CTRL_O); // the list takes its own escape exit: the panel closes
+  await settle();
+  assert.match(h.lastFramePlain(), /you > /, "closed from the list");
+
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  assert.match(h.lastFramePlain(), /inbox · L1 rework/, "drilled into a review");
+  h.send(CTRL_O); // and from the body, which Backspace would only pop back from
+  await settle();
+  assert.match(h.lastFramePlain(), /you > /, "closed from the body");
+
+  h.send("typed\r");
+  assert.equal(await answer, "typed", "no toggle leaked a keystroke into the buffer");
   h.stop();
 });

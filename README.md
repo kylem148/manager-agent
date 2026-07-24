@@ -341,6 +341,7 @@ flat over time — small rewritten orientation files plus large append-only logs
         │   └── sessions/          verbatim per-session transcripts (the record)
         └── .dispatch/          crew-dispatch state (only after `co link`)
             ├── config.json        repo path, named agent commands, caps, pane layout, anchor
+            ├── inbox.json         the last 20 crew reviews, newest first (Ctrl-O → Inbox)
             └── captures/          per-job captured output the co reviews from
 ```
 
@@ -460,6 +461,28 @@ independently (a later job finishing while an earlier one still runs delivers
 its own review). The session stays fully interactive the whole time, including
 with several jobs running at once; a failed or timed-out job never takes the
 session down.
+
+### Reviews are filed, not shouted
+
+A review is a **record**, not a wall of chat. The co-manager writes each one into
+a rolling inbox (the last 20, newest first, kept under the instance's
+`.dispatch/inbox.json` and so surviving a restart), and reads it back in the
+Ctrl-O panel's **Inbox** tab: one row per review with its level, verdict, and
+headline, and one keypress to read the whole thing.
+
+What reaches the conversation depends on the review's **level**, which the
+co-manager assigns from its own verdict:
+
+| level | when                                            | what you see in the chat                        |
+| ----- | ----------------------------------------------- | ----------------------------------------------- |
+| L1    | `rework`, or a real escalation only you can call | just the core decision it needs from you         |
+| L2    | `fix-commit`, or an `accept` with notes          | one grey line: headline + where to read the rest |
+| L3    | a clean `accept`                                 | nothing at all                                   |
+
+The full review body is never printed to the chat at any level — it lives in the
+inbox. So a clean chore costs you no attention, a mixed result costs you one
+line, and only a run that genuinely needs a decision interrupts you, with the
+decision and nothing else.
 
 The job — the `cd` into the repo, the agent command, the (possibly multi-line)
 order text, completion bookkeeping — is written to a **per-job script file**
@@ -595,7 +618,7 @@ src/
   index.ts config.ts paths.ts ui.ts model.ts research.ts
   cli/       auth.ts doctor.ts modelsdoctor.ts link.ts
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
-  session/   session.ts prompt.ts tools.ts
+  session/   session.ts prompt.ts tools.ts reviewinbox.ts
              crewpanes.ts dispatchconfig.ts transport.ts registry.ts
              worktrees.ts landing.ts landinggate.ts features.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
@@ -632,8 +655,20 @@ order: identity + constraints, operating notes, navigator voice, the protocol
 reference sections (memory / documents / research / orders / dispatch when linked
 / report review), then live state and the recent-conversation tail (logs
 excluded). `tools.ts` is the internal tool surface exposed to the model plus the
-executor that binds tools to memory + research; it holds the decision gate and
-the arm-only `dispatch_order` tool.
+executor that binds tools to memory + research; it holds the decision gate, the
+arm-only `dispatch_order` tool, and the `file_review` tool.
+
+`reviewinbox.ts` is the review record and its volume knob. A crew review used to
+be nothing but the co talking, so it neither survived the session nor varied in
+loudness with how much it mattered. Now `file_review` writes a structured record
+(job, feature, verdict, level, headline, body) into a capped rolling list — the
+last 20, newest first, persisted as JSON under the instance's `.dispatch/` and
+loaded at session start, so the inbox is populated before the panel is ever
+opened. Writes ride the shared memory write queue, so a whole-file rewrite can't
+interleave with the other tool calls of one model round. The same module owns the
+chat gate as one pure function: L2 returns exactly one dim pointer line, L1 and
+L3 return none (L1's signal is the co's own next sentence — the decision the
+captain has to make), and the body reaches the chat at no level.
 
 The dispatch layer is four focused modules. `crewpanes.ts` is the pure pane-
 placement planner (anchor takeover, alternating splits of the newest pane, cap +
@@ -714,8 +749,11 @@ promote path.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,
-and the modal Ctrl-O overlay that hosts both the doc viewer and the landing
-gate's review screen.
+and the Ctrl-O panel. The panel has three home tabs, cycled with Tab — the merge
+queue (which also hosts the landing gate's review screen), the doc viewer, and
+the review inbox — each reading a small injected source, so the Tui never
+reaches into git, the filesystem, or the session layer itself. A doc and a filed
+review both drill into the same paged body view the diff uses.
 `keys.ts` is the pure decode table that maps both legacy control bytes and
 enhanced-protocol CSI-u sequences onto one set of bindings. `tui.ts` is
 deliberately one large file: the render loop, input handling, and scroll state
