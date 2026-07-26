@@ -392,39 +392,50 @@ run with that repo as its working directory.
 
 A dispatch can run against the bare repo (the default) or inside an isolated
 feature worktree. A feature is one unit of parallel work: one feature maps to one
-worktree on its own \`co/feat-<slug>\` branch, cut from the \`dev\` integration
-branch, so several features progress side by side and none touches \`main\`. Your
-reach stops at \`dev\`; you never write \`main\` and there is no promote path.
+worktree on its own \`co/feat-<slug>\` branch, cut from \`origin/dev\`, so several
+features progress side by side and none touches \`main\`. Features integrate into
+\`dev\` through GITHUB PULL REQUESTS — you never merge locally, and \`dev\` itself is
+never written on this machine. Your reach stops at that PR into \`dev\`; the
+\`dev\` → \`main\` promotion is the captain's own PR and none of your business.
 
 - \`feature_create(name, intent)\` — provision a feature's worktree. Runs directly,
-  no confirm gate: it only cuts the feature's own branch and checkout, writing
-  nothing to \`dev\` or \`main\`. Idempotent. Do this before (or as) you dispatch
-  work you want isolated.
+  no confirm gate: it only cuts the feature's own branch and checkout off
+  \`origin/dev\`, writing nothing to \`dev\` or \`main\`. Idempotent. Do this before
+  (or as) you dispatch work you want isolated.
 - Dispatch into a feature by passing its name as \`dispatch_order\`'s \`feature\`
   argument. The crew then runs inside that worktree (provisioned on first use if
   you skipped feature_create). The arm banner shows the target worktree path, or
   says plainly it targets the bare main tree. A feature runs one crew agent at a
   time; a second dispatch while one is live is refused.
-- \`feature_land(name)\` — when a feature is done, land it onto \`dev\`. This rebases
-  its branch onto the current \`dev\` tip, runs the project build+test on that
-  combined state, and opens the Ctrl-O review gate showing the diff and result.
-  The gate IS the confirmation: the merge fires only if the captain presses [m]
-  over a green result. A conflict or a red build+test is shown but not mergeable.
-  On a merge the worktree and branch are torn down. There is no separate confirm
-  step and no way to merge without that keystroke, so never claim a feature
-  landed just because you called feature_land.
+- \`feature_land(name)\` — when a feature is done, land it into \`dev\`. This fetches,
+  rebases its branch onto the current \`origin/dev\` tip, runs the project build+test
+  on that combined state, pushes the branch and opens (or refreshes) its pull
+  request, then opens the Ctrl-O review gate showing the PR and the result. The
+  gate IS the confirmation: the merge fires only if the captain presses [m] over a
+  green result. A conflict or a red build+test is shown but not mergeable, and
+  neither is ever pushed or PR'd. On a merge the worktree is torn down and the
+  branch ref is kept. There is no separate confirm step and no way to merge
+  without that keystroke, so never claim a feature landed just because you called
+  feature_land.
 - \`feature_enqueue(name)\` — the normal way a finished feature lands. It joins a
   strictly serial merge queue: only the HEAD is ever worked, and it works itself
-  out — rebased onto the current \`dev\` tip and build+tested on that combined
-  state — coming back \`ready\`, \`blocked\`, or \`resolving\`. No confirm gate; call
-  it as soon as the captain says a feature is done.
-- **The merge itself is not yours.** A \`ready\` head shows its own diff, commits
-  and build+test result in the captain's Ctrl-O queue tab with a live \`[m]\`
-  beside them, and that keystroke merges it, tears the worktree down, advances
-  the queue and processes the next head. It sits there until they press it. You
-  do not open it, trigger it, wait for it, or ask for it — report that the head
-  is ready and carry on with something else. \`feature_merge_head\` is a fallback
-  for sessions with no panel; do not use it as the merge path.
+  out — rebased onto the freshly-fetched \`origin/dev\` tip, build+tested on that
+  combined state, pushed and PR'd — coming back \`ready\`, \`blocked\`, or
+  \`resolving\`. No confirm gate; call it as soon as the captain says a feature is
+  done.
+- **The merge itself is not yours.** A \`ready\` head shows its pull request,
+  commits and build+test result in the captain's Ctrl-O queue tab with a live
+  \`[m]\` beside them, and that keystroke merges the PR on GitHub (a merge commit),
+  tears the worktree down, advances the queue and processes the next head. It sits
+  there until they press it — and they may edit the PR on GitHub first. You do not
+  open it, trigger it, wait for it, or ask for it — report that the head is ready,
+  give them the PR link if you have it, and carry on with something else.
+  \`feature_merge_head\` is a fallback for sessions with no panel; do not use it as
+  the merge path.
+- If a head comes back blocked because a PREREQUISITE is missing — no \`gh\`, gh not
+  authenticated, no \`origin/dev\` — relay that message as-is. It is the captain's
+  to fix (install/authenticate gh, or push a \`dev\` branch); you cannot work around
+  it and must not try to merge some other way.
 - You engage on a BLOCKED head, and only then. If a merge leaves the new head
   blocked you are told automatically — you do not need the captain to relay it.
   Say in one line what is blocked and why, and for a rebase conflict or a red
@@ -437,16 +448,16 @@ reach stops at \`dev\`; you never write \`main\` and there is no promote path.
   the jobs dispatched under each, and the merge-queue position/state of anything
   enqueued. Use these to see what is in flight.
 - \`feature_abandon(name)\` — drop a feature WITHOUT landing: tears down its
-  worktree and deletes the branch only if it is fully merged. It refuses a
-  worktree with uncommitted changes (it reports instead of forcing) and keeps a
-  committed-but-unmerged branch rather than lose work. If it refuses, tell the
-  captain what is uncommitted and let them decide.
+  worktree and deletes the branch only if it is already contained in
+  \`origin/dev\`. It refuses a worktree with uncommitted changes (it reports
+  instead of forcing) and keeps a committed-but-unmerged branch rather than lose
+  work. If it refuses, tell the captain what is uncommitted and let them decide.
 - Use a feature when work should stay isolated (a risky change, parallel tracks,
   anything you will want to review and land as a unit). Use a bare dispatch for a
   quick one-off directly on the tree. Feature state is rebuilt from disk at
   startup, so a feature survives a restart; if startup surfaces an anomaly (a
-  branch with no worktree, a half-landed branch), relay it rather than acting
-  blindly.`;
+  branch holding unmerged work whose worktree is gone, a stray directory), relay
+  it rather than acting blindly.`;
 }
 
 export async function buildSystemPrompt(

@@ -6,7 +6,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { instancePaths } from "../paths.js";
-import { defaultWorktreeBase } from "./worktrees.js";
+import { defaultWorktreeBase, provisionWorktree } from "./worktrees.js";
+import { makeFakeForge } from "./forgefake.test.js";
 import {
   defaultDispatchConfig,
   writeDispatchConfig,
@@ -1520,6 +1521,9 @@ test("feature dispatch end-to-end: real provision, crew cwd = worktree on co/fea
     await fsp.writeFile(path.join(repo, "file.txt"), "hello\n", "utf8");
     runGit(repo, ["add", "."]);
     runGit(repo, ["commit", "-q", "-m", "init"]);
+    // Feature worktrees are cut from origin/dev, so the repo needs one. The fake
+    // forge serves it (and the fetch) with no network and no gh binary.
+    const forge = makeFakeForge(repo, { dev: runGit(repo, ["rev-parse", "main"]) });
 
     const paths = instancePaths(path.join(root, "home"), "inst");
     await fsp.mkdir(paths.captures, { recursive: true });
@@ -1532,7 +1536,15 @@ test("feature dispatch end-to-end: real provision, crew cwd = worktree on co/fea
 
     const queue = onCompleteQueue();
     await withRegistry(
-      { paths, config, onComplete: queue.handler, skipAnchorCheck: true, pollIntervalMs: 10_000 },
+      {
+        paths,
+        config,
+        onComplete: queue.handler,
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        // The REAL provisioning code path, with only the remote faked.
+        provisionWorktree: (opts, feature) => provisionWorktree({ ...opts, run: forge.run }, feature),
+      },
       async (reg) => {
         const worktree = path.join(defaultWorktreeBase(repo), "auth");
         const j1 = await reg.dispatch("one", undefined, { feature: "auth" });

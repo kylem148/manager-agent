@@ -2,29 +2,34 @@ import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import fs from "node:fs";
 import path from "node:path";
+import { requireRemoteDev, type CommandRunner } from "./forge.js";
 
 /**
  * Git-worktree lifecycle for parallel dispatch — the lowest layer of the
  * feature-isolation scheme. Each "feature" gets its own worktree on a fresh
- * `co/feat-<slug>` branch cut from the `dev` integration branch; a crew agent
- * works there in isolation, and higher layers later rebase the finished branch
- * onto dev, build, test, and merge behind a human gate. This module is only
- * the hands: ensure dev exists, provision a worktree, tear one down, and sweep
- * up zombies after a crash. Deterministic plumbing — no model, no network.
+ * `co/feat-<slug>` branch cut from `origin/dev`; a crew agent works there in
+ * isolation, and higher layers later rebase the finished branch onto the fresh
+ * `origin/dev`, build, test, push it, and land it through a GitHub pull request
+ * behind a human gate. This module is only the hands: verify the remote
+ * integration branch, provision a worktree, tear one down, and sweep up zombies
+ * after a crash. Deterministic plumbing — no model.
  * The dispatch registry consumes provisionWorktree for its feature-scoped
  * dispatches (a crew process launched with cwd = the feature's worktree);
- * landing.ts (the rebase + build+test + gated-merge engine) consumes
- * teardownWorktree and the exported git helpers below.
+ * landing.ts (the rebase + build+test + PR engine) consumes teardownWorktree
+ * and the exported git helpers below.
  *
  * Safety posture (the invariants everything below preserves):
  *  - `main` is human-only: nothing here writes to it, checks it out, or
- *    deletes it. It is read exactly once, as the base for creating `dev`.
- *  - The only ref ever created besides `co/feat-*` branches is `dev`
- *    (create-only, off main); the only refs ever deleted are `co/feat-*`.
- *  - A branch is deleted only when it is truly merged into dev — a merge-base
- *    ancestor check, not `git branch -d`'s HEAD-relative one (HEAD is usually
- *    main here, so -d would misjudge). Unmerged work is kept and reported,
- *    never force-dropped.
+ *    deletes it.
+ *  - THE LOCAL `dev` REF IS NEVER WRITTEN, and never even read (D-20260724-13).
+ *    `dev` is checked out in the captain's primary tree; the integration ref
+ *    everything here compares against is the remote-tracking `origin/dev`,
+ *    advanced only by `git fetch`. The only refs ever created are `co/feat-*`.
+ *  - A `co/feat-*` branch is deleted only on an explicit abandon, and only when
+ *    it is truly merged into `origin/dev` — a merge-base ancestor check, not
+ *    `git branch -d`'s HEAD-relative one (HEAD is usually main here, so -d would
+ *    misjudge). Unmerged work is kept and reported, never force-dropped. After a
+ *    PR merge the branch ref is kept deliberately (teardown's `keepBranch`).
  *  - A worktree with uncommitted changes is never removed: teardown throws,
  *    reconcile keeps it with a reason.
  *
@@ -51,7 +56,7 @@ import path from "node:path";
 
 export const FEATURE_BRANCH_PREFIX = "co/feat-";
 const DEFAULT_DEV_BRANCH = "dev";
-const DEFAULT_BASE_BRANCH = "main";
+const DEFAULT_REMOTE = "origin";
 
 /** The build artifacts provision links from the primary tree so a worktree is
  *  buildable without an install. Order matters only for readability. */
@@ -83,18 +88,26 @@ export interface WorktreeOptions {
   /** Managed home for feature worktrees, OUTSIDE the repo working tree.
    *  Defaults to a sibling of the repo: `<repo>-worktrees`. */
   baseDir?: string;
-  /** The integration branch features are cut from. Default "dev". */
+  /** The integration branch features are cut from and PR'd into. Default "dev".
+   *  Always addressed through the remote (`<remote>/<devBranch>`) — the local
+   *  ref of the same name is never read or written. */
   devBranch?: string;
-  /** The branch dev is created off when missing. Default "main"; never
-   *  written, only read. */
-  baseBranch?: string;
+  /** The remote carrying the integration branch. Default "origin". */
+  remote?: string;
+  /** Injected command runner for everything that touches the remote (fetch,
+   *  push, gh). Tests pass a fake; production omits it. */
+  run?: CommandRunner;
 }
 
 export interface ResolvedWorktreeOptions {
   repoPath: string;
   baseDir: string;
   devBranch: string;
-  baseBranch: string;
+  remote: string;
+  /** The remote-tracking integration ref, e.g. "origin/dev". THE base for every
+   *  cut, rebase and ancestor check in the feature flow. */
+  devRef: string;
+  run?: CommandRunner;
 }
 
 /** The default managed worktree home: a sibling dir of the repo. */
@@ -111,11 +124,32 @@ export function resolveWorktreeOptions(opts: WorktreeOptions): ResolvedWorktreeO
   if (baseDir === repoPath || baseDir.startsWith(repoPath + path.sep)) {
     throw new Error(`worktree base ${baseDir} must live outside the repo working tree ${repoPath}`);
   }
+  const devBranch = opts.devBranch ?? DEFAULT_DEV_BRANCH;
+  const remote = opts.remote ?? DEFAULT_REMOTE;
   return {
     repoPath,
     baseDir,
-    devBranch: opts.devBranch ?? DEFAULT_DEV_BRANCH,
-    baseBranch: opts.baseBranch ?? DEFAULT_BASE_BRANCH,
+    devBranch,
+    remote,
+    devRef: `${remote}/${devBranch}`,
+    ...(opts.run ? { run: opts.run } : {}),
+  };
+}
+
+/** The ForgeOptions any of these options resolve to — the one place the two
+ *  option shapes are bridged, so no caller hand-assembles a forge config. */
+export function forgeOptions(opts: WorktreeOptions): {
+  repoPath: string;
+  remote: string;
+  devBranch: string;
+  run?: CommandRunner;
+} {
+  const r = resolveWorktreeOptions(opts);
+  return {
+    repoPath: r.repoPath,
+    remote: r.remote,
+    devBranch: r.devBranch,
+    ...(r.run ? { run: r.run } : {}),
   };
 }
 
@@ -175,6 +209,13 @@ export async function git(cwd: string, args: string[]): Promise<string> {
 export async function branchExists(repoPath: string, branch: string): Promise<boolean> {
   const res = await runGit(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
   return res.code === 0;
+}
+
+/** Whether ANY ref resolves — used for the remote-tracking integration ref
+ *  (`origin/dev`), which is not under refs/heads and so is not a branchExists. */
+export async function refExists(repoPath: string, ref: string): Promise<boolean> {
+  const res = await runGit(repoPath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+  return res.code === 0 && res.stdout.trim() !== "";
 }
 
 /** Whether `branch` is fully contained in `target` — the guard that decides a
@@ -276,28 +317,28 @@ export async function isWorktreeDirty(worktreePath: string): Promise<boolean> {
 // --- lifecycle ---------------------------------------------------------------
 
 /**
- * Ensure the `dev` integration branch exists, creating it off `main` when
- * missing. Create-only and idempotent: an existing dev is never moved, and
- * main is only ever read. No checkout happens — `git branch dev main` writes
- * a ref, nothing else.
+ * Verify the integration branch is reachable on the remote, freshening the
+ * remote-tracking ref first. This REPLACED an earlier `ensureDevBranch` that
+ * created a local `dev` off `main` (D-20260724-13): co no longer owns `dev` in
+ * any sense — it neither creates it nor writes it. `dev` lives on the forge,
+ * features are cut from `origin/dev`, and they land on it through a pull
+ * request. A repo with no `origin/dev` is a clean, actionable refusal, not
+ * something for co to invent.
  */
-export async function ensureDevBranch(opts: WorktreeOptions): Promise<{ created: boolean; devBranch: string }> {
+export async function ensureRemoteDevBranch(
+  opts: WorktreeOptions,
+): Promise<{ devRef: string; devBranch: string }> {
   const r = resolveWorktreeOptions(opts);
-  if (await branchExists(r.repoPath, r.devBranch)) return { created: false, devBranch: r.devBranch };
-  if (!(await branchExists(r.repoPath, r.baseBranch))) {
-    throw new Error(
-      `cannot create '${r.devBranch}': base branch '${r.baseBranch}' does not exist in ${r.repoPath}`,
-    );
-  }
-  await git(r.repoPath, ["branch", r.devBranch, r.baseBranch]);
-  return { created: true, devBranch: r.devBranch };
+  await requireRemoteDev(forgeOptions(opts));
+  return { devRef: r.devRef, devBranch: r.devBranch };
 }
 
 /**
  * Provision a feature: a new worktree at `<baseDir>/<slug>` on a fresh
- * `co/feat-<slug>` branch cut from dev, with build artifacts symlinked from
- * the primary tree. Ensures dev first, so this works on a repo that has never
- * seen the flow.
+ * `co/feat-<slug>` branch cut from the freshly-fetched `origin/dev`, with build
+ * artifacts symlinked from the primary tree. Verifies the remote integration
+ * branch first, so a repo that can't support the flow fails here with a clear
+ * message instead of halfway through a landing.
  *
  * Idempotent for an already-provisioned feature (same branch, same path): the
  * existing worktree is returned, artifacts re-linked. Any OTHER collision — a
@@ -311,7 +352,7 @@ export async function provisionWorktree(opts: WorktreeOptions, feature: string):
   const branch = `${FEATURE_BRANCH_PREFIX}${slug}`;
   const worktreePath = path.join(r.baseDir, slug);
 
-  await ensureDevBranch(r);
+  await ensureRemoteDevBranch(opts);
 
   const existing = (await listWorktrees(r.repoPath)).find((w) => w.branch === `refs/heads/${branch}`);
   if (existing) {
@@ -332,7 +373,10 @@ export async function provisionWorktree(opts: WorktreeOptions, feature: string):
   }
 
   await fsp.mkdir(r.baseDir, { recursive: true });
-  await git(r.repoPath, ["worktree", "add", worktreePath, "-b", branch, r.devBranch]);
+  // Cut from the remote-tracking ref, never a local `dev`: the feature must be
+  // based on what the forge actually has, and `--no-track` keeps the new branch
+  // from adopting `origin/dev` as its upstream (it pushes to its own name).
+  await git(r.repoPath, ["worktree", "add", worktreePath, "-b", branch, "--no-track", r.devRef]);
   await linkArtifacts(r.repoPath, worktreePath);
   return { feature, slug, branch, worktreePath, provisionStatus: "ready" };
 }
@@ -346,19 +390,28 @@ export interface TeardownResult {
 }
 
 /**
- * Tear a feature down: remove its worktree, delete its branch, prune stale
- * worktree metadata. Tolerant of an already-removed worktree (a second
- * teardown is a no-op reporting false on both flags).
+ * Tear a feature down: remove its worktree, prune stale worktree metadata, and
+ * — unless told to keep it — delete its branch. Tolerant of an already-removed
+ * worktree (a second teardown is a no-op reporting false on both flags).
+ *
+ * `keepBranch` is how a LANDED feature is torn down (D-20260724-13): the PR
+ * merged the branch on the forge, so the branch ref is deliberately kept and
+ * only the local checkout goes away. Nothing here ever passes `--delete-branch`
+ * to gh either — the remote ref is the forge's and the captain's.
  *
  * Two things it will NOT do: remove a worktree with uncommitted changes
  * (`git worktree remove` without --force refuses, and the refusal is
- * surfaced, not overridden) and delete a branch that isn't fully merged into
- * dev — the merge-base ancestor check is the guard, and only a branch that
- * passes it is deleted (with -D, because -d judges against HEAD, which is the
- * primary tree's branch, not dev). An unmerged branch is kept and named in
- * the result.
+ * surfaced, not overridden) and, on an abandon, delete a branch that isn't
+ * fully merged into `origin/dev` — the merge-base ancestor check is the guard,
+ * and only a branch that passes it is deleted (with -D, because -d judges
+ * against HEAD, which is the primary tree's branch). An unmerged branch is kept
+ * and named in the result.
  */
-export async function teardownWorktree(opts: WorktreeOptions, feature: string): Promise<TeardownResult> {
+export async function teardownWorktree(
+  opts: WorktreeOptions,
+  feature: string,
+  extra: { keepBranch?: boolean } = {},
+): Promise<TeardownResult> {
   const r = resolveWorktreeOptions(opts);
   const slug = featureSlug(feature);
   const branch = `${FEATURE_BRANCH_PREFIX}${slug}`;
@@ -378,14 +431,18 @@ export async function teardownWorktree(opts: WorktreeOptions, feature: string): 
   let branchDeleted = false;
   let branchKeptReason: string | undefined;
   if (await branchExists(r.repoPath, branch)) {
-    const devExists = await branchExists(r.repoPath, r.devBranch);
-    if (devExists && (await isMergedInto(r.repoPath, branch, r.devBranch))) {
-      await git(r.repoPath, ["branch", "-D", branch]);
-      branchDeleted = true;
+    if (extra.keepBranch) {
+      branchKeptReason = `branch '${branch}' is kept by policy; only its worktree was removed`;
     } else {
-      branchKeptReason = devExists
-        ? `branch '${branch}' has commits not merged into '${r.devBranch}'`
-        : `no '${r.devBranch}' branch to verify the merge against`;
+      const devExists = await refExists(r.repoPath, r.devRef);
+      if (devExists && (await isMergedInto(r.repoPath, branch, r.devRef))) {
+        await git(r.repoPath, ["branch", "-D", branch]);
+        branchDeleted = true;
+      } else {
+        branchKeptReason = devExists
+          ? `branch '${branch}' has commits not merged into '${r.devRef}'`
+          : `no '${r.devRef}' ref to verify the merge against`;
+      }
     }
   }
   return { branch, worktreeRemoved, branchDeleted, ...(branchKeptReason ? { branchKeptReason } : {}) };
@@ -394,7 +451,9 @@ export async function teardownWorktree(opts: WorktreeOptions, feature: string): 
 export interface ReconcileReport {
   /** Zombie worktrees removed (registered, clean, co/feat-* only). */
   removedWorktrees: string[];
-  /** co/feat-* branches deleted — each verified merged into dev first. */
+  /** co/feat-* branches deleted. Since branch refs are kept after a PR merge
+   *  (D-20260724-13) this sweep deletes none and the list stays empty; it is
+   *  retained so a caller's reporting shape does not change. */
   removedBranches: string[];
   /** Unregistered leftover dirs removed from the managed base (each verified
    *  to be one of our orphaned worktrees before deletion). */
@@ -413,10 +472,11 @@ export interface ReconcileReport {
  *  2. Registered `co/feat-*` worktrees: remove the clean ones; a worktree with
  *     uncommitted work is kept (reported). Non-feature worktrees — the primary
  *     tree, anything detached, any user worktree — are never touched.
- *  3. `co/feat-*` branches with no remaining worktree: deleted only when
- *     merged into dev (which includes the freshly-provisioned-then-crashed
- *     case, where the branch still equals dev). Unmerged branches are kept.
- *     No other ref is ever considered.
+ *  3. `co/feat-*` branches with no remaining worktree: KEPT, and reported.
+ *     Branch refs outlive their worktrees by policy now that features land
+ *     through a PR (D-20260724-13) — a merged branch is the normal steady
+ *     state, not a zombie — so this pass deletes nothing. No other ref is ever
+ *     considered either way.
  *  4. Stray directories under the managed base that git no longer knows about
  *     (registration lost mid-crash): removed only after verifying the dir's
  *     `.git` file points into THIS repo's worktree metadata; anything else in
@@ -455,10 +515,11 @@ export async function reconcileWorktrees(
     report.removedWorktrees.push(entry.path);
   }
 
-  // Pass 3: feature branches left with no worktree.
+  // Pass 3: feature branches left with no worktree. Kept either way — a branch
+  // whose PR has merged is kept on purpose, and an unmerged one holds work.
   const remaining = await listWorktrees(r.repoPath);
   const stillAttached = new Set(remaining.map((w) => w.branch).filter((b): b is string => b !== null));
-  const devExists = await branchExists(r.repoPath, r.devBranch);
+  const devExists = await refExists(r.repoPath, r.devRef);
   const refsOut = await git(r.repoPath, [
     "for-each-ref",
     "--format=%(refname:short)",
@@ -467,15 +528,15 @@ export async function reconcileWorktrees(
   for (const branch of refsOut.split("\n").map((l) => l.trim()).filter(Boolean)) {
     if (keepBranches.has(branch) || stillAttached.has(`refs/heads/${branch}`)) continue;
     if (!devExists) {
-      report.kept.push({ ref: branch, reason: `no '${r.devBranch}' branch to verify the merge against` });
+      report.kept.push({ ref: branch, reason: `no '${r.devRef}' ref to verify the merge against` });
       continue;
     }
-    if (await isMergedInto(r.repoPath, branch, r.devBranch)) {
-      await git(r.repoPath, ["branch", "-D", branch]);
-      report.removedBranches.push(branch);
-    } else {
-      report.kept.push({ ref: branch, reason: `not merged into '${r.devBranch}'` });
-    }
+    report.kept.push({
+      ref: branch,
+      reason: (await isMergedInto(r.repoPath, branch, r.devRef))
+        ? `landed in '${r.devRef}'; branch refs are kept`
+        : `not merged into '${r.devRef}'`,
+    });
   }
 
   // Pass 4: unregistered leftovers in the managed base dir.
@@ -503,14 +564,16 @@ export async function reconcileWorktrees(
 /** What a boot reconcile could not cleanly account for. Every anomaly is
  *  SURFACED for a human/the co to resolve; reconcileFeatures never acts on one. */
 export type FeatureAnomalyKind =
-  /** A `co/feat-*` branch with no worktree that is NOT merged into dev: it holds
-   *  unmerged work but its checkout is gone (a crashed run, a manually-removed
-   *  worktree). Re-provision or investigate before the work is lost. */
+  /** A `co/feat-*` branch with no worktree that is NOT merged into `origin/dev`:
+   *  it holds unmerged work but its checkout is gone (a crashed run, a manually-
+   *  removed worktree). Re-provision or investigate before the work is lost.
+   *
+   *  Its counterpart — a branch with no worktree that IS contained in
+   *  `origin/dev` — is NOT an anomaly any more (D-20260724-13). That is exactly
+   *  what a landed feature looks like: the PR merged, the worktree was torn down,
+   *  the branch ref was kept on purpose. Reporting it would mean flagging every
+   *  feature ever landed on every boot. */
   | "branch-without-worktree"
-  /** A `co/feat-*` branch with no worktree that IS fully contained in dev: a
-   *  landing merged it but teardown never deleted the branch, or it never
-   *  diverged. No unmerged work; safe to tear down. */
-  | "half-landed"
   /** A directory under the managed base that git does not list as a worktree:
    *  an orphaned checkout (registration lost) or something foreign. Never ours
    *  to delete blindly, so it is reported for a human to judge. */
@@ -550,10 +613,10 @@ export interface FeatureReconcileReport {
  *
  *  - Every registered `co/feat-*` worktree whose directory exists becomes a
  *    ready record.
- *  - A `co/feat-*` branch with no worktree is an anomaly: `half-landed` when it
- *    is fully contained in dev (a landing that didn't finish tearing down, or a
- *    never-diverged branch — no unmerged work), else `branch-without-worktree`
- *    (unmerged work whose checkout is gone).
+ *  - A `co/feat-*` branch with no worktree is an anomaly ONLY when it is not
+ *    contained in `origin/dev` (`branch-without-worktree`: unmerged work whose
+ *    checkout is gone). A branch that IS contained is a landed feature whose ref
+ *    was kept by policy — the normal state, reported as nothing at all.
  *  - A directory under the managed base that git doesn't list as a worktree is a
  *    `stray-directory` anomaly (an orphaned checkout or something foreign).
  */
@@ -568,7 +631,7 @@ export async function reconcileFeatures(opts: WorktreeOptions): Promise<FeatureR
   await git(r.repoPath, ["worktree", "prune"]);
 
   const worktrees = await listWorktrees(r.repoPath);
-  const devExists = await branchExists(r.repoPath, r.devBranch);
+  const devExists = await refExists(r.repoPath, r.devRef);
 
   // Pass 1: registered feature worktrees → a ready record each.
   const attached = new Set<string>();
@@ -597,25 +660,17 @@ export async function reconcileFeatures(opts: WorktreeOptions): Promise<FeatureR
   ]);
   for (const branch of refsOut.split("\n").map((l) => l.trim()).filter(Boolean)) {
     if (attached.has(branch)) continue;
-    const merged = devExists && (await isMergedInto(r.repoPath, branch, r.devBranch));
-    if (merged) {
-      anomalies.push({
-        kind: "half-landed",
-        ref: branch,
-        detail:
-          `branch '${branch}' is fully contained in '${r.devBranch}' but has no worktree — ` +
-          `a landing left it behind (or it never diverged). No unmerged work; safe to tear down.`,
-      });
-    } else {
-      anomalies.push({
-        kind: "branch-without-worktree",
-        ref: branch,
-        detail: devExists
-          ? `branch '${branch}' has commits not in '${r.devBranch}' but its worktree is gone — ` +
-            `unmerged work whose checkout was lost. Re-provision or investigate before dropping it.`
-          : `branch '${branch}' exists with no worktree and there is no '${r.devBranch}' to compare against.`,
-      });
-    }
+    // Contained in origin/dev = landed, worktree torn down, ref kept by policy.
+    // That is the resting state of every feature co has ever landed; silence.
+    if (devExists && (await isMergedInto(r.repoPath, branch, r.devRef))) continue;
+    anomalies.push({
+      kind: "branch-without-worktree",
+      ref: branch,
+      detail: devExists
+        ? `branch '${branch}' has commits not in '${r.devRef}' but its worktree is gone — ` +
+          `unmerged work whose checkout was lost. Re-provision or investigate before dropping it.`
+        : `branch '${branch}' exists with no worktree and there is no '${r.devRef}' to compare against.`,
+    });
   }
 
   // Pass 3: directories under the managed base git doesn't list as worktrees.

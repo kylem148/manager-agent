@@ -1,5 +1,11 @@
 import fs from "node:fs";
-import { DEFAULT_BUILD_TEST_COMMAND, executeLanding, prepareLanding } from "./landing.js";
+import type { CommandRunner } from "./forge.js";
+import {
+  DEFAULT_BUILD_TEST_COMMAND,
+  executeLanding,
+  prepareLanding,
+  type LandingOptions,
+} from "./landing.js";
 import { reviewLanding, type LandingGateHost, type LandingGateResult } from "./landinggate.js";
 import {
   MergeQueue,
@@ -31,7 +37,8 @@ import {
  * The co-facing feature levers: the tool layer that lets the co-manager drive
  * the worktree harness end to end — create a feature (provision its worktree),
  * dispatch crew into it (the registry already does the dispatch; targeting is
- * threaded through the tool/session layer), and land it through the Ctrl-O gate.
+ * threaded through the tool/session layer), and land it — as a GitHub pull
+ * request into `dev` (D-20260724-13) — through the Ctrl-O gate.
  *
  * This module is deliberately thin. All the real machinery lives below it:
  * worktrees.ts (git plumbing), the DispatchRegistry (the feature-record map +
@@ -70,6 +77,11 @@ export interface FeatureManagerOptions {
   registry: DispatchRegistry;
   /** The linked repo — the WorktreeOptions.repoPath every lever operates on. */
   repoPath: string;
+  /** The remote carrying the integration branch. Default "origin". */
+  remote?: string;
+  /** Injected runner for everything that touches the remote (fetch/push/gh).
+   *  Tests pass a fake so no network and no gh binary are involved. */
+  run?: CommandRunner;
   /** The human landing gate (the Tui). Absent off a real terminal (PlainIO):
    *  feature_land then reports that landing needs an interactive session. */
   gateHost?: LandingGateHost;
@@ -128,8 +140,9 @@ export interface LandResult {
   summary: string;
   /** The prepare kind the gate reviewed (green/conflict/failed). */
   prepared: LandingGateResult["prepared"]["kind"];
-  /** Present on a merge: the merge sha + integration branch. */
-  merged?: { mergeSha: string; target: string };
+  /** Present on a merge: the merge commit, the integration branch, and the PR
+   *  that carried it. */
+  merged?: { mergeSha: string; target: string; pr: { number: number; url: string } };
   /** Present when the gate's merge attempt was refused (a stale green, etc.). */
   error?: string;
 }
@@ -137,6 +150,8 @@ export interface LandResult {
 export class FeatureManager {
   private readonly registry: DispatchRegistry;
   private readonly repoPath: string;
+  private readonly remote: string | undefined;
+  private readonly run: CommandRunner | undefined;
   private readonly gateHost?: LandingGateHost;
   private readonly buildTestCommand: string;
   private readonly deps: FeatureManagerDeps;
@@ -152,6 +167,8 @@ export class FeatureManager {
   constructor(opts: FeatureManagerOptions) {
     this.registry = opts.registry;
     this.repoPath = opts.repoPath;
+    this.remote = opts.remote;
+    this.run = opts.run;
     if (opts.gateHost) this.gateHost = opts.gateHost;
     this.buildTestCommand = opts.buildTestCommand ?? DEFAULT_BUILD_TEST_COMMAND;
     this.deps = {
@@ -165,6 +182,8 @@ export class FeatureManager {
     this.queue = new MergeQueue({
       repoPath: this.repoPath,
       buildTestCommand: this.buildTestCommand,
+      ...(this.remote ? { remote: this.remote } : {}),
+      ...(this.run ? { run: this.run } : {}),
       host: {
         isBusy: (feature) => this.isBusy(feature),
         forget: (feature) => {
@@ -186,7 +205,16 @@ export class FeatureManager {
   }
 
   private worktreeOptions(): WorktreeOptions {
-    return { repoPath: this.repoPath };
+    return {
+      repoPath: this.repoPath,
+      ...(this.remote ? { remote: this.remote } : {}),
+      ...(this.run ? { run: this.run } : {}),
+    };
+  }
+
+  /** The worktree options plus the build+test — what the landing engine takes. */
+  private landingOptions(): LandingOptions {
+    return { ...this.worktreeOptions(), buildTestCommand: this.buildTestCommand };
   }
 
   /** Find a tracked record by feature name OR slug — the two handles a caller
@@ -250,14 +278,16 @@ export class FeatureManager {
   }
 
   /**
-   * Land a feature: run the landing prepare (rebase onto dev + build+test on the
-   * combined state) and open the Ctrl-O gate on the result. The gate IS the
-   * confirmation — there is no separate prompt, and the merge fires only if the
-   * human presses [m] over a green prepare. On a merge the feature's worktree and
-   * branch are torn down (executeLanding), so its registry record is dropped too.
+   * Land a feature: run the landing prepare (fetch, rebase onto `origin/dev`,
+   * build+test on the combined state, push, open/refresh its PR) and open the
+   * Ctrl-O gate on the result. The gate IS the confirmation — there is no separate
+   * prompt, and the merge (`gh pr merge --merge`) fires only if the human presses
+   * [m] over a green prepare. On a merge the feature's worktree is torn down and
+   * its branch ref kept, so its registry record is dropped too.
    *
    * Refuses cleanly (never throws) when no interactive gate is available (a
-   * piped/non-TTY session) or when the feature isn't tracked.
+   * piped/non-TTY session), when the feature isn't tracked, or when a prerequisite
+   * is missing (no gh, not authenticated, no `origin/dev`).
    */
   async land(name: string): Promise<LandResult> {
     const record = this.findRecord(name);
@@ -294,24 +324,38 @@ export class FeatureManager {
       };
     }
 
-    const result = await this.deps.review(
-      this.gateHost,
-      { repoPath: this.repoPath, buildTestCommand: this.buildTestCommand },
-      feature,
-    );
-
     const target = resolveWorktreeOptions(this.worktreeOptions()).devBranch;
+    let result: LandingGateResult;
+    try {
+      result = await this.deps.review(this.gateHost, this.landingOptions(), feature);
+    } catch (e) {
+      // A prepare precondition failed — a missing prerequisite (no gh, not
+      // authenticated, no origin/dev) or a lifecycle problem. Report it, don't
+      // crash the tool call: the captain needs the message, not a stack.
+      const error = e instanceof Error ? e.message : String(e);
+      return {
+        feature,
+        outcome: "rejected",
+        prepared: "failed",
+        summary: `'${feature}' could not be prepared for landing: ${error}`,
+        error,
+      };
+    }
+
     if (result.outcome === "merged" && result.landed) {
-      // The worktree and branch are gone (executeLanding tore them down); drop
-      // the record and its intent so list/status reflect reality.
+      // The worktree is gone and the branch ref kept (executeLanding tore only
+      // the checkout down); drop the record and its intent so list/status
+      // reflect reality.
       this.registry.removeFeature(feature);
       if (record) this.intents.delete(record.slug);
       return {
         feature,
         outcome: "merged",
         prepared: result.prepared.kind,
-        summary: `landed ${feature}: ${result.landed.mergeSha.slice(0, 7)} on ${target}`,
-        merged: { mergeSha: result.landed.mergeSha, target },
+        summary:
+          `landed ${feature}: PR #${result.landed.pr.number} merged into ${target} ` +
+          `(${result.landed.mergeSha.slice(0, 7)})`,
+        merged: { mergeSha: result.landed.mergeSha, target, pr: result.landed.pr },
       };
     }
 
@@ -394,10 +438,11 @@ export class FeatureManager {
   }
 
   /**
-   * MERGE THE READY HEAD — the panel's [m] (D-20260724-12). Lands the head on
-   * dev, tears its worktree/branch down, advances the queue, and processes the
-   * new head against the new dev tip, all in one call and with nothing waiting on
-   * a human: the keystroke that got here IS the authorisation. Only a `ready`
+   * MERGE THE READY HEAD — the panel's [m] (D-20260724-12). Merges the head's
+   * pull request on GitHub, tears its worktree down (keeping the branch ref),
+   * advances the queue, and processes the new head against the freshly-fetched
+   * `origin/dev`, all in one call and with nothing waiting on a human: the
+   * keystroke that got here IS the authorisation. Only a `ready`
    * (green) head merges; anything else is refused cleanly with the reason and
    * writes nothing. Never throws.
    *
@@ -418,7 +463,8 @@ export class FeatureManager {
    *    reporting the head's state and that the live `[m]` in the Ctrl-O queue tab
    *    is the captain's to press. The co is free; there is nothing to wait for.
    *  - No panel (piped/non-TTY): there is no key to press, so the ready head is
-   *    merged directly — same guards, same executeLanding, still local-only.
+   *    merged directly — same guards, same executeLanding, same `gh pr merge
+   *    --merge`.
    */
   async mergeHead(): Promise<MergeHeadResult> {
     if (!this.gateHost) return this.queue.mergeReadyHead();
@@ -516,7 +562,7 @@ export class FeatureManager {
   /**
    * Boot reconcile: rebuild feature records from the on-disk worktrees and seed
    * the registry, so a feature survives a session restart. Non-destructive —
-   * anomalies (a branch with no worktree, a half-landed branch, a stray dir) are
+   * anomalies (a branch holding unmerged work with no worktree, a stray dir) are
    * returned for surfacing, never acted on. Records already tracked are
    * overwritten by the fresh on-disk truth.
    */
@@ -557,8 +603,8 @@ function buildResolveOrder(opts: {
   const { feature, branch, target, kind, buildTestCommand, reason } = opts;
   const diagnosis =
     kind === "conflict"
-      ? `Rebasing ${branch} onto ${target} hit merge conflicts.`
-      : `${branch} rebases onto ${target} cleanly, but the combined build+test is failing.`;
+      ? `Rebasing ${branch} onto origin/${target} hit merge conflicts.`
+      : `${branch} rebases onto origin/${target} cleanly, but the combined build+test is failing.`;
   const lines = [
     `You are resolving a blocked merge-queue head for the feature "${feature}".`,
     ``,
@@ -568,14 +614,15 @@ function buildResolveOrder(opts: {
     ...(reason ? [`Queue diagnosis: ${reason}`] : []),
     ``,
     `Do this, in order:`,
-    `1. Rebase ${branch} onto the current ${target} tip: \`git fetch\` if needed, then \`git rebase ${target}\`.`,
+    `1. \`git fetch origin\`, then rebase ${branch} onto the current remote tip: \`git rebase origin/${target}\`.`,
     `2. Resolve any conflicts so the rebase completes cleanly. Keep both sides' intent; do not drop work.`,
     `3. Make the combined build+test pass: run \`${buildTestCommand}\` and fix whatever is red until it is green.`,
     `4. Commit your resolution on ${branch} (the rebase's conflict resolutions plus any fixes). Leave the worktree clean.`,
     ``,
     `HARD RULES:`,
     `- NEVER check out, merge into, or push ${target} (dev) or main. You only ever touch ${branch} in this worktree.`,
-    `- Do not merge the feature yourself. The captain merges it through the review gate after you finish.`,
+    `- Do not push the branch and do not open or merge a pull request. The queue pushes ${branch} and opens its PR`,
+    `  itself once the rebased branch is green, and the captain merges that PR. Your job ends at a clean, green commit.`,
     `- Leave the worktree clean (no uncommitted changes) so the queue can re-process it.`,
     ``,
     `When \`${buildTestCommand}\` passes on the rebased branch and everything is committed, you are done.`,

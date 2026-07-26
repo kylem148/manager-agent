@@ -386,7 +386,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // Boot reconcile: rebuild feature records from the on-disk worktrees so a
   // feature (1 feature → 1 worktree → 1 branch) survives a restart. Read-only
   // over feature state — it rebuilds records and SURFACES anomalies (a branch
-  // with no worktree, a half-landed branch, a stray dir), destroying nothing.
+  // with unmerged work but no worktree, a stray dir), destroying nothing.
   // Best-effort: a repo that has never seen the flow, or a git hiccup, must not
   // block the session opening.
   if (state.features) {
@@ -985,7 +985,8 @@ async function panelMergeHead(state: SessionState): Promise<QueueMergeResult> {
   if (res.merged) {
     io.appendBlock(
       c.green(
-        `  · merged ${res.feature} → ${res.target} (${res.mergeSha?.slice(0, 7) ?? "?"})` +
+        `  · merged ${res.feature}${res.pr ? ` (PR #${res.pr.number})` : ""} → ${res.target} ` +
+          `(${res.mergeSha?.slice(0, 7) ?? "?"})` +
           (head ? `; next head '${head.feature}' is ${head.status}` : "; the queue is now empty"),
       ),
     );

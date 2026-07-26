@@ -250,14 +250,16 @@ export type QueueHeadDetail =
   | {
       kind: "ready";
       feature: string;
-      /** The integration branch the merge writes (e.g. "dev"). */
+      /** The integration branch the PR merges into (e.g. "dev"). */
       target: string;
       /** The per-job commits the merge preserves, oldest first. */
       commits: string[];
-      /** The full patch against the target — shown inline, under the list. */
-      diff: string;
       /** The build+test that passed on the rebased state: the merge's evidence. */
       buildTest?: { command: string; ms: number };
+      /** The open pull request [m] merges — title and body shown inline, so the
+       *  captain reads what will land where the key that lands it lives. The
+       *  patch itself is on GitHub (that is where they can comment on it). */
+      pr?: { number: number; url: string; title: string; body: string };
     }
   | {
       kind: "blocked";
@@ -372,7 +374,13 @@ export interface LandingReview {
 /** A prepare outcome shaped for display. The session layer maps the landing
  *  engine's result onto this, so the Tui stays free of git types. */
 export type LandingPrepared =
-  | { kind: "green"; commits: string[]; diff: string }
+  | {
+      kind: "green";
+      commits: string[];
+      diff: string;
+      /** The pull request [m] would merge, when the prepare opened one. */
+      pr?: { number: number; url: string; title: string };
+    }
   | { kind: "conflict"; conflictFiles: string[]; detail: string }
   | { kind: "failed"; exitCode: number; output: string };
 
@@ -504,6 +512,11 @@ function renderLandingBody(
     `${p.commits.length} commit${p.commits.length === 1 ? "" : "s"} · ` +
     `${files} file${files === 1 ? "" : "s"} changed`;
   rows.push(...wrap("  " + c.bold(summary)));
+  if (p.pr) {
+    // The merge is the PR's, so name it: [m] here presses `gh pr merge --merge`.
+    rows.push(...wrap("  " + c.cyan(`PR #${p.pr.number}`) + " " + p.pr.title));
+    rows.push(...wrap("  " + c.dim(p.pr.url)));
+  }
   rows.push("");
   if (p.commits.length === 0) {
     rows.push(...wrap("  " + c.yellow(`no commits beyond ${review.target}; nothing to land`)));
@@ -535,12 +548,14 @@ function buildTestPhrase(bt: { command: string; ms: number } | undefined, ok: bo
  * The queue head's inline body (D-20260724-12): everything the captain needs to
  * decide the [m] that sits right there in the same view.
  *
- * A READY head renders its evidence — commit count + files changed + the
- * build+test that passed, the per-job commit list, then the full patch against
- * the target. A BLOCKED head renders why it cannot merge (and offers no [m]
- * anywhere): the conflicted paths and git's account, or the red build+test's
- * exit code and output. Every line is wrapped, so nothing is clipped out of a
- * merge decision.
+ * A READY head renders the PULL REQUEST it would merge (D-20260724-13) — its
+ * number and URL, its title, the build+test that passed on the rebased state,
+ * the per-job commit list, and the PR description co composed. The patch is not
+ * repeated here: it lives on GitHub at that URL, which is also where the captain
+ * can edit the message or comment on it before pressing [m]. A BLOCKED head
+ * renders why it cannot merge (and offers no [m] anywhere): the conflicted paths
+ * and git's account, or the red build+test's exit code and output. Every line is
+ * wrapped, so nothing is clipped out of a merge decision.
  */
 export function renderQueueHeadDetail(detail: QueueHeadDetail, width: number): string[] {
   const wrap = (s: string): string[] => (s === "" ? [""] : wrapLine(s, width));
@@ -574,16 +589,18 @@ export function renderQueueHeadDetail(detail: QueueHeadDetail, width: number): s
     return rows;
   }
 
-  const files = diffFileCount(detail.diff);
+  const pr = detail.pr;
   rows.push(
     ...wrap(
       "  " +
-        c.bold(
-          `${detail.commits.length} commit${detail.commits.length === 1 ? "" : "s"} · ` +
-            `${files} file${files === 1 ? "" : "s"} changed`,
-        ),
+        c.bold(pr ? `PR #${pr.number} → ${detail.target}` : `${detail.feature} → ${detail.target}`) +
+        c.dim(` · ${detail.commits.length} commit${detail.commits.length === 1 ? "" : "s"}`),
     ),
   );
+  if (pr) {
+    rows.push(...wrap("  " + pr.title));
+    rows.push(...wrap("  " + c.dim(pr.url)));
+  }
   rows.push(...wrap("  " + c.green(buildTestPhrase(detail.buildTest, true))));
   rows.push("");
   for (const cl of detail.commits) {
@@ -591,11 +608,11 @@ export function renderQueueHeadDetail(detail: QueueHeadDetail, width: number): s
     const styled = sp === -1 ? c.dim(cl) : c.dim(cl.slice(0, sp)) + " " + cl.slice(sp + 1);
     rows.push(...wrap("  " + styled));
   }
-  if (detail.diff !== "") {
+  if (pr && pr.body.trim() !== "") {
     rows.push("");
-    rows.push(...wrap(c.dim(`── diff vs ${detail.target} ──`)));
+    rows.push(...wrap(c.dim("── pull request ──")));
     rows.push("");
-    for (const l of detail.diff.split("\n")) rows.push(...wrap(colorDiffLine(l)));
+    for (const l of pr.body.split("\n")) rows.push(...wrap("  " + l));
   }
   return rows;
 }
@@ -3292,7 +3309,7 @@ export class Tui implements SessionIO {
     const detailKey = !d
       ? "-"
       : d.kind === "ready"
-        ? `r:${d.feature}:${d.commits.length}:${d.diff.length}:${d.buildTest?.ms ?? -1}`
+        ? `r:${d.feature}:${d.commits.length}:${d.pr?.number ?? -1}:${d.pr?.body.length ?? 0}:${d.buildTest?.ms ?? -1}`
         : `b:${d.feature}:${d.blockedKind ?? "-"}:${d.reason.length}:${(d.detail ?? d.output ?? "").length}`;
     const entries = view.entries
       .map((e) => `${e.feature}/${e.status}/${e.commitsReady ?? ""}/${e.blockedKind ?? ""}/${e.resolveAttempts ?? ""}`)
@@ -3334,10 +3351,12 @@ export class Tui implements SessionIO {
       rows.push("  " + c.cyan(`merging ${this.queueMerging}…`));
     } else if (mergeable) {
       rows.push("");
-      rows.push(
-        "  " + c.dim("this head is ready — press ") + c.cyan("m") +
-          c.dim(mergeable.target ? ` to merge it onto ${mergeable.target}` : " to merge it"),
-      );
+      const what = mergeable.prNumber
+        ? ` to merge PR #${mergeable.prNumber}${mergeable.target ? ` into ${mergeable.target}` : ""}`
+        : mergeable.target
+          ? ` to merge it into ${mergeable.target}`
+          : " to merge it";
+      rows.push("  " + c.dim("this head is ready — press ") + c.cyan("m") + c.dim(what));
     }
     if (detail) {
       rows.push(...renderQueueHeadDetail(detail, this.cols));
@@ -3462,7 +3481,8 @@ export class Tui implements SessionIO {
       if (this.queueMerging) {
         left = " " + c.cyan(`merging ${this.queueMerging}…`) + " ";
       } else if (this.mergeableHead()) {
-        left = " " + c.cyan("m") + c.dim(" merge · space/b page · ") +
+        const m = this.mergeableHead();
+        left = " " + c.cyan("m") + c.dim(`${m?.prNumber ? ` merge PR #${m.prNumber}` : " merge"} · space/b page · `) +
           c.dim(`${tabHint}Esc close`) + " ";
       } else {
         left = ` ${c.dim("space/b page · " + tabHint + "Esc close")} `;
@@ -3493,7 +3513,7 @@ export class Tui implements SessionIO {
    * land. A source with no `headDetail` at all is trusted on its view, so a
    * minimal list source still works; one that HAS a body must agree with it.
    */
-  private mergeableHead(): { feature: string; target?: string } | null {
+  private mergeableHead(): { feature: string; target?: string; prNumber?: number } | null {
     if (!this.queue?.merge) return null;
     const view = this.queue.view();
     const head = view.head ?? view.entries[0] ?? null;
@@ -3503,7 +3523,11 @@ export class Tui implements SessionIO {
     if (!this.queue.headDetail) return { feature: head.feature };
     const detail = this.queue.headDetail();
     if (!detail || detail.kind !== "ready" || detail.commits.length === 0) return null;
-    return { feature: detail.feature, target: detail.target };
+    return {
+      feature: detail.feature,
+      target: detail.target,
+      ...(detail.pr ? { prNumber: detail.pr.number } : {}),
+    };
   }
 
   /** The drilled review view's action bar: [m] armed only for a mergeable prepare
