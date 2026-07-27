@@ -255,6 +255,7 @@ Slash-commands are optional overrides:
 | `/sync`            | refresh `activeContext.md` from recent activity           |
 | `/archive <log>`   | move a log's history into `archive/`                      |
 | `/effort [level]`  | show or set thinking effort for this session              |
+| `/cost`            | tokens, dollars and time spent — session, today, all time  |
 | `/help`            | list commands                                             |
 | `/exit`            | leave (auto-saves: refreshes `activeContext.md` if stale)  |
 
@@ -849,6 +850,71 @@ sources pays one fetch timeout rather than three. Memory writes are serialized
 behind a single queue (`memory/writequeue.ts`) so that concurrency can't
 interleave a read-modify-write.
 
+## What a turn costs
+
+Every turn is metered. Nothing is printed while you work — no running total, no
+warning, no nag — and the whole thing surfaces in one place, `/cost`:
+
+```
+cost
+  session    5,749 out          $0.4864     3 turn(s)
+  today      5,749 out          $0.4864     3 turn(s)
+  all time   55,249 out         $3.51       28 turn(s)
+
+  per day    $0.7015 per active day (5) · $0.5011 per calendar day (7)
+  last 7d    ▅▃·█▃·▄  $3.51  (07-21 → 07-27)
+  model time <1s this session · 3m 58s all time
+
+  session tokens: in 626 · cache write 23,592 · cache read 45,092 · out 5,749
+  us.anthropic.claude-opus-4-8 — bedrock $6.00/$30.00 per Mtok · cache write $12.00 (1h) · cache read $0.60
+  since 2026-07-21 · last turn 2026-07-27 14:22
+```
+
+Output tokens lead because that's the number you can hold onto. The dollar
+figure is computed from all four classes Bedrock bills separately, and it has
+to be: this app re-sends a ~22k-token prefix every round trip, so the prompt
+side dominates. In the session above, output was 35% of the bill; on a cold
+first turn, where the whole prefix is written to cache at the 2x rate, it was
+5%. A meter that priced output alone would be wrong by most of the invoice.
+
+**Two daily averages, because one of them is always the misleading one.** Per
+*active* day answers "what does a working day cost me"; per *calendar* day
+answers "what is this costing me to run". An instance used hard on five days
+out of thirty has a very different number for each, and showing only one
+invites the wrong conclusion. The `last 7d` sparkline is there so a spike or a
+trend is visible without reading a table — and a day with no turns is a gap
+(`·`), never a short bar, because "I didn't work" and "I worked cheaply" are
+different facts and flattening them is how an average starts lying.
+
+Days are bucketed in **your** timezone, not UTC. A session at 6pm Pacific is
+already tomorrow in UTC, and a meter that filed an evening's work under the next
+day would tell someone who'd been working since breakfast that today cost them
+nothing.
+
+`model time` is wall-clock spent inside `runTurn` — the time you actually spent
+waiting. It's banked in a `finally`, so a turn that errors out still counts the
+time even though it billed no tokens.
+
+The rates in `src/cost.ts` are **Bedrock's, not Anthropic's first-party list**.
+The same Opus 4.8 that costs $5/$25 per million on the Anthropic API costs
+$6/$30 here, so pricing against the first-party table would understate every
+invoice by 20%. A model with no rate on file still gets its tokens counted;
+`/cost` says the cost is unknown rather than inventing a number, and adding a
+model is one line.
+
+The totals live in `.cost.json` at the instance root, written after every turn
+rather than at exit, so a crash never loses the record of money already spent.
+It holds two things: an all-time aggregate per model that is never trimmed, and
+a rolling per-day series capped at 400 days. Ageing a day out of the series
+never touches the aggregate, so the all-time figure stays exact even once the
+daily detail behind it is gone. A ledger written before the series existed loads
+with its totals intact and an empty series — per-day figures start from the
+upgrade rather than being back-filled with numbers we can't know.
+
+Only turns this app makes are counted — crew panes run Claude Code and bill
+against your Claude Code account, not the Bedrock key, so they can't appear
+here.
+
 ## Architecture notes
 
 `src/` is one level deep: shared primitives and the bin entry sit at the root,
@@ -857,7 +923,7 @@ they want, so a cold start only loads what it uses.
 
 ```
 src/
-  index.ts config.ts paths.ts ui.ts model.ts research.ts
+  index.ts config.ts paths.ts ui.ts model.ts research.ts cost.ts
   cli/       auth.ts doctor.ts modelsdoctor.ts link.ts
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
              visuals.ts
@@ -881,6 +947,9 @@ Tests live next to the code they cover (`src/tui/keys.test.ts`, etc.).
   loop, thinking/effort config. Bedrock is the only backend (V1).
 - **`src/research.ts`** — `SearchProvider` (Brave/Tavily/SearXNG) and `Fetcher`
   (Jina/HTTP) behind small interfaces; everything optional.
+- **`src/cost.ts`** — the spend meter: Bedrock rate table, four-class pricing,
+  the durable per-instance ledger, and the `/cost` report. Silent by design;
+  `model.ts` feeds it and nothing else reads it.
 
 **`src/memory/`** — `memory.ts` holds instance scaffolding, live-state
 read/rewrite, append-only logs with decision-id minting, log search / range

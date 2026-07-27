@@ -1,6 +1,7 @@
 import { AnthropicBedrock } from "@anthropic-ai/bedrock-sdk";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Effort, ModelConfig } from "./config.js";
+import { emptyUsage, type TokenUsage } from "./cost.js";
 
 /**
  * Thin wrapper over the Anthropic Bedrock client. Responsibilities:
@@ -24,6 +25,18 @@ export interface ToolResult {
 }
 
 export type ToolExecutor = (block: ToolUseBlock) => Promise<ToolResult>;
+
+/** Everything one assistant turn needs. */
+export interface TurnArgs {
+  system: string;
+  messages: MessageParam[];
+  tools: Tool[];
+  executor: ToolExecutor;
+  handlers?: StreamHandlers;
+  maxToolRounds?: number;
+  /** Run this turn at a different effort than the session default. */
+  effort?: Effort;
+}
 
 export interface StreamHandlers {
   /** Called for each chunk of visible answer text. */
@@ -75,7 +88,9 @@ export interface StreamHandlers {
  * what mattered was proving the entry is not on the default clock. If a future
  * SDK or endpoint change rejects the field, drop back to a bare `ephemeral`.
  */
-const CACHE_CONTROL = { type: "ephemeral" as const, ttl: "1h" as const };
+export const CACHE_TTL = "1h" as const;
+
+const CACHE_CONTROL = { type: "ephemeral" as const, ttl: CACHE_TTL };
 
 /**
  * How many content blocks back the lagging message breakpoint sits. Each
@@ -154,6 +169,19 @@ function fmtMs(ms: number): string {
 export class ModelProvider {
   private client: AnthropicBedrock;
   private cfg: ModelConfig;
+  /**
+   * Tokens billed since the last drain, summed across every round of every turn.
+   *
+   * Accumulated unconditionally — unlike the CO_DEBUG_TIMING counters, which
+   * report the same numbers as a diagnostic and are off by default. Spend
+   * happens whether or not anyone asked to watch it, so the meter always runs;
+   * `/cost` is the only thing that ever shows it (see cost.ts).
+   */
+  private pending: TokenUsage = emptyUsage();
+  /** Wall-clock spent inside runTurn since the last drain — the time the
+   *  captain actually waited, which is the other half of "what did this cost".
+   *  Measured for every turn, not just under CO_DEBUG_TIMING. */
+  private pendingMs = 0;
 
   constructor(cfg: ModelConfig) {
     this.cfg = cfg;
@@ -213,6 +241,25 @@ export class ModelProvider {
   }
 
   /**
+   * Take everything billed since the last call, plus the wall-clock it took,
+   * and reset the counters.
+   *
+   * Drain-and-reset rather than a running getter so the caller can fold each
+   * turn into the durable ledger exactly once, with no risk of double-counting.
+   * The session drains in a `finally`, so a turn that throws part-way still
+   * banks the rounds that already completed and were already billed. (Tokens
+   * spent on a round that threw mid-stream are lost to the meter — the SDK
+   * gives us no usage for a message that never finalized. The elapsed time is
+   * still counted: the captain waited for it either way.)
+   */
+  drainUsage(): { usage: TokenUsage; ms: number } {
+    const drained = { usage: this.pending, ms: this.pendingMs };
+    this.pending = emptyUsage();
+    this.pendingMs = 0;
+    return drained;
+  }
+
+  /**
    * Change effort for the rest of the session (/effort). baseParams() is rebuilt
    * per turn, so the next turn picks this up; an in-flight turn is unaffected.
    * cfg is the live ModelConfig object, so the session's own view updates too.
@@ -254,17 +301,24 @@ export class ModelProvider {
    * Run one assistant turn to completion, resolving any tool calls via the
    * provided executor. Streams text deltas through handlers. Returns the full
    * final message and the (possibly extended) message history.
+   *
+   * A thin timing shim over the real loop: wall-clock is banked in a `finally`
+   * so a turn that throws still records the time the captain spent waiting for
+   * it. Keeping the shim separate is what lets the loop below keep its early
+   * returns instead of being wrapped in a try block.
    */
-  async runTurn(args: {
-    system: string;
-    messages: MessageParam[];
-    tools: Tool[];
-    executor: ToolExecutor;
-    handlers?: StreamHandlers;
-    maxToolRounds?: number;
-    /** Run this turn at a different effort than the session default. */
-    effort?: Effort;
-  }): Promise<{ messages: MessageParam[]; finalText: string }> {
+  async runTurn(args: TurnArgs): Promise<{ messages: MessageParam[]; finalText: string }> {
+    const startedAt = Date.now();
+    try {
+      return await this.runTurnInner(args);
+    } finally {
+      this.pendingMs += Date.now() - startedAt;
+    }
+  }
+
+  private async runTurnInner(
+    args: TurnArgs,
+  ): Promise<{ messages: MessageParam[]; finalText: string }> {
     const { system, tools, executor, handlers } = args;
     const messages = [...args.messages];
     const maxRounds = args.maxToolRounds ?? 12;
@@ -304,6 +358,19 @@ export class ModelProvider {
       }
 
       const message = await stream.finalMessage();
+
+      // Meter first, and unconditionally: everything below this line is either
+      // optional diagnostics or an early return, and the tokens are billed
+      // either way. Every field is read defensively — a counter is the least
+      // load-bearing thing in this file, and a missing usage block must cost an
+      // inaccurate /cost line, never the captain's turn.
+      const billed = message.usage;
+      if (billed) {
+        this.pending.input += billed.input_tokens ?? 0;
+        this.pending.cacheWrite += billed.cache_creation_input_tokens ?? 0;
+        this.pending.cacheRead += billed.cache_read_input_tokens ?? 0;
+        this.pending.output += billed.output_tokens ?? 0;
+      }
 
       if (timing) {
         const u = message.usage;

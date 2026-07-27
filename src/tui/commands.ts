@@ -32,6 +32,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "sync", desc: "refresh activeContext.md from recent activity" },
   { name: "archive", arg: "<log>", desc: "move a log's history into archive/" },
   { name: "effort", arg: "[level]", desc: "show or set thinking effort for this session" },
+  { name: "cost", desc: "tokens, dollars and time spent — session, today, all time" },
   { name: "help", desc: "this help" },
   { name: "exit", desc: "leave (auto-saves: refreshes activeContext.md)", aliases: ["quit"] },
 ];

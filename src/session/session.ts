@@ -3,7 +3,8 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { effortLevelsFor, parseEffort, type Config, type Effort } from "../config.js";
 import type { InstancePaths } from "../paths.js";
-import { ModelProvider, type MessageParam } from "../model.js";
+import { CACHE_TTL, ModelProvider, type MessageParam } from "../model.js";
+import { CostLedger, formatCostReport } from "../cost.js";
 import { buildSystemPrompt } from "./prompt.js";
 import {
   toolDefinitions,
@@ -132,6 +133,8 @@ interface SessionState {
    *  default its jobId/feature to the run the co was just handed, so the co only
    *  has to name them when it files a review for something else. */
   reviewingJob: Job | null;
+  /** The token/cost meter. Fed after every turn, shown only by /cost. */
+  costs: CostLedger;
 }
 
 const PROMPT_LABEL = c.cyan("you › ");
@@ -279,6 +282,10 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // after a restart still open its pull request with the message the co wrote.
   const featureStore = await FeatureStore.load(paths);
 
+  // The spend meter. Loads before the first turn (including the cold-start
+  // greeting, which is a real billed turn) and is otherwise silent all session.
+  const costs = await CostLedger.load(paths);
+
   const system = await buildSystemPrompt(paths, cfg.research, {
     excludeTranscript: transcript.file,
     dispatch: dispatch
@@ -352,6 +359,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     queueNotices: [],
     inbox,
     reviewingJob: null,
+    costs,
   };
 
   // Wire the job registry when linked. On completion a job is queued for review
@@ -686,6 +694,12 @@ async function drive(
   } finally {
     // Never leave the wheel spinning — including when the turn throws.
     io.setBusy(null);
+    // Bank what this turn cost, before anything else can fail. In the `finally`
+    // so a turn that threw still records the rounds that completed and were
+    // billed; a quiet turn (the exit distill) is metered exactly like a spoken
+    // one, because it costs exactly like one.
+    const spent = state.model.drainUsage();
+    await state.costs.record(state.model.modelId, spent.usage, { ms: spent.ms });
   }
 
   // If the model produced no streamed text but a final string exists, show it
@@ -1325,6 +1339,19 @@ async function handleCommand(state: SessionState, raw: string): Promise<CommandR
       }
       const dest = await archiveLog(state.paths, target);
       io.appendBlock(dest ? c.dim(`archived ${target} → ${dest}`) : c.dim(`${target} has nothing to archive`));
+      return "ok";
+    }
+
+    case "cost": {
+      // The one place spend is ever visible. Nothing else in the session
+      // mentions it — that's the whole design (see cost.ts).
+      for (const l of formatCostReport({
+        ledger: state.costs,
+        modelId: state.model.modelId,
+        cacheTtl: CACHE_TTL,
+      })) {
+        io.appendBlock(l);
+      }
       return "ok";
     }
 

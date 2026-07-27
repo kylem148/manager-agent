@@ -7,6 +7,7 @@ import path from "node:path";
  *
  *   <home>/
  *     instances/<name>/
+ *       .cost.json                   running token/cost meter, shown by /cost
  *       docs/                        user-facing documents (flat, starts empty)
  *         architecture.md, plan.md, ...  born with their workflow, via the doc tool
  *       .memory/                     hidden substrate the co-manager manages
@@ -81,6 +82,12 @@ export interface InstancePaths {
    *  Lives beside the dispatch config for the same reason the inbox does — feature
    *  worktrees are dispatch state — and is never written into the user's repo. */
   featureStore: string;
+  /** The running token/cost meter for this instance (see cost.ts). Sits at the
+   *  instance root rather than in .memory/ or .dispatch/ because it is neither:
+   *  not the co-manager's substrate (the co never reads or writes it, and it is
+   *  not in the system prompt) and not dispatch state. It is the app's own
+   *  bookkeeping about the app, surfaced only by /cost. */
+  costLedger: string;
   /** Directory holding per-job capture files. */
   captures: string;
   /** Resolve a per-job capture file under .dispatch/captures/. */
@@ -116,6 +123,7 @@ export function instancePaths(home: string, name: string): InstancePaths {
     dispatchConfig: path.join(dispatch, "config.json"),
     reviewInbox: path.join(dispatch, "inbox.json"),
     featureStore: path.join(dispatch, "features.json"),
+    costLedger: path.join(root, ".cost.json"),
     captures,
     captureFile: (jobId) => path.join(captures, `${jobId}.log`),
     liveFile: (f) => path.join(memory, f),
