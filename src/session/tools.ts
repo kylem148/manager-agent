@@ -291,7 +291,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "dispatch_order",
       description:
-        "Arm a direct dispatch of an implementation-ready order to the crew (the registered coding agent). This does NOT run anything: it stages the order and shows the captain the exact order text plus the resolved command and target, and waits. The dispatch fires only if the captain then types `confirm`; any other input cancels it. Use this instead of writing plain-text orders when the captain wants the order run directly. Draft the full order (same checklist as a written order: read-docs-first, goal, context, decisions, constraints, acceptance, verification, commit) as the `order` argument. Optionally scope it to a feature with `feature`: the crew then runs inside that feature's isolated worktree (provisioned on first use) instead of the bare main tree. Arm at most one order per turn.",
+        "Arm a direct dispatch of an implementation-ready order to the crew (the registered coding agent). This does NOT run anything: it stages the order and shows the captain the exact order text plus the resolved command and target, and waits. The dispatch fires only if the captain then types `confirm`; any other input cancels it. Use this instead of writing plain-text orders when the captain wants the order run directly. Draft the full order (same checklist as a written order: read-docs-first, goal, context, decisions, constraints, acceptance, verification, close-the-report, commit) as the `order` argument. Optionally scope it to a feature with `feature`: the crew then runs inside that feature's isolated worktree (provisioned on first use) instead of the bare main tree. Arm at most one order per turn.",
       input_schema: {
         type: "object",
         properties: {
@@ -361,12 +361,12 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
           prTitle: {
             type: "string",
             description:
-              "The pull request's title: one concise imperative line saying what this PR does (e.g. \"Add passkey login to the web app\"). Write it as a developer would — no bot voice, no attribution, nothing about how the work was produced. Omitted, the title falls back to the branch's commit subject.",
+              "The pull request's title: one concise imperative line saying what this PR does (e.g. \"Add passkey login to the web app\"), specific enough to stand alone as the permanent history entry — never \"Fix bug\", \"Update .gitignore\", or \"Changes per feedback\". Write it as a developer would — no bot voice, no attribution, nothing about how the work was produced. Omitted, the title falls back to the branch's commit subject.",
           },
           prBody: {
             type: "string",
             description:
-              "The pull request's description: short human prose (a paragraph, or a few lines) on what the PR accomplishes and why — the context a reviewer wants and the diff does not show. Plain markdown, no headings ceremony, no attribution or co-provenance boilerplate, and never a commit list or a checks summary (co appends those itself). Omitted, the description falls back to a one-line mechanical summary.",
+              "The pull request's description, written to the five-section template the dispatch protocol specifies (`## What`, `## Why`, `## How`, `## Testing`, `## Other Notes`, dropping any section you would leave empty): What and Why carry what the PR accomplishes and why, How carries the approaches tried and abandoned, Testing records ONLY the local verification the crew actually ran and its results, never a to-do list for the reader. No attribution or co-provenance boilerplate, and never a commit list or a checks summary (co appends those itself). Omitted, the description falls back to a one-line mechanical summary.",
           },
         },
         required: ["name"],

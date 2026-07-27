@@ -625,6 +625,19 @@ stored. Either way co only ever writes the message when it CREATES the pull
 request — once it exists, the title and the description are yours, and
 re-processing rewrites nothing but the fenced evidence.
 
+**The message has a shape.** The description is five sections: `## What` changed,
+`## Why` it was necessary, `## How` it was approached (the roads not taken
+included), `## Testing` for the verification that was actually run, and
+`## Other Notes` for what is deliberately left out and what comes next. A section
+with nothing real to say is dropped rather than left as empty scaffolding, so a
+one-line fix stays a title and two sections. co never sees the diff, so the
+material for What and Testing comes out of the crew's completion report, which
+every order now tells the crew to close with three things: the diffstat, the
+verification it ran with its real output, and the approaches it tried and
+abandoned with the reason each was dropped. Testing is a record of what was done,
+never a to-do list for the reader, and it covers the crew's local verification
+only: the PR's CI result is already in the fenced block below it.
+
 **And you can rewrite it without leaving the terminal: `e`.** On the queue tab,
 beside the `[m]`, `e` opens the head PR's message in a small editor over the
 panel — line 1 the title, a blank line, then the description, the way you write a
