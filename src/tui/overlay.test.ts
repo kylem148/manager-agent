@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   Tui,
+  normalizeSelection,
   osc52,
   renderMarkdownDoc,
   type DocSource,
@@ -532,6 +533,240 @@ test("y does not disturb paging, back, or close on a doc", async () => {
   h.send("done\r");
   assert.equal(await answer, "done", "and the prompt never saw any of it");
   h.stop();
+});
+
+// --- selecting text inside the panel with the mouse ---------------------------
+//
+// The panel keeps mouse reporting on and owns the whole screen, so the terminal
+// will not do its own click-drag here. It gets the transcript's treatment: a
+// left-drag highlights and, on release, copies through OSC 52. This is what
+// makes a PARTIAL copy possible - `y` takes a whole doc, a drag takes the bit
+// you actually want, on any view.
+
+/** An SGR 1006 mouse report. Screen coords are 1-based; the panel body starts at
+ *  row 2 (row 1 is the header, the last row is the footer). */
+const mousePress = (x: number, y: number): string => `\x1b[<0;${x};${y}M`;
+const mouseDrag = (x: number, y: number): string => `\x1b[<32;${x};${y}M`;
+const mouseRelease = (x: number, y: number): string => `\x1b[<0;${x};${y}m`;
+
+test("a left-drag over a doc selects those cells and copies them on release", async () => {
+  // Three short lines, so the body rows map predictably onto screen rows 2,3,4…
+  const docs = fakeDocs({ "notes.md": "alpha\nbravo\ncharlie\n" });
+  const h = harness(docs, 60, 12);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  assert.match(h.lastFramePlain(), /alpha/, "the doc is on screen");
+
+  const before = h.writes().length;
+  // Drag across "alpha" only: columns 1..5 on its row. The row is read back out
+  // of the frame rather than assumed - the renderer may prepend a blank line.
+  const alphaRow = docRowOf(h, "alpha");
+  h.send(mousePress(1, alphaRow));
+  h.send(mouseDrag(5, alphaRow));
+  h.send(mouseRelease(5, alphaRow));
+  await settle();
+  assert.equal(clipboardPayload(h.writes().slice(before)), "alpha", "just the dragged cells");
+  h.stop();
+});
+
+/** The 1-based screen row a body line was painted on, read back out of the last
+ *  frame's cursor-positioning sequences. Keeps the mouse tests honest about
+ *  where the renderer actually put things. */
+function docRowOf(h: Harness, needle: string): number {
+  const frame = h.lastFrame();
+  const re = /\x1b\[(\d+);1H\x1b\[2K([^\x1b]*)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(frame)) !== null) {
+    if (stripAnsi(m[2]!).includes(needle)) return Number(m[1]);
+  }
+  throw new Error(`no painted row contains ${JSON.stringify(needle)}`);
+}
+
+test("a multi-row drag copies whole interior rows and partial end rows", async () => {
+  const docs = fakeDocs({ "notes.md": "alpha\nbravo\ncharlie\n" });
+  const h = harness(docs, 60, 12);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  const top = docRowOf(h, "alpha");
+
+  const before = h.writes().length;
+  // From column 3 of "alpha" through column 4 of "charlie": the interior row
+  // comes whole, the two end rows are cut at the drag's columns.
+  h.send(mousePress(3, top));
+  h.send(mouseDrag(4, top + 2));
+  h.send(mouseRelease(4, top + 2));
+  await settle();
+  assert.equal(clipboardPayload(h.writes().slice(before)), "pha\nbravo\nchar");
+  h.stop();
+});
+
+test("dragging upward copies the same text as dragging downward", async () => {
+  const docs = fakeDocs({ "notes.md": "alpha\nbravo\ncharlie\n" });
+  const h = harness(docs, 60, 12);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  const top = docRowOf(h, "alpha");
+
+  const before = h.writes().length;
+  h.send(mousePress(4, top + 2)); // start at the bottom, drag up
+  h.send(mouseDrag(3, top));
+  h.send(mouseRelease(3, top));
+  await settle();
+  assert.equal(clipboardPayload(h.writes().slice(before)), "pha\nbravo\nchar");
+  h.stop();
+});
+
+test("the dragged cells are highlighted, and the receipt names what was copied", async () => {
+  const docs = fakeDocs({ "notes.md": "alpha\nbravo\ncharlie\n" });
+  const h = harness(docs, 60, 12);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  const top = docRowOf(h, "alpha");
+
+  h.send(mousePress(1, top));
+  h.send(mouseDrag(5, top));
+  await settle();
+  // Reverse video is on while the drag is live, so the selection is visible.
+  assert.match(h.lastFrame(), /\x1b\[7malpha\x1b\[27m/, "the dragged cells are highlighted");
+
+  h.send(mouseRelease(5, top));
+  await settle();
+  assert.match(h.lastFramePlain(), /copied 1 line\b/, "singular for one row");
+  assert.match(h.lastFramePlain(), /allow clipboard access/, "with the OSC 52 caveat");
+  h.stop();
+});
+
+test("a selection spanning a paragraph break reads as continuous but copies a real blank line", async () => {
+  const docs = fakeDocs({ "notes.md": "alpha\n\nbravo\n" });
+  const h = harness(docs, 60, 12);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  const top = docRowOf(h, "alpha");
+
+  const before = h.writes().length;
+  h.send(mousePress(1, top));
+  h.send(mouseDrag(5, top + 2)); // through the blank row between them
+  await settle();
+  // highlightRange has nothing to reverse on an empty row, so without the filler
+  // the selection would tear into stripes at every paragraph break.
+  assert.match(h.lastFrame(), /\x1b\[7m \x1b\[27m/, "the blank row is highlighted through");
+
+  h.send(mouseRelease(5, top + 2));
+  await settle();
+  // The filler is presentational only: the clipboard gets a genuine empty line,
+  // not a stray space.
+  assert.equal(clipboardPayload(h.writes().slice(before)), "alpha\n\nbravo");
+  h.stop();
+});
+
+test("a click with no drag copies nothing and just dismisses the highlight", async () => {
+  const docs = fakeDocs({ "notes.md": "alpha\nbravo\n" });
+  const h = harness(docs, 60, 12);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  const top = docRowOf(h, "alpha");
+
+  const before = h.writes().length;
+  h.send(mousePress(3, top));
+  h.send(mouseRelease(3, top)); // pressed and released on the same cell
+  await settle();
+  assert.equal(clipboardPayload(h.writes().slice(before)), null, "nothing copied");
+  assert.ok(!h.lastFramePlain().includes("copied"), "and nothing claimed");
+  h.stop();
+});
+
+test("the next keypress clears the selection and its receipt", async () => {
+  const docs = fakeDocs({ "notes.md": "alpha\nbravo\ncharlie\n" });
+  const h = harness(docs, 60, 12);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  const top = docRowOf(h, "alpha");
+
+  h.send(mousePress(1, top));
+  h.send(mouseDrag(5, top));
+  h.send(mouseRelease(5, top));
+  await settle();
+  assert.match(h.lastFramePlain(), /copied 1 line/);
+
+  h.send("j"); // any key
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("copied 1 line"), "the receipt is gone");
+  assert.ok(!h.lastFrame().includes("\x1b[7malpha"), "and so is the highlight");
+  h.stop();
+});
+
+test("the wheel still scrolls the panel, and a drag never fires the queue's [m]", async () => {
+  const long = Array.from({ length: 100 }, (_, i) => `line ${i + 1}`).join("\n");
+  const docs = fakeDocs({ "long.md": long });
+  const h = harness(docs, 60, 12);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  assert.match(h.lastFramePlain(), /line 1line 2/, "at the top");
+  h.send("\x1b[<65;10;5M"); // wheel down
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("line 1line 2"), "the wheel still scrolls");
+  h.stop();
+});
+
+test("a drag selects on the inbox tab too, not just on a doc", async () => {
+  const entry: InboxPanelEntry = {
+    level: "L1",
+    verdict: "rework",
+    headline: "auth middleware never ran",
+    body: "zulu\nyankee\n",
+    timestamp: "2026-07-24T11:05:00.000Z",
+    jobId: "job-003",
+  };
+  const h = harness(undefined, 72, 14, undefined, { list: () => [entry] });
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1"); // drill into the filed review
+  await settle();
+  const row = docRowOf(h, "zulu");
+
+  const before = h.writes().length;
+  h.send(mousePress(1, row));
+  h.send(mouseDrag(4, row));
+  h.send(mouseRelease(4, row));
+  await settle();
+  assert.equal(clipboardPayload(h.writes().slice(before)), "zulu", "the body surface selects too");
+  h.stop();
+});
+
+test("normalizeSelection orders endpoints the same whichever way the drag went", () => {
+  const down = normalizeSelection({ anchorRow: 1, anchorCol: 2, focusRow: 3, focusCol: 4 });
+  const up = normalizeSelection({ anchorRow: 3, anchorCol: 4, focusRow: 1, focusCol: 2 });
+  assert.deepEqual(down, { top: 1, bottom: 3, topCol: 2, bottomCol: 5 });
+  assert.deepEqual(up, down, "direction is not information");
+  // A single cell still selects that one cell (bottomCol is exclusive).
+  assert.deepEqual(normalizeSelection({ anchorRow: 2, anchorCol: 7, focusRow: 2, focusCol: 7 }), {
+    top: 2, bottom: 2, topCol: 7, bottomCol: 8,
+  });
 });
 
 // --- empty + degraded --------------------------------------------------------

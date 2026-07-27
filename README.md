@@ -312,15 +312,18 @@ The session is a scrollable terminal UI, not a plain read-out:
   override key (Option in iTerm2, Fn in Terminal.app, Shift in most others) and
   drag, then copy as usual. To turn off mouse capture entirely (wheel stops
   scrolling, native click-drag selection always works), set `CO_MOUSE=off`.
-- **Copying a doc out** of the Ctrl-O panel is `y`. The panel takes the whole
-  keyboard and swallows the mouse (only the wheel scrolls there), so no drag can
-  select inside it — `y` on an open doc puts its **raw markdown** on your system
-  clipboard instead, which is what you actually want back from a cheat-sheet the
-  co-manager wrote: the source, not a width-wrapped screenshot of it. It goes
-  through OSC 52, so it works over SSH too. That sequence is write-only and
-  nothing acknowledges it, so if a paste comes up empty, allow clipboard access
-  in your terminal (Terminal.app doesn't support OSC 52 at all; iTerm2 and
-  Ghostty have a setting for it). The footer says so when you press the key.
+- **Copying out of the Ctrl-O panel** works two ways, because there are two
+  questions. **Drag** to select part of what you're looking at: the cells
+  highlight and the text is on your clipboard the moment you let go — on any
+  tab, so a PR link on the queue, a paragraph of a doc and a chunk of a filed
+  review all come out the same way. **`y`** on an open doc takes the whole
+  thing, as **raw markdown** rather than the painted rows, which is what you
+  actually want back from a cheat-sheet the co-manager wrote: the source, not a
+  width-wrapped screenshot of it. Both go through OSC 52, so both work over SSH.
+  That sequence is write-only and nothing acknowledges it, so if a paste comes up
+  empty, allow clipboard access in your terminal (Terminal.app doesn't support
+  OSC 52 at all; iTerm2 and Ghostty have a setting for it). The footer says so
+  each time it copies.
 - **Pasting a large block** collapses it to a chip like `[Pasted text #1 +43
   lines]` instead of flooding the input, and the full text is sent when you
   submit (backspace deletes the whole chip). One-liners paste inline. This uses
@@ -1058,9 +1061,10 @@ callback that is the only thing the keystroke can reach; the features tab is
 read-only by construction (no selector, no `[m]`, it only pages), so the overview
 can never be the thing that merged something; a pending `feature_land` review
 gets a fifth tab of its own for as long as it is pending, so the two merges never
-share a key. A doc and a filed review drill into the same paged body view, and
-an open doc adds `y` — copy its raw markdown to the system clipboard over OSC 52,
-the same escape the transcript's drag-selection already uses.
+share a key. A doc and a filed review drill into the same paged body view. The
+panel body is one selection surface: a left-drag highlights and copies out of any
+view over OSC 52 (the same escape the transcript's own drag-selection uses), and
+an open doc additionally binds `y` to copy its raw markdown whole.
 `keys.ts` is the pure decode table that maps both legacy control bytes and
 enhanced-protocol CSI-u sequences onto one set of bindings. `tui.ts` is
 deliberately one large file: the render loop, input handling, and scroll state

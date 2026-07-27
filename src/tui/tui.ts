@@ -22,12 +22,12 @@
  *    SSH). The terminal's modifier-key override (hold Option in iTerm2, Fn in
  *    Terminal.app, Shift elsewhere) still works as a fallback, and CO_MOUSE=off
  *    disables capture entirely.
- *    The Ctrl-O panel takes the whole keyboard AND swallows the mouse (only the
- *    wheel scrolls there), so a drag can't select inside it. Getting text out of
- *    a doc is a KEY instead: `y` copies the open doc's raw markdown through the
- *    same OSC 52 path. Deliberately the source rather than the painted rows -
- *    the point is to carry away the document, not a width-wrapped screenshot of
- *    it.
+ *    The Ctrl-O panel gets the same treatment on its own body: a left-drag over
+ *    any panel view highlights and copies, so a paragraph of a doc, a PR link on
+ *    the queue tab or a chunk of a filed review all come out the same way. On
+ *    top of that a doc has `y`, which copies its RAW markdown rather than the
+ *    painted rows - the two answer different questions ("give me this bit of
+ *    what I'm looking at" vs "give me that document"), so both exist.
  *  - PgUp/PgDn/Ctrl-Home/Ctrl-End scroll from the keyboard; ↑/↓ navigate INPUT
  *    HISTORY (this is the behavior users expect and the old bug conflated).
  *  - SIGWINCH re-wraps and repaints. Every exit path restores the terminal.
@@ -106,6 +106,45 @@ function countLines(text: string): number {
  */
 export function osc52(text: string): string {
   return `${ESC}]52;c;${Buffer.from(text, "utf8").toString("base64")}\x07`;
+}
+
+/**
+ * What a copy tells the captain. It names what was SENT, not what landed: OSC 52
+ * is unacknowledged, so the moment of the copy is the only place worth spending
+ * a footer on the one way it silently fails.
+ */
+export function copyReceipt(lines: number): string {
+  return `copied ${lines} line${lines === 1 ? "" : "s"} · if nothing pastes, allow clipboard access (OSC 52)`;
+}
+
+/** A drag's two endpoints, in absolute row + 0-based visible column. */
+export interface SelectionRange {
+  anchorRow: number;
+  anchorCol: number;
+  focusRow: number;
+  focusCol: number;
+}
+
+/**
+ * Order a selection's endpoints top-to-bottom so highlight and copy don't care
+ * which direction the user dragged. `bottomCol` is exclusive (the column just
+ * past the last selected cell), so the cell the drag ended on is included.
+ *
+ * Shared by the transcript and the panel: two selection surfaces that disagreed
+ * about which end was the top would be two different bugs.
+ */
+export function normalizeSelection(sel: SelectionRange): {
+  top: number;
+  bottom: number;
+  topCol: number;
+  bottomCol: number;
+} {
+  const forward =
+    sel.focusRow > sel.anchorRow ||
+    (sel.focusRow === sel.anchorRow && sel.focusCol >= sel.anchorCol);
+  return forward
+    ? { top: sel.anchorRow, bottom: sel.focusRow, topCol: sel.anchorCol, bottomCol: sel.focusCol + 1 }
+    : { top: sel.focusRow, bottom: sel.anchorRow, topCol: sel.focusCol, bottomCol: sel.anchorCol + 1 };
 }
 
 /**
@@ -1050,13 +1089,26 @@ interface PanelState {
    *  unlike the docs/inbox lists it pages rather than clipping. */
   featuresScroll: number;
   /**
-   * The doc view's copy confirmation, shown in the footer in place of the key
-   * hints, or null. Sticky until the next panel key rather than timed out: it
-   * mirrors the transcript's finished selection, which stays highlighted as its
-   * own receipt until something dismisses it, and a copy is worth confirming
-   * for as long as the captain is still looking at what he copied.
+   * The copy confirmation, shown in the footer in place of the key hints, or
+   * null. Sticky until the next panel key rather than timed out: it mirrors the
+   * transcript's finished selection, which stays highlighted as its own receipt
+   * until something dismisses it, and a copy is worth confirming for as long as
+   * the captain is still looking at what he copied.
    */
   copyNotice: string | null;
+  /**
+   * Mouse text selection over the panel body, in the SAME shape the transcript
+   * uses. `anchorRow`/`focusRow` are absolute indices into the current view's
+   * body rows (not screen rows), so the selection survives scrolling mid-drag;
+   * the columns are 0-based visible columns. `selecting` is true only during an
+   * active left-drag - the highlight persists after release as the visual half
+   * of the receipt, until a key or a fresh click clears it.
+   */
+  selection: SelectionRange | null;
+  selecting: boolean;
+  /** The body row painted at the top of the viewport in the last paintPanel:
+   *  the anchor for mapping a mouse (x, y) back to an absolute body row. */
+  lastStart: number;
 }
 
 /**
@@ -1174,9 +1226,7 @@ export class Tui implements SessionIO {
   // click clears it. `lastPaintStart` is the transcript row shown at the top of
   // the viewport in the last paint(), the anchor for mapping mouse (x,y) back to
   // absolute coordinates.
-  private selection:
-    | { anchorRow: number; anchorCol: number; focusRow: number; focusCol: number }
-    | null = null;
+  private selection: SelectionRange | null = null;
   private selecting = false;
   private lastPaintStart = 0;
 
@@ -1839,39 +1889,18 @@ export class Tui implements SessionIO {
   private applySelection(line: string, absRow: number): string {
     const sel = this.selection;
     if (!sel) return line;
-    const { top, bottom, topCol, bottomCol } = this.normalizedSelection(sel);
+    const { top, bottom, topCol, bottomCol } = normalizeSelection(sel);
     if (absRow < top || absRow > bottom) return line;
     const from = absRow === top ? topCol : 0;
     const to = absRow === bottom ? bottomCol : Number.MAX_SAFE_INTEGER;
     return highlightRange(line, from, to);
   }
 
-  /**
-   * Order a selection's endpoints top-to-bottom so highlight/copy don't care
-   * which direction the user dragged. `bottomCol` is exclusive (the column just
-   * past the last selected cell).
-   */
-  private normalizedSelection(sel: NonNullable<Tui["selection"]>): {
-    top: number;
-    bottom: number;
-    topCol: number;
-    bottomCol: number;
-  } {
-    // bottomCol is exclusive, so the cell the drag ended on is included: +1
-    // past the ending cell's column.
-    const forward =
-      sel.focusRow > sel.anchorRow ||
-      (sel.focusRow === sel.anchorRow && sel.focusCol >= sel.anchorCol);
-    return forward
-      ? { top: sel.anchorRow, bottom: sel.focusRow, topCol: sel.anchorCol, bottomCol: sel.focusCol + 1 }
-      : { top: sel.focusRow, bottom: sel.anchorRow, topCol: sel.focusCol, bottomCol: sel.anchorCol + 1 };
-  }
-
   /** The plain text of the current selection, joined with newlines. */
   private selectionText(): string {
     const sel = this.selection;
     if (!sel) return "";
-    const { top, bottom, topCol, bottomCol } = this.normalizedSelection(sel);
+    const { top, bottom, topCol, bottomCol } = normalizeSelection(sel);
     const rowsAll = this.renderedRows();
     const out: string[] = [];
     for (let r = top; r <= bottom && r < rowsAll.length; r++) {
@@ -2755,6 +2784,9 @@ export class Tui implements SessionIO {
       queueSig: "",
       featuresScroll: 0,
       copyNotice: null,
+      selection: null,
+      selecting: false,
+      lastStart: 0,
     };
     if (this.docs) {
       this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
@@ -2787,6 +2819,8 @@ export class Tui implements SessionIO {
         this.panel.docs = docs;
         this.panel.docsLoading = false;
         this.panel.docsError = null;
+        // The list just changed under any selection standing on it.
+        this.clearPanelSelection();
         this.paint();
       }
     } catch (e) {
@@ -2915,11 +2949,11 @@ export class Tui implements SessionIO {
       const rows = renderMarkdownDoc(content, this.cols);
       const scroll = Math.min(this.panel.view.scroll, Math.max(0, rows.length - this.overlayViewport()));
       this.panel.view = { kind: "doc", name, content, rows, scroll, error: null };
-      // A copy receipt is only true of the text it was taken from. This is the
-      // one refresh path no keystroke passes through (an agent rewrote the doc
-      // under the captain), so retire the receipt here rather than let it vouch
-      // for content that has since moved on.
-      if (changed) this.panel.copyNotice = null;
+      // A receipt is only true of the text it was taken from, and a highlight
+      // only of the rows it was dragged over. This is the one refresh path no
+      // keystroke passes through (an agent rewrote the doc under the captain),
+      // so retire both here rather than let them vouch for content that moved.
+      if (changed) this.clearPanelSelection();
       this.paint();
     } catch {
       // Deleted out from under us: drop back to the list rather than show stale.
@@ -2932,6 +2966,9 @@ export class Tui implements SessionIO {
    *  the queue tab re-renders itself because its cache key carries the width. */
   private reflowPanel(): void {
     if (!this.panel) return;
+    // A resize re-wraps every row, so a selection made at the old width points
+    // at text that has moved. Drop it rather than highlight the wrong cells.
+    this.clearPanelSelection();
     const v = this.panel.view;
     if (v.kind === "doc") {
       const rows = renderMarkdownDoc(v.content, this.cols);
@@ -3043,13 +3080,12 @@ export class Tui implements SessionIO {
   }
 
   private consumeOverlayCsi(data: string, i: number): number {
-    // Mouse: swallow, and let the wheel scroll a doc (a bonus; never required).
+    // Mouse (SGR 1006), same wire format the transcript decodes: the wheel
+    // scrolls the body, and a left-drag selects and copies out of it.
     if (data[i + 2] === "<") {
       const end = this.findMouseEnd(data, i + 3);
       if (end === -1) return data.length - i;
-      const b = Number.parseInt(data.slice(i + 3, end).split(";")[0] ?? "", 10);
-      if (b === 64) this.overlayScrollBy(-3);
-      else if (b === 65) this.overlayScrollBy(3);
+      this.handlePanelMouse(data.slice(i + 3, end), data[end] === "M");
       return end - i + 1;
     }
 
@@ -3114,14 +3150,13 @@ export class Tui implements SessionIO {
 
   private dispatchOverlay(input: OverlayInput): void {
     if (!this.panel) return;
-    // A standing copy confirmation is dismissed by the next key, whatever it is,
-    // the way any real keystroke clears the transcript's copied-selection
-    // highlight. Cleared BEFORE routing so `y` re-sets it on the way through and
-    // a repeat copy still reads as a fresh receipt.
-    if (this.panel.copyNotice !== null) {
-      this.panel.copyNotice = null;
-      this.paint();
-    }
+    // A standing selection and its receipt are dismissed by the next key,
+    // whatever it is, the way any real keystroke clears the transcript's
+    // copied-selection highlight. Cleared BEFORE routing so `y` re-sets the
+    // receipt on the way through and a repeat copy still reads as a fresh one.
+    // It also means every view change clears the selection for free: they are
+    // all key-driven, and a row index means something else on the next view.
+    this.clearPanelSelection();
     // Ctrl-O toggles the panel shut from any view — the same key that opened it.
     // It takes each view's OWN escape exit rather than a second, divergent close
     // path, so it inherits their rules (notably the review view's mid-merge
@@ -3282,12 +3317,168 @@ export class Tui implements SessionIO {
       return;
     }
     this.copyToClipboard(content);
-    const n = countLines(content);
-    // OSC 52 is unacknowledged, so this names what was SENT and warns about the
-    // one way it silently fails. The moment the key is pressed is the only place
-    // that caveat is worth spending a footer on.
-    this.panel.copyNotice =
-      `copied ${n} line${n === 1 ? "" : "s"} · if nothing pastes, allow clipboard access (OSC 52)`;
+    this.panel.copyNotice = copyReceipt(countLines(content));
+    this.paint();
+  }
+
+  // --- selecting text inside the panel ----------------------------------------
+  //
+  // The panel owns the whole screen while it is up, and mouse reporting stays on
+  // underneath it, so the terminal will not do its own click-drag here. It gets
+  // the same treatment the transcript already gets: a left-drag highlights the
+  // cells in reverse video and, on release, copies the plain text through OSC 52.
+  //
+  // This works on EVERY panel view, not just a doc - the body is one surface, so
+  // a PR link on the queue tab or a paragraph of a filed review copies exactly
+  // the way a paragraph of a doc does. It is purely additive: no key binding
+  // moves, and a click with no drag copies nothing.
+  //
+  // What it yields is the RENDERED text, wrapped as painted, which is the whole
+  // point of a partial selection. `y` remains the way to take a doc away whole,
+  // in its raw markdown.
+
+  /**
+   * Handle an SGR mouse report while the panel is up. `body` is "b;x;y" (1-based
+   * screen coords); `press` is true for the M terminator (button-down/motion)
+   * and false for m (release). Bit layout as in handleMouse: low two bits are
+   * the button, 32 is motion, 64 is the wheel.
+   */
+  private handlePanelMouse(body: string, press: boolean): void {
+    const parts = body.split(";");
+    const b = Number.parseInt(parts[0] ?? "", 10);
+    const x = Number.parseInt(parts[1] ?? "", 10);
+    const y = Number.parseInt(parts[2] ?? "", 10);
+    if (Number.isNaN(b)) return;
+
+    if (b === 64) { this.overlayScrollBy(-3); return; }
+    if (b === 65) { this.overlayScrollBy(3); return; }
+
+    const button = b & 0b11;
+    const motion = (b & 32) !== 0;
+    if (button !== 0) return;
+
+    if (!motion && press) this.beginPanelSelection(x, y);
+    else if (motion && press) this.extendPanelSelection(x, y);
+    else if (!press) this.endPanelSelection();
+  }
+
+  /**
+   * Map a 1-based screen (x, y) to an absolute (row, col) in the current body.
+   *
+   * Screen row 1 is the header and the last row is the footer, so the body
+   * occupies rows 2..rows-1 and `y - 2` is the offset into the viewport. A drag
+   * that strays onto the header or the footer clamps into the body instead of
+   * being dropped, so running off the top or bottom edge still selects sensibly.
+   */
+  private panelMouseToCell(x: number, y: number): { row: number; col: number } | null {
+    const panel = this.panel;
+    if (!panel) return null;
+    const rowInView = Math.max(0, Math.min(this.overlayViewport() - 1, y - 2));
+    return { row: panel.lastStart + rowInView, col: Math.max(0, x - 1) };
+  }
+
+  private beginPanelSelection(x: number, y: number): void {
+    const panel = this.panel;
+    const cell = this.panelMouseToCell(x, y);
+    if (!panel || !cell) return;
+    // A fresh drag retires the previous copy's receipt: it described a selection
+    // that is about to stop existing.
+    panel.copyNotice = null;
+    panel.selecting = true;
+    panel.selection = {
+      anchorRow: cell.row,
+      anchorCol: cell.col,
+      focusRow: cell.row,
+      focusCol: cell.col,
+    };
+    this.paint();
+  }
+
+  private extendPanelSelection(x: number, y: number): void {
+    const panel = this.panel;
+    if (!panel?.selecting || !panel.selection) return;
+    const cell = this.panelMouseToCell(x, y);
+    if (!cell) return;
+    // Auto-scroll at the body's edges so a selection can span more than one
+    // screenful. The rows are absolute, so the anchor stays put as it scrolls.
+    if (y <= 2) this.overlayScrollBy(-1);
+    else if (y >= this.rows - 1) this.overlayScrollBy(1);
+    panel.selection.focusRow = cell.row;
+    panel.selection.focusCol = cell.col;
+    this.paint();
+  }
+
+  /**
+   * Left release: finalize. A bare click (press and release on the same cell)
+   * selected nothing, so it just dismisses any standing highlight rather than
+   * copying an empty string - which is also what makes a stray click on the
+   * queue tab harmless.
+   */
+  private endPanelSelection(): void {
+    const panel = this.panel;
+    if (!panel?.selecting) return;
+    panel.selecting = false;
+    const sel = panel.selection;
+    const dragged =
+      sel != null && (sel.anchorRow !== sel.focusRow || sel.anchorCol !== sel.focusCol);
+    const text = dragged ? this.panelSelectionText() : "";
+    if (text === "") {
+      panel.selection = null;
+      this.paint();
+      return;
+    }
+    this.copyToClipboard(text);
+    panel.copyNotice = copyReceipt(countLines(text));
+    this.paint();
+  }
+
+  /** The plain text of the panel's current selection, joined with newlines. */
+  private panelSelectionText(): string {
+    const sel = this.panel?.selection;
+    if (!sel) return "";
+    const { top, bottom, topCol, bottomCol } = normalizeSelection(sel);
+    const { body } = this.panelFrame();
+    const out: string[] = [];
+    // Clamped to the real body, so a drag that ran past the end doesn't tack
+    // phantom blank lines onto the clipboard.
+    for (let r = top; r <= bottom && r < body.length; r++) {
+      const from = r === top ? topCol : 0;
+      const to = r === bottom ? bottomCol : Number.MAX_SAFE_INTEGER;
+      out.push(sliceVisibleText(body[r] ?? "", from, to));
+    }
+    return out.join("\n");
+  }
+
+  /**
+   * Overlay the selection highlight onto the body row at absolute index
+   * `absRow`. Rows outside the selection come back untouched.
+   *
+   * An empty row inside the selection is painted as a single highlighted space.
+   * highlightRange returns a blank row unchanged (there is nothing to reverse),
+   * which in the transcript is invisible but in a doc would tear every selection
+   * spanning a paragraph break into stripes. The space is presentational only -
+   * the copy reads the original row, so a blank line stays blank.
+   */
+  private applyPanelSelection(line: string, absRow: number): string {
+    const sel = this.panel?.selection;
+    if (!sel) return line;
+    const { top, bottom, topCol, bottomCol } = normalizeSelection(sel);
+    if (absRow < top || absRow > bottom) return line;
+    const from = absRow === top ? topCol : 0;
+    const to = absRow === bottom ? bottomCol : Number.MAX_SAFE_INTEGER;
+    if (line === "" && absRow > top && absRow < bottom) return `${ESC}[7m ${ESC}[27m`;
+    return highlightRange(line, from, to);
+  }
+
+  /** Drop any panel selection and its receipt. Called wherever the rows beneath
+   *  a selection stop meaning what they meant when it was made. */
+  private clearPanelSelection(): void {
+    const panel = this.panel;
+    if (!panel) return;
+    if (!panel.selection && !panel.selecting && panel.copyNotice === null) return;
+    panel.selection = null;
+    panel.selecting = false;
+    panel.copyNotice = null;
     this.paint();
   }
 
@@ -3498,52 +3689,57 @@ export class Tui implements SessionIO {
   }
 
   /** Paint the full-screen panel: header/tab bar, content viewport, footer. */
+  /**
+   * What the panel is showing right now: the header title, the body rows, and
+   * the body row the viewport starts at.
+   *
+   * ONE source of truth, read by both the paint and the mouse-selection copy, so
+   * a drag can only ever copy the rows that were actually painted under it. The
+   * queue body is fetched before its scroll is read because queueBody() clamps
+   * that scroll to the freshly-built row count.
+   */
+  private panelFrame(): { title: string; body: string[]; start: number } {
+    const panel = this.panel;
+    if (!panel) return { title: "", body: [], start: 0 };
+    const v = panel.view;
+    if (v.kind === "queue") {
+      const body = this.queueBody();
+      return { title: "queue", body, start: panel.queueScroll };
+    }
+    if (v.kind === "features") {
+      const body = this.featuresTabRows();
+      // A feature landing (or being abandoned) shortens the list; never strand
+      // the view past its end.
+      const max = Math.max(0, body.length - this.overlayViewport());
+      if (panel.featuresScroll > max) panel.featuresScroll = max;
+      return { title: "features", body, start: panel.featuresScroll };
+    }
+    if (v.kind === "docs") return { title: "docs", body: this.docsTabRows(panel), start: 0 };
+    if (v.kind === "doc") return { title: `docs · ${v.name}`, body: v.rows, start: v.scroll };
+    if (v.kind === "inbox") return { title: "inbox", body: this.inboxTabRows(), start: 0 };
+    if (v.kind === "inboxItem") {
+      return { title: `inbox · ${v.entry.level} ${v.entry.verdict}`, body: v.rows, start: v.scroll };
+    }
+    const pr = this.pendingReview;
+    return {
+      title: pr ? `review · ${pr.review.feature} → ${pr.review.target}` : "review",
+      body: pr ? pr.rows : ["", "  " + c.dim("no review is pending.")],
+      start: pr ? pr.scroll : 0,
+    };
+  }
+
   private paintPanel(): void {
     const panel = this.panel;
     if (!panel) return;
     const w = this.cols;
     const vp = this.overlayViewport();
-    const v = panel.view;
-
-    let title: string;
-    let body: string[];
-    let start = 0;
-    if (v.kind === "queue") {
-      title = "queue";
-      body = this.queueBody();
-      start = panel.queueScroll;
-    } else if (v.kind === "features") {
-      title = "features";
-      body = this.featuresTabRows();
-      // A feature landing (or being abandoned) shortens the list; never strand
-      // the view past its end.
-      const max = Math.max(0, body.length - vp);
-      if (panel.featuresScroll > max) panel.featuresScroll = max;
-      start = panel.featuresScroll;
-    } else if (v.kind === "docs") {
-      title = "docs";
-      body = this.docsTabRows(panel);
-    } else if (v.kind === "doc") {
-      title = `docs · ${v.name}`;
-      body = v.rows;
-      start = v.scroll;
-    } else if (v.kind === "inbox") {
-      title = "inbox";
-      body = this.inboxTabRows();
-    } else if (v.kind === "inboxItem") {
-      title = `inbox · ${v.entry.level} ${v.entry.verdict}`;
-      body = v.rows;
-      start = v.scroll;
-    } else {
-      const pr = this.pendingReview;
-      title = pr ? `review · ${pr.review.feature} → ${pr.review.target}` : "review";
-      body = pr ? pr.rows : ["", "  " + c.dim("no review is pending.")];
-      start = pr ? pr.scroll : 0;
-    }
+    const { title, body, start } = this.panelFrame();
+    panel.lastStart = start; // anchor for mapping mouse (x, y) → absolute body row
 
     const frame: string[] = [term.moveTo(1, 1) + term.clearLine + this.overlayHeader(title)];
     for (let r = 0; r < vp; r++) {
-      const lineText = body[start + r] ?? "";
+      const absRow = start + r;
+      const lineText = this.applyPanelSelection(body[absRow] ?? "", absRow);
       frame.push(term.moveTo(2 + r, 1) + term.clearLine + this.clip(lineText, w));
     }
     frame.push(term.moveTo(this.rows, 1) + term.clearLine + this.panelFooter(body.length, start, vp));
@@ -3873,8 +4069,22 @@ export class Tui implements SessionIO {
       right = below > 0 ? `${below} more below ` : "end ";
     }
 
+    // A standing copy receipt speaks for every view, because a drag selects on
+    // every view. It yields to a merge in flight: "merging…" is the one thing on
+    // this line that must not be covered, and it lasts seconds at most.
+    const notice = this.panel?.copyNotice;
+    const merging = this.queueMerging !== null || this.pendingReview?.status === "merging";
+
     let left: string;
-    if (v?.kind === "review") {
+    if (notice && !merging) {
+      // The receipt takes the position indicator's room too when it needs it:
+      // the indicator is one keypress from coming back, whereas a half-printed
+      // "71 mo" is just debris. The caveat is the part that must survive a
+      // narrow terminal, so the lead-in is what shortens.
+      const terse = notice.replace("if nothing pastes, allow", "allow");
+      left = ` ${c.cyan(2 + visibleWidth(notice) <= w ? notice : terse)} `;
+      right = "";
+    } else if (v?.kind === "review") {
       left = " " + this.reviewActionBar() + " ";
     } else if (v?.kind === "queue") {
       // The [m] hint is a plain function of the head's state — it appears when
@@ -3895,28 +4105,19 @@ export class Tui implements SessionIO {
     } else if (v?.kind === "docs" || v?.kind === "inbox") {
       left = ` 1-9/a-z open · ${tabHint}Esc close `;
     } else if (v?.kind === "doc") {
-      const notice = this.panel?.copyNotice;
-      if (notice) {
-        // The receipt replaces the hints while it stands, and takes the position
-        // indicator's room too when it needs it: the indicator is one keypress
-        // from coming back, whereas a half-printed "71 mo" is just debris. The
-        // caveat is the part that must survive a narrow terminal, so the lead-in
-        // is what shortens.
-        const terse = notice.replace("if nothing pastes, allow", "allow");
-        const fits = 2 + visibleWidth(notice) <= w;
-        left = ` ${c.cyan(fits ? notice : terse)} `;
-        right = "";
-      } else {
-        // `y` is the only ACTION key on a doc, so it leads and is coloured the
-        // way the queue tab leads with its [m]. Where the full run won't fit
-        // beside the scroll indicator the paging tail is dropped rather than
-        // letting clip() eat the end: a hint that's always truncated away is a
-        // hint nobody discovers, and space/b is the paging key that matters.
-        const long = " copy · space/b page · j/k line · g/G ends · Backspace back · Esc close ";
-        const short = " copy · space/b page · Backspace back · Esc close ";
-        const fits = 1 + 1 + visibleWidth(long) + visibleWidth(right) <= w;
-        left = " " + c.cyan("y") + (fits ? long : short);
-      }
+      // `y` is the only ACTION key on a doc, so it leads and is coloured the way
+      // the queue tab leads with its [m]. The run shortens to fit beside the
+      // position indicator rather than letting clip() eat its end: a hint that
+      // is always truncated away is a hint nobody discovers. The drag hint is
+      // first out, because the gesture is self-revealing where a key is not -
+      // you drag, the highlight appears, the receipt names what it took.
+      const room = w - 2 - visibleWidth(right); // the leading space + the `y`
+      const tiers = [
+        " copy · drag select · space/b page · j/k line · g/G ends · Backspace back · Esc close ",
+        " copy · space/b page · j/k line · g/G ends · Backspace back · Esc close ",
+        " copy · space/b page · Backspace back · Esc close ",
+      ];
+      left = " " + c.cyan("y") + (tiers.find((t) => t.length <= room) ?? tiers[tiers.length - 1]!);
     } else {
       // a filed review body: the shared paging surface, no actions of its own
       left = " space/b page · j/k line · g/G ends · Backspace back · Esc close ";
