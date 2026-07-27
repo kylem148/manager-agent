@@ -176,8 +176,16 @@ access.
 `BEDROCK_MODEL_ID` is a Bedrock model id: a foundation-model id
 (`anthropic.claude-...`) or, for recent models on on-demand throughput, a
 cross-region **inference profile** id (`us.anthropic.claude-...` /
-`eu.anthropic.claude-...`). The default is Opus 4.8 (`us.anthropic.claude-opus-4-8`),
-which requires the inference-profile form: the bare `anthropic.claude-opus-4-8`
+`eu.anthropic.claude-...`). The default is Opus 4.8
+(`us.anthropic.claude-opus-4-8`). Three ids are known to work on this account:
+
+| `BEDROCK_MODEL_ID`               | notes                                        |
+| -------------------------------- | -------------------------------------------- |
+| `us.anthropic.claude-opus-4-8`   | default; most capable, most expensive        |
+| `us.anthropic.claude-sonnet-5`   | cheaper tier, keeps every effort level       |
+| `us.anthropic.claude-sonnet-4-6` | cheaper tier; does **not** accept `xhigh`    |
+
+All three require the inference-profile form: the bare `anthropic.claude-...`
 is rejected for on-demand throughput. These ids are served over the standard
 Bedrock runtime path (`AnthropicBedrock`), not the newer Mantle endpoint; a
 Bedrock API key that lacks Mantle entitlement 404s there, so the app stays on

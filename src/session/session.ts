@@ -1,7 +1,7 @@
 import * as readline from "node:readline";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { EFFORT_LEVELS, parseEffort, type Config, type Effort } from "../config.js";
+import { effortLevelsFor, parseEffort, type Config, type Effort } from "../config.js";
 import type { InstancePaths } from "../paths.js";
 import { ModelProvider, type MessageParam } from "../model.js";
 import { buildSystemPrompt } from "./prompt.js";
@@ -1330,14 +1330,24 @@ async function handleCommand(state: SessionState, raw: string): Promise<CommandR
       // Session-scoped override of CO_EFFORT. Takes effect on the next turn;
       // nothing is written to disk, so a restart returns to the configured
       // default (set CO_EFFORT to make a change stick).
+      // The ladder is per-model: xhigh arrived with Opus 4.7, so on the 4.6
+      // generation it is a 400 on every subsequent turn rather than a level
+      // the model merely ignores. Offer and accept only what this model takes.
+      const levels = effortLevelsFor(state.model.modelId);
       const current = state.model.effort ?? "(unset)";
       if (!arg) {
-        io.appendBlock(c.dim(`effort: ${current}  (levels: ${EFFORT_LEVELS.join(", ")})`));
+        io.appendBlock(c.dim(`effort: ${current}  (levels: ${levels.join(", ")})`));
         return "ok";
       }
       const next = parseEffort(arg);
       if (!next) {
-        io.appendBlock(c.yellow(`usage: /effort [${EFFORT_LEVELS.join("|")}]`));
+        io.appendBlock(c.yellow(`usage: /effort [${levels.join("|")}]`));
+        return "ok";
+      }
+      if (!levels.includes(next)) {
+        io.appendBlock(
+          c.yellow(`${next} is not accepted by ${state.model.modelId} — levels: ${levels.join(", ")}`),
+        );
         return "ok";
       }
       state.model.setEffort(next);

@@ -154,8 +154,9 @@ export class ModelProvider {
     // while the Mantle endpoint 404s ("model does not exist") for the same key
     // and every id format — our account isn't entitled to Mantle. This mirrors
     // Claude Code's own working setup (CLAUDE_CODE_USE_BEDROCK=1, Mantle off).
-    // Verified end-to-end against the live key on 2026-07-16. Don't switch to
-    // Mantle without re-confirming entitlement, or Opus 4.8 will break.
+    // Verified end-to-end against the live key on 2026-07-16, and re-confirmed
+    // 2026-07-27 (runtime ✓ / Mantle 404 for the same id). Don't switch to
+    // Mantle without re-confirming entitlement, or the model will break.
     //
     // Re-confirmed 2026-07-20, this time including the id form Anthropic's docs
     // actually publish for Mantle (bare `anthropic.claude-opus-4-8`, no geo
@@ -168,6 +169,16 @@ export class ModelProvider {
     // Mantle "for full feature parity" without enumerating what legacy lacks —
     // so treat feature support here as empirical, not promised. Prompt caching
     // was measured working on this path the same day (see CACHE_CONTROL below).
+    //
+    // The same holds for the Sonnet line, checked on 2026-07-27 while costing
+    // out a cheaper default: `us.anthropic.claude-sonnet-4-6` and
+    // `us.anthropic.claude-sonnet-5` both answer on runtime and both reject the
+    // un-prefixed `anthropic.claude-sonnet-*` form for on-demand throughput.
+    // Adaptive thinking, tools, and prompt caching were all exercised together
+    // on Sonnet 4.6 here (cache_read 3477 on the second identical call), so the
+    // whole turn shape this file builds is known-good on the cheaper models if
+    // that trade is ever worth making — the one thing that is NOT is
+    // effort=xhigh, which 400s below Opus 4.7 (see effortLevelsFor).
     this.client = new AnthropicBedrock({
       awsRegion: cfg.region,
       ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
@@ -177,6 +188,11 @@ export class ModelProvider {
   /** Effort currently sent with every turn. */
   get effort(): Effort | undefined {
     return this.cfg.effort;
+  }
+
+  /** The Bedrock model id every turn is sent to. Read by /effort and /status. */
+  get modelId(): string {
+    return this.cfg.modelId;
   }
 
   /**

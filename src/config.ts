@@ -49,12 +49,62 @@ export type Effort = (typeof EFFORT_LEVELS)[number];
  * Validate a user- or env-supplied effort string. Returns null for anything
  * unrecognised so callers decide whether to fall back (config) or complain
  * (the /effort command).
+ *
+ * This checks the level exists at all, not that the configured model accepts
+ * it — see effortLevelsFor for the per-model ladder.
  */
 export function parseEffort(raw: string | undefined): Effort | null {
   const lower = raw?.trim().toLowerCase();
   return (EFFORT_LEVELS as readonly string[]).includes(lower ?? "")
     ? (lower as Effort)
     : null;
+}
+
+/** The ladder without xhigh, for models predating Opus 4.7. */
+const NO_XHIGH: readonly Effort[] = ["low", "medium", "high", "max"];
+
+/**
+ * Models that reject `xhigh`. The level was introduced with Opus 4.7, so the
+ * whole 4.6 generation is one step short — Bedrock answers a request carrying
+ * it with a flat 400 (`output_config.effort: Input should be 'low', 'medium',
+ * 'high' or 'max'`), which kills the turn rather than degrading it.
+ *
+ * Verified against the live key on 2026-07-27: on
+ * us.anthropic.claude-sonnet-4-6 the low/medium/high/max rungs all answer and
+ * xhigh 400s, while us.anthropic.claude-sonnet-5 accepts all five.
+ */
+const NO_XHIGH_MODELS = /(sonnet-4-6|opus-4-6)/;
+
+/**
+ * The effort levels a given Bedrock model id actually accepts.
+ *
+ * Unknown ids get the full ladder: that is the pre-existing behaviour, so a
+ * model nobody has characterised here fails loudly at the API rather than
+ * being quietly capped. Models older than the 4.6 generation are not covered —
+ * some reject `output_config.effort` outright — but comanager has never been
+ * run on one, so this deliberately does not guess on their behalf.
+ */
+export function effortLevelsFor(modelId: string): readonly Effort[] {
+  return NO_XHIGH_MODELS.test(modelId) ? NO_XHIGH : EFFORT_LEVELS;
+}
+
+/**
+ * Lower an effort level to the strongest accepted rung at or below it. Applied
+ * to CO_EFFORT at load so a value left behind by a previous model (xhigh from
+ * an Opus 4.8 config, say) degrades instead of 400-ing every turn.
+ *
+ * Degrading matters more than it sounds: xhigh sits between high and max, so
+ * rounding an unsupported xhigh *up* would quietly raise token spend on every
+ * turn — the opposite of why anyone moves to a cheaper model.
+ */
+export function clampEffort(effort: Effort, modelId: string): Effort {
+  const levels = effortLevelsFor(modelId);
+  if (levels.includes(effort)) return effort;
+  const wanted = EFFORT_LEVELS.indexOf(effort);
+  const below = EFFORT_LEVELS.filter(
+    (l, i) => i <= wanted && levels.includes(l),
+  );
+  return below[below.length - 1] ?? levels[0]!;
 }
 
 /** Accepted terminal-visual levels, richest to plainest. */
@@ -92,6 +142,21 @@ export function parseVisualsLevel(raw: string | undefined): VisualsLevel | null 
 export function visualsLevel(): VisualsLevel {
   return parseVisualsLevel(process.env.CO_VISUALS) ?? "full";
 }
+
+/**
+ * Model used when BEDROCK_MODEL_ID is unset.
+ *
+ * The `us.` prefix is load-bearing, not decorative — this is a cross-region
+ * inference profile id, and the bare foundation id is rejected for on-demand
+ * throughput ("Retry your request with the ID or ARN of an inference profile").
+ * Confirmed for opus-4-8, sonnet-4-6 and sonnet-5 on 2026-07-27.
+ *
+ * The Sonnet tier runs at a materially lower per-token rate and was briefly the
+ * default; `us.anthropic.claude-sonnet-4-6` and `us.anthropic.claude-sonnet-5`
+ * are both known to answer on this account if cost ever outranks capability.
+ * Note Sonnet 4.6 does not accept effort=xhigh — see effortLevelsFor.
+ */
+export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-4-8";
 
 export interface ModelConfig {
   region: string;
@@ -151,6 +216,8 @@ export function loadConfig(): Config {
   const thinkingRaw = (env("CO_THINKING") ?? "adaptive").toLowerCase();
   const thinking = thinkingRaw === "off" ? "off" : "adaptive";
 
+  const modelId = env("BEDROCK_MODEL_ID") ?? DEFAULT_MODEL_ID;
+
   // Effort controls thinking depth and overall token spend. Default high, which
   // is what Anthropic recommends for Opus 4.8 on "intelligence-sensitive
   // workloads" — they reserve xhigh for coding and agentic use, and a co-manager
@@ -162,7 +229,10 @@ export function loadConfig(): Config {
   // fewer and more consolidated tool calls — which is the second-order win here,
   // since every extra tool call is another full round trip.
   // Raise it per-session with /effort, or set CO_EFFORT to make a change stick.
-  const effort: Effort = parseEffort(env("CO_EFFORT")) ?? "high";
+  //
+  // Clamped to the model's ladder: not every model accepts every rung, and an
+  // unsupported level is a 400 on every turn rather than a soft degrade.
+  const effort: Effort = clampEffort(parseEffort(env("CO_EFFORT")) ?? "high", modelId);
 
   const searchRaw = (env("CO_SEARCH_PROVIDER") ?? "auto").toLowerCase();
   const searchProvider: SearchProviderName = (
@@ -180,7 +250,7 @@ export function loadConfig(): Config {
       region: env("AWS_REGION") ?? "us-west-2",
       apiKey: bearer,
       authMode,
-      modelId: env("BEDROCK_MODEL_ID") ?? "us.anthropic.claude-opus-4-8",
+      modelId,
       maxTokens: parseIntOr("CO_MAX_TOKENS", 32000),
       thinking,
       effort,

@@ -3,7 +3,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import * as readline from "node:readline";
 import type { Config } from "../config.js";
-import { redactSecret } from "../config.js";
+import { DEFAULT_MODEL_ID, redactSecret } from "../config.js";
 import { c, line } from "../ui.js";
 
 /**
@@ -16,7 +16,10 @@ import { c, line } from "../ui.js";
  */
 
 const DEFAULT_REGION = "us-west-2";
-const DEFAULT_MODEL = "us.anthropic.claude-opus-4-8";
+// Shared with loadConfig so rotating a token can never pin a different model
+// than a fresh install would pick. Only written when BEDROCK_MODEL_ID is
+// absent — an existing choice is left alone.
+const DEFAULT_MODEL = DEFAULT_MODEL_ID;
 
 export async function runAuthBedrock(cfg: Config): Promise<number> {
   const home = cfg.home;
