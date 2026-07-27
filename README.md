@@ -934,3 +934,4 @@ provider abstractions (`ModelProvider`, `SearchProvider`, `Fetcher`) and the
 ## License
 
 MIT
+Conflict-test marker: ALPHA channel.
