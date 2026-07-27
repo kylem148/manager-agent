@@ -116,6 +116,12 @@ npm run typecheck           # tsc --noEmit
 `npm link` also works as an alternative to `npm install -g .` if you want the
 global command to track your working tree while developing.
 
+Pull requests into `dev` and `main` run the same two things in GitHub Actions
+(`.github/workflows/ci.yml`) on Node 22: `npm run typecheck` and `npm test`. That
+is deliberate rather than incidental. This repo lands its own work through co's
+merge queue, which gates a head on the pull request's real checks, so without a
+workflow here every landing would come back ungated (see "Landing work" below).
+
 ## Configure
 
 Copy `.env.example` to `.env` (in the working directory) or to
