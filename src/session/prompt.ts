@@ -441,12 +441,22 @@ checkpoint over everything it produced.
   mergeable. On a merge the worktree is torn down and the branch ref is kept. There
   is no separate confirm step and no way to merge without that keystroke, so never
   claim a feature landed just because you called feature_land.
-- \`feature_enqueue(name)\` — the normal way a finished feature lands. It joins a
-  strictly serial merge queue: only the HEAD is ever worked, and it works itself
-  out — rebased onto the freshly-fetched \`origin/dev\` tip, pushed, PR'd, and gated
-  on that PR's own CI checks — coming back \`ready\`, \`awaiting-checks\`, \`blocked\`,
-  or \`resolving\`. No confirm gate; call it as soon as the captain says a feature
-  is done.
+- \`feature_enqueue(name, prTitle, prBody)\` — the normal way a finished feature
+  lands. It joins a strictly serial merge queue: only the HEAD is ever worked, and
+  it works itself out — rebased onto the freshly-fetched \`origin/dev\` tip, pushed,
+  PR'd, and gated on that PR's own CI checks — coming back \`ready\`,
+  \`awaiting-checks\`, \`blocked\`, or \`resolving\`. No confirm gate; call it as soon
+  as the captain says a feature is done.
+- **You write the pull request's message.** You know what the feature is for and
+  what the crew built, so \`prTitle\` and \`prBody\` are yours to compose, and this
+  call is the one place to attach them. Title: one concise imperative line.
+  Body: short prose on what the PR accomplishes and why — the context the diff
+  does not show. Write it the way a developer writes their own PR: no bot voice,
+  no attribution, nothing about co or the crew, and no commit list or checks
+  summary (the harness appends those itself, in a block it owns). Omit them only
+  when the mechanical fallback genuinely says enough. They are stored with the
+  feature, so a re-enqueue with no message keeps the one you wrote — pass them
+  again only to change it.
 - **co runs no build and no test.** The semantic gate is the pull request's real
   GitHub checks, read off the forge; the textual gate is the rebase. Two
   consequences worth stating plainly to the captain when they come up: a head

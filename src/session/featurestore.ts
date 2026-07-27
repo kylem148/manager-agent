@@ -9,12 +9,15 @@ import { serializeWrite } from "../memory/writequeue.js";
  * A feature is otherwise fully recoverable from disk — the boot reconcile
  * (worktrees.ts `reconcileFeatures`) rebuilds a record for every feature
  * worktree it finds, so the branch, the checkout and the slug all survive a
- * restart on their own. The INTENT does not: it is the one-line description the
- * co authored at `feature_create` time, it lives nowhere in git, and until now it
- * lived only in a Map that died with the session. That made the Ctrl-O features
- * tab lie after every restart — every recovered worktree showed up nameless.
+ * restart on their own. What does NOT survive is the PROSE the co wrote about the
+ * feature, which lives nowhere in git: the INTENT (the one-line description
+ * authored at `feature_create` time) and, since the authored-PR-message slice,
+ * the PR TITLE and BODY the co composes when it enqueues a finished feature.
+ * Both used to live only in a Map that died with the session — which made the
+ * Ctrl-O features tab lie after every restart, and would make a re-processed head
+ * silently fall back to the mechanical PR message.
  *
- * So intents are persisted here, keyed by slug (the handle that survives — the
+ * So that prose is persisted here, keyed by slug (the handle that survives — the
  * human name is not recoverable from a branch), as a small JSON object under the
  * instance's `.dispatch/` dir: the same tier the dispatch config, the review
  * inbox and the per-job captures live in, since a feature worktree is dispatch
@@ -22,40 +25,82 @@ import { serializeWrite } from "../memory/writequeue.js";
  * (a file there would show up as an untracked change in the captain's diff).
  *
  * It is a CACHE of authored prose, not a source of truth about anything: a
- * missing, corrupt or unwritable file degrades to "no description" and must never
- * fail a create, a merge or a session start. Writes therefore swallow their own
- * errors and ride the shared memory write queue, so a whole-file rewrite can't
- * interleave with the other tool calls of one model round.
+ * missing, corrupt or unwritable file degrades to "no description" (and, for the
+ * PR message, to landing.ts's mechanical composition) and must never fail a
+ * create, an enqueue, a merge or a session start. Writes therefore swallow their
+ * own errors and ride the shared memory write queue, so a whole-file rewrite
+ * can't interleave with the other tool calls of one model round.
  */
 
-/** The on-disk shape: `{ "<slug>": "<intent>" }`. Deliberately the smallest
- *  thing that works — one authored line per feature, obvious to read and safe to
- *  hand-edit. */
-export type FeatureIntents = Record<string, string>;
+/** Everything stored about one feature. Every field is optional and independent:
+ *  a feature may have an intent and no PR message, a PR title and no body, or
+ *  nothing at all (in which case it holds no row). */
+export interface FeatureMeta {
+  /** The one-line description the co gave at create time. */
+  intent?: string;
+  /** The PR title the co authored at enqueue time. Consumed by landing.ts; the
+   *  mechanical composition applies when it is absent. */
+  prTitle?: string;
+  /** The PR description the co authored at enqueue time — human prose only. co's
+   *  fenced evidence block is never part of it (it is stripped before storing and
+   *  regenerated on top at prepare time). */
+  prBody?: string;
+}
 
-/** Drop anything that isn't a slug → non-empty-string pair, so a hand-edited or
- *  half-written file can never poison the panel or the next write. */
-function coerce(raw: unknown): Map<string, string> {
-  const out = new Map<string, string>();
+/** The on-disk shape: `{ "<slug>": { intent?, prTitle?, prBody? } }`.
+ *
+ * A bare string value is the LEGACY shape (`{ "<slug>": "<intent>" }`, all this
+ * file held before the PR message joined it) and is read as an intent-only row,
+ * so a store written by an older build keeps every description it had. Writes are
+ * always the object form. */
+export type StoredFeatures = Record<string, FeatureMeta | string>;
+
+/** A trimmed non-empty string, or undefined — the only thing worth storing. */
+function text(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+/** Coerce one row. A string is the legacy intent-only form; an object keeps only
+ *  the fields it declares, as non-empty strings. Returns undefined for a row with
+ *  nothing left in it, so junk never becomes an empty entry. */
+function coerceMeta(raw: unknown): FeatureMeta | undefined {
+  const legacy = text(raw);
+  if (legacy) return { intent: legacy };
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  const o = raw as Record<string, unknown>;
+  const meta: FeatureMeta = {};
+  const intent = text(o.intent);
+  const prTitle = text(o.prTitle);
+  const prBody = text(o.prBody);
+  if (intent) meta.intent = intent;
+  if (prTitle) meta.prTitle = prTitle;
+  if (prBody) meta.prBody = prBody;
+  return Object.keys(meta).length === 0 ? undefined : meta;
+}
+
+/** Drop anything that isn't a slug → usable row, so a hand-edited or half-written
+ *  file can never poison the panel, a PR message, or the next write. */
+function coerce(raw: unknown): Map<string, FeatureMeta> {
+  const out = new Map<string, FeatureMeta>();
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return out;
-  for (const [slug, intent] of Object.entries(raw as Record<string, unknown>)) {
+  for (const [slug, row] of Object.entries(raw as Record<string, unknown>)) {
     if (typeof slug !== "string" || slug === "") continue;
-    if (typeof intent !== "string") continue;
-    const trimmed = intent.trim();
-    if (trimmed === "") continue;
-    out.set(slug, trimmed);
+    const meta = coerceMeta(row);
+    if (meta) out.set(slug, meta);
   }
   return out;
 }
 
 export class FeatureStore {
-  private readonly intents: Map<string, string>;
+  private readonly features: Map<string, FeatureMeta>;
 
   private constructor(
     private readonly filePath: string,
-    intents: Map<string, string>,
+    features: Map<string, FeatureMeta>,
   ) {
-    this.intents = intents;
+    this.features = features;
   }
 
   /**
@@ -75,24 +120,40 @@ export class FeatureStore {
   }
 
   /** In-memory store with no file behind it, for tests and degraded paths (an
-   *  unlinked instance has no `.dispatch/` tier to write into). */
-  static ephemeral(intents: FeatureIntents = {}): FeatureStore {
-    return new FeatureStore("", coerce(intents));
+   *  unlinked instance has no `.dispatch/` tier to write into). Seeds accept
+   *  either shape, exactly as the file does. */
+  static ephemeral(seed: StoredFeatures = {}): FeatureStore {
+    return new FeatureStore("", coerce(seed));
   }
 
   /** The stored one-liner for a slug, or undefined when none was ever set. */
   intent(slug: string): string | undefined {
-    return this.intents.get(slug);
+    return this.features.get(slug)?.intent;
   }
 
-  /** Every stored intent, as a plain object (a copy — callers must not mutate
-   *  the store through it). */
-  all(): FeatureIntents {
-    return Object.fromEntries(this.intents);
+  /**
+   * The PR title and body the co authored for a feature, or undefined when it
+   * never authored one. Both fields are independently optional: a feature may
+   * carry a title and no body, and landing.ts falls back to its mechanical
+   * composition for whichever half is missing.
+   */
+  prMessage(slug: string): { prTitle?: string; prBody?: string } | undefined {
+    const meta = this.features.get(slug);
+    if (!meta || (!meta.prTitle && !meta.prBody)) return undefined;
+    return {
+      ...(meta.prTitle ? { prTitle: meta.prTitle } : {}),
+      ...(meta.prBody ? { prBody: meta.prBody } : {}),
+    };
+  }
+
+  /** Everything stored, as a plain object (a copy — callers must not mutate the
+   *  store through it). */
+  all(): Record<string, FeatureMeta> {
+    return Object.fromEntries([...this.features].map(([slug, meta]) => [slug, { ...meta }]));
   }
 
   get size(): number {
-    return this.intents.size;
+    return this.features.size;
   }
 
   /**
@@ -102,17 +163,45 @@ export class FeatureStore {
    * sees it; the returned promise resolves when the file has been rewritten.
    */
   setIntent(slug: string, intent: string): Promise<void> {
-    const trimmed = intent.trim();
-    if (slug === "" || trimmed === "") return Promise.resolve();
-    if (this.intents.get(slug) === trimmed) return Promise.resolve();
-    this.intents.set(slug, trimmed);
+    return this.update(slug, { intent });
+  }
+
+  /**
+   * Record the PR message the co authored for a feature at enqueue time. Each
+   * field is an INDEPENDENT override: supplying one replaces the stored value,
+   * OMITTING one (or passing blank) leaves whatever is stored alone. That is what
+   * makes a re-enqueue with no arguments — the retry after a resolver run, or any
+   * automatic re-process — reuse the message the co already wrote instead of
+   * wiping it back to the mechanical fallback.
+   */
+  setPrMessage(slug: string, message: { prTitle?: string; prBody?: string }): Promise<void> {
+    return this.update(slug, message);
+  }
+
+  /** Drop everything stored for a feature — it landed, or it was abandoned. A
+   *  no-op for a slug that was never stored, so teardown paths can call it
+   *  blindly. */
+  forget(slug: string): Promise<void> {
+    if (!this.features.delete(slug)) return Promise.resolve();
     return this.persist();
   }
 
-  /** Drop a feature's intent — it landed, or it was abandoned. A no-op for a
-   *  slug that was never stored, so teardown paths can call it blindly. */
-  forget(slug: string): Promise<void> {
-    if (!this.intents.delete(slug)) return Promise.resolve();
+  /** Merge non-blank fields into a feature's row, and persist only if something
+   *  actually changed. The single write path: every setter is this, so "blank
+   *  never wipes" and "unchanged never rewrites" hold for every field at once. */
+  private update(slug: string, patch: FeatureMeta): Promise<void> {
+    if (slug === "") return Promise.resolve();
+    const current = this.features.get(slug);
+    const next: FeatureMeta = { ...current };
+    let changed = false;
+    for (const key of ["intent", "prTitle", "prBody"] as const) {
+      const value = text(patch[key]);
+      if (value === undefined || next[key] === value) continue;
+      next[key] = value;
+      changed = true;
+    }
+    if (!changed) return Promise.resolve();
+    this.features.set(slug, next);
     return this.persist();
   }
 

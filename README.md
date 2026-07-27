@@ -400,7 +400,7 @@ flat over time — small rewritten orientation files plus large append-only logs
         └── .dispatch/          crew-dispatch state (only after `co link`)
             ├── config.json        repo path, named agent commands, caps, pane layout, anchor
             ├── inbox.json         the last 20 crew reviews, newest first (Ctrl-O → Inbox)
-            ├── features.json      per-feature intents, keyed by slug (Ctrl-O → Features)
+            ├── features.json      per-feature intent + PR message, keyed by slug
             └── captures/          per-job captured output the co reviews from
 ```
 
@@ -601,6 +601,20 @@ so what you decide the merge on is what the merge will say. co's fenced evidence
 block is split off before painting: those markers are HTML comments GitHub hides,
 and what they wrap is the checks and commits already shown beside them.
 
+**The co-manager writes that message.** When you say a feature is done, it marks
+it done and composes the pull request in the same breath — a title and a
+description saying what the PR accomplishes and why, the way you'd write your
+own. It reads like a person's because a person's reasoning is behind it: the
+co-manager is the one that decided what the feature was for and reviewed what the
+crew built. It costs nothing extra, either: the message rides along on the
+mark-done call, so no model runs inside the queue. The message is stored with the
+feature, so a retry after a conflict, a resolver run, or a restart opens the PR
+with the same words rather than falling back. A feature enqueued without one gets
+the old mechanical line (the commit subject, and a one-sentence body), which is
+still the right answer for a one-commit chore. Either way co only ever writes the
+message when it CREATES the pull request — once it exists, the title and the
+description are yours, and re-processing rewrites nothing but the fenced evidence.
+
 **co runs no build and no test.** It used to, on the combined rebased tree, from
 a command it had to guess — and a guess is wrong the moment the repo isn't npm.
 GitHub is already testing exactly the state that matters (a `pull_request`
@@ -764,6 +778,11 @@ no "Generated with", no agent or tool signature. The same instruction is baked
 into the resolver order the merge queue sends into a blocked head. That is the
 whole of what comanager controls: the order text is the lever, because the
 commit itself is made by the coding agent, in its own process.
+
+Pull request messages follow the same rule, and there comanager owns the text
+outright: the title and description the co-manager writes for a PR say what the
+work does and why, and nothing about how it was produced — no signature, no
+"opened by", no mention of co or the crew anywhere in them.
 
 If your agent still signs its commits, that is its own default, not comanager's.
 For Claude Code the switch is `"includeCoAuthoredBy": false` in the settings.json
@@ -994,7 +1013,11 @@ have *already* published — the checks that judge them are the forge's and cann
 run on a PR that does not exist — and the branch is deliberately left rebased so
 a fix dispatch lands in the exact state CI failed on. The evidence block is
 written twice for the same reason: once when the PR is created, saying the
-checks are the gate, and once more with what they said. `executeLanding` is the
+checks are the gate, and once more with what they said. The PR's message is
+composed in one place here (`composePrMessage`): the co's authored title and body
+when the feature carries them, and the mechanical rules — the commit subject, or
+`<type>: <feature>`, plus a one-line summary — for whichever half it does not,
+per field. `executeLanding` is the
 separate callable that does the merge: `gh pr merge --merge`, a fetch, then
 teardown of the local worktree with the branch ref kept. It is pinned three
 ways — the checked tip, the `origin/dev` it was checked against, and the
@@ -1042,7 +1065,10 @@ writes nothing to dev or main); a dispatch can target a feature so the crew runs
 its worktree (provisioned on first use), and the arm banner names the target
 worktree or says plainly it targets the bare main tree. `feature_enqueue` marks
 a feature done and puts it in the merge queue, which is where landing normally
-happens; `feature_land` is the direct route for a feature that was never
+happens — and carries the PR title and body the co wrote for it, stored per slug
+and consumed by every later processing of that head, so the authored message is
+attached once, at the one moment a feature is declared done, and no model runs
+inside the queue; `feature_land` is the direct route for a feature that was never
 enqueued, and opens the gate above. `feature_merge_head` is **not** the merge:
 in an interactive session it merges nothing and just reports that the `[m]` is
 live, and it only performs a merge itself in a session with no panel at all
@@ -1069,14 +1095,20 @@ ordered closest-to-landing first. No git call and no model call, so the panel ca
 re-read it on every paint.
 
 `featurestore.ts` is the durable half of a feature record. Git rebuilds
-everything else about a feature from its worktree, but not the line the co wrote
-to say what it is FOR, so intents are persisted per slug in
+everything else about a feature from its worktree, but not the prose the co
+wrote about it — the intent saying what it is FOR, and the PR title and body it
+composed when it marked the feature done — so both are persisted per slug in
 `.dispatch/features.json` — beside the dispatch config and the review inbox,
 never inside the repo or the worktree — and read back at session start, which is
-what lets a recovered worktree still show its description. It is a cache of
-authored prose and behaves like one: a missing or corrupt file is an empty store,
-and a write that can't land costs a description, never a create, a merge or a
-teardown.
+what lets a recovered worktree still show its description and a re-processed head
+still open its pull request with the message the co wrote. Every field is an
+independent override: setting one leaves the others alone, and omitting one never
+wipes it, which is what makes a bare re-enqueue a retry rather than a reset. An
+older store written before the PR message existed reads back unchanged. It is a
+cache of authored prose and behaves like one: a missing or corrupt file is an
+empty store, a body is stripped of anything resembling co's evidence fence before
+it is written, and a write that can't land costs a description, never a create, a
+merge or a teardown.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,

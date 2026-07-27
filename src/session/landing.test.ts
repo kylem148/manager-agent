@@ -7,6 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import { CHECKS_GRACE_MS, CHECKS_INTERVAL_MS, CHECKS_TIMEOUT_MS, type ChecksPolicy } from "./checks.js";
 import {
+  authoredPrBody,
+  authoredPrTitle,
   composePrBody,
   composePrMessage,
   composePrTitle,
@@ -15,7 +17,7 @@ import {
   type LandingOptions,
   type PrepareGreen,
 } from "./landing.js";
-import { splitEvidence } from "./forge.js";
+import { EVIDENCE_CLOSE, EVIDENCE_OPEN, splitEvidence } from "./forge.js";
 import { provisionWorktree } from "./worktrees.js";
 import { makeFakeForge, type FakeCheck, type FakeForge } from "./forgefake.test.js";
 
@@ -168,6 +170,69 @@ test("composePrMessage is the one composition: the same title and body, in one c
   }
 });
 
+test("an authored message wins per field; the mechanical rules fill in the other half", () => {
+  const feature = "user auth";
+  const commits = ["abc1234 feat(auth): add login", "def5678 feat(auth): add recovery codes"];
+  const branch = "feat/user-auth";
+  const mechanical = composePrMessage({ feature, commits, branch });
+
+  // Both halves authored: the message is the co's, verbatim.
+  const both = composePrMessage({
+    feature,
+    commits,
+    branch,
+    authored: {
+      title: "Add passkey login to the web app",
+      body: "Passwords were the last thing keeping the support queue busy.\n\nRecovery codes come with it so nobody is locked out.",
+    },
+  });
+  assert.equal(both.title, "Add passkey login to the web app");
+  assert.equal(
+    both.body.trim(),
+    "Passwords were the last thing keeping the support queue busy.\n\nRecovery codes come with it so nobody is locked out.",
+  );
+
+  // One half authored: the other is exactly what it would have been anyway.
+  const titleOnly = composePrMessage({ feature, commits, branch, authored: { title: "Add passkey login" } });
+  assert.equal(titleOnly.title, "Add passkey login");
+  assert.equal(titleOnly.body, mechanical.body, "the body falls back, untouched");
+
+  const bodyOnly = composePrMessage({ feature, commits, branch, authored: { body: "Why it matters." } });
+  assert.equal(bodyOnly.title, mechanical.title, "the title falls back, untouched");
+  assert.equal(bodyOnly.body.trim(), "Why it matters.");
+
+  // Nothing usable is the same as nothing at all.
+  for (const authored of [{}, { title: "   ", body: "\n\n" }]) {
+    assert.deepEqual(composePrMessage({ feature, commits, branch, authored }), mechanical);
+  }
+  assert.deepEqual(composePrMessage({ feature, commits, branch }), mechanical);
+});
+
+test("authored text is normalised: a one-line title, and prose the evidence fence can never hide in", () => {
+  assert.equal(authoredPrTitle("  Add passkey\n  login  "), "Add passkey login", "one line, collapsed");
+  assert.equal(authoredPrTitle(""), undefined);
+  assert.equal(authoredPrTitle(undefined), undefined);
+
+  // The load-bearing one. Evidence is REGENERATED on every prepare and spliced
+  // onto the body; a copy of it inside the authored prose would be a second,
+  // frozen one. So the fence is stripped on the way in.
+  const smuggled = [
+    "Real prose about the change.",
+    "",
+    EVIDENCE_OPEN,
+    "### Checks",
+    "**green** — 1 of 1 checks passed.",
+    EVIDENCE_CLOSE,
+    "",
+    "More prose after it.",
+  ].join("\n");
+  const cleaned = authoredPrBody(smuggled);
+  assert.equal(cleaned, "Real prose about the change.\n\nMore prose after it.");
+  assert.doesNotMatch(cleaned, /co:evidence|### Checks/);
+  assert.equal(authoredPrBody(`${EVIDENCE_OPEN}\nonly evidence\n${EVIDENCE_CLOSE}`), "", "nothing left is nothing");
+  assert.equal(authoredPrBody(undefined), "");
+});
+
 test("the PR carries composePrMessage's output verbatim, and the fence is the only thing around it", async () => {
   // What the panel reads back off the head is this: the composed title, and the
   // composed body with co's evidence spliced in beside it. Pinning it here is
@@ -232,6 +297,42 @@ test("prepareLanding rebases onto origin/dev, pushes, and opens the PR — the l
     assert.equal(f.forge.branches.get("dev"), originDevBefore, "origin/dev is untouched by a prepare");
     // The branch really sits on the origin/dev tip now.
     assert.equal(run(f.repo, ["merge-base", "origin/dev", res.branch]), originDevBefore);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("an authored message opens the PR verbatim, with only the evidence fence added on top", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "passkeys");
+    await commitIn(rec.worktreePath, "auth.ts", "login\n", "job: passkey ceremony");
+    await commitIn(rec.worktreePath, "codes.ts", "codes\n", "job: recovery codes");
+
+    const authored = {
+      title: "Add passkey login to the web app",
+      body:
+        "Passwords were the last thing keeping the support queue busy, so login now goes through a passkey.\n\n" +
+        "Recovery codes ship with it: a lost device must not be a lost account.",
+    };
+    const res = await prepareLanding(f.opts(), "passkeys", authored);
+    assert.equal(res.kind, "green", `expected green, got ${JSON.stringify(res)}`);
+    if (res.kind !== "green") return;
+
+    const pr = f.forge.prFor("feat/passkeys")!;
+    assert.equal(pr.title, authored.title, "the title is the co's, verbatim");
+    const parts = splitEvidence(pr.body);
+    assert.equal(parts.prose, authored.body, "and so is the description, verbatim");
+    // The mechanical composition is NOT what landed — this is the whole point.
+    const mechanical = composePrMessage({ feature: "passkeys", commits: res.commits, branch: res.branch });
+    assert.notEqual(pr.title, mechanical.title);
+    assert.notEqual(parts.prose, mechanical.body.trim());
+
+    // Everything co owns still regenerates, unchanged, in its own fence.
+    assert.match(parts.evidence, /### Checks/);
+    assert.match(parts.evidence, /job: passkey ceremony/, "the commit list is co's, not the author's");
+    assert.match(parts.evidence, /job: recovery codes/);
+    assert.doesNotMatch(parts.prose, /### Checks|### Commits|<!--/, "and none of it leaked into the prose");
   } finally {
     await f.cleanup();
   }

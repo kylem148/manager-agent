@@ -75,6 +75,29 @@ test("the features protocol names branches <type>/<slug> and ownership by worktr
   }
 });
 
+test("enqueue is where co writes the PR message, in the house style", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    assert.match(prompt, /feature_enqueue\(name, prTitle, prBody\)/, "the lever carries the message");
+    assert.match(prompt, /You write the pull request's message/);
+    assert.match(prompt, /concise imperative line/, "the title rule");
+    assert.match(prompt, /what the PR accomplishes and why/, "the body rule");
+    assert.match(
+      prompt,
+      /no bot voice,\s+no attribution, nothing about co or the crew/,
+      "the house PR style: no co provenance anywhere in it (D-20260724-17)",
+    );
+    assert.match(
+      prompt,
+      /a re-enqueue with no message keeps the one you wrote/,
+      "so a retry never silently reverts to the mechanical fallback",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
 test("an ungated head comes with the offer to add a CI workflow, and never a held merge", async () => {
   const { paths, cleanup } = await makeInstance();
   try {

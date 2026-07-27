@@ -2,6 +2,7 @@ import { checksLine, type ChecksPolicy, type ChecksSummary } from "./checks.js";
 import {
   executeLanding,
   prepareLanding,
+  type AuthoredPrMessage,
   type LandingOptions,
   type PrepareResult,
 } from "./landing.js";
@@ -247,9 +248,17 @@ export interface MergeQueueHost {
    *  worktree. A worktree is worked serially, so the queue must never rebase or
    *  merge one out from under a live agent. */
   isBusy(feature: string): boolean;
-  /** Drop the feature's tracking (registry record + any intent) after it has
-   *  landed or been removed from the queue. */
+  /** Drop the feature's tracking (registry record + any stored prose) after it
+   *  has landed or been removed from the queue. */
   forget(feature: string): void;
+  /**
+   * The PR message the co authored for this feature, if any — read fresh on
+   * EVERY head processing rather than captured at enqueue, so the stored message
+   * is what a re-process uses: a resolver run, a merge advancing the queue, or a
+   * bare re-enqueue all compose the same PR the co wrote. Absent (or undefined)
+   * means landing.ts's mechanical composition applies.
+   */
+  prMessage?(feature: string): AuthoredPrMessage | undefined;
 }
 
 /** Test seams: the two pieces of the EXISTING landing machinery the queue
@@ -561,7 +570,15 @@ export class MergeQueue {
 
     let result: PrepareResult;
     try {
-      result = await this.deps.prepare(this.landingOptions(), head.feature);
+      // The authored PR message is looked up here, not carried in from enqueue:
+      // this is the one place the head is prepared, and every route into it (a
+      // first enqueue, a retry, a resolver finishing, the queue advancing after a
+      // merge) must produce the same message the co wrote.
+      result = await this.deps.prepare(
+        this.landingOptions(),
+        head.feature,
+        this.host.prMessage?.(head.feature),
+      );
     } catch (e) {
       // prepareLanding throws on a lifecycle problem (no branch/worktree, a
       // dirty or detached worktree). That is not mergeable either — surface it
