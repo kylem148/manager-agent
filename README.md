@@ -474,6 +474,14 @@ reused or the job queues. The split direction sequence and the cap are config
 values you can retune. Requires Ghostty 1.3+ and a one-time macOS Automation
 permission (granted the first time it scripts Ghostty).
 
+**Close crew panes freely.** A finished worker pane you close is dropped from
+the layout before the next placement is decided, so the following job grows from
+the newest pane that still exists, and from the anchor once you've closed every
+worker. Closing panes never breaks the link: you can spawn and delete crew panes
+all session without re-running anything. Only closing the *anchor* pane itself
+leaves nothing to grow from, and that fails the dispatch cleanly with a re-run
+`co pane` message rather than a broken link.
+
 **Dispatch is visible-only.** A crew agent runs in a visible Ghostty pane or it
 does not run at all — there is deliberately no background/headless path. If a
 pane can't be placed (Ghostty isn't reachable, or no crew pane has been
@@ -730,8 +738,10 @@ L3 return none (L1's signal is the co's own next sentence — the decision the
 captain has to make), and the body reaches the chat at no level.
 
 The dispatch layer is four focused modules. `crewpanes.ts` is the pure pane-
-placement planner (anchor takeover, alternating splits of the newest pane, cap +
-reuse-oldest, all configurable) with no I/O. `dispatchconfig.ts` reads/writes the
+placement planner (anchor takeover, alternating splits of the newest *living*
+pane, cap + reuse-oldest, all configurable) with no I/O; it exposes its tracked
+pane ids and a `prune` so a closed pane is dropped, and an emptied worker box
+falls back to splitting the anchor. `dispatchconfig.ts` reads/writes the
 per-instance `.dispatch/config.json`, resolves which named crew agent a dispatch
 uses (default or `confirm <name>` override), and resolves that agent's command
 into a runnable shell command line (git-style: the template runs verbatim, only
@@ -743,7 +753,11 @@ design: a pane that can't be placed raises a `PaneUnavailableError` and the
 dispatch fails cleanly. `registry.ts` owns in-flight jobs: it launches into a
 pane, polls captures for the sentinel, enforces timeouts, drains the pane queue,
 mints a unique capture key per dispatch, and fires a completion callback, all
-non-blocking.
+non-blocking. It is also what keeps the link durable across closed panes, from
+both sides: proactively, it probes every tracked pane's existence before
+planning and prunes the dead ones; reactively, a pane that dies between that
+sweep and the split is pruned and the placement re-planned against the
+survivors. One dead worker costs one pruned id, never the whole layout.
 
 `worktrees.ts` is the git-worktree lifecycle harness for the
 parallel-dispatch feature: ensure a `dev` integration branch exists (created
