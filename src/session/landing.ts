@@ -13,13 +13,14 @@ import {
   type PullRequest,
 } from "./forge.js";
 import {
+  DEFAULT_FEATURE_BRANCH_TYPE,
+  FEATURE_BRANCH_TYPES,
   branchExists,
-  featureBranch,
   featureSlug,
+  findFeatureWorktree,
   forgeOptions,
   git,
   isWorktreeDirty,
-  listWorktrees,
   resolveWorktreeOptions,
   runGit,
   teardownWorktree,
@@ -97,8 +98,10 @@ import {
  *
  * Safety posture: `main` is never read or written here. The local `dev` ref is
  * never read or written either — `origin/dev` is; the only local refs touched
- * are `co/feat-*` (rebase in prepare, worktree teardown after the merge) and
- * `refs/remotes/*` (via fetch). Deterministic plumbing plus gh — no model.
+ * are the feature branches co provisioned, resolved from their own worktrees
+ * and never from their names (rebase in prepare, worktree teardown after the
+ * merge), and `refs/remotes/*` (via fetch). Deterministic plumbing plus gh — no
+ * model.
  */
 
 export interface LandingOptions extends WorktreeOptions {
@@ -240,28 +243,32 @@ export interface LandResult {
  * exactly what each leaves behind.
  *
  * Preconditions are thrown, not classified: a missing prerequisite (no gh, not
- * authenticated, no `origin/dev`), a feature with no branch or no worktree, a
- * worktree not on its branch, or one with uncommitted changes is a
- * caller/lifecycle problem, not a landing outcome — and throwing before touching
- * anything trivially preserves every invariant. The queue turns such a throw
- * into a blocked head carrying the message; the tool layer reports it verbatim.
+ * authenticated, no `origin/dev`), a feature with no worktree, a worktree not on
+ * its branch, or one with uncommitted changes is a caller/lifecycle problem, not
+ * a landing outcome — and throwing before touching anything trivially preserves
+ * every invariant. The queue turns such a throw into a blocked head carrying the
+ * message; the tool layer reports it verbatim.
+ *
+ * The branch is read off the feature's registered worktree, never derived from
+ * its name: co lands the branch it actually provisioned, and a same-named branch
+ * it did not create is not reachable from here.
  */
 export async function prepareLanding(opts: LandingOptions, feature: string): Promise<PrepareResult> {
   const r = resolveWorktreeOptions(opts);
   const forge = forgeOptions(opts);
   const slug = featureSlug(feature);
-  const branch = featureBranch(feature);
 
+  const owned = await findFeatureWorktree(opts, feature);
+  if (!owned || !fs.existsSync(owned.path)) {
+    throw new Error(
+      `feature '${feature}' (${slug}) has no worktree under ${r.baseDir}; dispatch it first or run reconcile`,
+    );
+  }
+  const branch = owned.branch;
   if (!(await branchExists(r.repoPath, branch))) {
     throw new Error(`feature '${feature}' has no branch '${branch}' in ${r.repoPath}`);
   }
-  const entry = (await listWorktrees(r.repoPath)).find((w) => w.branch === `refs/heads/${branch}`);
-  if (!entry || !fs.existsSync(entry.path)) {
-    throw new Error(
-      `feature '${feature}' (${slug}) has no worktree for '${branch}'; dispatch it first or run reconcile`,
-    );
-  }
-  const worktreePath = entry.path;
+  const worktreePath = owned.path;
   // The rebase acts on the worktree's HEAD; make sure that IS the feature
   // branch (a crew could conceivably have detached or switched it).
   const head = await runGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
@@ -332,8 +339,8 @@ export async function prepareLanding(opts: LandingOptions, feature: string): Pro
     composeEvidence({ commits, devSha, featureSha, devRef: r.devRef, ...(checks ? { checks } : {}) });
   const ensured = await ensurePr(forge, {
     branch,
-    title: composePrTitle(feature, commits),
-    body: composePrBody({ feature, branch, target: r.devBranch }),
+    title: composePrTitle(feature, commits, branch),
+    body: composePrBody({ feature, commits }),
     evidence: evidenceOf(),
   });
 
@@ -393,8 +400,16 @@ export async function executeLanding(
 ): Promise<LandResult> {
   const r = resolveWorktreeOptions(opts);
   const forge = forgeOptions(opts);
-  const branch = featureBranch(feature);
 
+  // Same rule as prepare: the branch is the one this feature's own worktree has
+  // checked out. No worktree, no landing.
+  const owned = await findFeatureWorktree(opts, feature);
+  if (!owned) {
+    throw new Error(
+      `feature '${feature}' has no worktree under ${r.baseDir}; re-provision it or run reconcile`,
+    );
+  }
+  const branch = owned.branch;
   if (!(await branchExists(r.repoPath, branch))) {
     throw new Error(`feature '${feature}' has no branch '${branch}' in ${r.repoPath}`);
   }
@@ -454,7 +469,7 @@ export async function executeLanding(
   }
 
   // The PR merged the branch on the forge; the ref stays, the checkout goes.
-  const teardown = await teardownWorktree(opts, feature, { keepBranch: true });
+  const teardown = await teardownWorktree(opts, feature, { keepBranch: true, branch });
   return {
     feature,
     branch,
@@ -468,39 +483,48 @@ export async function executeLanding(
 // --- the PR message ----------------------------------------------------------
 
 /**
- * The PR title. A single-commit feature takes that commit's own subject (the
- * crew already wrote the one-line summary); anything larger is titled by the
- * feature, because a multi-commit branch has no single subject that is honest.
- * Written once, at create time — an update never overwrites it, so a captain who
- * retitles the PR on GitHub keeps their title.
+ * The PR title, written the way a person would write it. A single-commit branch
+ * takes that commit's own subject (already a Conventional Commits line); a
+ * multi-commit branch has no single honest subject, so it is titled
+ * `<type>: <feature>` from the branch's own conventional type. Written once, at
+ * create time — an update never overwrites it, so a captain who retitles the PR
+ * on GitHub keeps their title.
  */
-export function composePrTitle(feature: string, commits: string[]): string {
+export function composePrTitle(feature: string, commits: string[], branch?: string): string {
   if (commits.length === 1) {
     const only = commits[0]!;
     const sp = only.indexOf(" ");
     const subject = sp === -1 ? "" : only.slice(sp + 1).trim();
     if (subject) return subject;
   }
-  return feature.trim() || "feature";
+  const name = feature.trim() || "feature";
+  return `${branchType(branch)}: ${name.toLowerCase()}`;
 }
 
-/** The PR description co writes on create: what this is and how it will be
- *  merged. Everything volatile lives in the evidence block instead, so a
+/** The conventional type a branch carries (`fix/stale-token` → "fix"), falling
+ *  back to the default for anything else — an older `co/feat-*` name, a branch
+ *  with no prefix at all, or one whose prefix isn't a conventional type. */
+function branchType(branch?: string): string {
+  const slash = branch?.indexOf("/") ?? -1;
+  const prefix = slash > 0 ? branch!.slice(0, slash) : "";
+  return FEATURE_BRANCH_TYPES.find((t) => t === prefix) ?? DEFAULT_FEATURE_BRANCH_TYPE;
+}
+
+/** The PR description: a plain one-line summary of what the branch does, the way
+ *  a developer opening a PR would write it. Everything volatile — the commit
+ *  list, the checks result — lives in the evidence block below, so a
  *  re-processed head refreshes the numbers without touching this prose (or any
  *  the captain has since added around it). */
-export function composePrBody(opts: { feature: string; branch: string; target: string }): string {
-  return [
-    `Feature **${opts.feature}** → \`${opts.target}\`.`,
-    ``,
-    `\`${opts.branch}\` was rebased onto the current \`${opts.target}\` tip before this PR opened, so the ` +
-      `checks below ran on the state \`${opts.target}\` will actually hold. This PR's own CI is the merge ` +
-      `gate — co runs no build or test of its own. The evidence below is regenerated every time the branch ` +
-      `is re-processed.`,
-    ``,
-    `Merged with a merge commit, so the feature's per-job commits and its branch topology survive. ` +
-      `The branch ref is kept after the merge.`,
-    ``,
-  ].join("\n");
+export function composePrBody(opts: { feature: string; commits: string[] }): string {
+  const name = sentenceCase(opts.feature.trim() || "this branch");
+  const summary = opts.commits.length > 1 ? `${name}, in ${opts.commits.length} commits.` : `${name}.`;
+  return [summary, ``].join("\n");
+}
+
+/** Capitalise a feature handle for use as a sentence ("user auth" → "User
+ *  auth"), leaving an already-capitalised or non-alphabetic start alone. */
+function sentenceCase(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 /** The fenced block co owns inside the PR body: what is in this branch, what it

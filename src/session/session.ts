@@ -63,7 +63,7 @@ import {
 import { DispatchRegistry, readFileTail, type Job } from "./registry.js";
 import { FeatureManager } from "./features.js";
 import type { MergeHeadResult } from "./mergequeue.js";
-import { FEATURE_BRANCH_PREFIX, defaultWorktreeBase, featureSlug } from "./worktrees.js";
+import { DEFAULT_FEATURE_BRANCH_TYPE, defaultWorktreeBase, featureSlug } from "./worktrees.js";
 import { scrubCapture } from "./transport.js";
 import { findCrewTranscript, renderTranscriptForReview } from "./crewtranscript.js";
 
@@ -851,16 +851,17 @@ function visualsFor(io: SessionIO): EffectiveVisuals {
  * Where a confirmed dispatch is headed, as the flourish and its static label
  * show it: a feature's own branch, or the bare main tree. Prefers the branch the
  * feature record already carries and falls back to projecting the name a
- * provision would mint, so a first-use dispatch (nothing provisioned yet) still
- * names the branch the crew will actually be on. Pure display — it provisions
- * nothing, exactly like describeTarget above it.
+ * provision would mint (the default type, since a first-use dispatch never
+ * supplied one), so a dispatch with nothing provisioned yet still names the
+ * branch the crew will actually be on. Pure display — it provisions nothing,
+ * exactly like describeTarget above it.
  */
 function dispatchTarget(state: SessionState, feature?: string): DispatchTarget {
   if (!feature) return { kind: "main" };
   const record = state.features?.list().find((f) => f.feature === feature || f.slug === feature);
   return {
     kind: "feature",
-    branch: record?.branch ?? FEATURE_BRANCH_PREFIX + safeFeatureSlug(feature),
+    branch: record?.branch ?? `${DEFAULT_FEATURE_BRANCH_TYPE}/${safeFeatureSlug(feature)}`,
   };
 }
 

@@ -7,6 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import { CHECKS_GRACE_MS, CHECKS_INTERVAL_MS, CHECKS_TIMEOUT_MS, type ChecksPolicy } from "./checks.js";
 import {
+  composePrBody,
+  composePrTitle,
   executeLanding,
   prepareLanding,
   type LandingOptions,
@@ -126,6 +128,29 @@ test("the checks wait is bounded by default: a real timeout, a real interval, a 
   assert.ok(CHECKS_GRACE_MS > 0 && CHECKS_GRACE_MS <= CHECKS_TIMEOUT_MS);
 });
 
+test("the PR message reads like a person's: a conventional title and a plain body", () => {
+  // One commit: the crew's own subject, verbatim.
+  assert.equal(
+    composePrTitle("user auth", ["abc1234 feat(auth): add login"], "feat/user-auth"),
+    "feat(auth): add login",
+  );
+  // Several: a conventional title built from the branch's own type.
+  assert.equal(composePrTitle("User Auth", ["a one", "b two"], "feat/user-auth"), "feat: user auth");
+  assert.equal(composePrTitle("Stale Token", ["a one", "b two"], "fix/stale-token"), "fix: stale token");
+  // A legacy branch, or none at all, falls back to the default type.
+  assert.equal(composePrTitle("Prompt Fixes", ["a one", "b two"], "co/feat-prompt-fixes"), "feat: prompt fixes");
+  assert.equal(composePrTitle("Prompt Fixes", ["a one", "b two"]), "feat: prompt fixes");
+
+  const one = composePrBody({ feature: "user auth", commits: ["a one"] });
+  assert.match(one, /^User auth\.$/m);
+  const many = composePrBody({ feature: "user auth", commits: ["a one", "b two"] });
+  assert.match(many, /^User auth, in 2 commits\.$/m);
+  // Nothing in it advertises how the work was produced.
+  for (const body of [one, many]) {
+    assert.doesNotMatch(body, /co[- ]?manager|\bcrew\b|dispatch|worktree|Co-Authored-By|Generated with/i);
+  }
+});
+
 test("prepareLanding rebases onto origin/dev, pushes, and opens the PR — the local dev ref never moves", async () => {
   const f = await makeRepo();
   try {
@@ -136,7 +161,7 @@ test("prepareLanding rebases onto origin/dev, pushes, and opens the PR — the l
     const originDevBefore = f.forge.branches.get("dev")!;
 
     const res = await prepareGreen(f, "alpha");
-    assert.equal(res.branch, "co/feat-alpha");
+    assert.equal(res.branch, "feat/alpha");
     assert.equal(res.devSha, originDevBefore, "the base is the origin/dev tip");
     assert.equal(res.featureSha, sha(f.repo, res.branch), "featureSha is the branch tip");
     assert.match(res.diff, /\+alpha work/);
@@ -145,14 +170,20 @@ test("prepareLanding rebases onto origin/dev, pushes, and opens the PR — the l
 
     // Published: the rebased tip is on the remote, and a PR into dev is open.
     assert.equal(res.pushed, true);
-    assert.equal(f.forge.branches.get("co/feat-alpha"), res.featureSha, "the TESTED sha was pushed");
+    assert.equal(f.forge.branches.get("feat/alpha"), res.featureSha, "the TESTED sha was pushed");
     assert.equal(res.pr?.created, true);
-    const pr = f.forge.prFor("co/feat-alpha")!;
+    const pr = f.forge.prFor("feat/alpha")!;
     assert.equal(pr.base, "dev");
     assert.equal(pr.title, "job: alpha work", "a one-commit feature takes that commit's subject");
     assert.match(pr.body, /### Checks/);
     assert.match(pr.body, /job: alpha work/, "the commit list is in the PR body");
-    assert.match(pr.body, /merge commit/, "the PR states how it will be merged");
+    // The message is a developer's, not a machine's: no co-manager provenance
+    // anywhere in the rendered text.
+    assert.doesNotMatch(pr.title, /co[- ]?manager|\bco\b/i);
+    assert.doesNotMatch(
+      pr.body.replace(/<!--[\s\S]*?-->/g, ""),
+      /co[- ]?manager|crew|dispatch|Co-Authored-By/i,
+    );
 
     // Non-destructive locally: the captain's dev and main are byte-identical.
     assert.equal(sha(f.repo, "dev"), localDevBefore);
@@ -454,7 +485,7 @@ test("prepareLanding throws on a dirty worktree and on a feature with no worktre
     assert.ok(fs.existsSync(path.join(rec.worktreePath, "wip.txt")), "the uncommitted work survives");
     assert.deepEqual(f.forge.pushes, []);
 
-    await assert.rejects(prepareLanding(f.opts(), "never-dispatched"), /no branch/);
+    await assert.rejects(prepareLanding(f.opts(), "never-dispatched"), /has no worktree under/);
   } finally {
     await f.cleanup();
   }

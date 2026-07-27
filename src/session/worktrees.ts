@@ -7,7 +7,7 @@ import { requireRemoteDev, type CommandRunner } from "./forge.js";
 /**
  * Git-worktree lifecycle for parallel dispatch — the lowest layer of the
  * feature-isolation scheme. Each "feature" gets its own worktree on a fresh
- * `co/feat-<slug>` branch cut from `origin/dev`; a crew agent works there in
+ * `<type>/<slug>` branch cut from `origin/dev`; a crew agent works there in
  * isolation, and higher layers later rebase the finished branch onto the fresh
  * `origin/dev`, build, test, push it, and land it through a GitHub pull request
  * behind a human gate. This module is only the hands: verify the remote
@@ -18,18 +18,35 @@ import { requireRemoteDev, type CommandRunner } from "./forge.js";
  * landing.ts (the rebase + PR + checks engine) consumes teardownWorktree
  * and the exported git helpers below.
  *
+ * OWNERSHIP: which branches are co's. Feature branches carry ordinary
+ * Conventional Commits prefixes (`feat/<slug>`, `fix/<slug>`, …), so the NAME
+ * proves nothing — the captain's own `feat/login` must never be adopted,
+ * rebuilt, or deleted as if co had cut it. The signal is the WORKTREE: co's
+ * features are exactly the branches checked out in the worktrees co registered
+ * directly under the managed base dir, one directory per slug. Every path that
+ * writes (teardown, abandon) resolves a feature's branch from that worktree and
+ * from nothing else. Branches co cuts are additionally marked in the repo's
+ * local git config (`branch.<name>.comanager-feature = <slug>`), which outlives
+ * the checkout and lets the READ-ONLY reconcile passes still recognise a branch
+ * whose worktree is gone; the marker reports, it never authorises a deletion.
+ * Branches from before conventional naming (`co/feat-<slug>`) are recognised by
+ * that prefix too, so features an older build created stay manageable. Nothing
+ * is ever renamed.
+ *
  * Safety posture (the invariants everything below preserves):
  *  - `main` is human-only: nothing here writes to it, checks it out, or
  *    deletes it.
  *  - THE LOCAL `dev` REF IS NEVER WRITTEN, and never even read (D-20260724-13).
  *    `dev` is checked out in the captain's primary tree; the integration ref
  *    everything here compares against is the remote-tracking `origin/dev`,
- *    advanced only by `git fetch`. The only refs ever created are `co/feat-*`.
- *  - A `co/feat-*` branch is deleted only on an explicit abandon, and only when
- *    it is truly merged into `origin/dev` — a merge-base ancestor check, not
- *    `git branch -d`'s HEAD-relative one (HEAD is usually main here, so -d would
- *    misjudge). Unmerged work is kept and reported, never force-dropped. After a
- *    PR merge the branch ref is kept deliberately (teardown's `keepBranch`).
+ *    advanced only by `git fetch`. The only refs ever created are the feature
+ *    branches co cuts itself.
+ *  - A feature branch is deleted only on an explicit abandon, only when co owns
+ *    it by the worktree rule above, and only when it is truly merged into
+ *    `origin/dev` — a merge-base ancestor check, not `git branch -d`'s
+ *    HEAD-relative one (HEAD is usually main here, so -d would misjudge).
+ *    Unmerged work is kept and reported, never force-dropped. After a PR merge
+ *    the branch ref is kept deliberately (teardown's `keepBranch`).
  *  - A worktree with uncommitted changes is never removed: teardown throws,
  *    reconcile keeps it with a reason.
  *
@@ -54,7 +71,37 @@ import { requireRemoteDev, type CommandRunner } from "./forge.js";
  * names and paths are never re-tokenized.
  */
 
-export const FEATURE_BRANCH_PREFIX = "co/feat-";
+/** The Conventional Commits types a feature branch may be prefixed with. The
+ *  branch reads as a human's would: `feat/login`, `fix/stale-token`. */
+export const FEATURE_BRANCH_TYPES = [
+  "feat",
+  "fix",
+  "docs",
+  "refactor",
+  "chore",
+  "test",
+  "perf",
+  "build",
+  "ci",
+  "style",
+] as const;
+
+export type FeatureBranchType = (typeof FEATURE_BRANCH_TYPES)[number];
+
+/** The type a feature gets when none is supplied. */
+export const DEFAULT_FEATURE_BRANCH_TYPE: FeatureBranchType = "feat";
+
+/** The prefix co minted before conventional naming. RECOGNISED, never minted:
+ *  existing `co/feat-*` features stay manageable and are never renamed. */
+export const LEGACY_FEATURE_BRANCH_PREFIX = "co/feat-";
+
+/** The git-config variable co stamps on a branch it cuts, under that branch's
+ *  own section: `branch.<name>.comanager-feature = <slug>`. A durable, name-
+ *  independent record that co created the ref, used by the read-only reconcile
+ *  passes to still recognise a branch whose worktree has gone. It never
+ *  authorises a delete — only a registered worktree does that. */
+const OWNERSHIP_CONFIG_VAR = "comanager-feature";
+
 const DEFAULT_DEV_BRANCH = "dev";
 const DEFAULT_REMOTE = "origin";
 
@@ -75,7 +122,10 @@ export interface FeatureRecord {
   feature: string;
   /** The slug derived from the name; the branch and worktree dir both use it. */
   slug: string;
-  /** The feature branch, always `co/feat-<slug>`. */
+  /** The feature branch: `<type>/<slug>` for anything co cuts now, or whatever
+   *  the feature's existing worktree is checked out on (a `co/feat-<slug>` from
+   *  an older build). Always read from the worktree, never re-derived from the
+   *  feature name. */
   branch: string;
   /** Absolute path of the feature's worktree under the managed base dir. */
   worktreePath: string;
@@ -157,7 +207,7 @@ export function forgeOptions(opts: WorktreeOptions): {
 
 /** Slug a feature name for use in a branch and directory name: lowercase,
  *  alphanumeric runs joined by single dashes, capped at 48 chars. Throws when
- *  nothing survives — a branch named `co/feat-` would be a footgun. */
+ *  nothing survives — a branch named `feat/` would be a footgun. */
 export function featureSlug(feature: string): string {
   const slug = feature
     .toLowerCase()
@@ -169,9 +219,41 @@ export function featureSlug(feature: string): string {
   return slug;
 }
 
-/** The branch a feature lives on: `co/feat-<slug>`. */
-export function featureBranch(feature: string): string {
-  return `${FEATURE_BRANCH_PREFIX}${featureSlug(feature)}`;
+/** Validate a caller-supplied branch type against the Conventional Commits set,
+ *  tolerating case and surrounding space. An absent type is the default (feat);
+ *  anything outside the set is refused by name rather than silently coerced —
+ *  the branch is a durable artifact and a typo'd prefix would outlive the call. */
+export function normalizeFeatureType(type?: string): FeatureBranchType {
+  const t = (type ?? "").trim().toLowerCase();
+  if (!t) return DEFAULT_FEATURE_BRANCH_TYPE;
+  const match = FEATURE_BRANCH_TYPES.find((v) => v === t);
+  if (!match) {
+    throw new Error(
+      `unknown branch type ${JSON.stringify(type)}; use one of ${FEATURE_BRANCH_TYPES.join(", ")}`,
+    );
+  }
+  return match;
+}
+
+/** The branch a NEW feature is cut on: `<type>/<slug>`, e.g. `feat/user-auth`.
+ *  This mints a name; it does not identify an existing feature. Never use it to
+ *  decide a branch is co's — see findFeatureWorktree for that. */
+export function featureBranch(feature: string, type?: string): string {
+  return `${normalizeFeatureType(type)}/${featureSlug(feature)}`;
+}
+
+/** The pre-conventional name for a feature: `co/feat-<slug>`. Only used to
+ *  recognise (and refuse to clobber) branches an older build cut. */
+export function legacyFeatureBranch(feature: string): string {
+  return `${LEGACY_FEATURE_BRANCH_PREFIX}${featureSlug(feature)}`;
+}
+
+/** Where a feature's checkout lives: `<baseDir>/<slug>`. This path IS the
+ *  ownership signal — a registered worktree here is co's, whatever its branch
+ *  is called. */
+export function featureWorktreePath(opts: WorktreeOptions, feature: string): string {
+  const r = resolveWorktreeOptions(opts);
+  return path.join(r.baseDir, featureSlug(feature));
 }
 
 // --- git plumbing ------------------------------------------------------------
@@ -267,6 +349,129 @@ function samePath(a: string, b: string): boolean {
   return realpathOr(a) === realpathOr(b);
 }
 
+// --- ownership ---------------------------------------------------------------
+//
+// The whole of "is this branch co's?" lives here. Nothing below reads a branch
+// NAME to answer it: a feature is a registered worktree sitting directly under
+// the managed base dir, and its branch is whatever that worktree has checked
+// out. A human's `feat/login` in their own tree is invisible to every function
+// in this file.
+
+/** One feature as it exists on disk: the checkout co registered, the slug its
+ *  directory is named for, and the branch it is actually on. */
+export interface FeatureWorktree {
+  /** Absolute path of the checkout, as git reports it. */
+  path: string;
+  /** The directory's own name, which is the feature slug. */
+  slug: string;
+  /** The branch checked out there — the ONLY authority on a feature's branch. */
+  branch: string;
+}
+
+/**
+ * Every worktree co owns: the registered worktrees that sit DIRECTLY under the
+ * managed base dir with a branch checked out. That containment is the ownership
+ * test — co created the base dir and puts exactly one checkout per feature in
+ * it, so a worktree there is co's by construction, whatever its branch is
+ * called, and a worktree anywhere else is not co's however it is named.
+ *
+ * The primary tree is skipped explicitly (a base dir configured as the repo's
+ * parent would otherwise sweep the repo itself in), and so is any detached
+ * checkout, which has no branch to manage.
+ */
+export async function listFeatureWorktrees(opts: WorktreeOptions): Promise<FeatureWorktree[]> {
+  const r = resolveWorktreeOptions(opts);
+  const base = realpathOr(r.baseDir);
+  const out: FeatureWorktree[] = [];
+  for (const entry of await listWorktrees(r.repoPath)) {
+    if (samePath(entry.path, r.repoPath)) continue;
+    const branch = entry.branch?.startsWith("refs/heads/")
+      ? entry.branch.slice("refs/heads/".length)
+      : null;
+    if (!branch) continue;
+    const dir = realpathOr(entry.path);
+    if (path.dirname(dir) !== base) continue;
+    out.push({ path: entry.path, slug: path.basename(dir), branch });
+  }
+  return out;
+}
+
+/** The worktree co owns for a feature (matched by slug, i.e. by directory), or
+ *  null when co has no checkout for it. Every caller that is about to act on a
+ *  feature's branch resolves it through here. */
+export async function findFeatureWorktree(
+  opts: WorktreeOptions,
+  feature: string,
+): Promise<FeatureWorktree | null> {
+  const slug = featureSlug(feature);
+  const all = await listFeatureWorktrees(opts);
+  return all.find((w) => w.slug === slug) ?? null;
+}
+
+/** Stamp the ownership marker on a branch co just cut. Written to the repo's
+ *  local config, which is shared by every worktree and outlives all of them.
+ *  Best-effort on purpose: the marker only feeds read-only reporting, and the
+ *  worktree it describes already exists by the time this runs, so a config that
+ *  cannot be written must not turn a completed provision into a half-state. */
+async function markOwnedBranch(repoPath: string, branch: string, slug: string): Promise<void> {
+  try {
+    await runGit(repoPath, ["config", "--local", `branch.${branch}.${OWNERSHIP_CONFIG_VAR}`, slug]);
+  } catch {
+    // Nothing to do: the worktree is the ownership signal that matters.
+  }
+}
+
+/**
+ * The branches co cut that still exist, by the two name-independent signals:
+ * the config marker co stamps at provision time, and the legacy `co/feat-*`
+ * prefix from before conventional naming. READ-ONLY use only — this feeds the
+ * reconcile passes that REPORT a branch whose worktree has gone. A delete is
+ * never authorised from here; only a registered worktree authorises that.
+ *
+ * `git branch -D` drops the whole `branch.<name>` config section with the ref,
+ * so a marker cannot outlive its branch through co's own paths; a ref deleted
+ * some other way is filtered out against the live ref list anyway.
+ */
+export async function listOwnedFeatureBranches(
+  opts: WorktreeOptions,
+): Promise<{ branch: string; slug: string }[]> {
+  const r = resolveWorktreeOptions(opts);
+  const live = new Set(
+    (await git(r.repoPath, ["for-each-ref", "--format=%(refname:short)", "refs/heads/"]))
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean),
+  );
+  const found = new Map<string, string>();
+
+  const marked = await runGit(r.repoPath, [
+    "config",
+    "--local",
+    "--get-regexp",
+    `^branch\\..*\\.${OWNERSHIP_CONFIG_VAR}$`,
+  ]);
+  // Exit 1 is "no matches", which is simply a repo with no marked branches.
+  if (marked.code === 0) {
+    const suffix = `.${OWNERSHIP_CONFIG_VAR}`;
+    for (const line of marked.stdout.split("\n")) {
+      const sp = line.indexOf(" ");
+      const key = (sp === -1 ? line : line.slice(0, sp)).trim();
+      const value = sp === -1 ? "" : line.slice(sp + 1).trim();
+      if (!key.startsWith("branch.") || !key.endsWith(suffix)) continue;
+      const branch = key.slice("branch.".length, key.length - suffix.length);
+      if (!branch || !live.has(branch)) continue;
+      found.set(branch, value || branch.slice(branch.lastIndexOf("/") + 1));
+    }
+  }
+
+  for (const branch of live) {
+    if (!branch.startsWith(LEGACY_FEATURE_BRANCH_PREFIX)) continue;
+    if (!found.has(branch)) found.set(branch, branch.slice(LEGACY_FEATURE_BRANCH_PREFIX.length));
+  }
+
+  return [...found].map(([branch, slug]) => ({ branch, slug }));
+}
+
 // --- build-artifact links ----------------------------------------------------
 
 /** Symlink node_modules/ (and dist/ if present) from the primary tree into the
@@ -335,26 +540,36 @@ export async function ensureRemoteDevBranch(
 
 /**
  * Provision a feature: a new worktree at `<baseDir>/<slug>` on a fresh
- * `co/feat-<slug>` branch cut from the freshly-fetched `origin/dev`, with build
+ * `<type>/<slug>` branch cut from the freshly-fetched `origin/dev`, with build
  * artifacts symlinked from the primary tree. Verifies the remote integration
  * branch first, so a repo that can't support the flow fails here with a clear
- * message instead of halfway through a landing.
+ * message instead of halfway through a landing. `type` is a Conventional
+ * Commits type (default feat) and is validated before anything is created.
  *
- * Idempotent for an already-provisioned feature (same branch, same path): the
- * existing worktree is returned, artifacts re-linked. Any OTHER collision — a
- * leftover branch without its worktree, the worktree registered elsewhere, an
- * occupied path — throws with a pointer at reconcile/teardown rather than
- * guessing which half-state to destroy.
+ * Idempotent for an already-provisioned feature: the existing worktree is
+ * returned AS IT IS — on whatever branch it holds, including a `co/feat-*` one
+ * an older build cut — and its artifacts are re-linked. Nothing is renamed and
+ * no second branch is minted for a feature that already has a checkout.
+ *
+ * Any other collision — a leftover branch of either naming scheme without its
+ * worktree, an occupied path — throws with a pointer at reconcile/teardown
+ * rather than guessing which half-state to destroy.
  */
-export async function provisionWorktree(opts: WorktreeOptions, feature: string): Promise<FeatureRecord> {
+export async function provisionWorktree(
+  opts: WorktreeOptions,
+  feature: string,
+  extra: { type?: string } = {},
+): Promise<FeatureRecord> {
   const r = resolveWorktreeOptions(opts);
   const slug = featureSlug(feature);
-  const branch = `${FEATURE_BRANCH_PREFIX}${slug}`;
-  const worktreePath = path.join(r.baseDir, slug);
+  const branch = featureBranch(feature, extra.type);
+  const worktreePath = featureWorktreePath(opts, feature);
 
   await ensureRemoteDevBranch(opts);
 
-  const existing = (await listWorktrees(r.repoPath)).find((w) => w.branch === `refs/heads/${branch}`);
+  // Ownership is the worktree, so idempotency asks the worktree — not the name
+  // a fresh provision would have picked.
+  const existing = await findFeatureWorktree(opts, feature);
   if (existing) {
     if (!samePath(existing.path, worktreePath) || !fs.existsSync(existing.path)) {
       throw new Error(
@@ -363,10 +578,19 @@ export async function provisionWorktree(opts: WorktreeOptions, feature: string):
       );
     }
     await linkArtifacts(r.repoPath, worktreePath);
-    return { feature, slug, branch, worktreePath, provisionStatus: "ready" };
+    return { feature, slug, branch: existing.branch, worktreePath, provisionStatus: "ready" };
   }
-  if (await branchExists(r.repoPath, branch)) {
-    throw new Error(`branch '${branch}' already exists without a worktree; run reconcile or teardown first`);
+  // Both naming schemes are checked. The conventional name may be the captain's
+  // own branch, which co must not cut over or adopt; a bare `co/feat-<slug>` is
+  // a feature an older build left behind, and minting a second branch for the
+  // same slug would silently orphan it. Either way: refuse, destroy nothing.
+  for (const taken of [branch, legacyFeatureBranch(feature)]) {
+    if (await branchExists(r.repoPath, taken)) {
+      throw new Error(
+        `branch '${taken}' already exists and is not a feature co provisioned; ` +
+          `run reconcile or teardown first, or use a different name or type`,
+      );
+    }
   }
   if (fs.existsSync(worktreePath)) {
     throw new Error(`worktree path ${worktreePath} is already occupied; run reconcile first`);
@@ -377,6 +601,7 @@ export async function provisionWorktree(opts: WorktreeOptions, feature: string):
   // based on what the forge actually has, and `--no-track` keeps the new branch
   // from adopting `origin/dev` as its upstream (it pushes to its own name).
   await git(r.repoPath, ["worktree", "add", worktreePath, "-b", branch, "--no-track", r.devRef]);
+  await markOwnedBranch(r.repoPath, branch, slug);
   await linkArtifacts(r.repoPath, worktreePath);
   return { feature, slug, branch, worktreePath, provisionStatus: "ready" };
 }
@@ -406,21 +631,28 @@ export interface TeardownResult {
  * and only a branch that passes it is deleted (with -D, because -d judges
  * against HEAD, which is the primary tree's branch). An unmerged branch is kept
  * and named in the result.
+ *
+ * WHICH BRANCH IT ACTS ON is never guessed from the feature name. It is the one
+ * the feature's registered worktree has checked out; failing that (the checkout
+ * is already gone) the caller's own record via `extra.branch`; failing that the
+ * legacy `co/feat-<slug>`, which is a name only co ever minted. A conventional
+ * `<type>/<slug>` is never assumed, so a human branch that happens to match a
+ * feature's slug is not reachable from here.
  */
 export async function teardownWorktree(
   opts: WorktreeOptions,
   feature: string,
-  extra: { keepBranch?: boolean } = {},
+  extra: { keepBranch?: boolean; branch?: string } = {},
 ): Promise<TeardownResult> {
   const r = resolveWorktreeOptions(opts);
-  const slug = featureSlug(feature);
-  const branch = `${FEATURE_BRANCH_PREFIX}${slug}`;
+
+  const owned = await findFeatureWorktree(opts, feature);
+  const branch = owned?.branch ?? extra.branch ?? legacyFeatureBranch(feature);
 
   let worktreeRemoved = false;
-  const entry = (await listWorktrees(r.repoPath)).find((w) => w.branch === `refs/heads/${branch}`);
-  if (entry && fs.existsSync(entry.path)) {
-    await unlinkArtifacts(entry.path);
-    await git(r.repoPath, ["worktree", "remove", entry.path]);
+  if (owned && fs.existsSync(owned.path)) {
+    await unlinkArtifacts(owned.path);
+    await git(r.repoPath, ["worktree", "remove", owned.path]);
     worktreeRemoved = true;
   }
   // Prune BEFORE the branch delete: a crashed run can leave metadata for a
@@ -449,9 +681,10 @@ export async function teardownWorktree(
 }
 
 export interface ReconcileReport {
-  /** Zombie worktrees removed (registered, clean, co/feat-* only). */
+  /** Zombie worktrees removed (registered, clean, and under the managed base —
+   *  i.e. co's own). */
   removedWorktrees: string[];
-  /** co/feat-* branches deleted. Since branch refs are kept after a PR merge
+  /** Feature branches deleted. Since branch refs are kept after a PR merge
    *  (D-20260724-13) this sweep deletes none and the list stays empty; it is
    *  retained so a caller's reporting shape does not change. */
   removedBranches: string[];
@@ -469,20 +702,21 @@ export interface ReconcileReport {
  *
  * Four passes:
  *  1. `git worktree prune` — clears metadata whose directory is already gone.
- *  2. Registered `co/feat-*` worktrees: remove the clean ones; a worktree with
- *     uncommitted work is kept (reported). Non-feature worktrees — the primary
- *     tree, anything detached, any user worktree — are never touched.
- *  3. `co/feat-*` branches with no remaining worktree: KEPT, and reported.
- *     Branch refs outlive their worktrees by policy now that features land
- *     through a PR (D-20260724-13) — a merged branch is the normal steady
- *     state, not a zombie — so this pass deletes nothing. No other ref is ever
- *     considered either way.
+ *  2. Registered worktrees co owns (directly under the managed base): remove
+ *     the clean ones; a worktree with uncommitted work is kept (reported).
+ *     Everything else — the primary tree, anything detached, any worktree the
+ *     captain made elsewhere — is never touched, whatever its branch is called.
+ *  3. Branches co cut (config marker, or the legacy prefix) with no remaining
+ *     worktree: KEPT, and reported. Branch refs outlive their worktrees by
+ *     policy now that features land through a PR (D-20260724-13) — a merged
+ *     branch is the normal steady state, not a zombie — so this pass deletes
+ *     nothing. No other ref is ever considered either way.
  *  4. Stray directories under the managed base that git no longer knows about
  *     (registration lost mid-crash): removed only after verifying the dir's
  *     `.git` file points into THIS repo's worktree metadata; anything else in
  *     the base dir is kept and reported.
  *
- * `keep` names features (or full `co/feat-*` branch names) to leave alone —
+ * `keep` names features (by name or slug) or full branch names to leave alone —
  * the seam for a future caller with in-flight features.
  */
 export async function reconcileWorktrees(
@@ -490,19 +724,20 @@ export async function reconcileWorktrees(
   extra: { keep?: string[] } = {},
 ): Promise<ReconcileReport> {
   const r = resolveWorktreeOptions(opts);
-  const keepBranches = new Set(
-    (extra.keep ?? []).map((k) => (k.startsWith(FEATURE_BRANCH_PREFIX) ? k : featureBranch(k))),
+  // A keep entry is a branch name if it looks like one (branches are prefixed,
+  // slugs never contain a slash); otherwise it names a feature.
+  const keepBranches = new Set((extra.keep ?? []).filter((k) => k.includes("/")));
+  const keepSlugs = new Set(
+    (extra.keep ?? []).filter((k) => !k.includes("/")).map((k) => safeFeatureSlug(k)).filter(Boolean),
   );
   const report: ReconcileReport = { removedWorktrees: [], removedBranches: [], removedStrays: [], kept: [] };
 
   await git(r.repoPath, ["worktree", "prune"]);
 
-  // Pass 2: registered feature worktrees.
-  for (const entry of await listWorktrees(r.repoPath)) {
-    const branch = entry.branch?.startsWith("refs/heads/") ? entry.branch.slice("refs/heads/".length) : null;
-    if (!branch || !branch.startsWith(FEATURE_BRANCH_PREFIX)) continue;
-    if (keepBranches.has(branch)) {
-      report.kept.push({ ref: branch, reason: "listed as in-flight" });
+  // Pass 2: the worktrees co owns.
+  for (const entry of await listFeatureWorktrees(opts)) {
+    if (keepBranches.has(entry.branch) || keepSlugs.has(entry.slug)) {
+      report.kept.push({ ref: entry.branch, reason: "listed as in-flight" });
       continue;
     }
     if (!fs.existsSync(entry.path)) continue; // pruned above; defensive
@@ -520,13 +755,9 @@ export async function reconcileWorktrees(
   const remaining = await listWorktrees(r.repoPath);
   const stillAttached = new Set(remaining.map((w) => w.branch).filter((b): b is string => b !== null));
   const devExists = await refExists(r.repoPath, r.devRef);
-  const refsOut = await git(r.repoPath, [
-    "for-each-ref",
-    "--format=%(refname:short)",
-    `refs/heads/${FEATURE_BRANCH_PREFIX}*`,
-  ]);
-  for (const branch of refsOut.split("\n").map((l) => l.trim()).filter(Boolean)) {
-    if (keepBranches.has(branch) || stillAttached.has(`refs/heads/${branch}`)) continue;
+  for (const { branch, slug } of await listOwnedFeatureBranches(opts)) {
+    if (keepBranches.has(branch) || keepSlugs.has(slug)) continue;
+    if (stillAttached.has(`refs/heads/${branch}`)) continue;
     if (!devExists) {
       report.kept.push({ ref: branch, reason: `no '${r.devRef}' ref to verify the merge against` });
       continue;
@@ -561,10 +792,20 @@ export async function reconcileWorktrees(
 
 // --- boot reconcile (non-destructive) ----------------------------------------
 
+/** Slug a name without throwing, so a degenerate keep entry is ignored rather
+ *  than blowing up a sweep. */
+function safeFeatureSlug(name: string): string {
+  try {
+    return featureSlug(name);
+  } catch {
+    return "";
+  }
+}
+
 /** What a boot reconcile could not cleanly account for. Every anomaly is
  *  SURFACED for a human/the co to resolve; reconcileFeatures never acts on one. */
 export type FeatureAnomalyKind =
-  /** A `co/feat-*` branch with no worktree that is NOT merged into `origin/dev`:
+  /** A branch co cut, with no worktree, that is NOT merged into `origin/dev`:
    *  it holds unmerged work but its checkout is gone (a crashed run, a manually-
    *  removed worktree). Re-provision or investigate before the work is lost.
    *
@@ -588,9 +829,9 @@ export interface FeatureAnomaly {
 }
 
 export interface FeatureReconcileReport {
-  /** Feature records rebuilt from the on-disk `co/feat-*` worktrees, keyed by
-   *  slug (the original human name is not recoverable from a branch, so
-   *  `feature` is set to the slug). Ready to seed the in-memory registry. */
+  /** Feature records rebuilt from the worktrees on disk, keyed by slug (the
+   *  original human name is not recoverable from a directory, so `feature` is
+   *  set to the slug). Ready to seed the in-memory registry. */
   records: FeatureRecord[];
   /** Everything that could not be turned into a clean record. Surfaced, never
    *  destroyed. */
@@ -607,16 +848,20 @@ export interface FeatureReconcileReport {
  * a human to resolve.
  *
  * Why not reuse reconcileWorktrees at boot: that sweep removes every clean
- * `co/feat-*` worktree not in its `keep` list. At boot the in-memory feature map
- * is empty, so it would tear down every in-progress feature — the exact opposite
+ * feature worktree not in its `keep` list. At boot the in-memory feature map is
+ * empty, so it would tear down every in-progress feature — the exact opposite
  * of surviving a restart.
  *
- *  - Every registered `co/feat-*` worktree whose directory exists becomes a
- *    ready record.
- *  - A `co/feat-*` branch with no worktree is an anomaly ONLY when it is not
+ *  - Every worktree co owns (registered, directly under the managed base) whose
+ *    directory exists becomes a ready record, on whatever branch it holds. That
+ *    is what makes a feature survive a restart without co ever having to guess
+ *    an ownership prefix — and what keeps a `co/feat-*` feature from an older
+ *    build manageable under exactly the same rules.
+ *  - A branch co cut with no worktree is an anomaly ONLY when it is not
  *    contained in `origin/dev` (`branch-without-worktree`: unmerged work whose
  *    checkout is gone). A branch that IS contained is a landed feature whose ref
- *    was kept by policy — the normal state, reported as nothing at all.
+ *    was kept by policy — the normal state, reported as nothing at all. A branch
+ *    co did NOT cut is not co's business and is never reported at all.
  *  - A directory under the managed base that git doesn't list as a worktree is a
  *    `stray-directory` anomaly (an orphaned checkout or something foreign).
  */
@@ -633,32 +878,27 @@ export async function reconcileFeatures(opts: WorktreeOptions): Promise<FeatureR
   const worktrees = await listWorktrees(r.repoPath);
   const devExists = await refExists(r.repoPath, r.devRef);
 
-  // Pass 1: registered feature worktrees → a ready record each.
-  const attached = new Set<string>();
-  const registeredPaths = new Set<string>();
-  for (const entry of worktrees) {
-    registeredPaths.add(realpathOr(entry.path));
-    const branch = entry.branch?.startsWith("refs/heads/") ? entry.branch.slice("refs/heads/".length) : null;
-    if (!branch || !branch.startsWith(FEATURE_BRANCH_PREFIX)) continue;
-    attached.add(branch);
+  // Pass 1: the worktrees co owns → a ready record each.
+  const registeredPaths = new Set(worktrees.map((w) => realpathOr(w.path)));
+  const attached = new Set(
+    worktrees
+      .map((w) => w.branch)
+      .filter((b): b is string => Boolean(b?.startsWith("refs/heads/")))
+      .map((b) => b.slice("refs/heads/".length)),
+  );
+  for (const entry of await listFeatureWorktrees(opts)) {
     if (!fs.existsSync(entry.path)) continue; // pruned above; defensive
-    const slug = branch.slice(FEATURE_BRANCH_PREFIX.length);
     records.push({
-      feature: slug,
-      slug,
-      branch,
+      feature: entry.slug,
+      slug: entry.slug,
+      branch: entry.branch,
       worktreePath: entry.path,
       provisionStatus: "ready",
     });
   }
 
-  // Pass 2: feature branches with no worktree.
-  const refsOut = await git(r.repoPath, [
-    "for-each-ref",
-    "--format=%(refname:short)",
-    `refs/heads/${FEATURE_BRANCH_PREFIX}*`,
-  ]);
-  for (const branch of refsOut.split("\n").map((l) => l.trim()).filter(Boolean)) {
+  // Pass 2: branches co cut that have no worktree.
+  for (const { branch } of await listOwnedFeatureBranches(opts)) {
     if (attached.has(branch)) continue;
     // Contained in origin/dev = landed, worktree torn down, ref kept by policy.
     // That is the resting state of every feature co has ever landed; silence.

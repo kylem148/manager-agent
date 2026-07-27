@@ -188,7 +188,7 @@ export interface DispatchOptions {
   /** Scope the dispatch to a feature: its worktree is provisioned on first use
    *  (reused on every later dispatch until landing) and the crew process runs
    *  with the worktree as its working directory, so the agent operates in the
-   *  feature's isolated checkout on its `co/feat-<slug>` branch, never the
+   *  feature's isolated checkout on its own `<type>/<slug>` branch, never the
    *  primary tree. Omit for the plain repo-cwd dispatch. */
   feature?: string;
 }
@@ -624,6 +624,10 @@ export class DispatchRegistry {
       return existing;
     }
     const slug = featureSlug(feature);
+    // The in-flight record projects the branch a default provision would mint;
+    // the record the provision returns replaces it with the branch actually
+    // checked out, which for a feature created with a type (or by an older
+    // build) is a different name.
     const pending: FeatureRecord = {
       feature,
       slug,
