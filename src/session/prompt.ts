@@ -390,18 +390,27 @@ run with that repo as its working directory.
 
 ### Features (parallel worktrees)
 
-A dispatch can run against the bare repo (the default) or inside an isolated
-feature worktree. A feature is one unit of parallel work: one feature maps to one
-worktree on its own \`co/feat-<slug>\` branch, cut from \`origin/dev\`, so several
-features progress side by side and none touches \`main\`. Features integrate into
-\`dev\` through GITHUB PULL REQUESTS — you never merge locally, and \`dev\` itself is
-never written on this machine. Your reach stops at that PR into \`dev\`; the
-\`dev\` → \`main\` promotion is the captain's own PR and none of your business.
+A dispatch runs either inside an isolated feature worktree or, when you name no
+feature, against the bare main tree. A feature is one unit of parallel work: one
+feature maps to one worktree on its own \`co/feat-<slug>\` branch, cut from
+\`origin/dev\`, so several features progress side by side and none touches \`main\`.
+Features integrate into \`dev\` through GITHUB PULL REQUESTS — you never merge
+locally, and \`dev\` itself is never written on this machine. Your reach stops at
+that PR into \`dev\`; the \`dev\` → \`main\` promotion is the captain's own PR and none
+of your business.
+
+**Default to a feature.** Any work that changes the repo in a non-trivial way
+goes into an isolated worktree and lands as a PR into \`dev\`. Reserve a bare
+dispatch on the main tree for work that is both tightly scoped and low risk: a
+read-only investigation or audit with nothing to commit, or a single trivial
+self-contained change. When unsure, choose the feature and the PR. The crew works
+autonomously, so that PR and the \`[m]\` gate on it are the captain's review
+checkpoint over everything it produced.
 
 - \`feature_create(name, intent)\` — provision a feature's worktree. Runs directly,
   no confirm gate: it only cuts the feature's own branch and checkout off
   \`origin/dev\`, writing nothing to \`dev\` or \`main\`. Idempotent. Do this before
-  (or as) you dispatch work you want isolated.
+  (or as) you dispatch anything that changes the repo.
 - Dispatch into a feature by passing its name as \`dispatch_order\`'s \`feature\`
   argument. The crew then runs inside that worktree (provisioned on first use if
   you skipped feature_create). The arm banner shows the target worktree path, or
@@ -452,12 +461,9 @@ never written on this machine. Your reach stops at that PR into \`dev\`; the
   \`origin/dev\`. It refuses a worktree with uncommitted changes (it reports
   instead of forcing) and keeps a committed-but-unmerged branch rather than lose
   work. If it refuses, tell the captain what is uncommitted and let them decide.
-- Use a feature when work should stay isolated (a risky change, parallel tracks,
-  anything you will want to review and land as a unit). Use a bare dispatch for a
-  quick one-off directly on the tree. Feature state is rebuilt from disk at
-  startup, so a feature survives a restart; if startup surfaces an anomaly (a
-  branch holding unmerged work whose worktree is gone, a stray directory), relay
-  it rather than acting blindly.`;
+- Feature state is rebuilt from disk at startup, so a feature survives a restart;
+  if startup surfaces an anomaly (a branch holding unmerged work whose worktree is
+  gone, a stray directory), relay it rather than acting blindly.`;
 }
 
 export async function buildSystemPrompt(
