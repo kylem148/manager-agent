@@ -116,6 +116,12 @@ npm run typecheck           # tsc --noEmit
 `npm link` also works as an alternative to `npm install -g .` if you want the
 global command to track your working tree while developing.
 
+Pull requests into `dev` and `main` run the same two things in GitHub Actions
+(`.github/workflows/ci.yml`) on Node 22: `npm run typecheck` and `npm test`. That
+is deliberate rather than incidental. This repo lands its own work through co's
+merge queue, which gates a head on the pull request's real checks, so without a
+workflow here every landing would come back ungated (see "Landing work" below).
+
 ## Configure
 
 Copy `.env.example` to `.env` (in the working directory) or to
@@ -606,6 +612,12 @@ has nothing to verify against, says exactly that in the panel and on the PR, and
 leaves the merge to you. A *broken* read is different — gh missing, gh
 unauthenticated, GitHub returning an error — and that blocks the head with gh's
 own message rather than quietly passing as ungated.
+
+Ungated does have a cause, though, so the co-manager names it instead of just
+reporting the state: the repo has no workflow producing checks on its pull
+requests, and it offers once to have the crew add a small standard one. Decline
+and it drops the subject for the rest of the session. It never holds a merge over
+it; the `[m]` is live either way.
 
 The wait on pending checks is bounded (five minutes by default, re-read every
 ten seconds). When it runs out the head sits in `awaiting-checks` rather than

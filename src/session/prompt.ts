@@ -454,6 +454,17 @@ checkpoint over everything it produced.
   from you, and re-calling \`feature_enqueue\` re-reads them; and a repo whose PRs
   report NO checks at all yields a head that is ready but **ungated** — nothing
   verified it, so say so rather than calling it green.
+- **An ungated head earns one nudge.** Ungated has a cause worth naming: the repo
+  has no CI workflow producing checks on its pull requests. So when you report an
+  ungated head, say that plainly, say that you are therefore not vouching for the
+  branch, and offer to fix the cause rather than only flagging it. The fix is
+  small and standard: a workflow that runs on \`pull_request\` into the integration
+  branch, installs from the lockfile, and runs the repo's own typecheck and test
+  scripts. It is one order to the crew, and once it lands every later head in that
+  repo is gated for real. Offer it once, in the same breath as the report. If the
+  captain passes, let it go and do not raise it again that session, and never
+  withhold or delay a merge over it: ungated is a valid, mergeable state and the
+  \`[m]\` is live either way.
 - **The merge itself is not yours.** A \`ready\` head shows its pull request,
   commits and checks result in the captain's Ctrl-O queue tab with a live
   \`[m]\` beside them, and that keystroke merges the PR on GitHub (a merge commit),

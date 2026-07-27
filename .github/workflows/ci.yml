@@ -1,0 +1,41 @@
+name: CI
+
+# The gate co reads. co runs no build and no test of its own (D-20260727-9): it
+# rebases a feature onto origin/dev, opens the PR, and then reads THIS workflow's
+# result off the forge. Without a pull_request workflow here, every landing in
+# this repo comes back "ready: ungated" — mergeable, but with nothing vouching
+# for it. So this file is what makes co's own merge queue actually gated.
+on:
+  pull_request:
+    branches: [dev, main]
+
+# A push to a PR branch supersedes the run before it; there is no reason to keep
+# paying for the older one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: typecheck and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # 22 is what the runtime is developed against; package.json asks for
+          # >=20. Pinned to the major so patch releases come for free.
+          node-version: '22'
+          cache: npm
+
+      # `npm ci` also runs the repo's own `prepare` script (tsc + chmod), so a
+      # broken build fails right here, exactly as it does in a fresh clone.
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
