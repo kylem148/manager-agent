@@ -610,10 +610,18 @@ crew built. It costs nothing extra, either: the message rides along on the
 mark-done call, so no model runs inside the queue. The message is stored with the
 feature, so a retry after a conflict, a resolver run, or a restart opens the PR
 with the same words rather than falling back. A feature enqueued without one gets
-the old mechanical line (the commit subject, and a one-sentence body), which is
-still the right answer for a one-commit chore. Either way co only ever writes the
-message when it CREATES the pull request — once it exists, the title and the
-description are yours, and re-processing rewrites nothing but the fenced evidence.
+the old mechanical line (a single commit's own subject, or `<type>: <feature>` for
+a branch of several, plus a one-sentence body), which is still the right answer
+for a one-commit chore. The fallback is per half, not all or nothing: a title with
+no description falls back for the description alone. A re-enqueue carrying neither
+keeps what is already stored rather than wiping it, which is what makes retrying a
+blocked head a retry and not a reset. And what the co-manager writes is prose, only
+prose: the commit list and the checks result stay co's own, regenerated on every
+processing inside the fenced block further down the description, so an authored
+description that arrives carrying a fence of its own has it stripped before it is
+stored. Either way co only ever writes the message when it CREATES the pull
+request — once it exists, the title and the description are yours, and
+re-processing rewrites nothing but the fenced evidence.
 
 **co runs no build and no test.** It used to, on the combined rebased tree, from
 a command it had to guess — and a guess is wrong the moment the repo isn't npm.
@@ -1017,7 +1025,12 @@ checks are the gate, and once more with what they said. The PR's message is
 composed in one place here (`composePrMessage`): the co's authored title and body
 when the feature carries them, and the mechanical rules — the commit subject, or
 `<type>: <feature>`, plus a one-line summary — for whichever half it does not,
-per field. `executeLanding` is the
+per field. An authored title is folded to one line before it reaches gh, and an
+authored body is re-split against the evidence fence on the way through, so
+nothing the co wrote can freeze a stale copy of the checks into the description.
+The authored message is only ever used to CREATE the pull request; an open one
+keeps the title and prose it has, and re-processing touches nothing but the
+fenced block. `executeLanding` is the
 separate callable that does the merge: `gh pr merge --merge`, a fetch, then
 teardown of the local worktree with the branch ref kept. It is pinned three
 ways — the checked tip, the `origin/dev` it was checked against, and the
@@ -1042,7 +1055,10 @@ worked, and it works itself out — `prepareLanding` rebases it onto the fresh
 `ready` (green, or ungated when the PR reports no checks), `awaiting-checks`
 (CI still running — a wait, not a failure), `blocked` (a rebase conflict, a red
 check, or a missing prerequisite), or `resolving`. Everything behind the head
-sits untouched, so nothing is ever speculatively pushed.
+sits untouched, so nothing is ever speculatively pushed. The head's PR message is
+read out of the feature store on every processing rather than captured at enqueue
+time, so a retry, a resolver run and the queue advancing after a merge all compose
+the pull request the co actually wrote.
 
 **The merge is panel-native, not a co tool call.** A `ready` head simply
 *carries* an `[m]` in the Ctrl-O queue tab, alongside its pull request, commit
@@ -1065,11 +1081,15 @@ writes nothing to dev or main); a dispatch can target a feature so the crew runs
 its worktree (provisioned on first use), and the arm banner names the target
 worktree or says plainly it targets the bare main tree. `feature_enqueue` marks
 a feature done and puts it in the merge queue, which is where landing normally
-happens — and carries the PR title and body the co wrote for it, stored per slug
-and consumed by every later processing of that head, so the authored message is
-attached once, at the one moment a feature is declared done, and no model runs
-inside the queue; `feature_land` is the direct route for a feature that was never
-enqueued, and opens the gate above. `feature_merge_head` is **not** the merge:
+happens — and carries the PR title and body the co wrote for it, as its own
+`prTitle` and `prBody` arguments, stored per slug and consumed by every later
+processing of that head, so the authored message is attached once, at the one
+moment a feature is declared done, and no model runs inside the queue; each half
+is optional and falls back to the mechanical composition on its own, and the call
+reports back which half is authored and which is mechanical, so a bare re-enqueue
+visibly reuses the message already written. `feature_land` is the direct route
+for a feature that was never enqueued, and opens the gate above.
+`feature_merge_head` is **not** the merge:
 in an interactive session it merges nothing and just reports that the `[m]` is
 live, and it only performs a merge itself in a session with no panel at all
 (piped/non-TTY), where there is no key to press. `feature_resolve_head` arms a

@@ -74,11 +74,12 @@ export interface InstancePaths {
    *  Lives beside the dispatch config because a review is the tail end of a
    *  dispatch; never written into the user's repo. */
   reviewInbox: string;
-  /** Per-feature metadata co authored and git cannot recover: the feature's
-   *  intent (its one-line description). Keyed by slug, read at startup so the
-   *  descriptions survive a restart. Lives beside the dispatch config for the
-   *  same reason the inbox does — feature worktrees are dispatch state — and is
-   *  never written into the user's repo. */
+  /** Per-feature prose co authored and git cannot recover: the feature's intent
+   *  (its one-line description) and the PR title/body co wrote when it enqueued
+   *  the feature. Keyed by slug, read at startup so both survive a restart and a
+   *  re-processed head still opens its pull request with the message co wrote.
+   *  Lives beside the dispatch config for the same reason the inbox does — feature
+   *  worktrees are dispatch state — and is never written into the user's repo. */
   featureStore: string;
   /** Directory holding per-job capture files. */
   captures: string;
