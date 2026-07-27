@@ -15,6 +15,7 @@ import {
   fmtDuration,
   fmtUsd,
   formatCostReport,
+  formatFleetReport,
   localDay,
   normalizeModelId,
   ratesFor,
@@ -68,6 +69,31 @@ test("opus 4.8 carries the bedrock rate, not the first-party one", () => {
 
 test("an unknown model has no rates rather than a guessed one", () => {
   assert.equal(ratesFor("us.anthropic.claude-something-9"), null);
+});
+
+test("opus 5 is priced, but flagged as derived rather than published", () => {
+  // The model this app is actually pointed at. AWS publishes no Opus 5 row, but
+  // Anthropic documents it as a drop-in at Opus 4.8's pricing and Bedrock
+  // resells that tier at a flat 1.2x — so it is priced, and the report says the
+  // rate is derived rather than passing an inference off as a quote.
+  const r = ratesFor("us.anthropic.claude-opus-5")!;
+  assert.ok(r, "the configured model must price, or the meter is useless");
+  assert.equal(r.input, 6);
+  assert.equal(r.output, 30);
+  assert.equal(r.confirmed, false);
+
+  assert.equal(ratesFor("us.anthropic.claude-opus-4-8")!.confirmed, true);
+});
+
+test("a derived rate is announced on the report's rate line", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("us.anthropic.claude-opus-5", usage({ output: 1_000 }));
+  const text = plain(
+    formatCostReport({ ledger, modelId: "us.anthropic.claude-opus-5", cacheTtl: "1h" }),
+  );
+  assert.match(text, /rate derived, not published by AWS/);
+  assert.doesNotMatch(text, /no bedrock rate on file/, "it IS priced, just not quoted");
+  assert.match(text, /\$0\.0300/, "1,000 output tokens at $30/Mtok");
 });
 
 test("launch pricing applies inside its window and lapses after", () => {
@@ -458,4 +484,105 @@ test("a turn recorded today shows up under today even late in the evening", asyn
     }),
   );
   assert.match(text, /today {6}1,000 out/);
+});
+
+// --- the fleet view (`co cost`) -----------------------------------------------
+
+/** An instance whose meter already holds `output` tokens on `day`. */
+async function fleetMember(name: string, day: string, output: number, ms = 0) {
+  const ledger = CostLedger.ephemeral({ since: `${day}T09:00:00.000Z` });
+  if (output > 0) {
+    await ledger.record("us.anthropic.claude-opus-5", usage({ output }), { now: at(day), ms });
+  }
+  return { name, ledger };
+}
+
+test("the fleet view sums every instance, because the bedrock key is shared", async () => {
+  // The whole reason `co cost` exists: three co-managers on one key produce one
+  // invoice, and no per-instance /cost can show it.
+  const entries = [
+    await fleetMember("alpha", "2026-07-26", 100_000),
+    await fleetMember("bravo", "2026-07-27", 200_000),
+    await fleetMember("idle", "2026-07-27", 0),
+  ];
+
+  const text = plain(
+    formatFleetReport({ entries, cacheTtl: "1h", home: "/home/co", now: at("2026-07-27") }),
+  );
+
+  assert.match(text, /cost across 3 co-managers/);
+  // $3 + $6 of output at $30/Mtok.
+  assert.match(text, /alpha\s+100,000\s+\$3\.00/);
+  assert.match(text, /bravo\s+200,000\s+\$6\.00/);
+  assert.match(text, /total\s+300,000\s+\$9\.00\s+2/, "totals tokens, dollars and turns");
+});
+
+test("the fleet view lists idle instances rather than hiding them", async () => {
+  const entries = [
+    await fleetMember("busy", "2026-07-27", 100_000),
+    await fleetMember("never-used", "2026-07-27", 0),
+  ];
+  const text = plain(
+    formatFleetReport({ entries, cacheTtl: "1h", home: "/home/co", now: at("2026-07-27") }),
+  );
+  assert.match(text, /never-used\s+0\s+\$0\.0000\s+0\s+—/, "zero spend is information");
+});
+
+test("the fleet view is ordered by spend so the culprit is on top", async () => {
+  const entries = [
+    await fleetMember("cheap", "2026-07-27", 1_000),
+    await fleetMember("expensive", "2026-07-27", 900_000),
+    await fleetMember("middling", "2026-07-27", 50_000),
+  ];
+  const lines = plain(
+    formatFleetReport({ entries, cacheTtl: "1h", home: "/home/co", now: at("2026-07-27") }),
+  ).split("\n");
+  const order = lines
+    .map((l) => ["expensive", "middling", "cheap"].find((n) => l.trimStart().startsWith(n)))
+    .filter(Boolean);
+  assert.deepEqual(order, ["expensive", "middling", "cheap"]);
+});
+
+test("fleet day averages merge the series across instances", async () => {
+  // Two instances active on two different days: $3 each, 2 active days, and a
+  // calendar span starting at the EARLIEST instance's first turn.
+  const entries = [
+    await fleetMember("alpha", "2026-07-25", 100_000),
+    await fleetMember("bravo", "2026-07-27", 100_000),
+  ];
+  const text = plain(
+    formatFleetReport({ entries, cacheTtl: "1h", home: "/home/co", now: at("2026-07-27") }),
+  );
+  assert.match(text, /\$3\.00 per active day \(2\)/);
+  assert.match(text, /\$2\.00 per calendar day \(3\)/, "07-25 → 07-27 inclusive");
+});
+
+test("fleet wall-clock is summed across instances", async () => {
+  const entries = [
+    await fleetMember("alpha", "2026-07-27", 10, 60_000),
+    await fleetMember("bravo", "2026-07-27", 10, 180_000),
+  ];
+  const text = plain(
+    formatFleetReport({ entries, cacheTtl: "1h", home: "/home/co", now: at("2026-07-27") }),
+  );
+  assert.match(text, /model time 4m 0s all time/);
+});
+
+test("an empty home says so instead of rendering an empty table", () => {
+  const text = plain(formatFleetReport({ entries: [], cacheTtl: "1h", home: "/home/co" }));
+  assert.match(text, /no co-managers yet in \/home\/co/);
+});
+
+test("the fleet view flags a derived rate and never pads rows with trailing space", async () => {
+  const entries = [await fleetMember("solo", "2026-07-27", 1_000)];
+  const lines = formatFleetReport({
+    entries,
+    cacheTtl: "1h",
+    home: "/home/co",
+    now: at("2026-07-27"),
+  });
+  assert.match(plain(lines), /rate derived, not published by AWS/);
+  for (const l of lines) {
+    assert.equal(l, l.replace(/\s+$/, ""), `line has trailing whitespace: ${JSON.stringify(l)}`);
+  }
 });

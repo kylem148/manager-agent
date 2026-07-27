@@ -63,6 +63,10 @@ export interface Rates {
   cacheWrite5m: number;
   cacheWrite1h: number;
   cacheRead: number;
+  /** False when AWS does not publish a row for this model and the rate is
+   *  derived instead. /cost says so on the rate line rather than presenting an
+   *  inference as a quote. */
+  confirmed: boolean;
 }
 
 /**
@@ -83,13 +87,14 @@ function money(n: number): number {
   return Math.round(n * 1e6) / 1e6;
 }
 
-function rates(input: number, output: number): Rates {
+function rates(input: number, output: number, confirmed = true): Rates {
   return {
     input,
     output,
     cacheWrite5m: money(input * WRITE_5M_MULTIPLE),
     cacheWrite1h: money(input * WRITE_1H_MULTIPLE),
     cacheRead: money(input * READ_MULTIPLE),
+    confirmed,
   };
 }
 
@@ -113,8 +118,18 @@ interface RateEntry {
  * A model that is not in here is not a failure — `/cost` still reports its
  * tokens and says plainly that it has no rate on file, rather than inventing a
  * number. Adding one is a single line.
+ *
+ * One entry is DERIVED rather than quoted, and flagged as such. Opus 5 has no
+ * row on the Bedrock pricing page (checked 2026-07-27), but Anthropic documents
+ * it as a drop-in upgrade "at Opus 4.8's pricing" — $5/$25 first-party, exactly
+ * what Opus 4.8 costs there — and Bedrock resells that tier at a flat 1.2x
+ * ($6/$30). Leaving it unpriced would mean the meter reports nothing for the
+ * model this app is actually pointed at, which is worse than a well-founded
+ * estimate that announces itself. Replace with the published row the moment AWS
+ * lists one.
  */
 const BEDROCK_RATES: Record<string, RateEntry> = {
+  "claude-opus-5": { rates: rates(6, 30, /*confirmed*/ false) },
   "claude-opus-4-8": { rates: rates(6, 30) },
   "claude-sonnet-5": {
     rates: rates(3, 15),
@@ -603,7 +618,8 @@ export function formatCostReport(opts: {
     c.dim(
       r
         ? `  ${modelId} — bedrock ${rate(r.input)}/${rate(r.output)} per Mtok · ` +
-            `cache write ${rate(write)} (${cacheTtl}) · cache read ${rate(r.cacheRead)}`
+            `cache write ${rate(write)} (${cacheTtl}) · cache read ${rate(r.cacheRead)}` +
+            (r.confirmed ? "" : "  [rate derived, not published by AWS]")
         : `  ${modelId} — no bedrock rate on file; tokens are counted, cost is not`,
     ),
   );
@@ -620,6 +636,176 @@ export function formatCostReport(opts: {
     out.push(
       c.yellow(
         `  totals exclude un-priced model(s): ${unpriced.join(", ")} — add rates in src/cost.ts`,
+      ),
+    );
+  }
+  return out;
+}
+
+// --- the fleet view (`co cost`) -----------------------------------------------
+
+/** One instance's meter, for the cross-instance rollup. */
+export interface FleetEntry {
+  name: string;
+  ledger: CostLedger;
+}
+
+/** Sum the per-day series across instances, keeping the per-model split so each
+ *  day still prices correctly when instances run different models. */
+function mergeDays(entries: FleetEntry[]): Record<string, DayTotals> {
+  const merged: Record<string, DayTotals> = {};
+  for (const { ledger } of entries) {
+    for (const [day, byModel] of Object.entries(ledger.lifetime().days)) {
+      const bucket = (merged[day] ??= {});
+      for (const [id, t] of Object.entries(byModel)) {
+        const prev = bucket[id] ?? emptyTotals();
+        bucket[id] = { ...addUsage(prev, t), turns: prev.turns + t.turns, ms: prev.ms + t.ms };
+      }
+    }
+  }
+  return merged;
+}
+
+/** Sum all-time per-model totals across instances. */
+function mergeModels(entries: FleetEntry[]): Record<string, ModelTotals> {
+  const merged: Record<string, ModelTotals> = {};
+  for (const { ledger } of entries) {
+    for (const [id, t] of Object.entries(ledger.lifetime().models)) {
+      const prev = merged[id] ?? emptyTotals();
+      merged[id] = { ...addUsage(prev, t), turns: prev.turns + t.turns, ms: prev.ms + t.ms };
+    }
+  }
+  return merged;
+}
+
+/**
+ * The `co cost` report: every co-manager on this machine, and the total.
+ *
+ * The per-instance /cost answers "what has THIS co-manager cost me". It cannot
+ * answer "what am I actually being billed", because the ledger is per instance
+ * and the Bedrock key is not — three co-managers on one key produce one invoice.
+ * This is that view: the sum, plus the split, so a surprising total can be
+ * attributed to the instance that caused it.
+ */
+export function formatFleetReport(opts: {
+  entries: FleetEntry[];
+  cacheTtl: "5m" | "1h";
+  home: string;
+  now?: Date;
+}): string[] {
+  const { entries, cacheTtl, home } = opts;
+  const now = opts.now ?? new Date();
+  const today = localDay(now);
+
+  if (entries.length === 0) {
+    return ["", c.dim(`no co-managers yet in ${home}. create one:  co create <name>`)];
+  }
+
+  const out: string[] = [
+    "",
+    c.bold(`cost across ${entries.length} co-manager${entries.length === 1 ? "" : "s"}`),
+    "",
+  ];
+
+  const nameWidth = Math.max(10, ...entries.map((e) => e.name.length)) + 2;
+  out.push(
+    c.dim(
+      `  ${"co-manager".padEnd(nameWidth)}${"out".padEnd(14)}${"cost".padEnd(12)}` +
+        `${"turns".padEnd(8)}last`,
+    ),
+  );
+
+  // Sort by spend, dearest first: the whole point of the split is attribution,
+  // and the instance you need to look at is the one at the top.
+  const rows = entries
+    .map((e) => {
+      const life = e.ledger.lifetime();
+      const s = summarize(life.models, cacheTtl, today);
+      return { name: e.name, s, last: s.turns > 0 ? fmtLocalStamp(life.last) : "—" };
+    })
+    .sort((a, b) => b.s.cost - a.s.cost || b.s.output - a.s.output);
+
+  for (const row of rows) {
+    const money = row.s.unpriced.length > 0 ? `${fmtUsd(row.s.cost)}+` : fmtUsd(row.s.cost);
+    const idle = row.s.turns === 0;
+    const text = (
+      `  ${row.name.padEnd(nameWidth)}${fmtTokens(row.s.output).padEnd(14)}` +
+      `${money.padEnd(12)}${String(row.s.turns).padEnd(8)}${row.last}`
+    ).trimEnd();
+    out.push(idle ? c.dim(text) : text);
+  }
+
+  const allModels = mergeModels(entries);
+  const total = summarize(allModels, cacheTtl, today);
+  const totalMoney = total.unpriced.length > 0 ? `${fmtUsd(total.cost)}+` : fmtUsd(total.cost);
+  out.push(c.dim(`  ${"".padEnd(nameWidth)}${"─".repeat(32)}`));
+  out.push(
+    c.bold(
+      (
+        `  ${"total".padEnd(nameWidth)}${fmtTokens(total.output).padEnd(14)}` +
+        `${totalMoney.padEnd(12)}${String(total.turns)}`
+      ).trimEnd(),
+    ),
+  );
+
+  // --- the time dimension, summed across the fleet ---
+  out.push("");
+  const days = mergeDays(entries);
+  const dayCosts = new Map<string, number>();
+  for (const [day, byModel] of Object.entries(days)) {
+    dayCosts.set(day, summarize(byModel, cacheTtl, day).cost);
+  }
+  const activeDays = [...dayCosts.values()].filter((v) => v > 0).length;
+
+  // Earliest first turn across every instance — the fleet's real start date.
+  const firstDay = entries
+    .map((e) => localDay(new Date(e.ledger.lifetime().since)))
+    .sort()[0]!;
+  const calendarDays = daysSpanned(firstDay, today);
+
+  if (total.turns === 0) {
+    out.push(c.dim("  per day    nothing metered yet"));
+  } else {
+    out.push(
+      c.dim(
+        `  per day    ${fmtUsd(activeDays > 0 ? total.cost / activeDays : 0)} per active day ` +
+          `(${activeDays}) · ${fmtUsd(total.cost / Math.max(1, calendarDays))} per calendar day ` +
+          `(${calendarDays})`,
+      ),
+    );
+  }
+
+  const window = Array.from({ length: 7 }, (_, i) => dayBefore(today, 6 - i));
+  const windowCosts = window.map((d) => dayCosts.get(d) ?? 0);
+  out.push(
+    c.dim(
+      `  last 7d    ${sparkline(windowCosts)}  ` +
+        `${fmtUsd(windowCosts.reduce((a, b) => a + b, 0))}  ` +
+        `(${window[0]!.slice(5)} → ${today.slice(5)})`,
+    ),
+  );
+  if (total.ms > 0) out.push(c.dim(`  model time ${fmtDuration(total.ms)} all time`));
+
+  // --- what is being billed ---
+  out.push("");
+  for (const [modelId, t] of Object.entries(allModels).sort((a, b) => b[1].output - a[1].output)) {
+    const r = ratesFor(modelId, today);
+    out.push(
+      c.dim(
+        r
+          ? `  ${modelId} — $${r.input.toFixed(2)}/$${r.output.toFixed(2)} per Mtok · ` +
+              `${fmtTokens(t.output)} out` +
+              (r.confirmed ? "" : "  [rate derived, not published by AWS]")
+          : `  ${modelId} — no bedrock rate on file; ${fmtTokens(t.output)} out, cost not counted`,
+      ),
+    );
+  }
+  out.push(c.dim(`  since ${firstDay} · ${home}`));
+
+  if (total.unpriced.length > 0) {
+    out.push(
+      c.yellow(
+        `  the total excludes un-priced model(s): ${total.unpriced.join(", ")} — add rates in src/cost.ts`,
       ),
     );
   }

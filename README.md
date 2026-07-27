@@ -226,6 +226,7 @@ co create my-saas        # create an instance from the template
 co my-saas               # open an interactive session (creates it if missing)
 co delete my-saas        # permanently delete an instance (type the name to confirm)
 co delete my-saas -y     # skip the prompt (--force / -y) for scripting
+co cost                  # tokens, dollars and time across every co-manager
 co link my-saas          # register a repo + agent command so it can dispatch to the crew
 co pane my-saas          # designate the crew anchor pane (macOS + Ghostty)
 co auth bedrock          # set the Bedrock bearer token in ~/co-managers/.env (0600)
@@ -902,6 +903,32 @@ invoice by 20%. A model with no rate on file still gets its tokens counted;
 `/cost` says the cost is unknown rather than inventing a number, and adding a
 model is one line.
 
+### One key, many co-managers
+
+`/cost` is scoped to the co-manager you're in, because that's where its ledger
+lives. That answers "what has this one cost me" and cannot answer "what am I
+being billed" — the Bedrock key is shared, so every instance lands on one
+invoice. `co cost` is that view, and it needs no session:
+
+```
+cost across 3 co-managers
+
+  co-manager  out           cost        turns   last
+  gav-lib     14,030        $0.9931     5       2026-07-27 14:49
+  dotcor      0             $0.0000     0       —
+  testing     0             $0.0000     0       —
+              ────────────────────────────────
+  total       14,030        $0.9931     5
+
+  per day    $0.9931 per active day (1) · $0.9931 per calendar day (1)
+  last 7d    ······█  $0.9931  (07-21 → 07-27)
+  model time 2m 53s all time
+```
+
+Rows are ordered by spend, so a surprising total is attributable at a glance.
+Idle instances are listed rather than hidden — "this one has cost nothing" is
+information, and omitting it makes the fleet look smaller than it is.
+
 The totals live in `.cost.json` at the instance root, written after every turn
 rather than at exit, so a crash never loses the record of money already spent.
 It holds two things: an all-time aggregate per model that is never trimmed, and
@@ -924,7 +951,7 @@ they want, so a cold start only loads what it uses.
 ```
 src/
   index.ts config.ts paths.ts ui.ts model.ts research.ts cost.ts
-  cli/       auth.ts doctor.ts modelsdoctor.ts link.ts
+  cli/       auth.ts doctor.ts modelsdoctor.ts link.ts cost.ts
   tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
              visuals.ts
   session/   session.ts prompt.ts tools.ts reviewinbox.ts
@@ -1238,8 +1265,9 @@ animation from the other direction, so "never during token streaming" holds
 whichever happens first.
 
 **`src/cli/`** — `doctor.ts` and `modelsdoctor.ts` diagnostics, `auth.ts` for
-writing the Bedrock token, and `link.ts` for `co link` (register repo + agent
-command) and `co pane` (designate the crew anchor pane).
+writing the Bedrock token, `link.ts` for `co link` (register repo + agent
+command) and `co pane` (designate the crew anchor pane), and `cost.ts` for
+`co cost` (spend across every instance, no session needed).
 
 ### V1 scope and extension points
 
