@@ -14,6 +14,10 @@ import type { ResearchConfig } from "../config.js";
  * the branch a feature is cut on. Both are prose the model acts on rather than
  * code that enforces itself, which is exactly why they are pinned here — a
  * silent edit to either changes the git history of every project co touches.
+ *
+ * The ungated nudge is pinned for the same reason. co gates on the PR's real
+ * checks now, so a repo with no CI workflow lands everything ungated; the only
+ * thing that tells the captain WHY, and offers the fix, is this prose.
  */
 
 async function makeInstance(): Promise<{ paths: InstancePaths; cleanup: () => Promise<void> }> {
@@ -66,6 +70,28 @@ test("the features protocol names branches <type>/<slug> and ownership by worktr
     // into a prompt where the feature levers do not exist.
     const unlinked = await buildSystemPrompt(paths, RESEARCH);
     assert.ok(!unlinked.includes("<type>/<slug>"));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("an ungated head comes with the offer to add a CI workflow, and never a held merge", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    assert.match(prompt, /An ungated head earns one nudge/);
+    assert.match(
+      prompt,
+      /the repo\s+has no CI workflow producing checks on its pull requests/,
+      "the cause is named, not just the symptom",
+    );
+    assert.match(prompt, /runs on \\?`pull_request`/, "and the fix it offers is a concrete one");
+    assert.match(prompt, /Offer it once/, "a nudge, not a nag");
+    assert.match(
+      prompt,
+      /never\s+withhold or delay a merge over it/,
+      "ungated stays a valid, mergeable state",
+    );
   } finally {
     await cleanup();
   }

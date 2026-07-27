@@ -613,6 +613,12 @@ leaves the merge to you. A *broken* read is different — gh missing, gh
 unauthenticated, GitHub returning an error — and that blocks the head with gh's
 own message rather than quietly passing as ungated.
 
+Ungated does have a cause, though, so the co-manager names it instead of just
+reporting the state: the repo has no workflow producing checks on its pull
+requests, and it offers once to have the crew add a small standard one. Decline
+and it drops the subject for the rest of the session. It never holds a merge over
+it; the `[m]` is live either way.
+
 The wait on pending checks is bounded (five minutes by default, re-read every
 ten seconds). When it runs out the head sits in `awaiting-checks` rather than
 hanging or claiming a verdict; re-enqueuing it reads the checks again.
