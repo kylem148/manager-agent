@@ -1,12 +1,13 @@
-import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { awaitPrChecks, checksLine, failedChecks, type ChecksPolicy, type ChecksSummary } from "./checks.js";
 import {
+  ensurePr,
   fetchRemote,
   mergePr,
-  openOrUpdatePr,
   pushFeatureBranch,
   remoteDevSha,
   requireForge,
+  updatePrEvidence,
   viewPr,
   findOpenPr,
   type PullRequest,
@@ -44,13 +45,12 @@ import {
  *
  *  PREPARE (prepareLanding) — non-destructive to `dev`. Fetch, rebase the
  *  feature branch onto the FRESH `origin/dev` tip inside the feature's own
- *  worktree, run the project's combined build+test there, then publish: push the
- *  rebased branch (force-with-lease — a rebase rewrites shas) and open or update
- *  the PR into `dev` with a composed message carrying the commit list and the
- *  build+test evidence. Returns `green` (with the PR), `conflict` (the rebase
- *  stopped; it is aborted and the branch restored byte-for-byte, and nothing is
- *  pushed), or `failed` (build/test red on the combined state; nothing is pushed
- *  and the branch is left rebased so a fix lands in the exact red state).
+ *  worktree, push the rebased branch (force-with-lease — a rebase rewrites
+ *  shas), open or reuse the PR into `dev`, and then READ that PR's GitHub checks
+ *  (D-20260727-1). Returns `green` (checks passed, or the PR has none at all —
+ *  an UNGATED ready), `conflict` (the rebase stopped; it is aborted and the
+ *  branch restored byte-for-byte, and nothing is pushed), `failed` (a check went
+ *  red), or `pending` (checks were still running when the bounded wait expired).
  *
  *  EXECUTE (executeLanding) — the gated merge. `gh pr merge --merge`, then a
  *  fetch, then teardown of the local worktree ONLY. Two live call sites, both a
@@ -60,19 +60,35 @@ import {
  *  at all is feature_merge_head in a session that HAS no panel (piped/non-TTY),
  *  where there is no key to press.
  *
- * WHY build+test runs on the combined state: feature A green and feature B
- * green does not make A+B green — B may compile against code A just changed.
- * The rebase puts the feature on top of everything already landed, so the
- * build+test that gates the merge sees exactly the tree `dev` will hold. That
- * also makes landings serial by nature: each prepare rebases onto whatever
- * `origin/dev` is at that moment, and executeLanding refuses a green that has
- * gone stale (`origin/dev` moved since the prepare — the A-green + B-green = red
- * hole), sending the head back for a fresh fetch/rebase/build+test.
+ * CO RUNS NO BUILD AND NO TEST (D-20260727-1). It used to: a combined build+test
+ * on the rebased worktree, from a command it had to guess. GitHub already runs
+ * the real thing against the real combined state, and already blocks the merge
+ * on it, so co reads that verdict instead of reproducing it. What co still owns
+ * is the TEXTUAL half of the gate — the rebase onto the current `origin/dev` —
+ * because that is git's question, not CI's. See checks.ts for why the guess had
+ * to go and what each verdict means.
  *
- * THE TESTED TIP IS THE MERGED TIP. The push publishes exactly the sha the
- * build+test ran on, and before merging, the PR's head on the forge is compared
+ * WHY THE REBASE COMES FIRST: feature A green and feature B green does not make
+ * A+B green — B may compile against code A just changed. The rebase puts the
+ * feature on top of everything already landed, and GitHub's `pull_request`
+ * workflows test a merge of the PR head with its base, so the checks that gate
+ * the merge see exactly the tree `dev` will hold. That also makes landings
+ * serial by nature: each prepare rebases onto whatever `origin/dev` is at that
+ * moment, and executeLanding refuses a green that has gone stale (`origin/dev`
+ * moved since the prepare — the A-green + B-green = red hole), sending the head
+ * back for a fresh fetch/rebase/checks read.
+ *
+ * A RED STATE NOW REACHES THE FORGE, and must: the checks that judge it are the
+ * forge's, and they cannot run on a PR that does not exist. So unlike the old
+ * local build+test, a `failed` prepare has already pushed and opened its PR —
+ * which is also where the captain and the resolver read what went wrong. Nothing
+ * red ever MERGES; that guarantee is unchanged and lives in the queue's ready
+ * gate and executeLanding's pins.
+ *
+ * THE CHECKED TIP IS THE MERGED TIP. The push publishes exactly the sha the
+ * checks ran on, and before merging, the PR's head on the forge is compared
  * against that sha. A branch someone pushed to in between fails loudly instead
- * of merging something nobody tested.
+ * of merging something nobody checked.
  *
  * HARD MERGE RULES (enforced in forge.ts, restated because they are contracts):
  * always `--merge`, a real merge commit — never squash, never rebase-merge, so
@@ -85,33 +101,13 @@ import {
  * `refs/remotes/*` (via fetch). Deterministic plumbing plus gh — no model.
  */
 
-/** The real default combined build+test: the repo's own typecheck + test
- *  scripts. Injectable via LandingOptions.buildTestCommand so unit tests use
- *  a fast fake instead of recursing into a real suite. */
-export const DEFAULT_BUILD_TEST_COMMAND = "npm run typecheck && npm test";
-
-/** Keep only the tail of a build+test's output — a chatty suite can emit
- *  megabytes, and the failure summary lives at the end. */
-const OUTPUT_TAIL_LIMIT = 64 * 1024;
-
 export interface LandingOptions extends WorktreeOptions {
-  /** The combined build+test command, run via `sh -c` with the rebased
-   *  worktree as cwd. Defaults to DEFAULT_BUILD_TEST_COMMAND. */
-  buildTestCommand?: string;
+  /** How long co waits on the PR's CI checks, and how often it looks. Defaults
+   *  live in checks.ts; tests inject a no-op sleep. */
+  checks?: ChecksPolicy;
 }
 
-/** What the combined build+test did, carried on a prepare result so a review
- *  surface can STATE the evidence ("green · npm run typecheck && npm test ·
- *  12.4s") instead of implying it. Optional on the results so a hand-built
- *  PrepareResult (tests, fakes) stays valid. */
-export interface BuildTestSummary {
-  /** The exact command that ran, in the rebased worktree. */
-  command: string;
-  /** Wall-clock duration of the run, in milliseconds. */
-  ms: number;
-}
-
-/** The pull request a green prepare opened or refreshed — the thing the panel
+/** The pull request a prepare opened or reused — the thing the panel
  *  renders and the thing [m] merges. */
 export interface LandingPullRequest {
   number: number;
@@ -123,9 +119,11 @@ export interface LandingPullRequest {
   created: boolean;
 }
 
-/** Prepare succeeded: the feature is rebased onto devSha, build+test is green on
- *  that combined state, the branch is pushed, and the PR is open. executeLanding
- *  pins to featureSha AND devSha, so approval covers exactly this state. */
+/** Prepare succeeded: the feature is rebased onto devSha, the branch is pushed,
+ *  the PR is open, and its checks came back green — or it has none at all, in
+ *  which case this is still a ready head but an UNGATED one (`checks.ungated`),
+ *  merged on the captain's judgment rather than on CI. executeLanding pins to
+ *  featureSha AND devSha, so approval covers exactly this state. */
 export interface PrepareGreen {
   kind: "green";
   feature: string;
@@ -142,8 +140,9 @@ export interface PrepareGreen {
    *  Empty means the feature holds no commits beyond dev — nothing to land, and
    *  nothing is pushed or PR'd. */
   commits: string[];
-  /** The build+test that passed on the combined state — the merge's evidence. */
-  buildTest?: BuildTestSummary;
+  /** What GitHub's checks said — the merge's evidence, including the ungated
+   *  case. Absent only when there was nothing to land (no PR, so no checks). */
+  checks?: ChecksSummary;
   /** The open PR into `dev`. Absent only when there was nothing to land. */
   pr?: LandingPullRequest;
   /** Whether this prepare actually pushed (false when the remote already had
@@ -167,29 +166,47 @@ export interface PrepareConflict {
   detail: string;
 }
 
-/** The rebase succeeded but build+test is red on the combined state. Nothing
- *  was pushed and no PR was opened or updated — an unbuildable state never
- *  reaches the forge. The branch is deliberately left REBASED (not rolled
- *  back): the red state only exists on the combined tree, so a fix dispatch
- *  needs the worktree to hold exactly that tree — rolling back would hide the
- *  very failure the crew is being sent in to fix. All feature work is preserved
- *  (same commits, replayed onto dev). */
+/** The rebase was clean, the branch is pushed and the PR is open — and one of
+ *  its CI checks came back RED. The direct analog of the old red build+test:
+ *  the head blocks and feature_resolve_head applies. The branch is deliberately
+ *  left REBASED (not rolled back): the failure only exists on the combined tree,
+ *  so a fix dispatch needs the worktree to hold exactly that tree. All feature
+ *  work is preserved (same commits, replayed onto dev), and the PR stays open —
+ *  it is where the failing run is read. */
 export interface PrepareFailed {
   kind: "failed";
   feature: string;
   branch: string;
   /** The `origin/dev` tip the feature was rebased onto. */
   devSha: string;
-  /** The rebased feature tip the red build+test ran on. */
+  /** The rebased feature tip the checks ran on. */
   featureSha: string;
-  exitCode: number;
-  /** Combined stdout+stderr tail of the build+test run. */
-  output: string;
-  /** The build+test that went red, so a review surface can name the command. */
-  buildTest?: BuildTestSummary;
+  /** The per-job commits the PR carries. */
+  commits: string[];
+  /** The checks read, including exactly which ones failed and where to read them. */
+  checks: ChecksSummary;
+  /** The PR the red checks ran on. Unlike a local build, a check cannot exist
+   *  without a PR, so this is always present. */
+  pr: LandingPullRequest;
 }
 
-export type PrepareResult = PrepareGreen | PrepareConflict | PrepareFailed;
+/** The rebase was clean, the branch is pushed and the PR is open — and its CI
+ *  checks were STILL RUNNING when co's bounded wait expired. Not a failure and
+ *  not a green: the head simply waits, and re-processing it reads the checks
+ *  again. Nothing is rolled back. */
+export interface PreparePending {
+  kind: "pending";
+  feature: string;
+  branch: string;
+  devSha: string;
+  featureSha: string;
+  commits: string[];
+  /** The checks as of the last read — which ones are still running. */
+  checks: ChecksSummary;
+  pr: LandingPullRequest;
+}
+
+export type PrepareResult = PrepareGreen | PrepareConflict | PrepareFailed | PreparePending;
 
 /** What the merge is pinned to. Every field is a refusal if it no longer holds,
  *  so approval can never cover more (or other) work than was reviewed. */
@@ -218,9 +235,9 @@ export interface LandResult {
 
 /**
  * PREPARE phase: fetch, rebase the feature onto the fresh `origin/dev` tip in
- * its own worktree, run the combined build+test there, and — only if that is
- * green — push the branch and open/refresh its PR. Non-destructive to `dev` in
- * every outcome; see the result types for exactly what each leaves behind.
+ * its own worktree, push it, open or reuse its PR, and read that PR's GitHub
+ * checks. Non-destructive to `dev` in every outcome; see the result types for
+ * exactly what each leaves behind.
  *
  * Preconditions are thrown, not classified: a missing prerequisite (no gh, not
  * authenticated, no `origin/dev`), a feature with no branch or no worktree, a
@@ -297,58 +314,55 @@ export async function prepareLanding(opts: LandingOptions, feature: string): Pro
   }
 
   const featureSha = (await git(r.repoPath, ["rev-parse", branch])).trim();
-  const command = opts.buildTestCommand ?? DEFAULT_BUILD_TEST_COMMAND;
-  const startedAt = Date.now();
-  const buildTest = await runBuildTest(command, worktreePath);
-  const summary: BuildTestSummary = { command, ms: Date.now() - startedAt };
-  if (buildTest.code !== 0) {
-    // Red never reaches the forge: no push, no PR. Whatever PR may already be
-    // open from an earlier green keeps its last evidence rather than being
-    // rewritten with a failure the captain can't merge anyway.
-    return {
-      kind: "failed",
-      feature,
-      branch,
-      devSha,
-      featureSha,
-      exitCode: buildTest.code,
-      output: buildTest.output,
-      buildTest: summary,
-    };
-  }
-
   const diff = await git(r.repoPath, ["diff", `${devSha}..${featureSha}`]);
   const log = await git(r.repoPath, ["log", "--reverse", "--format=%h %s", `${devSha}..${featureSha}`]);
   const commits = log.split("\n").map((l) => l.trim()).filter(Boolean);
-  const green: PrepareGreen = {
-    kind: "green",
-    feature,
-    branch,
-    devSha,
-    featureSha,
-    diff,
-    commits,
-    buildTest: summary,
-  };
+  const green: PrepareGreen = { kind: "green", feature, branch, devSha, featureSha, diff, commits };
   // Nothing to land: don't push an empty branch or open a PR with no commits.
   // The caller (the queue) treats an empty green as "nothing to land".
   if (commits.length === 0) return green;
 
+  // Publish first, THEN read the verdict. The checks that gate this merge are
+  // GitHub's, run against this PR, so the PR has to exist before there is
+  // anything to read (D-20260727-1). The evidence block is written twice for
+  // that reason: once on create, saying the checks are the gate, and once more
+  // below with what they actually said.
   const push = await pushFeatureBranch(forge, branch, featureSha);
-  const upsert = await openOrUpdatePr(forge, {
+  const evidenceOf = (checks?: ChecksSummary): string =>
+    composeEvidence({ commits, devSha, featureSha, devRef: r.devRef, ...(checks ? { checks } : {}) });
+  const ensured = await ensurePr(forge, {
     branch,
     title: composePrTitle(feature, commits),
     body: composePrBody({ feature, branch, target: r.devBranch }),
-    evidence: composeEvidence({ commits, devSha, featureSha, devRef: r.devRef, buildTest: summary }),
+    evidence: evidenceOf(),
   });
-  green.pushed = push.pushed;
-  green.pr = {
-    number: upsert.pr.number,
-    url: upsert.pr.url,
-    title: upsert.pr.title,
-    body: upsert.pr.body,
-    created: upsert.created,
+
+  // Wait out anything still running, within bounds. The grace window for "no
+  // checks reported yet" applies only when this prepare actually published
+  // something — that is the one moment GitHub might not have registered a
+  // workflow run yet, and "not created yet" must never read as "no CI".
+  const checks = await awaitPrChecks(forge, ensured.pr.number, opts.checks, {
+    published: push.pushed || ensured.created,
+  });
+  const refreshed = await updatePrEvidence(forge, ensured.pr, evidenceOf(checks));
+  const pr: LandingPullRequest = {
+    number: refreshed.pr.number,
+    url: refreshed.pr.url,
+    title: refreshed.pr.title,
+    body: refreshed.pr.body,
+    created: ensured.created,
   };
+
+  if (checks.verdict === "failed") {
+    return { kind: "failed", feature, branch, devSha, featureSha, commits, checks, pr };
+  }
+  if (checks.verdict === "pending") {
+    return { kind: "pending", feature, branch, devSha, featureSha, commits, checks, pr };
+  }
+  // passed, or none at all — an ungated ready, flagged as such on the summary.
+  green.pushed = push.pushed;
+  green.checks = checks;
+  green.pr = pr;
   return green;
 }
 
@@ -478,9 +492,10 @@ export function composePrBody(opts: { feature: string; branch: string; target: s
   return [
     `Feature **${opts.feature}** → \`${opts.target}\`.`,
     ``,
-    `\`${opts.branch}\` was rebased onto the current \`${opts.target}\` tip and the project's combined ` +
-      `build+test ran on that combined state before this PR opened. The evidence below is regenerated ` +
-      `every time the branch is re-processed.`,
+    `\`${opts.branch}\` was rebased onto the current \`${opts.target}\` tip before this PR opened, so the ` +
+      `checks below ran on the state \`${opts.target}\` will actually hold. This PR's own CI is the merge ` +
+      `gate — co runs no build or test of its own. The evidence below is regenerated every time the branch ` +
+      `is re-processed.`,
     ``,
     `Merged with a merge commit, so the feature's per-job commits and its branch topology survive. ` +
       `The branch ref is kept after the merge.`,
@@ -488,27 +503,22 @@ export function composePrBody(opts: { feature: string; branch: string; target: s
   ].join("\n");
 }
 
-/** The fenced block co owns inside the PR body: what is in this branch and the
- *  proof it builds on top of the current `dev`. Rewritten on every prepare. */
+/** The fenced block co owns inside the PR body: what is in this branch, what it
+ *  was rebased onto, and what the PR's own checks made of it. Rewritten on every
+ *  prepare — and deliberately free of anything that changes on its own (no
+ *  timings), so re-processing an unchanged head sends no edit at all. */
 export function composeEvidence(opts: {
   commits: string[];
   devSha: string;
   featureSha: string;
   devRef: string;
-  buildTest?: BuildTestSummary;
+  checks?: ChecksSummary;
 }): string {
-  const secs = opts.buildTest
-    ? opts.buildTest.ms >= 1000
-      ? `${(opts.buildTest.ms / 1000).toFixed(1)}s`
-      : `${opts.buildTest.ms}ms`
-    : "";
   const lines = [
-    `### Build + test`,
-    opts.buildTest
-      ? `**green** — \`${opts.buildTest.command}\` in ${secs}, on the rebased tree.`
-      : `**green** on the rebased tree.`,
+    `### Checks`,
+    checksEvidence(opts.checks),
     ``,
-    `Rebased onto \`${opts.devRef}\` @ \`${opts.devSha.slice(0, 7)}\`; tested tip \`${opts.featureSha.slice(0, 7)}\`.`,
+    `Rebased onto \`${opts.devRef}\` @ \`${opts.devSha.slice(0, 7)}\`; checked tip \`${opts.featureSha.slice(0, 7)}\`.`,
     ``,
     `### Commits (${opts.commits.length})`,
     ...opts.commits.map((cl) => {
@@ -519,20 +529,26 @@ export function composeEvidence(opts: {
   return lines.join("\n");
 }
 
-/** One build+test run: `sh -c <command>` in the worktree, combined output
- *  captured (tail-limited), exit code returned rather than thrown — a red
- *  suite is a landing outcome, not an exception. */
-function runBuildTest(command: string, cwd: string): Promise<{ code: number; output: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn("sh", ["-c", command], { cwd, stdio: ["ignore", "pipe", "pipe"] });
-    let output = "";
-    const append = (d: unknown) => {
-      output += String(d);
-      if (output.length > OUTPUT_TAIL_LIMIT) output = output.slice(-OUTPUT_TAIL_LIMIT);
-    };
-    child.stdout.on("data", append);
-    child.stderr.on("data", append);
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ code: code ?? -1, output }));
-  });
+/** The checks line inside the evidence block. The no-checks case is stated in
+ *  full rather than left blank: an ungated merge is a thing the captain should
+ *  read on the PR, not a silence. */
+function checksEvidence(checks?: ChecksSummary): string {
+  if (!checks) {
+    return `This pull request's own CI is the merge gate; the result lands here once it reports.`;
+  }
+  switch (checks.verdict) {
+    case "none":
+      return (
+        `**ungated** — ${checksLine(checks)}. Merging it is a human judgment call; co has nothing to ` +
+        `verify against.`
+      );
+    case "passed":
+      return `**green** — ${checksLine(checks)}.`;
+    case "failed": {
+      const names = failedChecks(checks).map((r) => (r.link ? `[${r.name}](${r.link})` : `\`${r.name}\``));
+      return `**red** — ${checks.failed} of ${checks.total} checks failed: ${names.join(", ")}.`;
+    }
+    case "pending":
+      return `**pending** — ${checksLine(checks)} when co last looked.`;
+  }
 }

@@ -15,7 +15,7 @@ import { requireRemoteDev, type CommandRunner } from "./forge.js";
  * after a crash. Deterministic plumbing — no model.
  * The dispatch registry consumes provisionWorktree for its feature-scoped
  * dispatches (a crew process launched with cwd = the feature's worktree);
- * landing.ts (the rebase + build+test + PR engine) consumes teardownWorktree
+ * landing.ts (the rebase + PR + checks engine) consumes teardownWorktree
  * and the exported git helpers below.
  *
  * Safety posture (the invariants everything below preserves):

@@ -417,23 +417,29 @@ checkpoint over everything it produced.
   says plainly it targets the bare main tree. A feature runs one crew agent at a
   time; a second dispatch while one is live is refused.
 - \`feature_land(name)\` — when a feature is done, land it into \`dev\`. This fetches,
-  rebases its branch onto the current \`origin/dev\` tip, runs the project build+test
-  on that combined state, pushes the branch and opens (or refreshes) its pull
-  request, then opens the Ctrl-O review gate showing the PR and the result. The
-  gate IS the confirmation: the merge fires only if the captain presses [m] over a
-  green result. A conflict or a red build+test is shown but not mergeable, and
-  neither is ever pushed or PR'd. On a merge the worktree is torn down and the
-  branch ref is kept. There is no separate confirm step and no way to merge
-  without that keystroke, so never claim a feature landed just because you called
-  feature_land.
+  rebases its branch onto the current \`origin/dev\` tip, pushes the branch, opens (or
+  reuses) its pull request, and reads that PR's own GitHub CI checks, then opens the
+  Ctrl-O review gate showing the PR and the result. The gate IS the confirmation:
+  the merge fires only if the captain presses [m] over a green result. A rebase
+  conflict, a red check, or checks that have not reported yet are all shown but not
+  mergeable. On a merge the worktree is torn down and the branch ref is kept. There
+  is no separate confirm step and no way to merge without that keystroke, so never
+  claim a feature landed just because you called feature_land.
 - \`feature_enqueue(name)\` — the normal way a finished feature lands. It joins a
   strictly serial merge queue: only the HEAD is ever worked, and it works itself
-  out — rebased onto the freshly-fetched \`origin/dev\` tip, build+tested on that
-  combined state, pushed and PR'd — coming back \`ready\`, \`blocked\`, or
-  \`resolving\`. No confirm gate; call it as soon as the captain says a feature is
-  done.
+  out — rebased onto the freshly-fetched \`origin/dev\` tip, pushed, PR'd, and gated
+  on that PR's own CI checks — coming back \`ready\`, \`awaiting-checks\`, \`blocked\`,
+  or \`resolving\`. No confirm gate; call it as soon as the captain says a feature
+  is done.
+- **co runs no build and no test.** The semantic gate is the pull request's real
+  GitHub checks, read off the forge; the textual gate is the rebase. Two
+  consequences worth stating plainly to the captain when they come up: a head
+  \`awaiting-checks\` is simply waiting on CI — nothing is wrong, nothing is needed
+  from you, and re-calling \`feature_enqueue\` re-reads them; and a repo whose PRs
+  report NO checks at all yields a head that is ready but **ungated** — nothing
+  verified it, so say so rather than calling it green.
 - **The merge itself is not yours.** A \`ready\` head shows its pull request,
-  commits and build+test result in the captain's Ctrl-O queue tab with a live
+  commits and checks result in the captain's Ctrl-O queue tab with a live
   \`[m]\` beside them, and that keystroke merges the PR on GitHub (a merge commit),
   tears the worktree down, advances the queue and processes the next head. It sits
   there until they press it — and they may edit the PR on GitHub first. You do not
@@ -447,8 +453,8 @@ checkpoint over everything it produced.
   it and must not try to merge some other way.
 - You engage on a BLOCKED head, and only then. If a merge leaves the new head
   blocked you are told automatically — you do not need the captain to relay it.
-  Say in one line what is blocked and why, and for a rebase conflict or a red
-  build+test offer \`feature_resolve_head\`: it ARMS a fresh crew agent inside that
+  Say in one line what is blocked and why, and for a rebase conflict or a red CI
+  check offer \`feature_resolve_head\`: it ARMS a fresh crew agent inside that
   feature's own worktree (never \`dev\`) and runs only on the captain's typed
   \`confirm\`, bounded to a few attempts. When it finishes the head re-processes
   itself. Never tell the captain to press \`[m]\` on a blocked head — there isn't one.

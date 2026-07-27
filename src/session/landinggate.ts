@@ -1,3 +1,4 @@
+import { checksLine, type ChecksSummary } from "./checks.js";
 import {
   executeLanding,
   prepareLanding,
@@ -6,7 +7,7 @@ import {
   type PrepareResult,
 } from "./landing.js";
 import { resolveWorktreeOptions } from "./worktrees.js";
-import type { LandingGateOutcome, LandingPrepared, LandingReview } from "../tui/tui.js";
+import type { LandingGateOutcome, LandingPrepared, LandingReview, PanelChecks } from "../tui/tui.js";
 
 /**
  * The human landing gate: the review surface that sits between prepareLanding
@@ -45,10 +46,11 @@ export interface LandingGateResult {
  * Prepare `feature` and open the landing gate on the result.
  *
  * A green prepare arms [m]: pressing it runs executeLanding pinned to the
- * exact sha the diff and build+test covered, so approval can never merge more
- * than what was reviewed. [r]/Esc dismisses with no merge, leaving the branch
- * and worktree intact. A conflict or failed prepare opens the gate too - the
- * human sees why the feature is not mergeable - but [m] is disabled there. An
+ * exact sha the diff and the PR's checks covered, so approval can never merge
+ * more than what was reviewed. [r]/Esc dismisses with no merge, leaving the
+ * branch and worktree intact. A conflict, a red check or a still-pending check
+ * opens the gate too - the human sees why the feature is not mergeable - but [m]
+ * is disabled there. An
  * executeLanding refusal (e.g. a green gone stale because another feature
  * landed first) surfaces in the gate and comes back as outcome "failed"; the
  * cure is simply another reviewLanding for a fresh prepare.
@@ -56,7 +58,7 @@ export interface LandingGateResult {
  * `prepared` lets a caller that has ALREADY run prepareLanding (the merge queue
  * processes its head to decide ready/blocked before ever opening a gate) hand
  * that exact result in, so the gate shows it without a second rebase +
- * build+test. It changes nothing else: [m] still runs executeLanding pinned to
+ * checks read. It changes nothing else: [m] still runs executeLanding pinned to
  * the same featureSha, so the shas guard the merge exactly as a fresh prepare
  * would (a branch that moved since is refused with "moved since prepare"). Omit
  * it and the gate prepares itself, exactly as feature_land does.
@@ -110,6 +112,34 @@ function toView(p: PrepareResult): LandingPrepared {
     case "conflict":
       return { kind: "conflict", conflictFiles: p.conflictFiles, detail: p.detail };
     case "failed":
-      return { kind: "failed", exitCode: p.exitCode, output: p.output };
+      return {
+        kind: "failed",
+        reason: `PR #${p.pr.number}: ${checksLine(p.checks)}`,
+        checks: toChecksView(p.checks),
+      };
+    case "pending":
+      return {
+        kind: "pending",
+        reason: `PR #${p.pr.number}: ${checksLine(p.checks)}`,
+        checks: toChecksView(p.checks),
+      };
   }
+}
+
+/** The checks summary as the overlay shows it. Structurally identical to the
+ *  engine's, but restated through the Tui's own type so the layering holds. */
+function toChecksView(checks: ChecksSummary): PanelChecks {
+  return {
+    verdict: checks.verdict,
+    ungated: checks.ungated,
+    requiredOnly: checks.requiredOnly,
+    total: checks.total,
+    passed: checks.passed,
+    failed: checks.failed,
+    pending: checks.pending,
+    skipped: checks.skipped,
+    runs: checks.runs.map((r) => ({ name: r.name, bucket: r.bucket, ...(r.link ? { link: r.link } : {}) })),
+    ms: checks.ms,
+    ...(checks.timedOut ? { timedOut: checks.timedOut } : {}),
+  };
 }

@@ -5,8 +5,9 @@ import fsp from "node:fs/promises";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { ChecksPolicy } from "./checks.js";
 import { reviewLanding, type LandingGateHost } from "./landinggate.js";
-import { executeLanding, prepareLanding, type PrepareGreen } from "./landing.js";
+import { executeLanding, prepareLanding, type LandingOptions, type PrepareGreen } from "./landing.js";
 import { provisionWorktree } from "./worktrees.js";
 import { Tui, type InStream, type LandingReview, type OutStream } from "../tui/tui.js";
 import { stripAnsi } from "../tui/wrap.js";
@@ -38,14 +39,13 @@ interface Fixture {
   /** The integration tip as the remote holds it. */
   originDev: () => string;
   /** LandingOptions for this repo, wired to the fake forge. */
-  opts: (buildTestCommand?: string) => {
-    repoPath: string;
-    baseDir: string;
-    run: FakeForge["run"];
-    buildTestCommand: string;
-  };
+  opts: (checks?: ChecksPolicy) => LandingOptions;
   cleanup: () => Promise<void>;
 }
+
+/** No wall-clock in a unit test: the checks poll sleeps instantly and neither
+ *  deadline buys a second look unless a test asks for one. */
+const FAST: ChecksPolicy = { timeoutMs: 0, graceMs: 0, intervalMs: 1, sleep: async () => {} };
 
 async function makeRepo(): Promise<Fixture> {
   const root = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "co-gate-")));
@@ -68,11 +68,11 @@ async function makeRepo(): Promise<Fixture> {
     base,
     forge,
     originDev: () => forge.branches.get("dev")!,
-    opts: (buildTestCommand = "true") => ({
+    opts: (checks = FAST) => ({
       repoPath: repo,
       baseDir: base,
       run: forge.run,
-      buildTestCommand,
+      checks,
     }),
     cleanup: () => fsp.rm(root, { recursive: true, force: true }),
   };
@@ -276,28 +276,27 @@ test("a green gone stale under the open gate: execute refuses, outcome is failed
   }
 });
 
-test("a precomputed green is gated as-is, without a second prepare/build+test", async () => {
+test("a precomputed green is gated as-is, without a second prepare or checks read", async () => {
   const f = await makeRepo();
   try {
     const rec = await provisionWorktree({ repoPath: f.repo, baseDir: f.base, run: f.forge.run }, "prebaked");
     await commitIn(rec.worktreePath, "p.txt", "p\n", "job: p");
 
-    // The merge queue prepares its head (a passing build+test) to decide it's
+    // The merge queue prepares its head (reading its PR's checks) to decide it's
     // ready, THEN opens the gate with that exact result.
-    const green = await prepareLanding(
-      f.opts(),
-      "prebaked",
-    );
+    const green = await prepareLanding(f.opts(), "prebaked");
     assert.equal(green.kind, "green");
     const seen: LandingReview[] = [];
 
-    // Pass the precomputed green AND a build+test that would fail if it ran. It
-    // must not run: the gate shows the handed-in green and [m] merges it.
-    const res = await reviewLanding(
-      approvingHost(seen),
-      f.opts("exit 1"),
-      "prebaked",
-      green,
+    // Hand the precomputed green in, and make any FRESH read fail loudly. It must
+    // not happen: the gate shows the handed-in green and [m] merges it.
+    const checksBefore = f.forge.calls.filter((c) => c.startsWith("gh pr checks")).length;
+    f.forge.checksError = "a second checks read would have happened";
+    const res = await reviewLanding(approvingHost(seen), f.opts(), "prebaked", green);
+    assert.equal(
+      f.forge.calls.filter((c) => c.startsWith("gh pr checks")).length,
+      checksBefore,
+      "no second checks read",
     );
 
     assert.equal(res.outcome, "merged");

@@ -222,12 +222,17 @@ export interface QueuePanelEntry {
   /** 1-based landing position (1 is the head). */
   position: number;
   isHead: boolean;
-  status: "queued" | "head-processing" | "ready" | "blocked" | "resolving";
+  status: "queued" | "head-processing" | "awaiting-checks" | "ready" | "blocked" | "resolving";
   /** Commits awaiting merge on a ready head. */
   commitsReady?: number;
+  /** Present on a ready head whose PR reported no CI checks: mergeable, but
+   *  nothing verified it. Rendered, never swallowed. */
+  ungated?: boolean;
+  /** Present when awaiting-checks: how many checks are still running. */
+  checksPending?: number;
   /** Present when blocked: the human-readable reason. */
   blockedReason?: string;
-  /** Present when blocked: conflict vs red build+test. */
+  /** Present when blocked: conflict vs a red CI check. */
   blockedKind?: "conflict" | "failed";
   /** Resolver attempts spent so far on this head. */
   resolveAttempts?: number;
@@ -254,11 +259,21 @@ export type QueueHeadDetail =
       target: string;
       /** The per-job commits the merge preserves, oldest first. */
       commits: string[];
-      /** The build+test that passed on the rebased state: the merge's evidence. */
-      buildTest?: { command: string; ms: number };
+      /** What the PR's own CI checks said: the merge's evidence, including the
+       *  ungated case (no checks at all). */
+      checks?: PanelChecks;
       /** The open pull request [m] merges — title and body shown inline, so the
        *  captain reads what will land where the key that lands it lives. The
        *  patch itself is on GitHub (that is where they can comment on it). */
+      pr?: { number: number; url: string; title: string; body: string };
+    }
+  | {
+      kind: "awaiting";
+      feature: string;
+      target: string;
+      commits: string[];
+      /** The last read: which checks are still running. */
+      checks?: PanelChecks;
       pr?: { number: number; url: string; title: string; body: string };
     }
   | {
@@ -270,10 +285,10 @@ export type QueueHeadDetail =
       /** conflict: the unmerged paths and git's own account of the failing step. */
       conflictFiles?: string[];
       detail?: string;
-      /** failed: the red build+test's exit code and captured output. */
-      exitCode?: number;
-      output?: string;
-      buildTest?: { command: string; ms: number };
+      /** failed: the checks read, so the panel can name what went red and link
+       *  the run that says why. */
+      checks?: PanelChecks;
+      pr?: { number: number; url: string; title: string; body: string };
       resolveAttempts?: number;
       maxResolveAttempts?: number;
     };
@@ -296,7 +311,7 @@ export interface QueueMergeResult {
  * Tui never reaches into the engine.
  *
  * `headDetail` + `merge` are what make the queue tab PANEL-NATIVE: the tab shows
- * the ready head's diff and build+test inline and offers a live [m] that merges
+ * the ready head's PR and checks inline and offers a live [m] that merges
  * it directly through `merge`, with no co tool call anywhere in the loop and
  * nothing blocked waiting on the keystroke. Both are optional so a bare list
  * source (and every existing test that injects one) still works — without
@@ -382,7 +397,29 @@ export type LandingPrepared =
       pr?: { number: number; url: string; title: string };
     }
   | { kind: "conflict"; conflictFiles: string[]; detail: string }
-  | { kind: "failed"; exitCode: number; output: string };
+  | { kind: "failed"; reason: string; checks?: PanelChecks }
+  | { kind: "pending"; reason: string; checks?: PanelChecks };
+
+/**
+ * What a pull request's CI checks said, as the panel shows it. Structurally the
+ * session's ChecksSummary — declared here, like QueuePanelEntry, so the Tui never
+ * depends on the session layer. `ungated` is the one field that must never be
+ * rendered as an ordinary green: it means the PR reported NO checks at all, so
+ * nothing verified the merge but the captain.
+ */
+export interface PanelChecks {
+  verdict: "passed" | "failed" | "pending" | "none";
+  ungated: boolean;
+  requiredOnly: boolean;
+  total: number;
+  passed: number;
+  failed: number;
+  pending: number;
+  skipped: number;
+  runs: { name: string; bucket: string; link?: string }[];
+  ms: number;
+  timedOut?: boolean;
+}
 
 /** How a landing review ended: the human merged, declined, or dismissed a
  *  review whose merge attempt was refused. Only "merged" moved anything. */
@@ -501,10 +538,18 @@ function renderLandingBody(
     for (const l of p.detail.split("\n")) rows.push(...wrap("  " + c.dim(l)));
     return rows;
   }
-  if (p.kind === "failed") {
-    rows.push(...wrap("  " + c.red(`build+test failed on the rebased state (exit ${p.exitCode})`)));
+  if (p.kind === "failed" || p.kind === "pending") {
+    const head =
+      p.kind === "failed"
+        ? c.red(`the pull request's CI checks failed; there is nothing green to merge`)
+        : c.yellow(`the pull request's CI checks have not reported yet; there is nothing to merge yet`);
+    rows.push(...wrap("  " + head));
     rows.push("");
-    for (const l of p.output.split("\n")) rows.push(...wrap("  " + l));
+    rows.push(...wrap("  " + (p.kind === "failed" ? c.red(p.reason) : c.yellow(p.reason))));
+    if (p.checks) {
+      rows.push("");
+      for (const l of checkRunRows(p.checks)) rows.push(...wrap("  " + l));
+    }
     return rows;
   }
   const files = diffFileCount(p.diff);
@@ -536,12 +581,42 @@ function renderLandingBody(
   return rows;
 }
 
-/** A build+test run as one phrase: "green · npm test · 12.4s". */
-function buildTestPhrase(bt: { command: string; ms: number } | undefined, ok: boolean): string {
-  const verdict = ok ? "build+test green" : "build+test RED";
-  if (!bt) return verdict;
-  const secs = bt.ms >= 1000 ? `${(bt.ms / 1000).toFixed(1)}s` : `${bt.ms}ms`;
-  return `${verdict} · ${bt.command} · ${secs}`;
+/**
+ * A checks result as one phrase — the line that replaced "build+test green" when
+ * the gate became GitHub's (D-20260727-1). The ungated case gets its OWN wording
+ * rather than a green one: "no CI checks" is not a pass, it is the absence of a
+ * gate, and the captain has to see the difference at a glance.
+ */
+function checksPhrase(checks: PanelChecks | undefined): string {
+  if (!checks) return "checks: not reported";
+  const scope = checks.requiredOnly ? "required check" : "check";
+  const plural = (n: number): string => (n === 1 ? scope : `${scope}s`);
+  switch (checks.verdict) {
+    case "none":
+      return "no CI checks on this pull request; nothing verified it but you";
+    case "passed":
+      return `checks green · ${checks.total} ${plural(checks.total)} passed${
+        checks.skipped > 0 ? ` (${checks.skipped} skipped)` : ""
+      }`;
+    case "failed":
+      return `checks RED · ${checks.failed} of ${checks.total} ${plural(checks.total)} failed`;
+    case "pending":
+      return `checks pending · ${checks.pending} of ${checks.total} ${plural(checks.total)} still running${
+        checks.timedOut ? " (co stopped waiting)" : ""
+      }`;
+  }
+}
+
+/** One row per check that is not simply passing, with its run link. What a
+ *  captain (or a resolver) needs in order to act, without leaving the panel. */
+function checkRunRows(checks: PanelChecks | undefined): string[] {
+  const rows: string[] = [];
+  for (const r of checks?.runs ?? []) {
+    if (r.bucket === "pass" || r.bucket === "skipping") continue;
+    const mark = r.bucket === "fail" || r.bucket === "cancel" ? c.red("✗") : c.yellow("…");
+    rows.push(`  ${mark} ${r.name}${r.link ? " " + c.dim(r.link) : ""}`);
+  }
+  return rows;
 }
 
 /**
@@ -549,13 +624,19 @@ function buildTestPhrase(bt: { command: string; ms: number } | undefined, ok: bo
  * decide the [m] that sits right there in the same view.
  *
  * A READY head renders the PULL REQUEST it would merge (D-20260724-13) — its
- * number and URL, its title, the build+test that passed on the rebased state,
- * the per-job commit list, and the PR description co composed. The patch is not
- * repeated here: it lives on GitHub at that URL, which is also where the captain
- * can edit the message or comment on it before pressing [m]. A BLOCKED head
- * renders why it cannot merge (and offers no [m] anywhere): the conflicted paths
- * and git's account, or the red build+test's exit code and output. Every line is
- * wrapped, so nothing is clipped out of a merge decision.
+ * number and URL, its title, what that PR's CI checks said, the per-job commit
+ * list, and the PR description co composed. The patch is not repeated here: it
+ * lives on GitHub at that URL, which is also where the captain can edit the
+ * message or comment on it before pressing [m]. An AWAITING head renders what it
+ * is still waiting on. A BLOCKED head renders why it cannot merge (and offers no
+ * [m] anywhere): the conflicted paths and git's account, or the checks that went
+ * red with links to their runs. Every line is wrapped, so nothing is clipped out
+ * of a merge decision.
+ *
+ * The one rendering rule that carries weight: a ready head whose PR reported NO
+ * checks is drawn in YELLOW as UNGATED, never in green. co had nothing to verify
+ * it with, and the captain's [m] is the only gate — that has to look different
+ * from a real green (D-20260727-1).
  */
 export function renderQueueHeadDetail(detail: QueueHeadDetail, width: number): string[] {
   const wrap = (s: string): string[] => (s === "" ? [""] : wrapLine(s, width));
@@ -568,7 +649,7 @@ export function renderQueueHeadDetail(detail: QueueHeadDetail, width: number): s
       detail.blockedKind === "conflict"
         ? "rebase conflict"
         : detail.blockedKind === "failed"
-          ? "red build+test"
+          ? "failed CI checks"
           : "not mergeable";
     rows.push(...wrap("  " + c.red(c.bold(`BLOCKED (${kind})`)) + " " + c.dim("— no [m] on this head")));
     rows.push(...wrap("  " + c.red(detail.reason)));
@@ -577,14 +658,15 @@ export function renderQueueHeadDetail(detail: QueueHeadDetail, width: number): s
       rows.push(...wrap("  conflicted paths:"));
       for (const f of detail.conflictFiles) rows.push(...wrap("    " + c.red(f)));
     }
-    if (detail.exitCode !== undefined) {
+    if (detail.checks) {
       rows.push("");
-      rows.push(...wrap("  " + c.dim(buildTestPhrase(detail.buildTest, false) + ` · exit ${detail.exitCode}`)));
+      rows.push(...wrap("  " + c.dim(checksPhrase(detail.checks))));
+      for (const l of checkRunRows(detail.checks)) rows.push(...wrap("  " + l));
+      if (detail.pr) rows.push(...wrap("  " + c.dim(detail.pr.url)));
     }
-    const body = detail.detail ?? detail.output;
-    if (body) {
+    if (detail.detail) {
       rows.push("");
-      for (const l of body.split("\n")) rows.push(...wrap("  " + c.dim(l)));
+      for (const l of detail.detail.split("\n")) rows.push(...wrap("  " + c.dim(l)));
     }
     return rows;
   }
@@ -601,7 +683,16 @@ export function renderQueueHeadDetail(detail: QueueHeadDetail, width: number): s
     rows.push(...wrap("  " + pr.title));
     rows.push(...wrap("  " + c.dim(pr.url)));
   }
-  rows.push(...wrap("  " + c.green(buildTestPhrase(detail.buildTest, true))));
+  if (detail.kind === "awaiting") {
+    rows.push(...wrap("  " + c.yellow("WAITING on CI") + " " + c.dim("— no [m] until the checks report")));
+    rows.push(...wrap("  " + c.yellow(checksPhrase(detail.checks))));
+    for (const l of checkRunRows(detail.checks)) rows.push(...wrap("  " + l));
+  } else if (detail.checks?.ungated) {
+    rows.push(...wrap("  " + c.yellow(c.bold("UNGATED")) + " " + c.yellow(checksPhrase(detail.checks))));
+    rows.push(...wrap("  " + c.dim("[m] merges it on your judgment alone — read the PR before you press it.")));
+  } else {
+    rows.push(...wrap("  " + c.green(checksPhrase(detail.checks))));
+  }
   rows.push("");
   for (const cl of detail.commits) {
     const sp = cl.indexOf(" ");
@@ -824,7 +915,7 @@ const OVERLAY_LABELS = "123456789abcdefghjklmnopqrstuvwxyz";
  * body views page identically. Backspace/Esc walk back out.
  *
  * THE QUEUE TAB IS THE MERGE (D-20260724-12). A green head renders its own diff,
- * commits and build+test result right there and carries a live [m] that merges
+ * commits and checks result right there and carries a live [m] that merges
  * it — no co tool call, no gate, nothing waiting on the keystroke. The [m] is a
  * STATE, not a prompt: it is present because the head is green, it stays present
  * until pressed, and it disappears when the head changes. A blocked head renders
@@ -3306,21 +3397,30 @@ export class Tui implements SessionIO {
     if (!this.queue) return "none";
     const view = this.queue.view();
     const d = this.queue.headDetail?.() ?? null;
+    const checksKey = (k: PanelChecks | undefined): string =>
+      k ? `${k.verdict}:${k.total}:${k.failed}:${k.pending}:${k.ungated ? "u" : ""}` : "-";
     const detailKey = !d
       ? "-"
-      : d.kind === "ready"
-        ? `r:${d.feature}:${d.commits.length}:${d.pr?.number ?? -1}:${d.pr?.body.length ?? 0}:${d.buildTest?.ms ?? -1}`
-        : `b:${d.feature}:${d.blockedKind ?? "-"}:${d.reason.length}:${(d.detail ?? d.output ?? "").length}`;
+      : d.kind === "blocked"
+        ? `b:${d.feature}:${d.blockedKind ?? "-"}:${d.reason.length}:${(d.detail ?? "").length}:${checksKey(d.checks)}`
+        : `${d.kind === "ready" ? "r" : "w"}:${d.feature}:${d.commits.length}:${d.pr?.number ?? -1}:${
+            d.pr?.body.length ?? 0
+          }:${checksKey(d.checks)}`;
     const entries = view.entries
-      .map((e) => `${e.feature}/${e.status}/${e.commitsReady ?? ""}/${e.blockedKind ?? ""}/${e.resolveAttempts ?? ""}`)
+      .map(
+        (e) =>
+          `${e.feature}/${e.status}/${e.commitsReady ?? ""}/${e.ungated ? "u" : ""}/${
+            e.checksPending ?? ""
+          }/${e.blockedKind ?? ""}/${e.resolveAttempts ?? ""}`,
+      )
       .join(",");
     return `${this.cols}|${this.queueMerging ?? ""}|${this.queueMergeError ?? ""}|${entries}|${detailKey}`;
   }
 
   /**
    * The live merge queue as rows: the head first with its state, then the rest in
-   * landing order, then the head's INLINE body — a ready head's commits, diff and
-   * build+test evidence, or a blocked head's reason (D-20260724-12). Everything
+   * landing order, then the head's INLINE body — a ready head's commits, PR and
+   * checks evidence, or a blocked head's reason (D-20260724-12). Everything
    * needed to decide the merge, in the same view as the key that performs it.
    * Read fresh from the QueuePanelSource.
    */
@@ -3375,6 +3475,18 @@ export class Tui implements SessionIO {
     if (e.isHead) {
       if (e.status === "ready" && e.commitsReady !== undefined) {
         rows.push("      " + c.dim(`${e.commitsReady} commit${e.commitsReady === 1 ? "" : "s"} ready to land`));
+        if (e.ungated) {
+          rows.push("      " + c.yellow("no CI checks on its PR — merging is your judgment, not a green"));
+        }
+      } else if (e.status === "awaiting-checks") {
+        rows.push(
+          "      " +
+            c.yellow(
+              e.checksPending
+                ? `waiting on ${e.checksPending} CI check${e.checksPending === 1 ? "" : "s"} on its pull request`
+                : "waiting on its pull request's CI checks",
+            ),
+        );
       } else if (e.status === "blocked" && e.blockedReason) {
         rows.push("      " + c.red(e.blockedReason));
         if (e.blockedKind) {
@@ -3398,10 +3510,11 @@ export class Tui implements SessionIO {
   /** The coloured one-word state chip for a queue entry. */
   private queueStateLabel(e: QueuePanelEntry): string {
     switch (e.status) {
-      case "ready": return c.green("[ready]");
+      case "ready": return e.ungated ? c.yellow("[ready: ungated]") : c.green("[ready]");
       case "head-processing": return c.cyan("[processing]");
+      case "awaiting-checks": return c.yellow("[awaiting checks]");
       case "resolving": return c.yellow("[resolving]");
-      case "blocked": return c.red(`[blocked${e.blockedKind ? `: ${e.blockedKind === "conflict" ? "conflict" : "build+test"}` : ""}]`);
+      case "blocked": return c.red(`[blocked${e.blockedKind ? `: ${e.blockedKind === "conflict" ? "conflict" : "checks"}` : ""}]`);
       case "queued": return c.dim("[queued]");
     }
   }
@@ -3545,7 +3658,8 @@ export class Tui implements SessionIO {
     const why =
       pr.status === "failed" ? "merge failed"
       : p.kind === "conflict" ? "conflict"
-      : p.kind === "failed" ? "build+test red"
+      : p.kind === "failed" ? "checks red"
+      : p.kind === "pending" ? "checks pending"
       : "nothing to land";
     return c.dim(`m disabled (${why}) · `) + c.cyan("r") +
       c.dim(" close · space/b page · Esc close");
