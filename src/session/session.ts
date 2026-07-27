@@ -322,6 +322,11 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
                 headDetail: () => state.features?.headDetail() ?? null,
                 merge: () => panelMergeHead(state),
               },
+              // The features tab: every tracked worktree, not just the queued
+              // ones. Derived in memory from the registry + the queue + the
+              // stored intents, so this reads fresh at paint time like the other
+              // sources and costs no git call and no model call.
+              features: { list: () => state.features?.overview() ?? [] },
             }
           : {}),
       })

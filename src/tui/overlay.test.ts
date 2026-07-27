@@ -4,6 +4,8 @@ import {
   Tui,
   renderMarkdownDoc,
   type DocSource,
+  type FeaturePanelEntry,
+  type FeaturePanelSource,
   type InboxPanelEntry,
   type InStream,
   type LandingReview,
@@ -111,6 +113,7 @@ function harness(
   rows = 12,
   queue?: QueuePanelSource,
   inbox?: { list(): InboxPanelEntry[] },
+  features?: FeaturePanelSource,
 ): Harness {
   let listener: ((d: string) => void) | null = null;
   const writes: string[] = [];
@@ -131,6 +134,7 @@ function harness(
     docs,
     ...(queue ? { queue } : {}),
     ...(inbox ? { inbox } : {}),
+    ...(features ? { features } : {}),
   });
   tui.start();
   return {
@@ -1603,5 +1607,247 @@ test("Ctrl-O closes the panel from the inbox tab and from an open review", async
 
   h.send("typed\r");
   assert.equal(await answer, "typed", "no toggle leaked a keystroke into the buffer");
+  h.stop();
+});
+
+// --- the features tab (every tracked worktree) -------------------------------
+//
+// The overview the queue tab cannot give: the queue holds only what the captain
+// marked done, so everything still being worked is invisible there. This tab
+// lists EVERY tracked feature with its stored description, its state and its
+// branch. It is read-only by construction — no selector, no [m] — so the tests
+// below assert both what it shows and what it deliberately cannot do.
+
+function fakeFeatures(
+  initial: FeaturePanelEntry[],
+): FeaturePanelSource & { set(v: FeaturePanelEntry[]): void } {
+  let cur = initial;
+  return { list: () => cur, set: (v) => (cur = v) };
+}
+
+const FEATURES: FeaturePanelEntry[] = [
+  {
+    feature: "checkout",
+    branch: "co/feat-checkout",
+    intent: "stripe checkout with saved cards",
+    status: "ready",
+    busy: false,
+    position: 1,
+  },
+  {
+    feature: "user-auth",
+    branch: "co/feat-user-auth",
+    intent: "passkey login for the web app",
+    status: "queued",
+    busy: false,
+    position: 2,
+  },
+  {
+    feature: "search",
+    branch: "co/feat-search",
+    intent: "full-text search over the docs tier",
+    status: "working",
+    busy: true,
+  },
+];
+
+test("the features tab lists every tracked worktree with description, state and branch", async () => {
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /features/, "the header names the features tab");
+  assert.match(frame, /checkout\s+\[ready to merge\]\s+co\/feat-checkout/);
+  assert.match(frame, /stripe checkout with saved cards/, "the description comes from the intent");
+  assert.match(frame, /user-auth\s+\[queued #2\]\s+co\/feat-user-auth/, "a follower shows its position");
+  assert.match(frame, /passkey login for the web app/);
+  // The whole point: a feature still being worked, which the queue never sees.
+  assert.match(frame, /search\s+\[crew running\]\s+co\/feat-search/);
+  assert.match(frame, /full-text search over the docs tier/);
+  h.stop();
+});
+
+test("a feature with no intent renders a placeholder, never a blank row", async () => {
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([
+    { feature: "nameless", branch: "co/feat-nameless", status: "idle", busy: false },
+  ]));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /nameless\s+\[idle\]\s+co\/feat-nameless/);
+  assert.match(frame, /no description — created without an intent/);
+  h.stop();
+});
+
+test("an empty features list says so rather than showing a blank tab", async () => {
+  const h = harness(undefined, 72, 12, undefined, undefined, fakeFeatures([]));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /No feature worktrees yet/);
+  h.send("1"); // a stray key on an empty tab is a no-op, not a crash
+  await settle();
+  h.send(ESC);
+  h.stop();
+});
+
+test("a blocked feature and a resolving one carry their own chips, and a crew agent shows alongside a queue state", async () => {
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([
+    {
+      feature: "blocked-one",
+      branch: "co/feat-blocked-one",
+      intent: "the one that conflicts",
+      status: "blocked",
+      busy: false,
+      position: 1,
+      blockedKind: "conflict",
+    },
+    {
+      feature: "resolving-one",
+      branch: "co/feat-resolving-one",
+      intent: "being fixed by a fresh agent",
+      status: "resolving",
+      busy: true,
+      position: 2,
+    },
+    {
+      feature: "red-build",
+      branch: "co/feat-red-build",
+      intent: "green alone, red combined",
+      status: "blocked",
+      busy: false,
+      position: 3,
+      blockedKind: "failed",
+    },
+  ]));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /blocked-one\s+\[blocked: conflict\]/);
+  assert.match(frame, /red-build\s+\[blocked: build\+test\]/);
+  // A live agent is never hidden by the queue chip it sits behind.
+  assert.match(frame, /resolving-one\s+\[resolving\]\s+\[crew\]/);
+  h.stop();
+});
+
+test("the features tab pages a long list; nothing is silently clipped", async () => {
+  const many: FeaturePanelEntry[] = Array.from({ length: 30 }, (_, n) => ({
+    feature: `feat-${String(n + 1).padStart(2, "0")}`,
+    branch: `co/feat-feat-${String(n + 1).padStart(2, "0")}`,
+    intent: `intent number ${n + 1}`,
+    status: "idle" as const,
+    busy: false,
+  }));
+  const h = harness(undefined, 80, 14, undefined, undefined, fakeFeatures(many));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /feat-01/, "starts at the top");
+  assert.ok(!h.lastFramePlain().includes("feat-30"), "the tail is off screen, not dropped");
+  h.send("G");
+  await settle();
+  assert.match(h.lastFramePlain(), /feat-30/, "G reaches the end");
+  assert.match(h.lastFramePlain(), /intent number 30/, "with its description");
+  h.send("g");
+  await settle();
+  assert.match(h.lastFramePlain(), /feat-01/, "g returns to the top");
+  h.stop();
+});
+
+test("the features tab reads its source fresh: a feature created while the panel is open shows up", async () => {
+  const src = fakeFeatures([FEATURES[2]!]);
+  const h = harness(undefined, 80, 20, undefined, undefined, src);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("checkout"), "only the one feature to start");
+  src.set([FEATURES[0]!, FEATURES[2]!]);
+  h.tui.appendBlock("something happened");
+  await frame();
+  assert.match(h.lastFramePlain(), /checkout\s+\[ready to merge\]/, "the new feature is listed");
+  h.stop();
+});
+
+test("Tab cycles queue → features → docs → inbox, and the features tab merges nothing", async () => {
+  const docs = fakeDocs({ "plan.md": "# Plan\n" });
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(docs, 80, 20, q, fakeInbox(REVIEWS), fakeFeatures(FEATURES));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /head-a/, "opens on the queue tab, as before");
+  h.send("\t");
+  await settle();
+  assert.match(h.lastFramePlain(), /user-auth\s+\[queued #2\]/, "Tab reaches features");
+
+  // [m] is the queue tab's key and only the queue tab's: pressing it here must
+  // not merge the ready head sitting one tab away.
+  h.send("m");
+  await settle();
+  assert.equal(q.calls, 0, "no merge fired from the features tab");
+
+  h.send("\t");
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*plan\.md/, "Tab reaches docs");
+  h.send("\t");
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*\[L1\]\s*rework/, "Tab reaches the inbox");
+  h.send("\t");
+  await settle();
+  assert.match(h.lastFramePlain(), /head-a/, "and wraps back to the queue");
+  // Back on the queue, [m] still works exactly as it did.
+  h.send("m");
+  await settle();
+  assert.equal(q.calls, 1, "the queue tab's [m] is untouched");
+  q.resolveMerge({ merged: true, summary: "merged" });
+  await frame();
+  h.stop();
+});
+
+test("`i` cycles to the features tab too", async () => {
+  const q = fakeQueue({
+    size: 1,
+    head: null,
+    entries: [{ feature: "headfeat", position: 1, isHead: true, status: "queued" }],
+  });
+  const h = harness(undefined, 80, 20, q, undefined, fakeFeatures(FEATURES));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /headfeat/);
+  h.send("i");
+  await settle();
+  assert.match(h.lastFramePlain(), /co\/feat-checkout/, "`i` reached the features tab");
+  h.stop();
+});
+
+test("with only a features source wired, Ctrl-O opens it and keystrokes never reach the prompt", async () => {
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES));
+  const answer = h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /co\/feat-checkout/, "the features tab is the only tab");
+  h.send("hello");
+  await settle();
+  h.send(ESC);
+  h.send("real\r");
+  assert.equal(await answer, "real", "nothing typed on the tab leaked into the buffer");
+  h.stop();
+});
+
+test("Ctrl-O closes the panel from the features tab", async () => {
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES));
+  const answer = h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /co\/feat-checkout/);
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /you > /, "closed with the key that opened it");
+  h.send("typed\r");
+  assert.equal(await answer, "typed");
   h.stop();
 });

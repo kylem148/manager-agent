@@ -363,6 +363,61 @@ export interface InboxPanelSource {
   list(): InboxPanelEntry[];
 }
 
+/** Where a tracked feature stands, in one word. Structurally the session's
+ *  FeatureActivity — declared here, like QueuePanelEntry, so the low-level Tui
+ *  never depends on the session layer. The queue spellings are shared with
+ *  QueuePanelEntry's statuses so the two tabs never disagree about a feature
+ *  that appears in both. */
+export type FeaturePanelStatus =
+  | "working"
+  | "idle"
+  | "queued"
+  | "processing"
+  | "ready"
+  | "blocked"
+  | "resolving"
+  | "provisioning"
+  | "failed"
+  | "removed";
+
+/**
+ * One tracked feature worktree, as the panel's Features tab shows it: what it
+ * is, what is happening to it, and which branch it lives on. Structurally a
+ * subset of the session's FeatureOverview.
+ */
+export interface FeaturePanelEntry {
+  /** The feature handle (its created name, or its slug after a restart rebuilt
+   *  the record from the worktree on disk). */
+  feature: string;
+  /** The feature's branch, always `co/feat-<slug>`. */
+  branch: string;
+  /** The stored one-line description, when the feature has one. A feature
+   *  created without an intent renders a placeholder instead. */
+  intent?: string;
+  status: FeaturePanelStatus;
+  /** Whether a crew agent is running or queued in the worktree — shown even when
+   *  the status chip is saying something else (a queue position, say). */
+  busy: boolean;
+  /** 1-based landing position, when the feature is in the merge queue. */
+  position?: number;
+  /** Present when blocked: conflict vs red build+test. */
+  blockedKind?: "conflict" | "failed";
+}
+
+/**
+ * Backs the Ctrl-O panel's Features tab: EVERY tracked feature worktree, not
+ * just the ones queued to land. Read fresh at paint time like the queue and the
+ * inbox — the session derives it from in-memory state (registry records, jobs,
+ * the queue snapshot, the stored intents), so re-reading costs nothing and
+ * involves no git call, no filesystem read and no model call. Injected, so the
+ * Tui never reaches into the feature layer itself.
+ */
+export interface FeaturePanelSource {
+  /** Every tracked feature, in the order the tab lists them (the session sorts:
+   *  closest-to-landing first, then the rest alphabetically). */
+  list(): FeaturePanelEntry[];
+}
+
 /**
  * What the landing gate reviews and does - the Ctrl-O overlay's third mode,
  * opened programmatically via openLandingReview when a prepared feature awaits
@@ -746,6 +801,12 @@ export interface TuiOptions {
    * readable afterwards.
    */
   inbox?: InboxPanelSource;
+  /**
+   * Backs the Ctrl-O panel's Features tab (every tracked feature worktree). Omit
+   * off the feature flow (unlinked, or PlainIO) and the tab simply isn't there;
+   * session.ts supplies one bound to the FeatureManager when linked.
+   */
+  features?: FeaturePanelSource;
 }
 
 /**
@@ -906,13 +967,14 @@ const OVERLAY_LABELS = "123456789abcdefghjklmnopqrstuvwxyz";
  * does NOT auto-pop — the captain opens and closes it with Ctrl-O — and it hosts
  * the merge review in-place rather than through a separate modal surface.
  *
- * It has three home tabs, switched with Tab (or `i`), so their key spaces never
+ * It has four home tabs, switched with Tab (or `i`), so their key spaces never
  * collide: the `queue` tab ([m] merges the ready head, and the rest pages its
- * inline diff), the `docs` tab (1-9/a-z open a doc), and the `inbox` tab
- * (1-9/a-z open a filed crew review). Opening a doc drops into a `doc` view;
- * selecting a review drops into an `inboxItem` view. A pending feature_land
- * review adds a fourth `review` tab for as long as it is pending. All the
- * body views page identically. Backspace/Esc walk back out.
+ * inline diff), the `features` tab (every tracked worktree with its description,
+ * state and branch — read-only, it only pages), the `docs` tab (1-9/a-z open a
+ * doc), and the `inbox` tab (1-9/a-z open a filed crew review). Opening a doc
+ * drops into a `doc` view; selecting a review drops into an `inboxItem` view. A
+ * pending feature_land review adds a fifth `review` tab for as long as it is
+ * pending. All the body views page identically. Backspace/Esc walk back out.
  *
  * THE QUEUE TAB IS THE MERGE (D-20260724-12). A green head renders its own diff,
  * commits and checks result right there and carries a live [m] that merges
@@ -929,6 +991,9 @@ const OVERLAY_LABELS = "123456789abcdefghjklmnopqrstuvwxyz";
  */
 type PanelView =
   | { kind: "queue" }
+  /** Every tracked feature worktree with its description, state and branch. A
+   *  read-only overview: it scrolls, and nothing on it acts. */
+  | { kind: "features" }
   | { kind: "docs" }
   | { kind: "doc"; name: string; content: string; rows: string[]; scroll: number; error: string | null }
   | { kind: "inbox" }
@@ -958,6 +1023,10 @@ interface PanelState {
    *  depend on actually changed (see queueSignature). */
   queueRows: string[];
   queueSig: string;
+  /** Scroll offset of the features tab. It is a list, but an unbounded one — a
+   *  repo can have more features in flight than a small terminal has rows — so
+   *  unlike the docs/inbox lists it pages rather than clipping. */
+  featuresScroll: number;
 }
 
 /**
@@ -1134,6 +1203,7 @@ export class Tui implements SessionIO {
   private readonly docs?: DocSource;
   private readonly queue?: QueuePanelSource;
   private readonly inbox?: InboxPanelSource;
+  private readonly features?: FeaturePanelSource;
   private panel: PanelState | null = null;
   private unsubscribeDocs: (() => void) | null = null;
   // The panel-native merge (D-20260724-12). `queueMerging` names the feature
@@ -1166,6 +1236,7 @@ export class Tui implements SessionIO {
     this.docs = opts.docs;
     this.queue = opts.queue;
     this.inbox = opts.inbox;
+    this.features = opts.features;
   }
 
   // --- lifecycle -------------------------------------------------------------
@@ -2577,16 +2648,18 @@ export class Tui implements SessionIO {
   // The persistent, non-modal home for the instance's user-facing docs AND the
   // live merge queue (D-20260723-25). The captain opens/closes it with Ctrl-O
   // (the same key both ways — see togglePanel and the "close" panel input); it
-  // never auto-pops. Three tabs (Tab or `i` switches): the QUEUE tab shows the
+  // never auto-pops. Four tabs (Tab or `i` switches): the QUEUE tab shows the
   // ordered features and their state, with the ready head's review actioned
-  // in-place ([m] merge / [r] reject / [d] drill the full diff); the DOCS tab
-  // lists docs/ (selectable by letter) and opens one rendered through the SAME
-  // markdown renderer the transcript uses, refreshing live when an agent writes
-  // it; the INBOX tab lists the filed crew reviews and opens one's full body on
-  // that same surface. The docs read only through the injected DocSource (the
-  // sandboxed doc tool — the `.memory/` substrate is never listed or reachable
-  // here); the queue and the inbox read a fresh in-memory snapshot from their
-  // sources at paint time. No step
+  // in-place ([m] merge / [r] reject / [d] drill the full diff); the FEATURES tab
+  // shows EVERY tracked worktree — including the ones still being worked, which
+  // the queue never sees — with its stored description, its state and its branch;
+  // the DOCS tab lists docs/ (selectable by letter) and opens one rendered
+  // through the SAME markdown renderer the transcript uses, refreshing live when
+  // an agent writes it; the INBOX tab lists the filed crew reviews and opens
+  // one's full body on that same surface. The docs read only through the injected
+  // DocSource (the sandboxed doc tool — the `.memory/` substrate is never listed
+  // or reachable here); the queue, the features and the inbox read a fresh
+  // in-memory snapshot from their sources at paint time. No step
   // needs an arrow key: tab-switch is Tab, selection is a letter/number, paging
   // is less-style (space/b, j/k, d/u, g/G).
 
@@ -2617,7 +2690,7 @@ export class Tui implements SessionIO {
    * write queue for live refresh and loads the doc list asynchronously.
    */
   private openPanel(): void {
-    if (!this.docs && !this.queue && !this.inbox && !this.pendingReview) {
+    if (!this.docs && !this.queue && !this.inbox && !this.features && !this.pendingReview) {
       this.setStatus("panel unavailable");
       return;
     }
@@ -2651,6 +2724,7 @@ export class Tui implements SessionIO {
       queueScroll: 0,
       queueRows: [],
       queueSig: "",
+      featuresScroll: 0,
     };
     if (this.docs) {
       this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
@@ -2726,14 +2800,18 @@ export class Tui implements SessionIO {
   }
 
   /** The panel's home tabs, in order, given what's wired and pending: the queue
-   *  (when a queue source exists), docs (when a doc source exists), the review
-   *  inbox (when an inbox source exists), and a feature_land review whenever one
-   *  is pending. The review gets its own tab even alongside a queue: the queue
-   *  tab's [m] is the panel-native queue merge, and two different merges must
-   *  never share one key (D-20260724-12). Tab cycles these. */
+   *  (when a queue source exists), the features overview (when a feature source
+   *  exists), docs (when a doc source exists), the review inbox (when an inbox
+   *  source exists), and a feature_land review whenever one is pending. Features
+   *  sits beside the queue because they are two views of the same flow — the
+   *  queue is what is lined up to LAND, features is everything in flight — and
+   *  the review gets its own tab even alongside the queue: the queue tab's [m] is
+   *  the panel-native queue merge, and two different merges must never share one
+   *  key (D-20260724-12). Tab cycles these. */
   private panelTabs(): PanelView["kind"][] {
     const tabs: PanelView["kind"][] = [];
     if (this.queue) tabs.push("queue");
+    if (this.features) tabs.push("features");
     if (this.docs) tabs.push("docs");
     if (this.inbox) tabs.push("inbox");
     if (this.pendingReview) tabs.push("review");
@@ -2744,6 +2822,7 @@ export class Tui implements SessionIO {
    *  anything unrecognised falls back to the queue. */
   private homeView(kind: PanelView["kind"]): PanelView {
     switch (kind) {
+      case "features": return { kind: "features" };
       case "docs": return { kind: "docs" };
       case "inbox": return { kind: "inbox" };
       case "review": return { kind: "review" };
@@ -2844,6 +2923,14 @@ export class Tui implements SessionIO {
         get: () => panel.queueScroll,
         set: (n) => { panel.queueScroll = n; },
         rows: this.queueBody().length,
+      };
+    }
+    if (v.kind === "features") {
+      const panel = this.panel;
+      return {
+        get: () => panel.featuresScroll,
+        set: (n) => { panel.featuresScroll = n; },
+        rows: this.featuresTabRows().length,
       };
     }
     if (v.kind === "doc" || v.kind === "inboxItem") {
@@ -3005,6 +3092,7 @@ export class Tui implements SessionIO {
     if ("ch" in ev && ev.ch === "i") { this.switchTab(); return; }
     switch (this.panel.view.kind) {
       case "queue": this.queueTabInput(ev); return;
+      case "features": this.featuresTabInput(ev); return;
       case "docs": this.docsTabInput(ev, this.panel); return;
       case "doc": this.overlayDocInput(ev); return;
       case "inbox": this.inboxTabInput(ev); return;
@@ -3029,6 +3117,23 @@ export class Tui implements SessionIO {
       this.mergeReadyHead();
       return;
     }
+    if ("nav" in input) {
+      if (this.overlayScrollInput(input)) return;
+      if (input.nav === "escape" || input.nav === "back") this.closePanel();
+      return;
+    }
+    if (this.overlayScrollInput(input)) return;
+    if (input.ch === "q" || input.ch === "Q") this.closePanel();
+  }
+
+  /**
+   * The features tab: an overview, and nothing else. It pages like the queue tab
+   * (the list can outgrow the screen) and Esc/Backspace/q close the panel, but no
+   * key here acts on a feature — landing is the queue's [m], and creating,
+   * enqueuing and abandoning are the co's levers. Deliberately no [m] and no
+   * selector, so this tab can never be the thing that merged something.
+   */
+  private featuresTabInput(input: OverlayInput): void {
     if ("nav" in input) {
       if (this.overlayScrollInput(input)) return;
       if (input.nav === "escape" || input.nav === "back") this.closePanel();
@@ -3326,6 +3431,14 @@ export class Tui implements SessionIO {
       title = "queue";
       body = this.queueBody();
       start = panel.queueScroll;
+    } else if (v.kind === "features") {
+      title = "features";
+      body = this.featuresTabRows();
+      // A feature landing (or being abandoned) shortens the list; never strand
+      // the view past its end.
+      const max = Math.max(0, body.length - vp);
+      if (panel.featuresScroll > max) panel.featuresScroll = max;
+      start = panel.featuresScroll;
     } else if (v.kind === "docs") {
       title = "docs";
       body = this.docsTabRows(panel);
@@ -3547,6 +3660,92 @@ export class Tui implements SessionIO {
     return rows;
   }
 
+  /**
+   * The features tab: every tracked feature worktree, two rows each — the handle
+   * with its state chip and branch, then its description underneath.
+   *
+   * This is the view the queue tab cannot give. The queue holds only what the
+   * captain has marked done, so a feature still being worked is invisible there;
+   * here everything in flight shows at once, with the one thing git can't say
+   * about a branch — what it is FOR — read straight from the stored intent. No
+   * model call is made to describe anything, at paint time or ever: the intent is
+   * an authored one-liner, and a feature that never got one says so.
+   *
+   * Read fresh from the FeaturePanelSource, so a feature created, enqueued or
+   * landed while the panel is open shows on the next paint.
+   */
+  private featuresTabRows(): string[] {
+    if (!this.features) return ["", "  " + c.dim("Feature worktrees aren't available in this session.")];
+    const entries = this.features.list();
+    if (entries.length === 0) {
+      return [
+        "",
+        "  " + c.dim("No feature worktrees yet."),
+        "  " + c.dim("Each feature the co creates gets its own branch and checkout, and shows up here."),
+      ];
+    }
+    // Two columns, each as wide as its widest cell so the tab reads DOWN — the
+    // states in one column, the branches in another — rather than as ragged
+    // prose. Both capped, so one long name or one long chip can't push the
+    // branches off a narrow screen. The chip is measured by visible width: it
+    // carries colour, and padding on the raw string would count the escapes.
+    const chips = entries.map((e) => {
+      const crew = e.busy && e.status !== "working" ? " " + c.cyan("[crew]") : "";
+      return this.featureStateLabel(e) + crew;
+    });
+    const nameWidth = Math.min(28, Math.max(...entries.map((e) => e.feature.length)));
+    const chipWidth = Math.min(24, Math.max(...chips.map((s) => visibleWidth(s))));
+    const rows: string[] = [""];
+    entries.forEach((e, idx) => {
+      rows.push(...this.featureEntryRows(e, chips[idx]!, nameWidth, chipWidth));
+    });
+    return rows;
+  }
+
+  /** One feature as its two rows: handle + state + branch, then the description
+   *  (wrapped, so a long one is never clipped out of the overview). */
+  private featureEntryRows(
+    e: FeaturePanelEntry,
+    chip: string,
+    nameWidth: number,
+    chipWidth: number,
+  ): string[] {
+    const wrap = (s: string): string[] => (s === "" ? [""] : wrapLine(s, this.cols));
+    // A marker on the two states that want the eye: one that can be merged right
+    // now, and one that is holding the queue up.
+    const marker = e.status === "ready" ? c.green("▸") : e.status === "blocked" ? c.red("▸") : " ";
+    const name = e.feature.length > nameWidth ? e.feature : e.feature.padEnd(nameWidth);
+    const pad = " ".repeat(Math.max(0, chipWidth - visibleWidth(chip)));
+    const head = `${marker} ${c.bold(name)}  ${chip}${pad}  ` + c.dim(e.branch);
+    const intent = e.intent?.trim();
+    return [
+      ...wrap("  " + head),
+      ...wrap("      " + (intent ? intent : c.dim("no description — created without an intent"))),
+    ];
+  }
+
+  /** The coloured one-word state chip for a feature, mirroring the queue tab's
+   *  vocabulary for the states the two share. The `[crew]` marker beside it (see
+   *  featuresTabRows) is separate: an enqueued feature's queue state and a live
+   *  agent are both worth seeing, so neither hides the other. */
+  private featureStateLabel(e: FeaturePanelEntry): string {
+    switch (e.status) {
+      case "working": return c.cyan("[crew running]");
+      case "idle": return c.dim("[idle]");
+      case "queued": return c.dim(`[queued${e.position === undefined ? "" : ` #${e.position}`}]`);
+      case "processing": return c.cyan("[processing]");
+      case "ready": return c.green("[ready to merge]");
+      case "resolving": return c.yellow("[resolving]");
+      case "blocked":
+        return c.red(
+          `[blocked${e.blockedKind ? `: ${e.blockedKind === "conflict" ? "conflict" : "build+test"}` : ""}]`,
+        );
+      case "provisioning": return c.dim("[provisioning]");
+      case "failed": return c.red("[provision failed]");
+      case "removed": return c.dim("[worktree gone]");
+    }
+  }
+
   /** The docs tab as selectable rows: "a) plan.md". */
   private docsTabRows(panel: PanelState): string[] {
     if (!this.docs) return ["", "  " + c.dim("No doc surface in this session.")];
@@ -3581,7 +3780,8 @@ export class Tui implements SessionIO {
     const w = this.cols;
     const v = this.panel?.view;
     // Home tabs offer the switch hint whenever there's somewhere to switch to.
-    const onHomeTab = v?.kind === "queue" || v?.kind === "docs" || v?.kind === "inbox";
+    const onHomeTab =
+      v?.kind === "queue" || v?.kind === "features" || v?.kind === "docs" || v?.kind === "inbox";
     const tabHint = onHomeTab && this.panelTabs().length > 1 ? "Tab/i switch · " : "";
 
     let left: string;
@@ -3600,6 +3800,9 @@ export class Tui implements SessionIO {
       } else {
         left = ` ${c.dim("space/b page · " + tabHint + "Esc close")} `;
       }
+    } else if (v?.kind === "features") {
+      // Nothing here acts, so the bar advertises only paging and the exits.
+      left = ` ${c.dim("space/b page · " + tabHint + "Esc close")} `;
     } else if (v?.kind === "docs" || v?.kind === "inbox") {
       left = ` 1-9/a-z open · ${tabHint}Esc close `;
     } else {

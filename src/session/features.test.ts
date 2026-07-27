@@ -8,8 +8,9 @@ import path from "node:path";
 import { instancePaths, type InstancePaths } from "../paths.js";
 import { defaultDispatchConfig } from "./dispatchconfig.js";
 import { DispatchRegistry } from "./registry.js";
-import { FeatureManager } from "./features.js";
+import { FeatureManager, featureActivity } from "./features.js";
 import { FeatureStore } from "./featurestore.js";
+import type { QueueEntryView } from "./mergequeue.js";
 import {
   featureBranch,
   provisionWorktree,
@@ -480,6 +481,17 @@ test("a feature's intent SURVIVES a restart: the record is rebuilt from git, the
     // The original handle still resolves too, through the same slug match.
     assert.equal((await next.status("User Auth"))?.intent, "passkey login for the web app");
     assert.equal((await next.status("checkout"))?.intent, "stripe checkout with saved cards");
+
+    // And it reaches the panel's features tab, which is the whole point.
+    const overview = next.overview();
+    assert.deepEqual(
+      overview.map((f) => [f.feature, f.intent, f.status, f.branch]),
+      [
+        ["checkout", "stripe checkout with saved cards", "idle", "co/feat-checkout"],
+        ["user-auth", "passkey login for the web app", "idle", "co/feat-user-auth"],
+      ],
+      "every tracked worktree, described, alphabetical while none is queued",
+    );
   } finally {
     await fx.cleanup();
   }
@@ -491,10 +503,11 @@ test("a feature created without an intent survives a restart too, with no descri
     await fx.features.create("nameless");
     const next = await fx.restart();
     await next.reconcileAtBoot();
-    const row = await next.status("nameless");
+    const [row] = next.overview();
     assert.ok(row);
     assert.equal(row.feature, "nameless");
     assert.equal(row.intent, undefined, "no intent, and nothing invented to fill the gap");
+    assert.equal(row.status, "idle");
   } finally {
     await fx.cleanup();
   }
@@ -515,10 +528,75 @@ test("a landed feature's intent is dropped from the store, so the slug can be re
 
     const next = await fx.restart();
     await next.reconcileAtBoot();
-    assert.deepEqual(next.list(), [], "nothing tracked, nothing described");
+    assert.deepEqual(next.overview(), [], "nothing tracked, nothing described");
   } finally {
     await fx.cleanup();
   }
+});
+
+test("the features overview lists queued and unqueued side by side, closest-to-landing first", async () => {
+  const fx = await makeFixture();
+  try {
+    const queued = await fx.features.create("zeta-queued", "goes first because it is queued");
+    await commitIn(queued.feature.worktreePath, "z.txt", "z\n", "job: z");
+    await fx.features.create("alpha-idle", "still being worked");
+    await fx.features.enqueue("zeta-queued");
+
+    const rows = fx.features.overview();
+    assert.equal(rows.length, 2, "the unqueued feature is here too — the queue would never show it");
+    // Queue order wins over the alphabet: the queued feature leads even though
+    // its name sorts last.
+    assert.equal(rows[0]!.feature, "zeta-queued");
+    assert.equal(rows[0]!.position, 1);
+    assert.equal(rows[0]!.status, "ready", "the head processed to green");
+    assert.equal(rows[0]!.busy, false);
+    assert.equal(rows[1]!.feature, "alpha-idle");
+    assert.equal(rows[1]!.status, "idle");
+    assert.equal(rows[1]!.position, undefined);
+    assert.equal(rows[1]!.intent, "still being worked");
+    // Every row names the branch, so the tab can be read without the co.
+    assert.deepEqual(rows.map((r) => r.branch), ["co/feat-zeta-queued", "co/feat-alpha-idle"]);
+
+    // A blocked/resolving head reports as such, with its kind, so the tab agrees
+    // with the queue tab about the same feature.
+    const started = fx.features.beginResolveHead();
+    assert.equal(started.started, false, "a green head has nothing to resolve");
+    assert.equal(fx.features.overview()[0]!.status, "ready", "and nothing changed under it");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("feature status derivation: provisioning wins, then the queue, then a live crew agent", () => {
+  // The panel's chip, decided from state the session already holds — no git call
+  // and no model call, at paint time or ever.
+  const q = (status: QueueEntryView["status"], extra: Partial<QueueEntryView> = {}): QueueEntryView => ({
+    feature: "f",
+    position: 1,
+    isHead: true,
+    status,
+    ...extra,
+  });
+
+  // A half-provisioned worktree wins outright: nothing else about it is worth
+  // reading, and a `removed` record must never read as a provision failure.
+  assert.equal(featureActivity("provisioning", null, true), "provisioning");
+  assert.equal(featureActivity("failed", q("ready"), false), "failed");
+  assert.equal(featureActivity("removed", null, false), "removed");
+
+  // Then the queue, even with an agent running: a resolver working a blocked
+  // head is `resolving`, which says more than a generic `working` would.
+  assert.equal(featureActivity("ready", q("queued"), false), "queued");
+  assert.equal(featureActivity("ready", q("head-processing"), false), "processing");
+  assert.equal(featureActivity("ready", q("ready"), false), "ready");
+  assert.equal(featureActivity("ready", q("blocked", { blockedKind: "conflict" }), false), "blocked");
+  assert.equal(featureActivity("ready", q("resolving"), true), "resolving");
+
+  // Outside the queue: an agent in the worktree is `working`, and a feature
+  // simply being worked by the captain is `idle`.
+  assert.equal(featureActivity("ready", null, true), "working");
+  assert.equal(featureActivity("ready", null, false), "idle");
+  assert.equal(featureActivity("ready", undefined, false), "idle");
 });
 
 test("reconcileFeatures surfaces a branch-without-worktree anomaly for unmerged work, destroying nothing", async () => {

@@ -120,6 +120,68 @@ export interface CreateResult {
   feature: FeatureView;
 }
 
+/**
+ * Where a feature stands right now, in ONE word, for the panel's features tab.
+ * Derived entirely from state the session already holds — the registry's jobs,
+ * the merge queue, the record's provision status. No git call, no model call,
+ * nothing that costs anything to compute at paint time.
+ *
+ * The merge-queue statuses keep their queue spellings so the two tabs agree
+ * about a feature that is in both.
+ */
+export type FeatureActivity =
+  /** A crew agent is running (or queued) in the worktree, and the feature is not
+   *  in the merge queue. */
+  | "working"
+  /** Tracked, nothing running, not enqueued: work in the worktree, or waiting to
+   *  be enqueued. The resting state. */
+  | "idle"
+  /** In the merge queue behind the head. */
+  | "queued"
+  /** The head, being rebased + build+tested right now. */
+  | "processing"
+  /** The head, green: its [m] is live in the queue tab. */
+  | "ready"
+  /** The head, blocked on a rebase conflict, a red build+test, or a missing
+   *  prerequisite. */
+  | "blocked"
+  /** The head, with a fresh crew agent resolving it in its own worktree. */
+  | "resolving"
+  /** The worktree is still being provisioned. */
+  | "provisioning"
+  /** Provisioning failed; there is no usable checkout. */
+  | "failed"
+  /** The worktree was torn down while the record was still tracked. Nothing in
+   *  the flow leaves a feature here today; it exists so the record's own
+   *  `removed` provision status can never masquerade as a provision failure. */
+  | "removed";
+
+/**
+ * One feature as the Ctrl-O features tab shows it: what it is, where it is, and
+ * what is happening to it. This is the overview the queue tab deliberately does
+ * NOT give — the queue holds only the features the captain has marked done, and
+ * everything still being worked is invisible there.
+ */
+export interface FeatureOverview {
+  /** The feature handle (the name it was created under, or its slug after a
+   *  restart rebuilt the record from the worktree). */
+  feature: string;
+  slug: string;
+  branch: string;
+  /** The stored one-line description, when the co gave one at create time. */
+  intent?: string;
+  status: FeatureActivity;
+  /** Whether a crew agent is running or queued in the worktree. Reported
+   *  separately from `status` because an enqueued feature's queue state is the
+   *  more useful chip, and a resolver agent working a blocked head must still be
+   *  visible. */
+  busy: boolean;
+  /** 1-based landing position, when the feature is in the merge queue. */
+  position?: number;
+  /** Present when blocked: conflict vs red build+test. */
+  blockedKind?: "conflict" | "failed";
+}
+
 export interface AbandonResult {
   abandoned: boolean;
   /** Present when abandoned: what teardown did (worktree removed, branch kept
@@ -162,11 +224,11 @@ export class FeatureManager {
    *  and the head-only state machine; drives the EXISTING prepare + gate through
    *  the deps below. FeatureManager is its host (busy check + record cleanup). */
   private readonly queue: MergeQueue;
-  /** Intents keyed by slug, so status/list can show what a feature is FOR.
-   *  Durable: git can rebuild everything else about a feature from its worktree,
-   *  but not the line the co wrote, so that one field is persisted under
-   *  `.dispatch/features.json` (featurestore.ts) and read back at session
-   *  start. */
+  /** Intents keyed by slug, so status/list and the panel's features tab can show
+   *  what a feature is FOR. Durable: git can rebuild everything else about a
+   *  feature from its worktree, but not the line the co wrote, so that one field
+   *  is persisted under `.dispatch/features.json` (featurestore.ts) and read back
+   *  at session start. */
   private readonly store: FeatureStore;
 
   constructor(opts: FeatureManagerOptions) {
@@ -280,6 +342,42 @@ export class FeatureManager {
   /** Every tracked feature, newest bookkeeping last. */
   list(): FeatureView[] {
     return this.registry.listFeatures().map((r) => this.toView(r));
+  }
+
+  /**
+   * Every tracked feature as the Ctrl-O features tab shows it — the at-a-glance
+   * overview of everything in flight, not just what is queued to land. Pure
+   * in-memory derivation (registry records + jobs + the queue snapshot + the
+   * stored intent), so the panel can call it fresh on every paint the way it
+   * already does for the queue and the inbox.
+   *
+   * Ordered the way the captain reads it: whatever is closest to landing first
+   * (the merge queue, in its own landing order), then everything still being
+   * worked, alphabetically — a stable order, so a row never moves under the eye
+   * because a job started somewhere else.
+   */
+  overview(): FeatureOverview[] {
+    const rows = this.registry.listFeatures().map((record) => {
+      const queue = this.queue.viewFor(record.feature);
+      const busy = this.isBusy(record.feature);
+      const intent = this.store.intent(record.slug);
+      return {
+        feature: record.feature,
+        slug: record.slug,
+        branch: record.branch,
+        ...(intent ? { intent } : {}),
+        status: featureActivity(record.provisionStatus, queue, busy),
+        busy,
+        ...(queue ? { position: queue.position } : {}),
+        ...(queue?.blockedKind ? { blockedKind: queue.blockedKind } : {}),
+      } satisfies FeatureOverview;
+    });
+    return rows.sort((a, b) => {
+      const pa = a.position ?? Number.MAX_SAFE_INTEGER;
+      const pb = b.position ?? Number.MAX_SAFE_INTEGER;
+      if (pa !== pb) return pa - pb;
+      return a.slug.localeCompare(b.slug);
+    });
   }
 
   /** One feature's full picture, or null if nothing is tracked under that
@@ -601,14 +699,46 @@ export class FeatureManager {
    *
    * A rebuilt record carries its description with it: the record comes from git,
    * the intent comes from the persisted store (loaded at session start and keyed
-   * by the same slug the branch name yields), so `list`/`status` show what a
-   * recovered feature is FOR and not just where it lives.
+   * by the same slug the branch name yields), so `list`/`status`/`overview` show
+   * what a recovered feature is FOR and not just where it lives.
    */
   async reconcileAtBoot(): Promise<FeatureReconcileReport> {
     const report = await this.deps.reconcile(this.worktreeOptions());
     for (const record of report.records) this.registry.upsertFeature(record);
     return report;
   }
+}
+
+/**
+ * One feature's state as a single word, from what the session already knows.
+ *
+ * Precedence is deliberate. A half-provisioned worktree wins outright — there is
+ * no usable checkout, so nothing else about the feature is worth reading. Then
+ * the MERGE QUEUE, because once a feature is enqueued its queue state is the
+ * thing the captain is waiting on (a resolver agent working a blocked head shows
+ * as `resolving`, not as a generic `working`, which is the more useful of the
+ * two). A crew agent running outside the queue is `working`, and everything else
+ * is `idle`: created, maybe committed, not yet lined up to land. `busy` is
+ * carried alongside either way, so an agent is never invisible.
+ */
+export function featureActivity(
+  provisionStatus: FeatureRecord["provisionStatus"],
+  queue: QueueEntryView | null | undefined,
+  busy: boolean,
+): FeatureActivity {
+  if (provisionStatus === "provisioning") return "provisioning";
+  if (provisionStatus === "failed") return "failed";
+  if (provisionStatus === "removed") return "removed";
+  if (queue) {
+    switch (queue.status) {
+      case "queued": return "queued";
+      case "head-processing": return "processing";
+      case "ready": return "ready";
+      case "blocked": return "blocked";
+      case "resolving": return "resolving";
+    }
+  }
+  return busy ? "working" : "idle";
 }
 
 /** Slug a name without throwing (an empty/degenerate name just yields ""), so

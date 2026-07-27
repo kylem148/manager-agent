@@ -374,7 +374,7 @@ flat over time — small rewritten orientation files plus large append-only logs
         └── .dispatch/          crew-dispatch state (only after `co link`)
             ├── config.json        repo path, named agent commands, caps, pane layout, anchor
             ├── inbox.json         the last 20 crew reviews, newest first (Ctrl-O → Inbox)
-            ├── features.json      per-feature intents, keyed by slug
+            ├── features.json      per-feature intents, keyed by slug (Ctrl-O → Features)
             └── captures/          per-job captured output the co reviews from
 ```
 
@@ -524,6 +524,40 @@ The full review body is never printed to the chat at any level — it lives in t
 inbox. So a clean chore costs you no attention, a mixed result costs you one
 line, and only a run that genuinely needs a decision interrupts you, with the
 decision and nothing else.
+
+### Everything in flight: the Features tab
+
+The queue tab only shows what you've marked done. The Ctrl-O panel's **Features**
+tab shows every feature worktree that exists — including the ones still being
+worked, which the queue never sees — one after another, two lines each:
+
+```
+  ▸ checkout        [ready to merge]    co/feat-checkout
+      stripe checkout with saved cards
+    user-auth       [queued #2]         co/feat-user-auth
+      passkey login for the web app
+    search-reindex  [crew running]      co/feat-search-reindex
+      full-text search over the docs tier
+    migrations      [resolving] [crew]  co/feat-migrations
+      split the schema migration runner out of boot
+```
+
+The description is the **intent** the co-manager wrote when it created the
+feature — a plain authored line, not something regenerated per refresh, and no
+model is called to produce it. It is stored per feature under
+`.dispatch/features.json`, so it is still there after a restart, including for
+worktrees the startup sweep rebuilt from disk. A feature created without one says
+so rather than showing a blank.
+
+The state chip is derived from what the session already knows: a crew agent live
+in the worktree, a merge-queue position, a green head, a block, a resolver run.
+An agent working an enqueued feature shows a `[crew]` marker beside its queue
+state, so a running agent is never hidden by it, and a `▸` marks the two rows
+that want your eye — the one that can merge right now, and the one holding the
+queue up. Nothing on this tab acts — no
+selector, no `[m]`. Landing is the queue tab's keystroke, and creating, enqueuing
+and abandoning are the co-manager's levers; this is the overview you
+context-switch from.
 
 ### Landing work: one keystroke, `[m]`
 
@@ -987,26 +1021,34 @@ not an anomaly at all, it is what every landed feature leaves behind now that
 refs are kept. The co's reach stops at the PR into `dev`: it never touches
 `main` and there is no promote path.
 
+`overview()` is the same module's read side for the panel's features tab: every
+tracked feature as one row — handle, branch, stored intent, and a single-word
+state derived in memory from the record's provision status, the merge queue and
+the registry's jobs (provisioning first, then the queue, then a live crew agent),
+ordered closest-to-landing first. No git call and no model call, so the panel can
+re-read it on every paint.
+
 `featurestore.ts` is the durable half of a feature record. Git rebuilds
 everything else about a feature from its worktree, but not the line the co wrote
 to say what it is FOR, so intents are persisted per slug in
 `.dispatch/features.json` — beside the dispatch config and the review inbox,
-never inside the repo or the worktree — and read back at session start, so
-`feature_list`/`feature_status` still describe a recovered worktree. It is a
-cache of
+never inside the repo or the worktree — and read back at session start, which is
+what lets a recovered worktree still show its description. It is a cache of
 authored prose and behaves like one: a missing or corrupt file is an empty store,
 and a write that can't land costs a description, never a create, a merge or a
 teardown.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,
-and the Ctrl-O panel. The panel has three home tabs, cycled with Tab — the merge
-queue, the doc viewer, and the review inbox — each reading a small injected
-source, so the Tui never reaches into git, the filesystem, or the session layer
-itself. The queue tab renders the ready head's pull request and checks
-inline and owns the `[m]` that merges it, through an injected `merge` callback that is the
-only thing the keystroke can reach; a pending `feature_land` review gets a
-fourth tab of its own for as long as it is pending, so the two merges never
+and the Ctrl-O panel. The panel has four home tabs, cycled with Tab — the merge
+queue, the features overview, the doc viewer, and the review inbox — each reading
+a small injected source, so the Tui never reaches into git, the filesystem, or
+the session layer itself. The queue tab renders the ready head's pull request and
+checks inline and owns the `[m]` that merges it, through an injected `merge`
+callback that is the only thing the keystroke can reach; the features tab is
+read-only by construction (no selector, no `[m]`, it only pages), so the overview
+can never be the thing that merged something; a pending `feature_land` review
+gets a fifth tab of its own for as long as it is pending, so the two merges never
 share a key. A doc and a filed review drill into the same paged body view.
 `keys.ts` is the pure decode table that maps both legacy control bytes and
 enhanced-protocol CSI-u sequences onto one set of bindings. `tui.ts` is
