@@ -17,6 +17,9 @@ gated by a typed `confirm`, runs the agent in a visible pane you can watch and
 answer, and the co-manager reviews the captured result for you afterward. Even
 when dispatching, it never reads or edits repo files itself.
 
+Finished feature work integrates into `dev` as a GitHub pull request rather than
+a local merge (see "Landing work" below).
+
 ```
 Ghostty (or any terminal multiplexer)
 ├── pane 1: co-manager  ← the brain: architecture, research, decisions, orders
