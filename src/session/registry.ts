@@ -61,6 +61,13 @@ import {
  * ANCHOR (no living surface left to grow from) fails a dispatch, and then with a
  * clear re-run-`co pane` message, never a cryptic error.
  *
+ * The same principle covers a launch that fails with no pane dead at all. When a
+ * split succeeds but the new pane never runs its job, the transport reaps that
+ * pane and reports the failure as ORPHANED: the id was never committed to the
+ * layout, so there is nothing to prune and nothing tracked is wrong. That is a
+ * single-dispatch failure, bounded and not retried, and it costs the layout
+ * nothing. Only a pane we were HANDED and found gone or busy may cost it.
+ *
  * COMPLETION is detected from the capture file, which carries two kinds of
  * marker sharing one sentinel contract (sentinel.ts):
  *
@@ -169,6 +176,11 @@ export interface RegistryOptions {
    *  provisionWorktree (worktrees.ts), which is idempotent for an intact
    *  feature and throws with a reconcile pointer on any half-state. */
   provisionWorktree?: (opts: WorktreeOptions, feature: string) => Promise<FeatureRecord>;
+  /** Test seam: how long a pane launch gets to prove its job actually started
+   *  before the transport calls the launch failed. Defaults to the transport's
+   *  own budget (4s, generous on purpose); tests shorten it so exercising a
+   *  probe-timeout costs milliseconds instead of seconds. */
+  paneStartTimeoutMs?: number;
 }
 
 /** Per-dispatch options beyond the order and agent. */
@@ -242,6 +254,8 @@ export class DispatchRegistry {
   private readonly onHookIssue?: (message: string) => void;
   private readonly installHook: (agentCommand: string) => Promise<InstallResult>;
   private readonly provisionFeature: (opts: WorktreeOptions, feature: string) => Promise<FeatureRecord>;
+  /** Test-only override of the transport's launch-probe budget (see options). */
+  private readonly paneStartTimeoutMs?: number;
 
   constructor(opts: RegistryOptions) {
     this.paths = opts.paths;
@@ -266,6 +280,7 @@ export class DispatchRegistry {
     this.onHookIssue = opts.onHookIssue;
     this.installHook = opts.installHook ?? ((agentCommand) => installCrewStopHook({ agentCommand }));
     this.provisionFeature = opts.provisionWorktree ?? provisionWorktree;
+    this.paneStartTimeoutMs = opts.paneStartTimeoutMs;
     // Tests (and the no-anchor case) skip the live existence probe.
     this.anchorChecked = this.skipAnchorCheck || !this.layout;
   }
@@ -513,7 +528,9 @@ export class DispatchRegistry {
       } catch (e) {
         if (!(e instanceof PaneUnavailableError)) throw e;
         // Only a dead ANCHOR reaches here: launchResilient prunes-and-retries a
-        // dead worker pane, so a single closed worker never gets this far. The
+        // dead worker pane, and converts an orphaned launch failure to a plain
+        // Error, so neither a closed worker nor a split-that-never-ran gets this
+        // far (both take the fail-this-job-only path below instead). The
         // anchor is the growth root with no living surface behind it — there is
         // no background path, so drop the layout for the session, tell the
         // operator to re-run `co pane`, and fail the dispatch. Nothing launched.
@@ -549,6 +566,19 @@ export class DispatchRegistry {
     return (
       "couldn't open a crew pane — relink the dispatch pane and try again " +
       "(run `co pane` to designate the crew pane). Nothing was launched."
+    );
+  }
+
+  /** The message for an ORPHANED launch failure: Ghostty made the split, the job
+   *  never started in the new pane, and the transport closed it again. Pointedly
+   *  does NOT mention `co pane` — the anchor and every tracked pane are intact, so
+   *  re-designating the crew pane would be the wrong fix for the wrong problem.
+   *  Only this dispatch failed, and retrying it is the actual next step. */
+  private orphanLaunchMessage(): string {
+    return (
+      "couldn't start the crew job — Ghostty opened a new pane but the job never " +
+      "started in it, so the pane was closed again. The crew link is fine and " +
+      "nothing was launched; try the dispatch again."
     );
   }
 
@@ -650,6 +680,15 @@ export class DispatchRegistry {
    * into a clean "re-run `co pane`" failure. The loop is bounded: each retry
    * prunes exactly one tracked pane, and an emptied list falls back to the
    * anchor, which escapes rather than looping.
+   *
+   * An ORPHANED failure is neither of those and must not be treated as one. There
+   * the split SUCCEEDED, the pane we created never ran its job, and the transport
+   * already closed it again: that id was never committed to the layout, so there
+   * is no dead tracked pane behind it and the anchor is fine. It is re-thrown as a
+   * plain Error so neither caller's PaneUnavailableError branch fires — this one
+   * dispatch fails, the shared layout is untouched, and nobody is told to re-run
+   * `co pane` for a healthy link. It is deliberately NOT retried: a split that
+   * keeps being created but never runs its job would otherwise loop forever.
    */
   private async launchResilient(job: Job): Promise<boolean> {
     for (;;) {
@@ -657,6 +696,7 @@ export class DispatchRegistry {
         return await this.launchOnPane(job);
       } catch (e) {
         if (!(e instanceof PaneUnavailableError)) throw e;
+        if (e.orphaned) throw new Error(this.orphanLaunchMessage());
         const deadId = e.paneId;
         // The anchor itself is gone, or the failed id isn't a tracked worker we
         // can prune: there is no living surface to grow from. Surface it to the
@@ -684,6 +724,9 @@ export class DispatchRegistry {
       captureFile: job.captureFile,
       ...(job.agentName ? { agentName: job.agentName } : {}),
       ...(job.cwd ? { cwd: job.cwd } : {}),
+      ...(this.paneStartTimeoutMs !== undefined
+        ? { paneStartTimeoutMs: this.paneStartTimeoutMs }
+        : {}),
     });
     if (res.placement && res.placement.kind === "queue") return false;
     job.paneId = res.paneId;
@@ -876,7 +919,8 @@ export class DispatchRegistry {
         launched = await this.launchResilient(job);
       } catch (e) {
         if (e instanceof PaneUnavailableError) {
-          // launchResilient already pruned any dead worker pane and retried; only
+          // launchResilient already pruned any dead worker pane and retried, and
+          // already converted an orphaned launch failure to a plain Error, so only
           // a dead ANCHOR reaches here. There is no background path: drop pane
           // geometry for the session and fail this job cleanly — same as a
           // first-time dispatch that can't place a pane.

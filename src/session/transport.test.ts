@@ -330,6 +330,10 @@ test("launchGhostty degrades when a busy pane never starts the job (paste went n
     );
     assert.ok(err instanceof PaneUnavailableError, `expected PaneUnavailableError, got ${err}`);
     assert.match(err.message, /never started/);
+    // NOT orphaned: this pane was handed to us (the anchor) and is still there —
+    // it's busy, not dead-and-reaped. The registry's existing prune/anchor-loss
+    // handling must still apply to it.
+    assert.equal(err.orphaned, false, "a busy takeover pane is not an orphan");
     assert.equal(layout.paneCount, 0, "the failed plan is aborted");
     const entries = await fsp.readdir(paths.captures);
     assert.deepEqual(entries, [], "no capture and no orphaned job script left behind");
@@ -372,6 +376,11 @@ test("launchGhostty reaps a split it created when the job never starts in it", a
     assert.equal(layout.paneCount, 1, "only the pre-existing pane remains");
     assert.equal(closes.length, 1, "the stray split pane is closed");
     assert.ok(closes[0]!.includes('id = "pane-new"'), "closes the pane the split returned");
+    // The id it carries names a pane we CREATED and have already reaped, not a
+    // tracked pane that died. Flagging it keeps the registry from reading a
+    // healthy layout as a broken link (see the orphan path in registry.ts).
+    assert.equal(err.orphaned, true, "a reaped split-we-created is reported as orphaned");
+    assert.equal(err.paneId, "pane-new", "and names that pane, not the split origin");
   } finally {
     setOsaRunnerForTest(null);
     await cleanup();

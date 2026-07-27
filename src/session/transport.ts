@@ -439,10 +439,24 @@ async function ensureCaptureDir(paths: InstancePaths): Promise<void> {
  */
 export class PaneUnavailableError extends Error {
   readonly paneId: string;
-  constructor(paneId: string, cause: string) {
+  /**
+   * True when `paneId` names a pane THIS LAUNCH created and has already reaped,
+   * rather than a pane the layout tracks. A successful split whose job never
+   * started is the only such case: the id was never committed to the layout, so
+   * there is no dead tracked pane to prune and nothing in the layout is wrong —
+   * the anchor and every tracked pane are intact. The registry fails that one
+   * dispatch and leaves the shared layout (and the link) untouched.
+   *
+   * False for every failure that targets a pane we did NOT create — a stale or
+   * closed anchor, a dead tracked worker, a busy takeover/reuse pane — which keep
+   * the existing prune-and-retry / anchor-loss behavior unchanged.
+   */
+  readonly orphaned: boolean;
+  constructor(paneId: string, cause: string, orphaned = false) {
     super(`crew pane ${paneId} unavailable: ${cause}`);
     this.name = "PaneUnavailableError";
     this.paneId = paneId;
+    this.orphaned = orphaned;
   }
 }
 
@@ -476,6 +490,13 @@ async function waitForFileCreation(file: string, timeoutMs: number): Promise<boo
  * an editor or another agent owns it), so the plan is aborted, a
  * split-we-created is closed, and a PaneUnavailableError is raised. Nothing runs
  * invisibly: a busy pane means the operator retargets, not a background run.
+ *
+ * That failure comes in two flavors and the error tells them apart, because the
+ * registry must react differently. A takeover/reuse that never starts names a
+ * pane we were HANDED, which is still there and still tracked. A split that never
+ * starts names a pane we CREATED and have just closed again: `orphaned` is set,
+ * because that id was never committed to the layout and nothing tracked is dead.
+ * Only the first kind may cost the layout anything.
  *
  * Any AppleScript failure targeting the pane (a closed/stale anchor surfaces as
  * Ghostty error -1719, plus permission or not-running failures) is likewise
@@ -561,8 +582,14 @@ export async function launchGhostty(args: {
   );
   if (!started) {
     layout.abort();
-    if (decision.kind === "split" && returnedId) {
-      // We created this pane and nothing is running in it; reap it.
+    // A split we created: the pane exists but nothing is running in it. Reap it,
+    // so a failed launch never leaks a pane, and mark the error ORPHANED — the id
+    // it carries is now a closed pane that was never committed to the layout, so
+    // the registry must not read it as a dead TRACKED pane and must not touch the
+    // layout over it. A takeover/reuse failure is not orphaned: that pane is one
+    // we were handed, it is still there, and the old behavior stands.
+    const orphaned = decision.kind === "split" && Boolean(returnedId);
+    if (orphaned) {
       try {
         await osaRunner(composeCloseScript(returnedId));
       } catch {
@@ -572,7 +599,10 @@ export async function launchGhostty(args: {
     await fsp.rm(scriptPath, { force: true }).catch(() => {});
     throw new PaneUnavailableError(
       paneId || targetId,
-      "the job never started there (pane busy with another program?)",
+      orphaned
+        ? "the job never started in the pane the split created; the stray pane was closed again"
+        : "the job never started there (pane busy with another program?)",
+      orphaned,
     );
   }
   layout.commit(paneId);
