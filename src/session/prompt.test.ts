@@ -94,9 +94,20 @@ test("enqueue is where co writes the PR message, in the house style", async () =
     );
     assert.match(
       prompt,
-      /nothing about co or the crew or how the work was produced/,
-      "said again for the body, which is where the temptation lives",
+      /The rule is about the ACTOR, not the\s+vocabulary: never name who performed the work/,
+      "said again for the body, and as the distinction that keeps it from over-firing",
     );
+    assert.match(
+      prompt,
+      /crew reports the suite is\s+green/,
+      "with the actor phrasing it forbids",
+    );
+    assert.match(
+      prompt,
+      /co-manager composes the PR body but never sees the diff/,
+      "and the product noun as SUBJECT it allows",
+    );
+    assert.match(prompt, /"`tsc --noEmit` clean"/, "with behaviour standing in for the actor");
     assert.match(
       prompt,
       /a re-enqueue with\s+no message keeps the one you wrote/,
@@ -120,6 +131,28 @@ test("the PR body is the five-section template, verification separated from clai
     );
     assert.match(prompt, /One line, imperative, specific/, "the title rule");
     assert.match(prompt, /Drop a section you would leave empty/, "no scaffolding on a trivial change");
+    // The form constraint is the whole reason the body stays readable, so the
+    // caps are pinned as numbers and not just as "keep it short".
+    assert.match(
+      prompt,
+      /Bullets only, no paragraphs anywhere in the body/,
+      "sections are lists, never prose",
+    );
+    assert.match(
+      prompt,
+      /Three bullets to a section\s+is typical, five is the absolute maximum/,
+      "with hard caps, so a section cannot grow back into a paragraph",
+    );
+    assert.match(
+      prompt,
+      /one short\s+sentence on one line/,
+      "and a bullet cannot become a paragraph on its own",
+    );
+    assert.match(
+      prompt,
+      /deliberate trade\s+for a body a reviewer will actually read, not an oversight/,
+      "the lost detail is a known cost, not a gap for someone to restore prose over",
+    );
     assert.match(prompt, /roads not taken/, "How is where the abandoned approaches go");
     assert.match(
       prompt,

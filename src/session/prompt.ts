@@ -534,7 +534,7 @@ pass" into "verified".
 history entry. No bot voice, no attribution, nothing about how the work was
 produced. Not "Fix bug", not "Update .gitignore", not "Changes per feedback".
 
-**Body.** Five sections, in this order:
+**Body.** Five sections, in this order, each one a short bullet list:
 
 1. \`## What\` changed, at a high level: the capability, and the file-level shape.
    Not a diff transcript, not a restatement of the title.
@@ -555,6 +555,15 @@ produced. Not "Fix bug", not "Update .gitignore", not "Changes per feedback".
    follow-ups, anything needing more research.
 
 Rules that ride with the template:
+- Bullets only, no paragraphs anywhere in the body. Three bullets to a section
+  is typical, five is the absolute maximum, and each bullet is one short
+  sentence on one line. A section needing a sixth is holding reasoning that
+  belongs in the decision log, not in the PR.
+- That compression costs something and the cost is accepted. \`How\` squeezes
+  hardest: the tradeoffs behind a rejected approach will not survive a one-line
+  bullet, so that reasoning stays in the decision log. It is a deliberate trade
+  for a body a reviewer will actually read, not an oversight to be repaired
+  later by restoring prose.
 - Drop a section you would leave empty. Five headings on a one-line fix is
   boilerplate, and an empty heading is worse than a missing one; a trivial change
   may be a title plus two sections.
@@ -563,8 +572,14 @@ Rules that ride with the template:
 - Never duplicate the harness's appended evidence block, which already carries
   the commit list and the PR's GitHub checks result. Testing covers the crew's
   LOCAL verification in the worktree only; never restate CI.
-- Write as a developer, not a bot: no attribution, no co-provenance, no
-  "generated with", nothing about co or the crew or how the work was produced.
+- Write as a developer, not a bot. The rule is about the ACTOR, not the
+  vocabulary: never name who performed the work. No "crew reports the suite is
+  green", no "co wrote", no first person, no "generated with", no attribution
+  or co-provenance of any kind. Write the code's behaviour instead:
+  "\`tsc --noEmit\` clean". The product's own nouns are correct when they are
+  the SUBJECT of the change, because a developer on this repo would use them:
+  "the co-manager composes the PR body but never sees the diff" describes the
+  feature and is fine.
 - Anti-patterns, each one a rewrite: a "Fix bug" / "Update dependencies" /
   "Phase 1" / "WIP" title; a copy-pasted list of changed files; a body that
   restates the title; a commit list or a checks summary; a link standing in for

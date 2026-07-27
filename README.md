@@ -630,7 +630,13 @@ re-processing rewrites nothing but the fenced evidence.
 included), `## Testing` for the verification that was actually run, and
 `## Other Notes` for what is deliberately left out and what comes next. A section
 with nothing real to say is dropped rather than left as empty scaffolding, so a
-one-line fix stays a title and two sections. co never sees the diff, so the
+one-line fix stays a title and two sections. Every section is a short bullet
+list and never a paragraph: three bullets is typical, five is the ceiling, and
+each one is a single short sentence on its own line. That has a price, mostly in
+`How`, where the tradeoffs behind an approach that was tried and dropped will
+not fit in a one-line bullet; they stay in the decision log where they were
+argued out, and the PR stays something a reviewer reads to the end. co never
+sees the diff, so the
 material for What and Testing comes out of the crew's completion report, which
 every order now tells the crew to close with three things: the diffstat, the
 verification it ran with its real output, and the approaches it tried and
