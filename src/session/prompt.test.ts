@@ -10,9 +10,9 @@ import type { ResearchConfig } from "../config.js";
 
 /**
  * The parts of the system prompt that are load-bearing for what co's work LOOKS
- * LIKE in the repo afterwards: the branch a feature is cut on, and the commit
- * message the crew is told to write. Both are prose the model acts on rather
- * than code that enforces itself, which is exactly why they are pinned here — a
+ * LIKE in the repo afterwards: the commit message the crew is told to write, and
+ * the branch a feature is cut on. Both are prose the model acts on rather than
+ * code that enforces itself, which is exactly why they are pinned here — a
  * silent edit to either changes the git history of every project co touches.
  */
 
@@ -33,6 +33,20 @@ const DISPATCH = {
   agents: ["cc"],
   defaultAgent: "cc",
 };
+
+test("the orders protocol tells the crew to commit with no attribution trailer", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH);
+    assert.match(prompt, /Conventional Commits form/);
+    assert.match(prompt, /use EXACTLY the message you give/);
+    assert.match(prompt, /no\s+`Co-Authored-By` line/);
+    assert.match(prompt, /no "Generated with" line/);
+    assert.match(prompt, /attribution\s+trailer of any kind/);
+  } finally {
+    await cleanup();
+  }
+});
 
 test("the features protocol names branches <type>/<slug> and ownership by worktree", async () => {
   const { paths, cleanup } = await makeInstance();

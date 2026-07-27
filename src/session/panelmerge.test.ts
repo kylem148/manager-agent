@@ -236,7 +236,7 @@ test("e2e: the panel's [m] merges the head's PR, advances the queue, and the nex
     assert.match(frame, /checks green · 1 check passed/, "and what its CI checks said");
     assert.match(frame, /job: alpha slice/, "the commit it would land");
     assert.match(frame, /pull\/1/, "the PR's URL, to read or edit it on GitHub");
-    assert.match(frame, /Merged with a merge commit/, "and the PR message co composed");
+    assert.match(frame, /Alpha\./, "and the PR message itself, which reads like a person's");
     assert.equal(fx.originDev(), devStart, "showing it merged nothing");
 
     // THE KEYSTROKE. One byte, no tool call, nothing awaited by the co.

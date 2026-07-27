@@ -861,6 +861,11 @@ test("the resolve path: a conflict-blocked head is fixed by a fresh agent in its
     assert.equal(plan.kind, "conflict");
     assert.equal(plan.attempt, 1);
     assert.match(plan.order, /feat\/follow/, "the order names the feature branch");
+    assert.match(
+      plan.order,
+      /add nothing else: no `Co-Authored-By`/,
+      "and forbids an attribution trailer on the resolution commit",
+    );
     assert.match(plan.order, /NEVER check out, merge into, or push/i, "the order forbids touching dev");
     assert.match(plan.order, /do not push the branch/i, "the order forbids pushing or PR'ing");
     assert.match(plan.order, /git rebase origin\/dev/, "and names the remote-tracking base");

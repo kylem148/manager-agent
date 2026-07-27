@@ -267,7 +267,12 @@ as plain text, not into a memory file. Cover:
   \`type(optional scope): concise imperative subject\`. Types are feat, fix,
   refactor, docs, test, chore, style, perf, build, ci. Keep the subject terse
   (~50 chars), imperative, lowercase, no trailing period. Mark a breaking change
-  with \`!\` or a \`BREAKING CHANGE:\` footer. One logical change per commit.`;
+  with \`!\` or a \`BREAKING CHANGE:\` footer. One logical change per commit.
+  Tell the crew to use EXACTLY the message you give and add nothing to it: no
+  \`Co-Authored-By\` line, no "Generated with" line, no agent or tool attribution
+  trailer of any kind. The history should read as the captain's own work. Say it
+  in the order, every time - a coding agent that appends a signature by default
+  will keep doing it unless the order tells it not to.`;
 
 const REVIEW_PROTOCOL = `## Reviewing implementation reports
 

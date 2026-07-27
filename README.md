@@ -684,6 +684,23 @@ pane (HUP) or kill (TERM) still writes the sentinel before dying. So a
 non-Claude agent, or a Claude whose hook couldn't be installed, simply reports
 when the pane closes, exactly as before.
 
+### Commit messages carry no attribution
+
+Every order the co writes ends with the exact commit message it wants and an
+explicit instruction to use that message and nothing else — no `Co-Authored-By`,
+no "Generated with", no agent or tool signature. The same instruction is baked
+into the resolver order the merge queue sends into a blocked head. That is the
+whole of what comanager controls: the order text is the lever, because the
+commit itself is made by the coding agent, in its own process.
+
+If your agent still signs its commits, that is its own default, not comanager's.
+For Claude Code the switch is `"includeCoAuthoredBy": false` in the settings.json
+of the config dir that agent runs with (`~/.claude`, or e.g. `~/.claude-work` for
+a `CLAUDE_CONFIG_DIR=`-prefixed command) — the same file the crew Stop hook is
+merged into. comanager deliberately does **not** set it for you: it is a global
+preference for every commit you make with that agent, in every repo, and flipping
+it as a side effect of linking a repo would be a surprise.
+
 ## What makes a turn slow
 
 A turn is one or more round trips to Bedrock. Latency is dominated by three
