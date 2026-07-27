@@ -489,6 +489,38 @@ export class MergeQueue {
   }
 
   /**
+   * The head's open pull request, when it has one — what the panel's PR message
+   * editor loads and writes back to (D-20260727-15). Deliberately derived from
+   * headDetail rather than reaching into the entry: a head with no body has no
+   * PR to edit either, so the two can never disagree about whether the `e` key
+   * has anything to act on.
+   */
+  headPr(): { feature: string; pr: HeadPullRequest } | null {
+    const detail = this.headDetail();
+    if (!detail || !detail.pr) return null;
+    return { feature: detail.feature, pr: detail.pr };
+  }
+
+  /**
+   * Replace the head PR's stored title and body with what the forge now holds,
+   * after the captain edited the message. The queue caches the PR inside the
+   * head's prepare result, and headDetail paints from that cache — so without
+   * this the panel would keep showing the superseded message until the head was
+   * re-processed for some other reason.
+   *
+   * Pinned to the PR NUMBER: if the head advanced or was re-prepared while the
+   * edit was in flight, this writes nothing and says so, rather than stamping one
+   * pull request's message onto another's cache.
+   */
+  updateHeadPrMessage(pr: { number: number; title: string; body: string }): boolean {
+    const prepared = this.entries[0]?.prepared;
+    if (!prepared || !("pr" in prepared) || !prepared.pr) return false;
+    if (prepared.pr.number !== pr.number) return false;
+    prepared.pr = { ...prepared.pr, title: pr.title, body: pr.body };
+    return true;
+  }
+
+  /**
    * Add a feature to the back of the queue and, when it is (or becomes) the head,
    * process it. Idempotent: an already-queued feature keeps its position. There
    * is NO confirm gate here (D-20260723-23) — enqueue is the "mark done" verb; the

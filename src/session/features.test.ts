@@ -1106,6 +1106,143 @@ test("each half of the PR message overrides on its own; omitting one keeps what 
   }
 });
 
+test("the captain's in-panel edit rewrites the PR and the stored message, and keeps the fence", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("checkout", "stripe checkout with saved cards");
+    await commitIn(a.feature.worktreePath, "pay.ts", "pay\n", "job: the card form");
+    await fx.features.enqueue("checkout", {
+      prTitle: "Add saved cards to checkout",
+      prBody: "The co's first draft.",
+    });
+    const before = fx.forge.prFor("feat/checkout")!;
+    const evidenceBefore = splitEvidence(before.body).evidence;
+    assert.match(evidenceBefore, /### Checks/, "there is a real block to preserve");
+
+    const res = await fx.features.editHeadPrMessage({
+      title: "Add saved cards to checkout, and fix the totals",
+      body: "The totals drifted whenever a promo applied late.\n\nSaved cards are the visible half.",
+    });
+
+    // 1. GitHub holds the new message — and it is what came BACK from the forge.
+    const pr = fx.forge.prFor("feat/checkout")!;
+    assert.equal(pr.title, "Add saved cards to checkout, and fix the totals");
+    const parts = splitEvidence(pr.body);
+    assert.equal(
+      parts.prose,
+      "The totals drifted whenever a promo applied late.\n\nSaved cards are the visible half.",
+    );
+    assert.equal(res.title, pr.title, "the result is read back off the PR, not echoed from the buffer");
+    assert.equal(res.prose, parts.prose);
+    assert.equal(res.prNumber, pr.number);
+
+    // 2. The evidence block survived EXACTLY once, unchanged.
+    assert.equal(pr.body.match(/<!-- co:evidence -->/g)?.length, 1, "one fence, still");
+    assert.equal(pr.body.match(/<!-- \/co:evidence -->/g)?.length, 1);
+    assert.equal(parts.evidence, evidenceBefore, "and co's block is byte-for-byte what it was");
+    assert.match(parts.evidence, /job: the card form/);
+
+    // 3. The store carries it too, so a later re-processing can't resurrect the
+    //    superseded message.
+    assert.deepEqual((await FeatureStore.load(fx.paths)).prMessage("checkout"), {
+      prTitle: "Add saved cards to checkout, and fix the totals",
+      prBody: "The totals drifted whenever a promo applied late.\n\nSaved cards are the visible half.",
+    });
+
+    // 4. The panel repaints from it immediately — no re-processing needed.
+    const detail = fx.features.headDetail();
+    assert.equal(detail?.kind, "ready", "and the head is still exactly as ready as it was");
+    assert.equal(detail?.pr?.title, pr.title);
+    assert.equal(detail?.pr?.prose, parts.prose);
+    assert.equal(fx.features.queueView().head?.status, "ready", "the queue did not move");
+    assert.ok(!fx.forge.calls.some((c) => c.includes("pr merge")), "and nothing merged");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("an edit that empties the description really empties it, in both places", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("terse");
+    await commitIn(a.feature.worktreePath, "t.txt", "t\n", "job: terse");
+    await fx.features.enqueue("terse", { prTitle: "A title", prBody: "A description to delete." });
+
+    await fx.features.editHeadPrMessage({ title: "A title", body: "   \n\n  " });
+    const pr = fx.forge.prFor("feat/terse")!;
+    assert.equal(splitEvidence(pr.body).prose, "", "the description is gone from the PR");
+    assert.match(splitEvidence(pr.body).evidence, /### Checks/, "the evidence is not");
+    assert.equal(
+      (await FeatureStore.load(fx.paths)).prMessage("terse")?.prBody,
+      undefined,
+      "and a deleted description cannot come back from the store",
+    );
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("an edit with an empty title is refused outright — nothing is written anywhere", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("titled");
+    await commitIn(a.feature.worktreePath, "t.txt", "t\n", "job: titled");
+    await fx.features.enqueue("titled", { prTitle: "The only title", prBody: "Body." });
+    const before = { ...fx.forge.prFor("feat/titled")! };
+
+    await assert.rejects(
+      () => fx.features.editHeadPrMessage({ title: "   ", body: "new body" }),
+      /needs a title/,
+    );
+    const after = fx.forge.prFor("feat/titled")!;
+    assert.equal(after.title, before.title, "the PR is untouched");
+    assert.equal(after.body, before.body);
+    assert.equal((await FeatureStore.load(fx.paths)).prMessage("titled")?.prBody, "Body.");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("an edit is pinned to the PR it was opened on, and refuses one that moved under it", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("pinned");
+    await commitIn(a.feature.worktreePath, "p.txt", "p\n", "job: pinned");
+    await fx.features.enqueue("pinned", { prTitle: "A title", prBody: "A body." });
+    const pr = fx.forge.prFor("feat/pinned")!;
+
+    await assert.rejects(
+      () => fx.features.editHeadPrMessage({ title: "new", body: "new", prNumber: pr.number + 99 }),
+      /changed while you were editing/,
+      "a stale pin is a loud refusal, never a write to whatever the head is now",
+    );
+    assert.equal(fx.forge.prFor("feat/pinned")!.title, "A title", "and nothing was written");
+
+    // The matching pin goes through, unchanged in every other respect.
+    const ok = await fx.features.editHeadPrMessage({
+      title: "new title",
+      body: "new body",
+      prNumber: pr.number,
+    });
+    assert.equal(ok.title, "new title");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("editing a head with no pull request is refused, not silently ignored", async () => {
+  const fx = await makeFixture();
+  try {
+    await assert.rejects(
+      () => fx.features.editHeadPrMessage({ title: "t", body: "b" }),
+      /no open pull request/,
+      "an empty queue has no message to edit",
+    );
+  } finally {
+    await fx.cleanup();
+  }
+});
+
 test("an authored body can never smuggle co's evidence fence into the stored message", async () => {
   const fx = await makeFixture();
   try {

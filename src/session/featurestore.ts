@@ -173,9 +173,19 @@ export class FeatureStore {
    * makes a re-enqueue with no arguments — the retry after a resolver run, or any
    * automatic re-process — reuse the message the co already wrote instead of
    * wiping it back to the mechanical fallback.
+   *
+   * `allowClear` is the one caller that means it: the captain editing the message
+   * in the Ctrl-O panel (D-20260727-15). A description they deleted must not come
+   * back the next time a PR is created for that feature, so there a supplied-but-
+   * empty field really does erase the stored one. An omitted field still leaves
+   * it alone, so the rule that protects a bare re-enqueue is untouched.
    */
-  setPrMessage(slug: string, message: { prTitle?: string; prBody?: string }): Promise<void> {
-    return this.update(slug, message);
+  setPrMessage(
+    slug: string,
+    message: { prTitle?: string; prBody?: string },
+    opts: { allowClear?: boolean } = {},
+  ): Promise<void> {
+    return this.update(slug, message, opts);
   }
 
   /** Drop everything stored for a feature — it landed, or it was abandoned. A
@@ -188,20 +198,35 @@ export class FeatureStore {
 
   /** Merge non-blank fields into a feature's row, and persist only if something
    *  actually changed. The single write path: every setter is this, so "blank
-   *  never wipes" and "unchanged never rewrites" hold for every field at once. */
-  private update(slug: string, patch: FeatureMeta): Promise<void> {
+   *  never wipes" and "unchanged never rewrites" hold for every field at once —
+   *  except for a caller that passes `allowClear` and an explicit empty string,
+   *  which is a deliberate erase (see setPrMessage). A row left with no fields at
+   *  all is dropped rather than stored as an empty object. */
+  private update(
+    slug: string,
+    patch: FeatureMeta,
+    opts: { allowClear?: boolean } = {},
+  ): Promise<void> {
     if (slug === "") return Promise.resolve();
     const current = this.features.get(slug);
     const next: FeatureMeta = { ...current };
     let changed = false;
     for (const key of ["intent", "prTitle", "prBody"] as const) {
+      if (!(key in patch)) continue; // omitted: never touched
       const value = text(patch[key]);
-      if (value === undefined || next[key] === value) continue;
+      if (value === undefined) {
+        if (!opts.allowClear || next[key] === undefined) continue;
+        delete next[key];
+        changed = true;
+        continue;
+      }
+      if (next[key] === value) continue;
       next[key] = value;
       changed = true;
     }
     if (!changed) return Promise.resolve();
-    this.features.set(slug, next);
+    if (Object.keys(next).length === 0) this.features.delete(slug);
+    else this.features.set(slug, next);
     return this.persist();
   }
 

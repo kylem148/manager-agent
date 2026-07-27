@@ -98,6 +98,24 @@ test("enqueue is where co writes the PR message, in the house style", async () =
   }
 });
 
+test("the panel's `e` editor is in the protocol, with the captain's version winning", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    // The co is the only thing that can tell the captain the key exists, so the
+    // key itself is pinned, not just the idea of editing.
+    assert.match(prompt, /`e` in the queue tab edits your PR message/);
+    assert.match(prompt, /Ctrl-S to write it back/, "and how the edit is committed");
+    assert.match(
+      prompt,
+      /never re-send yours over it with another\s+`feature_enqueue`/,
+      "an edit of theirs is not something co undoes with its own draft",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
 test("an ungated head comes with the offer to add a CI workflow, and never a held merge", async () => {
   const { paths, cleanup } = await makeInstance();
   try {

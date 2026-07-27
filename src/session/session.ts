@@ -40,6 +40,7 @@ import {
   type AnimationSpec,
   type SessionIO,
   type DocSource,
+  type PrMessageSaveResult,
   type QueueMergeResult,
 } from "../tui/tui.js";
 import {
@@ -330,6 +331,12 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
                     : { size: 0, head: null, entries: [] },
                 headDetail: () => state.features?.headDetail() ?? null,
                 merge: () => panelMergeHead(state),
+                // `e` in the queue tab edits the head PR's message in place
+                // (D-20260727-15). Like `merge` it is a keystroke calling
+                // straight into the engine — but it merges nothing: it rewrites
+                // a title and a description on GitHub and in the feature store,
+                // and leaves the checks, the gate and the queue untouched.
+                editPrMessage: (message) => panelEditPrMessage(state, message),
               },
               // The features tab: every tracked worktree, not just the queued
               // ones. Derived in memory from the registry + the queue + the
@@ -970,6 +977,36 @@ async function fireDispatch(
     // The launch itself is handled above; this covers the bookkeeping after it
     // (the resolver-head transition), so it must not read as "nothing ran".
     io.appendBlock(c.red(`  · dispatch launched but post-launch bookkeeping failed: ${(e as Error).message}`));
+  }
+}
+
+/**
+ * The panel's `e` → Ctrl-S (D-20260727-15): write the captain's edited title and
+ * description onto the head's pull request.
+ *
+ * Runs outside the agent loop, exactly like the [m] below, and tells the co
+ * nothing: the PR's message is the captain's to write, and a model turn about it
+ * would be pure noise. What it does leave is a dim transcript line, so the
+ * session's own record shows the message changed and when.
+ *
+ * Never throws into the Tui — a failure comes back as a result the popup prints
+ * over the captain's still-intact buffer.
+ */
+async function panelEditPrMessage(
+  state: SessionState,
+  message: { title: string; body: string; prNumber: number },
+): Promise<PrMessageSaveResult> {
+  const { io } = state;
+  if (!state.features) {
+    return { saved: false, summary: "the merge queue is unavailable in this session." };
+  }
+  try {
+    const res = await state.features.editHeadPrMessage(message);
+    io.appendBlock(c.dim(`  · rewrote the message on PR #${res.prNumber} (${res.feature})`));
+    return { saved: true, summary: `PR #${res.prNumber} message updated: ${res.title}` };
+  } catch (e) {
+    const error = e instanceof Error ? e.message : String(e);
+    return { saved: false, summary: `the PR message was not written: ${error}`, error };
   }
 }
 

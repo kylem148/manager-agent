@@ -48,6 +48,20 @@ import {
   type Action,
   type KeyEvent,
 } from "./keys.js";
+import {
+  TextEditor,
+  inputRowStarts,
+  joinMessage,
+  layoutBuffer,
+  scrollToCursor,
+  type EditorLayout,
+} from "./editor.js";
+
+// The buffer/edit model is shared with the panel's PR message editor; it lives
+// in ./editor so both surfaces bind keys to ONE set of editing rules. Re-exported
+// because the input-layout tests (and any future caller) have always reached it
+// through this module.
+export { inputRowStarts };
 
 const ESC = "\x1b";
 const CSI = "\x1b[";
@@ -145,61 +159,6 @@ export function normalizeSelection(sel: SelectionRange): {
   return forward
     ? { top: sel.anchorRow, bottom: sel.focusRow, topCol: sel.anchorCol, bottomCol: sel.focusCol + 1 }
     : { top: sel.focusRow, bottom: sel.anchorRow, topCol: sel.focusCol, bottomCol: sel.anchorCol + 1 };
-}
-
-/**
- * Word-wrap the plain-text input buffer into visual rows no wider than `avail`
- * visible columns, returning the buffer offset at which each row starts
- * (`starts[0]` is always 0).
- *
- * The rows are *contiguous*: every character of `buf` belongs to exactly one
- * row and no boundary space is dropped. That is the whole trick — it lets the
- * editor word-wrap yet still map a `cursor` index to an exact (row, col) via
- * `starts`, which is why the editor used to hard-wrap by column instead. We
- * break after the last space that fits so words stay whole; the trailing space
- * rides along on the end of the row (invisible). A word longer than a full row
- * is hard-split at the column edge as a last resort so nothing overflows.
- *
- * The buffer may contain literal newlines (Shift+Enter / Ctrl-J compose a
- * multi-line message), and each one ends its row unconditionally: the row after
- * it starts at the index just past the "\n", so the newline character itself is
- * the last character of the row it terminates. Callers slicing a row must strip
- * that trailing "\n" before painting it — see inputLayout. Tabs never reach the
- * buffer (Tab is a completion key) and every other char counts as one column,
- * matching the width assumptions the rest of the editor already makes.
- */
-export function inputRowStarts(buf: string, avail: number): number[] {
-  const width = Math.max(1, avail);
-  const starts = [0];
-  const n = buf.length;
-  let rowStart = 0;
-  while (rowStart <= n) {
-    // Wrap only up to the next hard break; the newline owns the row end.
-    const nl = buf.indexOf("\n", rowStart);
-    const lineEnd = nl === -1 ? n : nl;
-
-    let cur = rowStart;
-    for (;;) {
-      let col = 0;
-      let lastBreak = -1; // buffer index just past the last space seen this row
-      let j = cur;
-      for (; j < lineEnd && col < width; j++) {
-        col++;
-        if (buf[j] === " ") lastBreak = j + 1;
-      }
-      if (j >= lineEnd) break; // the remainder fits on the current row
-      // Break after the last fitting space so the following word stays whole;
-      // if the row is one unbroken word, hard-split at the column edge (j).
-      const next = lastBreak > cur ? lastBreak : j;
-      starts.push(next);
-      cur = next;
-    }
-
-    if (nl === -1) break;
-    starts.push(nl + 1); // the row after the hard break (possibly empty)
-    rowStart = nl + 1;
-  }
-  return starts;
 }
 
 /**
@@ -375,6 +334,20 @@ export interface PanelPullRequest {
   prose?: string;
 }
 
+/**
+ * What a panel-driven edit of the head PR's message did (D-20260727-15). The
+ * saved title and prose come back FROM the forge — the session re-reads the pull
+ * request after writing it — so the panel repaints from what GitHub stored
+ * rather than from the buffer the captain typed.
+ */
+export interface PrMessageSaveResult {
+  saved: boolean;
+  /** One line for the queue tab to carry after the popup closes. */
+  summary: string;
+  /** Present when nothing was written: why. The popup stays open over it. */
+  error?: string;
+}
+
 /** What a panel-driven merge did, for the flash line. Rejection of the promise
  *  is handled too, so a thrown callback can't wedge the panel mid-merge. */
 export interface QueueMergeResult {
@@ -411,6 +384,25 @@ export interface QueuePanelSource {
    * landed AND the queue has advanced, so the next paint shows the new head.
    */
   merge?(): Promise<QueueMergeResult>;
+  /**
+   * Write a new title and description onto the head's pull request — the `e`
+   * editor's save (D-20260727-15). Called ONLY from Ctrl-S in that popup, at
+   * most once at a time (the popup locks while it is in flight).
+   *
+   * `body` is PROSE ONLY: the popup never loads co's fenced evidence block and
+   * never sends one, and the implementation splices the existing block back
+   * around this text. Saving merges nothing and changes no queue state.
+   * Absent (like `merge`) means the tab is read-only and `e` is refused.
+   *
+   * `prNumber` is the pull request the popup was OPENED on. It is a pin, not a
+   * lookup: if the head has moved on since (a resolver finished and re-prepared
+   * it), the save must fail rather than stamp one PR's message onto another.
+   */
+  editPrMessage?(message: {
+    title: string;
+    body: string;
+    prNumber: number;
+  }): Promise<PrMessageSaveResult>;
 }
 
 /**
@@ -1139,7 +1131,12 @@ type PanelView =
   /** The ready head's full paged diff, drilled into with [d] from the queue tab.
    *  Its rows/scroll live on `pendingReview` (mutated in place), so this carries
    *  no state of its own. */
-  | { kind: "review" };
+  | { kind: "review" }
+  /** The head PR's message, open in a popup editor over the queue tab (`e`).
+   *  Like `review` it carries no state of its own — the buffer lives on
+   *  `PanelState.prEdit` and is mutated in place, so a resize (which re-lays
+   *  every row) can never swap the text under the captain's caret. */
+  | { kind: "prEdit" };
 
 interface PanelState {
   view: PanelView;
@@ -1182,6 +1179,37 @@ interface PanelState {
   /** The body row painted at the top of the viewport in the last paintPanel:
    *  the anchor for mapping a mouse (x, y) back to an absolute body row. */
   lastStart: number;
+  /** The open PR message editor, or null. Non-null exactly while the view is
+   *  `prEdit`; kept on the panel rather than in the view so the buffer survives
+   *  a resize and a repaint by identity. */
+  prEdit: PrEditState | null;
+}
+
+/**
+ * The PR message editor's live state (D-20260727-15): one buffer in `git commit`
+ * shape (line 1 the title, a blank line, then the description), the popup's own
+ * scroll, and whatever it currently has to say back to the captain.
+ *
+ * It edits the PROSE ONLY. co's fenced evidence block is split off before the
+ * buffer is filled and spliced back on by the save path, so the captain never
+ * sees those markers and cannot delete the block by editing around it.
+ */
+interface PrEditState {
+  editor: TextEditor;
+  /** The pull request being edited — pinned, so a save can name it and a head
+   *  that changed underneath is visible rather than silently retargeted. */
+  prNumber: number;
+  feature: string;
+  /** Top visual row of the popup's viewport. Kept in step with the caret by
+   *  scrollToCursor on every paint. */
+  scroll: number;
+  /** "saving": `gh pr edit` is in flight; every key is ignored until it settles,
+   *  the same fire-once interlock the queue merge uses. */
+  status: "editing" | "saving";
+  /** A refusal or a gh failure, shown inside the popup with the buffer intact. */
+  error: string | null;
+  /** True once Esc has been pressed on a dirty buffer: the next Esc discards. */
+  escPending: boolean;
 }
 
 /**
@@ -1369,6 +1397,12 @@ export class Tui implements SessionIO {
   // head, present until pressed or until the head's state changes.
   private queueMerging: string | null = null;
   private queueMergeError: string | null = null;
+  // What the PR message editor has to say on the queue tab after it closes: the
+  // save that landed, or the reason `e` had nothing to open. It banners at the
+  // top of the tab (like queueMergeError, and for the same reason: a flash on
+  // the separator is invisible while the panel owns the screen) and is replaced
+  // by the next thing worth saying rather than timing out.
+  private queueEditNotice: { text: string; ok: boolean } | null = null;
   // A merge review awaiting the captain's [m]/[r]/[d], tracked apart from the
   // panel's open/closed state: openLandingReview sets it and flashes a hint (it
   // never force-opens the panel), and the captain opens the panel to act on it.
@@ -1553,42 +1587,14 @@ export class Tui implements SessionIO {
    * long line no longer splits words mid-word at the column edge; a word wider
    * than a row is still hard-split so nothing overflows. See inputRowStarts for
    * why contiguous rows keep the cursor index → (row, col) mapping exact.
+   *
+   * The wrapping itself lives in ./editor, shared with the panel's PR message
+   * editor: two editors on one screen must not disagree about where a line
+   * breaks or where the caret is inside it.
    */
-  private inputLayout(): {
-    segs: string[];
-    starts: number[];
-    cursorRow: number;
-    cursorCol: number;
-  } {
-    const promptW = visibleWidth(this.promptLabel);
-    const avail = Math.max(1, this.cols - promptW);
-    const starts = inputRowStarts(this.buf, avail);
-
-    const segs: string[] = [];
-    for (let r = 0; r < starts.length; r++) {
-      const raw = this.buf.slice(starts[r]!, starts[r + 1] ?? this.buf.length);
-      // A hard-broken row carries its terminating "\n" as its last character.
-      // Painting that would emit a real line break mid-frame, so drop it here;
-      // the index math above (and the cursor mapping below) still counts it.
-      segs.push(raw.endsWith("\n") ? raw.slice(0, -1) : raw);
-    }
-
-    // The cursor sits on the last row whose start offset is <= cursor; its
-    // column is the distance from that row's start.
-    let cursorRow = starts.length - 1;
-    while (cursorRow > 0 && starts[cursorRow]! > this.cursor) cursorRow--;
-    let cursorCol = this.cursor - starts[cursorRow]!;
-
-    // A cursor sitting exactly at the end of a row that fills the full width
-    // (a hard-split word, or a trailing space that wrapped) belongs at the
-    // start of a fresh row below it; add that row so the caret stays visible.
-    if (cursorCol >= avail) {
-      cursorRow++;
-      cursorCol = 0;
-      if (segs.length <= cursorRow) segs.push("");
-    }
-    if (segs.length === 0) segs.push("");
-    return { segs, starts, cursorRow, cursorCol };
+  private inputLayout(): EditorLayout {
+    const avail = Math.max(1, this.cols - visibleWidth(this.promptLabel));
+    return layoutBuffer(this.buf, this.cursor, avail);
   }
 
   /**
@@ -2477,6 +2483,11 @@ export class Tui implements SessionIO {
         this.togglePanel();
         return;
 
+      case "save":
+        // Ctrl-S belongs to the panel's PR message editor. The prompt has
+        // nothing to save — Enter sends — so it stays the no-op it always was.
+        return;
+
       case "none":
         return;
     }
@@ -2860,6 +2871,7 @@ export class Tui implements SessionIO {
       selection: null,
       selecting: false,
       lastStart: 0,
+      prEdit: null,
     };
     if (this.docs) {
       this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
@@ -3111,6 +3123,11 @@ export class Tui implements SessionIO {
 
   /** Parse one key/sequence while the panel is open. Returns bytes consumed. */
   private consumeOverlay(data: string, i: number): number {
+    // The PR message editor takes the keyboard whole while it is open: it needs
+    // the EDITOR's decode table (where Ctrl-U kills to line start), not the
+    // panel's (where it pages up), so it is routed before any panel translation
+    // rather than through dispatchOverlay.
+    if (this.panel?.view.kind === "prEdit") return this.consumePrEdit(data, i);
     const ch = data[i]!;
     if (ch === ESC && data[i + 1] === "[") return this.consumeOverlayCsi(data, i);
     // A lone ESC leaves. (Under the Kitty protocol Escape arrives as CSI 27 u,
@@ -3267,6 +3284,14 @@ export class Tui implements SessionIO {
   private queueTabInput(input: OverlayInput): void {
     if ("ch" in input && input.ch === "m") {
       this.mergeReadyHead();
+      return;
+    }
+    // `e` edits the head PR's message (D-20260727-15). Checked beside [m] and
+    // before the paging surface for the same reason: an action key must never be
+    // shadowed by a scroll key. It writes a title and a body and nothing else —
+    // merging is still [m], and still a separate, deliberate keystroke.
+    if ("ch" in input && input.ch === "e") {
+      this.openPrEditor();
       return;
     }
     if ("nav" in input) {
@@ -3761,6 +3786,409 @@ export class Tui implements SessionIO {
     else this.closePanel();
   }
 
+  // --- the PR message editor (in-panel popup) ---------------------------------
+  //
+  // `e` on a queue head whose pull request exists opens a small popup over the
+  // tab holding that PR's own prose: line 1 the title, a blank line, then the
+  // description (D-20260727-15). Ctrl-S writes it to GitHub through the injected
+  // `editPrMessage`; Esc cancels, warning once when the buffer is dirty.
+  //
+  // Three properties are load-bearing:
+  //
+  //  - IT EDITS PROSE ONLY. co's fenced evidence block never enters the buffer
+  //    (the source hands the panel a body already split at the fence) and never
+  //    leaves it, so the captain cannot see, break or delete the block that the
+  //    harness regenerates on every head processing.
+  //  - IT IS THE SAME EDITOR AS THE PROMPT. The buffer model, the wrapping and
+  //    the cursor mapping are ./editor's, shared with the input bar; the keys
+  //    come off the same decode table. There are no modes to enter and nothing
+  //    new to learn — except that Enter inserts a newline here, because a
+  //    description is prose and there is nothing to send.
+  //  - SAVING NEVER MERGES. It writes a title and a body and nothing else: the
+  //    head's status, its checks, its `[m]` and the queue's order are exactly
+  //    where they were, and `[m]` remains a separate, deliberate keystroke.
+
+  /**
+   * The popup's geometry, derived from the screen every time it is needed rather
+   * than stored: a resize then re-lays it out instead of tearing (the same rule
+   * the animation region follows). `textRows` is the buffer viewport's height;
+   * the box also carries two borders and one message line.
+   */
+  private prEditBox(): { left: number; top: number; width: number; textRows: number } {
+    const width = Math.max(24, Math.min(this.cols - 4, 76));
+    // The panel body is rows 2..rows-1; the box lives inside that, never over
+    // the tab bar or the footer.
+    const body = Math.max(1, this.rows - 2);
+    const textRows = Math.max(1, Math.min(14, body - 3));
+    const height = textRows + 3;
+    const left = 1 + Math.max(0, Math.floor((this.cols - width) / 2));
+    const top = Math.max(2, Math.min(1 + Math.floor((this.rows - height) / 2), this.rows - height));
+    return { left, top, width, textRows };
+  }
+
+  /** Columns of buffer text inside the box (border + one space on each side). */
+  private prEditWidth(): number {
+    return Math.max(1, this.prEditBox().width - 4);
+  }
+
+  /**
+   * `e` on the queue tab: open the head PR's message in the popup.
+   *
+   * A strict no-op with a stated reason unless there is something to edit — a
+   * wired edit callback and a head that actually HAS a pull request. A head
+   * still processing, or one whose prepare never got as far as opening a PR, has
+   * no message to rewrite, and saying so beats a popup over nothing.
+   */
+  private openPrEditor(): void {
+    const panel = this.panel;
+    if (!panel) return;
+    const refuse = (text: string): void => {
+      this.queueEditNotice = { text, ok: false };
+      this.paint();
+    };
+    if (!this.queue?.editPrMessage) {
+      refuse("editing a pull request message isn't available in this session.");
+      return;
+    }
+    const detail = this.queue.headDetail?.() ?? null;
+    const pr = detail?.pr;
+    if (!detail || !pr) {
+      refuse("this head has no pull request yet — nothing to edit. One opens when the head is processed.");
+      return;
+    }
+    // `prose` is the body with co's evidence fence already split off by the
+    // source. A source that doesn't split falls back to the raw body, exactly as
+    // the painted message does.
+    const prose = (pr.prose ?? pr.body).trim();
+    panel.prEdit = {
+      editor: new TextEditor(joinMessage(pr.title, prose)),
+      prNumber: pr.number,
+      feature: detail.feature,
+      scroll: 0,
+      status: "editing",
+      error: null,
+      escPending: false,
+    };
+    panel.view = { kind: "prEdit" };
+    this.queueEditNotice = null;
+    this.clearPanelSelection();
+    this.paint();
+  }
+
+  /** Leave the editor for the queue tab underneath, optionally leaving a line
+   *  behind on it. Never called while a save is in flight. */
+  private closePrEditor(notice?: { text: string; ok: boolean }): void {
+    const panel = this.panel;
+    if (!panel) return;
+    panel.prEdit = null;
+    if (panel.view.kind === "prEdit") panel.view = { kind: "queue" };
+    if (notice) this.queueEditNotice = notice;
+    this.paint();
+  }
+
+  /** Esc: cancel. A clean buffer leaves at once; a dirty one warns first and
+   *  discards on the second consecutive Esc, so a whole rewritten description is
+   *  never one stray keypress from gone. */
+  private escapePrEditor(wasEscPending: boolean): void {
+    const state = this.panel?.prEdit;
+    if (!state) return;
+    if (state.editor.dirty && !wasEscPending) {
+      state.escPending = true;
+      this.paint();
+      return;
+    }
+    this.closePrEditor(
+      state.editor.dirty
+        ? { text: `discarded the unsaved edit to PR #${state.prNumber}`, ok: false }
+        : undefined,
+    );
+  }
+
+  /**
+   * Parse one key/sequence while the PR editor owns the keyboard. Mirrors the
+   * prompt's consume(): the same escape/CSI shapes, decoded by the same table,
+   * so every binding behaves identically in both editors.
+   */
+  private consumePrEdit(data: string, i: number): number {
+    const state = this.panel?.prEdit;
+    if (!state) return 1;
+    const saving = state.status === "saving";
+    const ch = data[i]!;
+
+    // A bracketed paste: the content is ordinary text, inserted in one go so a
+    // long paste costs one repaint rather than one per character. A paste split
+    // across data events falls back to the per-character path below, where CR
+    // lands as a newline — which is what Enter does here anyway.
+    if (data.startsWith(PASTE_START, i)) {
+      const end = data.indexOf(PASTE_END, i + PASTE_START.length);
+      const body = data.slice(i + PASTE_START.length, end === -1 ? data.length : end);
+      if (!saving && body !== "") this.prEditAction({ kind: "insert", text: body });
+      return (end === -1 ? data.length : end + PASTE_END.length) - i;
+    }
+    if (data.startsWith(PASTE_END, i)) return PASTE_END.length;
+
+    // Alt+Enter as an ESC prefix, checked before the generic ESC dispatch for
+    // the same reason the prompt checks it: otherwise it reads as a lone Escape.
+    if (ch === ESC && (data[i + 1] === "\r" || data[i + 1] === "\n")) {
+      if (!saving) this.prEditAction({ kind: "newline" });
+      return 2;
+    }
+    if (ch === ESC && data[i + 1] === "[") return this.consumePrEditCsi(data, i);
+    if (ch === ESC) {
+      if (!saving) this.prEditAction({ kind: "escape" });
+      return 1;
+    }
+    if (!saving) this.prEditAction(classifyByte(ch));
+    return 1;
+  }
+
+  /** The CSI half of the editor's input: arrows, Home/End, Delete, the enhanced
+   *  protocols' spellings — and mouse reports, which are consumed WHOLE and
+   *  dropped so a drag can neither type its own coordinates into the buffer nor
+   *  start a panel selection behind the popup. */
+  private consumePrEditCsi(data: string, i: number): number {
+    if (data[i + 2] === "<") {
+      const end = this.findMouseEnd(data, i + 3);
+      return end === -1 ? data.length - i : end - i + 1;
+    }
+    let j = i + 2;
+    while (j < data.length && !/[A-Za-z~]/.test(data[j]!)) j++;
+    if (j >= data.length) return data.length - i;
+    const final = data[j]!;
+    const params = data.slice(i + 2, j);
+    const consumed = j - i + 1;
+
+    const state = this.panel?.prEdit;
+    if (!state || state.status === "saving") return consumed;
+
+    switch (final) {
+      case "u": {
+        const ev = parseCsiU(params);
+        if (ev) this.prEditAction(classify(ev));
+        return consumed;
+      }
+      case "A": this.prEditMoveRow(-1); return consumed;
+      case "B": this.prEditMoveRow(1); return consumed;
+      case "C": this.prEditEdit(() => state.editor.right()); return consumed;
+      case "D": this.prEditEdit(() => state.editor.left()); return consumed;
+      case "H": this.prEditAction({ kind: "home" }); return consumed;
+      case "F": this.prEditAction({ kind: "end" }); return consumed;
+      case "~": {
+        const other = parseModifyOtherKeys(params);
+        if (other) {
+          this.prEditAction(classify(other));
+          return consumed;
+        }
+        const n = Number.parseInt(params, 10);
+        if (n === 3) this.prEditEdit(() => state.editor.deleteForward());
+        else if (n === 5) this.prEditPage(-1);
+        else if (n === 6) this.prEditPage(1);
+        else if (n === 1 || n === 7) this.prEditAction({ kind: "home" });
+        else if (n === 4 || n === 8) this.prEditAction({ kind: "end" });
+        return consumed;
+      }
+      default:
+        return consumed;
+    }
+  }
+
+  /**
+   * Apply one decoded action to the buffer. Every binding the prompt has means
+   * the same thing here, with exactly two deliberate differences: Enter inserts
+   * a newline instead of sending (a description is prose, and Ctrl-S is the
+   * commit), and Ctrl-O leaves through this view's own exit rather than closing
+   * the panel out from under an unsaved buffer.
+   */
+  private prEditAction(action: Action): void {
+    const state = this.panel?.prEdit;
+    if (!state || state.status === "saving") return;
+    const editor = state.editor;
+    // Only another Escape consumes the discard arming; every other key disarms.
+    const wasEscPending = state.escPending;
+    if (action.kind !== "escape" && action.kind !== "open-docs") state.escPending = false;
+
+    switch (action.kind) {
+      case "insert":
+        editor.insert(action.text);
+        break;
+      // A bare Enter and every modified spelling of it do the same thing here.
+      case "newline":
+      case "submit":
+        editor.insert("\n");
+        break;
+      case "backspace":
+        editor.backspace();
+        break;
+      case "home":
+        editor.home();
+        break;
+      case "end":
+        editor.end();
+        break;
+      case "kill-to-start":
+        editor.killToStart();
+        break;
+      case "kill-to-end":
+        editor.killToEnd();
+        break;
+      case "save":
+        this.savePrMessage();
+        return;
+      case "escape":
+      case "open-docs":
+        this.escapePrEditor(wasEscPending);
+        return;
+      // Tab, Ctrl-C and Ctrl-D have nothing to do in this buffer, and must not
+      // fall through to the panel's meanings for them (switch tab, quit).
+      case "tab":
+      case "interrupt":
+      case "eof":
+      case "none":
+        break;
+    }
+    this.paint();
+  }
+
+  /** Run a buffer mutation and repaint. The scroll follows on the next paint. */
+  private prEditEdit(fn: () => void): void {
+    const state = this.panel?.prEdit;
+    if (!state || state.status === "saving") return;
+    state.escPending = false;
+    fn();
+    this.paint();
+  }
+
+  /** Up/Down: one visual row, clamped at both ends. There is no history here to
+   *  fall through to — this buffer is the only thing the keys address. */
+  private prEditMoveRow(delta: 1 | -1): void {
+    const state = this.panel?.prEdit;
+    if (!state || state.status === "saving") return;
+    state.escPending = false;
+    state.editor.moveRow(delta, this.prEditWidth());
+    this.paint();
+  }
+
+  /** PgUp/PgDn: a viewport of rows at a time, by the same clamped row move. */
+  private prEditPage(delta: 1 | -1): void {
+    const state = this.panel?.prEdit;
+    if (!state || state.status === "saving") return;
+    state.escPending = false;
+    const width = this.prEditWidth();
+    for (let n = 0; n < this.prEditBox().textRows; n++) {
+      if (!state.editor.moveRow(delta, width)) break;
+    }
+    this.paint();
+  }
+
+  /**
+   * Ctrl-S: write the buffer to the pull request.
+   *
+   * Fire-once while in flight, like the queue merge. An empty title is refused
+   * HERE, before anything is sent, with the buffer left exactly as it is — gh
+   * would reject it anyway, and a refusal the captain can act on beats a stack
+   * trace from a subprocess. A failed save is the same: the popup stays open
+   * over the captain's text with the failure printed in it, so an edit is never
+   * silently dropped. Only a save that actually landed closes the popup, and
+   * what the tab paints afterwards is what the source read back from GitHub.
+   */
+  private savePrMessage(): void {
+    const state = this.panel?.prEdit;
+    if (!state || state.status === "saving") return;
+    const source = this.queue;
+    const save = source?.editPrMessage;
+    if (!source || !save) {
+      state.error = "editing a pull request message isn't available in this session.";
+      this.paint();
+      return;
+    }
+    const { title, body } = state.editor.message();
+    if (title === "") {
+      state.error = "line 1 is the title and it is empty — a pull request needs one. Nothing was sent.";
+      this.paint();
+      return;
+    }
+    state.status = "saving";
+    state.error = null;
+    state.escPending = false;
+    this.paint();
+    void save.call(source, { title, body, prNumber: state.prNumber }).then(
+      (res) => {
+        if (this.panel?.prEdit !== state) return; // closed or replaced since
+        state.status = "editing";
+        if (res.saved) {
+          this.closePrEditor({ text: res.summary, ok: true });
+          return;
+        }
+        state.error = res.error ?? res.summary;
+        this.paint();
+      },
+      (e: unknown) => {
+        if (this.panel?.prEdit !== state) return;
+        state.status = "editing";
+        state.error = e instanceof Error ? e.message : String(e);
+        this.paint();
+      },
+    );
+  }
+
+  /**
+   * The popup as painted rows, plus where the caret goes inside it (viewport
+   * coordinates: row 0 is the first text row).
+   *
+   * The viewport scroll is recomputed here from the caret rather than tracked by
+   * the key handlers, so every path that moves the caret — typing, arrows, a
+   * kill, a resize that re-wraps everything — keeps it on screen for free.
+   */
+  private prEditFrame(state: PrEditState): { rows: string[]; cursorRow: number; cursorCol: number } {
+    const { width, textRows } = this.prEditBox();
+    const inner = Math.max(1, width - 4);
+    const layout = state.editor.layout(inner);
+    state.scroll = scrollToCursor(state.scroll, layout.cursorRow, textRows, layout.segs.length);
+
+    const pad = (s: string, w: number): string => s + " ".repeat(Math.max(0, w - visibleWidth(s)));
+    // The two borders carry the two things worth carrying: what is being edited,
+    // and how to leave. Built as plain text and dimmed whole, so a colour reset
+    // inside can't cancel the border's own styling.
+    const border = (label: string, open: string, close: string): string => {
+      const lead = "─ " + this.clip(label, Math.max(0, width - 6)) + " ";
+      const fill = Math.max(0, width - visibleWidth(lead) - 2);
+      return c.dim(open + lead + "─".repeat(fill) + close);
+    };
+    // The title line is the first BUFFER line, however many visual rows it takes.
+    const titleEnd = state.editor.text.indexOf("\n");
+    const rows: string[] = [
+      border(`edit PR #${state.prNumber} · ${state.feature}`, "┌", "┐"),
+    ];
+    for (let r = 0; r < textRows; r++) {
+      const idx = state.scroll + r;
+      const seg = layout.segs[idx];
+      const start = layout.starts[idx];
+      const isTitle = seg !== undefined && start !== undefined && (titleEnd === -1 || start < titleEnd);
+      const text = seg === undefined ? "" : isTitle ? c.bold(seg) : seg;
+      rows.push(c.dim("│") + " " + pad(text, inner) + " " + c.dim("│"));
+    }
+    rows.push(c.dim("│") + " " + pad(this.prEditMessage(state, inner), inner) + " " + c.dim("│"));
+    rows.push(
+      border(
+        state.status === "saving" ? "saving…" : "Ctrl-S save · Esc cancel",
+        "└",
+        "┘",
+      ),
+    );
+    return { rows, cursorRow: layout.cursorRow - state.scroll, cursorCol: layout.cursorCol };
+  }
+
+  /** The popup's one message line: what it needs to say, most urgent first. */
+  private prEditMessage(state: PrEditState, width: number): string {
+    if (state.status === "saving") return c.cyan(this.clip(`writing PR #${state.prNumber}…`, width));
+    if (state.escPending) {
+      return c.yellow(this.clip("unsaved changes — Esc again to discard them", width));
+    }
+    if (state.error) return c.red(this.clip(state.error, width));
+    if (state.editor.dirty) return c.dim(this.clip("edited · Ctrl-S writes it to GitHub", width));
+    return c.dim(this.clip("line 1 is the title · Enter inserts a newline", width));
+  }
+
   /** Paint the full-screen panel: header/tab bar, content viewport, footer. */
   /**
    * What the panel is showing right now: the header title, the body rows, and
@@ -3775,9 +4203,13 @@ export class Tui implements SessionIO {
     const panel = this.panel;
     if (!panel) return { title: "", body: [], start: 0 };
     const v = panel.view;
-    if (v.kind === "queue") {
+    if (v.kind === "queue" || v.kind === "prEdit") {
+      // The message editor is a POPUP over this tab, not a view of its own: the
+      // queue stays painted underneath it (paintPanel overlays the box), so the
+      // captain never loses sight of the head they are writing about.
       const body = this.queueBody();
-      return { title: "queue", body, start: panel.queueScroll };
+      const title = panel.prEdit ? `queue · edit PR #${panel.prEdit.prNumber}` : "queue";
+      return { title, body, start: panel.queueScroll };
     }
     if (v.kind === "features") {
       const body = this.featuresTabRows();
@@ -3816,8 +4248,23 @@ export class Tui implements SessionIO {
       frame.push(term.moveTo(2 + r, 1) + term.clearLine + this.clip(lineText, w));
     }
     frame.push(term.moveTo(this.rows, 1) + term.clearLine + this.panelFooter(body.length, start, vp));
-    // The panel has no text cursor; hide the hardware caret while it's up.
-    frame.push(term.hideCursor);
+
+    // The PR message editor rides ON TOP of whatever the tab painted: its rows
+    // are laid over the middle of the body, so the head it is about stays
+    // visible around it. It is also the one panel view with a real text cursor,
+    // so the caret is placed and shown instead of hidden.
+    const edit = panel.view.kind === "prEdit" ? panel.prEdit : null;
+    if (edit) {
+      const box = this.prEditBox();
+      const { rows: boxRows, cursorRow, cursorCol } = this.prEditFrame(edit);
+      for (let r = 0; r < boxRows.length; r++) {
+        frame.push(term.moveTo(box.top + r, box.left) + this.clip(boxRows[r]!, w));
+      }
+      frame.push(term.moveTo(box.top + 1 + cursorRow, box.left + 2 + cursorCol) + term.showCursor);
+    } else {
+      // Every other panel view has no text cursor; hide the hardware caret.
+      frame.push(term.hideCursor);
+    }
     this.out.write(frame.join(""));
   }
 
@@ -3877,7 +4324,9 @@ export class Tui implements SessionIO {
           }/${e.blockedKind ?? ""}/${e.resolveAttempts ?? ""}`,
       )
       .join(",");
-    return `${this.cols}|${this.queueMerging ?? ""}|${this.queueMergeError ?? ""}|${entries}|${detailKey}`;
+    return `${this.cols}|${this.queueMerging ?? ""}|${this.queueMergeError ?? ""}|${
+      this.queueEditNotice?.text ?? ""
+    }|${entries}|${detailKey}`;
   }
 
   /**
@@ -3895,6 +4344,11 @@ export class Tui implements SessionIO {
     const rows: string[] = [""];
     if (this.queueMergeError) {
       rows.push("  " + c.red(`merge failed: ${this.queueMergeError}`));
+      rows.push("");
+    }
+    if (this.queueEditNotice) {
+      const n = this.queueEditNotice;
+      rows.push("  " + (n.ok ? c.green(n.text) : c.yellow(n.text)));
       rows.push("");
     }
     if (view.size === 0) {
@@ -4157,20 +4611,35 @@ export class Tui implements SessionIO {
       const terse = notice.replace("if nothing pastes, allow", "allow");
       left = ` ${c.cyan(2 + visibleWidth(notice) <= w ? notice : terse)} `;
       right = "";
+    } else if (v?.kind === "prEdit") {
+      // The popup carries its own keys on its bottom border; the footer names
+      // what is being written, so the two never disagree about which PR it is.
+      const edit = this.panel?.prEdit;
+      left = edit
+        ? " " +
+          (edit.status === "saving"
+            ? c.cyan(`writing PR #${edit.prNumber}…`)
+            : c.cyan("Ctrl-S") + c.dim(` save PR #${edit.prNumber} · `) + c.cyan("Esc") + c.dim(" cancel")) +
+          " "
+        : " ";
     } else if (v?.kind === "review") {
       left = " " + this.reviewActionBar() + " ";
     } else if (v?.kind === "queue") {
       // The [m] hint is a plain function of the head's state — it appears when
       // the head goes green and stays until it is pressed or the head changes.
       // Nothing here is armed or awaited (D-20260724-12).
+      // `e` is advertised on the same rule as [m]: only where it would actually
+      // fire — a head that has a pull request, in a session wired to edit one.
+      const edit = this.editableHead();
+      const editHint = edit ? c.cyan("e") + c.dim(" edit message · ") : "";
       if (this.queueMerging) {
         left = " " + c.cyan(`merging ${this.queueMerging}…`) + " ";
       } else if (this.mergeableHead()) {
         const m = this.mergeableHead();
-        left = " " + c.cyan("m") + c.dim(`${m?.prNumber ? ` merge PR #${m.prNumber}` : " merge"} · space/b page · `) +
-          c.dim(`${tabHint}Esc close`) + " ";
+        left = " " + c.cyan("m") + c.dim(`${m?.prNumber ? ` merge PR #${m.prNumber}` : " merge"} · `) +
+          editHint + c.dim(`space/b page · ${tabHint}Esc close`) + " ";
       } else {
-        left = ` ${c.dim("space/b page · " + tabHint + "Esc close")} `;
+        left = " " + editHint + c.dim("space/b page · " + tabHint + "Esc close") + " ";
       }
     } else if (v?.kind === "features") {
       // Nothing here acts, so the bar advertises only paging and the exits.
@@ -4225,6 +4694,18 @@ export class Tui implements SessionIO {
       target: detail.target,
       ...(detail.pr ? { prNumber: detail.pr.number } : {}),
     };
+  }
+
+  /**
+   * Whether `e` is live right now, and on which pull request. The twin of
+   * mergeableHead, and for the same reason: ONE predicate behind the key and the
+   * hint that advertises it, so the editor can never be offered over a head with
+   * no PR (or hidden on one that has one).
+   */
+  private editableHead(): { prNumber: number } | null {
+    if (!this.queue?.editPrMessage) return null;
+    const pr = this.queue.headDetail?.()?.pr;
+    return pr ? { prNumber: pr.number } : null;
   }
 
   /** The drilled review view's action bar: [m] armed only for a mergeable prepare
