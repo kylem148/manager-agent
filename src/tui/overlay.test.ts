@@ -586,7 +586,7 @@ test("a refused merge surfaces the error in place; [m] stays off; dismissal repo
   const p = openReview(h, review);
   h.send("m");
   review.rejectMerge(
-    new Error("'co/feat-x' is not rebased onto the current 'dev' tip; run prepareLanding again"),
+    new Error("'feat/x' is not rebased onto the current 'dev' tip; run prepareLanding again"),
   );
   await settle();
   const frame = h.lastFramePlain();
@@ -1066,12 +1066,12 @@ test("a refused merge banners in place and leaves the head where it is", async (
   q.resolveMerge({
     merged: false,
     summary: "merging head-a was refused",
-    error: "'co/feat-head-a' has moved since prepare",
+    error: "'feat/head-a' has moved since prepare",
   });
   await settle();
 
   const frame = h.lastFramePlain();
-  assert.match(frame, /merge failed: 'co\/feat-head-a' has moved since prepare/, "the refusal is visible, not a flash");
+  assert.match(frame, /merge failed: 'feat\/head-a' has moved since prepare/, "the refusal is visible, not a flash");
   assert.match(frame, /head-a\s+\[ready\]/, "the head is still there");
   // And the key still works afterwards: nothing latched shut.
   h.send("m");

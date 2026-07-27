@@ -392,7 +392,7 @@ run with that repo as its working directory.
 
 A dispatch runs either inside an isolated feature worktree or, when you name no
 feature, against the bare main tree. A feature is one unit of parallel work: one
-feature maps to one worktree on its own \`co/feat-<slug>\` branch, cut from
+feature maps to one worktree on its own \`<type>/<slug>\` branch, cut from
 \`origin/dev\`, so several features progress side by side and none touches \`main\`.
 Features integrate into \`dev\` through GITHUB PULL REQUESTS — you never merge
 locally, and \`dev\` itself is never written on this machine. Your reach stops at
@@ -407,10 +407,16 @@ self-contained change. When unsure, choose the feature and the PR. The crew work
 autonomously, so that PR and the \`[m]\` gate on it are the captain's review
 checkpoint over everything it produced.
 
-- \`feature_create(name, intent)\` — provision a feature's worktree. Runs directly,
-  no confirm gate: it only cuts the feature's own branch and checkout off
-  \`origin/dev\`, writing nothing to \`dev\` or \`main\`. Idempotent. Do this before
-  (or as) you dispatch anything that changes the repo.
+- \`feature_create(name, type, intent)\` — provision a feature's worktree. Runs
+  directly, no confirm gate: it only cuts the feature's own branch and checkout
+  off \`origin/dev\`, writing nothing to \`dev\` or \`main\`. Idempotent. Do this
+  before (or as) you dispatch anything that changes the repo.
+- \`type\` is the Conventional Commits type the branch is named for, and you pick
+  it to fit the work: \`fix\` for a bug, \`refactor\` for a restructure, \`docs\`,
+  \`chore\`, \`test\`, \`perf\`, \`build\`, \`ci\`, \`style\`, and \`feat\` (the default) for
+  new capability. So "stale token bug" becomes \`fix/stale-token-bug\`. The
+  branches read like any developer's; nothing in the repo advertises how the
+  work was done.
 - Dispatch into a feature by passing its name as \`dispatch_order\`'s \`feature\`
   argument. The crew then runs inside that worktree (provisioned on first use if
   you skipped feature_create). The arm banner shows the target worktree path, or
@@ -469,7 +475,11 @@ checkpoint over everything it produced.
   work. If it refuses, tell the captain what is uncommitted and let them decide.
 - Feature state is rebuilt from disk at startup, so a feature survives a restart;
   if startup surfaces an anomaly (a branch holding unmerged work whose worktree is
-  gone, a stray directory), relay it rather than acting blindly.`;
+  gone, a stray directory), relay it rather than acting blindly.
+- A feature is identified by the WORKTREE co provisioned for it, never by its
+  branch name. A branch of the captain's that happens to look like a feature
+  branch is not a feature and no lever here can touch it — so never tell them a
+  branch is yours to land or abandon on the strength of its name.`;
 }
 
 export async function buildSystemPrompt(

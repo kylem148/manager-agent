@@ -136,7 +136,7 @@ test("prepareLanding rebases onto origin/dev, pushes, and opens the PR — the l
     const originDevBefore = f.forge.branches.get("dev")!;
 
     const res = await prepareGreen(f, "alpha");
-    assert.equal(res.branch, "co/feat-alpha");
+    assert.equal(res.branch, "feat/alpha");
     assert.equal(res.devSha, originDevBefore, "the base is the origin/dev tip");
     assert.equal(res.featureSha, sha(f.repo, res.branch), "featureSha is the branch tip");
     assert.match(res.diff, /\+alpha work/);
@@ -145,9 +145,9 @@ test("prepareLanding rebases onto origin/dev, pushes, and opens the PR — the l
 
     // Published: the rebased tip is on the remote, and a PR into dev is open.
     assert.equal(res.pushed, true);
-    assert.equal(f.forge.branches.get("co/feat-alpha"), res.featureSha, "the TESTED sha was pushed");
+    assert.equal(f.forge.branches.get("feat/alpha"), res.featureSha, "the TESTED sha was pushed");
     assert.equal(res.pr?.created, true);
-    const pr = f.forge.prFor("co/feat-alpha")!;
+    const pr = f.forge.prFor("feat/alpha")!;
     assert.equal(pr.base, "dev");
     assert.equal(pr.title, "job: alpha work", "a one-commit feature takes that commit's subject");
     assert.match(pr.body, /### Checks/);
@@ -454,7 +454,7 @@ test("prepareLanding throws on a dirty worktree and on a feature with no worktre
     assert.ok(fs.existsSync(path.join(rec.worktreePath, "wip.txt")), "the uncommitted work survives");
     assert.deepEqual(f.forge.pushes, []);
 
-    await assert.rejects(prepareLanding(f.opts(), "never-dispatched"), /no branch/);
+    await assert.rejects(prepareLanding(f.opts(), "never-dispatched"), /has no worktree under/);
   } finally {
     await f.cleanup();
   }

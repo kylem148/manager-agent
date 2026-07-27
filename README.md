@@ -319,7 +319,7 @@ The session is a scrollable terminal UI, not a plain read-out:
 - **Two small nautical moments** mark the two points where the session is doing
   something and would otherwise sit still. Firing a confirmed dispatch runs the
   order out to sea above the input bar, over the branch it's headed for
-  (`≈≈▸ dispatching → co/feat-auth`); `/exit` sails a ship across the width once
+  (`≈≈▸ dispatching → feat/user-auth`); `/exit` sails a ship across the width once
   while memory saves. Both are described below.
 
 ### Terminal visuals (`CO_VISUALS`)
@@ -341,7 +341,7 @@ The setting is a ceiling, not a promise: the environment can only lower it.
 terminal narrower than 40 columns, or a reduced-motion signal
 (`CO_REDUCED_MOTION`, `REDUCED_MOTION`, `PREFERS_REDUCED_MOTION`, `NO_MOTION`)
 each degrade it to the same single static ASCII line — `~~> dispatching ->
-co/feat-auth`, `~~ saving... fair winds`. Every glyph is one column of ASCII or
+feat/user-auth`, `~~ saving... fair winds`. Every glyph is one column of ASCII or
 box drawing with a plain-ASCII twin, there are no emoji, and the one colour
 accent always sits on a glyph or on text, never alone. A dispatch that targets
 the bare main tree says so in words rather than naming a branch.
@@ -823,7 +823,7 @@ survivors. One dead worker costs one pruned id, never the whole layout.
 `worktrees.ts` is the git-worktree lifecycle harness for the
 parallel-dispatch feature: verify the `origin/dev` integration branch is
 reachable (verify only — co never creates `dev`, locally or on the remote),
-provision a per-feature worktree on a fresh `co/feat-<slug>` branch cut from
+provision a per-feature worktree on a fresh `<type>/<slug>` branch cut from
 `origin/dev` (with `node_modules`/`dist` symlinked from the primary tree so it
 builds without an install), tear a finished feature down (after a PR merge the
 worktree goes and the branch ref is kept; on an explicit abandon, branch
@@ -832,7 +832,25 @@ work is never destroyed), and a reconcile sweep that cleans zombie checkouts
 left by a crashed run. The local `dev` ref is never read or written by any of
 it — the integration ref everything compares against is the remote-tracking
 `origin/dev`, advanced only by `git fetch`. Feature worktrees live outside the repo, by default in a sibling
-directory `<repo>-worktrees`. Deterministic plumbing; the registry consumes
+directory `<repo>-worktrees`.
+
+**Branch names are ordinary, and ownership does not depend on them.** A feature
+branch is `<type>/<slug>` with a Conventional Commits type the co picks for the
+work (`feat/user-auth`, `fix/stale-token`, `docs/orders-protocol`; `feat` is the
+default), so the branch list reads like any developer's. That means the name
+proves nothing about who cut it, and co never treats it as if it did: a feature
+is **the registered worktree co created under the managed base dir**, one
+directory per slug, and its branch is whatever that worktree has checked out.
+Every write — teardown, abandon, the boot rebuild — resolves the branch from
+there, so a `feat/login` of your own, in your own tree, is invisible to all of
+it. Branches co cuts are also stamped in the repo's local git config
+(`branch.<name>.comanager-feature`), which outlives the checkout and lets the
+read-only reconcile still report a branch whose worktree went missing; that
+marker reports, it never authorises a delete. Features from before this scheme
+(`co/feat-<slug>`) are recognised by exactly the same worktree rule and are
+never renamed.
+
+Deterministic plumbing; the registry consumes
 it for feature-scoped dispatch: a dispatch scoped to a feature provisions the
 worktree on first use (reused for every later dispatch to that feature),
 launches the crew process with the worktree as its working directory on both

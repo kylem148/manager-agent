@@ -17,8 +17,8 @@ import type { DispatchRegistry } from "./registry.js";
 import {
   featureBranch,
   featureSlug,
+  findFeatureWorktree,
   isWorktreeDirty,
-  listWorktrees,
   provisionWorktree,
   reconcileFeatures,
   resolveWorktreeOptions,
@@ -245,15 +245,19 @@ export class FeatureManager {
   /**
    * Provision a feature's worktree off dev and register the record. Runs direct
    * — no confirm gate — because it writes nothing to dev or main (it only cuts a
-   * fresh `co/feat-<slug>` branch and its isolated checkout). Idempotent for an
-   * intact feature (returns the existing worktree, created: false); throws with
-   * a reconcile pointer on a half-state, which the executor surfaces.
+   * fresh `<type>/<slug>` branch and its isolated checkout). `type` is a
+   * Conventional Commits type (default feat), validated by the plumbing before
+   * anything is created. Idempotent for an intact feature (returns the existing
+   * worktree on its existing branch, created: false); throws with a reconcile
+   * pointer on a half-state, which the executor surfaces.
    */
-  async create(name: string, intent?: string): Promise<CreateResult> {
+  async create(name: string, intent?: string, type?: string): Promise<CreateResult> {
     const before = this.findRecord(name);
     const alreadyReady =
       before?.provisionStatus === "ready" && fs.existsSync(before.worktreePath);
-    const record = await this.deps.provision(this.worktreeOptions(), name);
+    const record = await this.deps.provision(this.worktreeOptions(), name, {
+      ...(type ? { type } : {}),
+    });
     this.registry.upsertFeature(record);
     if (intent && intent.trim()) this.intents.set(record.slug, intent.trim());
     return { created: !alreadyReady, feature: this.toView(record) };
@@ -377,12 +381,15 @@ export class FeatureManager {
    * human's call, not the co's. Committed-but-unmerged work is preserved too —
    * teardownWorktree removes the worktree but keeps an unmerged branch and names
    * why, so nothing is silently lost.
+   *
+   * The feature is identified by its own worktree, so this can only ever act on
+   * a checkout co provisioned; the tracked record's branch is passed through as
+   * the fallback for the case where that checkout is already gone.
    */
   async abandon(name: string): Promise<AbandonResult> {
     const record = this.findRecord(name);
     const feature = record?.feature ?? name;
-    const branch = featureBranch(feature);
-    const entry = (await listWorktrees(this.repoPath)).find((w) => w.branch === `refs/heads/${branch}`);
+    const entry = await findFeatureWorktree(this.worktreeOptions(), feature);
     if (entry && fs.existsSync(entry.path) && (await isWorktreeDirty(entry.path))) {
       return {
         abandoned: false,
@@ -391,7 +398,9 @@ export class FeatureManager {
           `Commit or discard the work in the pane first, or decide deliberately to lose it.`,
       };
     }
-    const teardown = await this.deps.teardown(this.worktreeOptions(), feature);
+    const teardown = await this.deps.teardown(this.worktreeOptions(), feature, {
+      ...(record?.branch ? { branch: record.branch } : {}),
+    });
     this.registry.removeFeature(feature);
     if (record) this.intents.delete(record.slug);
     // Drop it from the merge queue too, so an abandoned feature never lingers as
@@ -513,6 +522,9 @@ export class FeatureManager {
     const gate = this.queue.canResolveHead();
     if (!gate.ok) return { ok: false, reason: gate.reason };
     const record = this.findRecord(gate.feature);
+    // The record's branch is the real one (it came from the worktree). The
+    // projection behind it is only for a queued feature whose record somehow
+    // went missing — order prose, not a ref anything acts on.
     const branch = record?.branch ?? featureBranch(gate.feature);
     const target = resolveWorktreeOptions(this.worktreeOptions()).devBranch;
     const detail = this.queue.headDetail();

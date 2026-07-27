@@ -20,6 +20,7 @@ import {
 import { searchWeb, fetchUrl } from "../research.js";
 import type { SearchOptions } from "../research.js";
 import type { FeatureManager } from "./features.js";
+import { FEATURE_BRANCH_TYPES } from "./worktrees.js";
 import {
   isReviewLevel,
   isReviewVerdict,
@@ -302,7 +303,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
           feature: {
             type: "string",
             description:
-              "Optional. Scope this dispatch to a feature: the crew runs in that feature's isolated worktree on its `co/feat-<slug>` branch, provisioned on first use. Use the same feature name you created (or will create) with feature_create. Omit to run on the bare main tree.",
+              "Optional. Scope this dispatch to a feature: the crew runs in that feature's isolated worktree on its own `<type>/<slug>` branch, provisioned on first use. Use the same feature name you created (or will create) with feature_create. Omit to run on the bare main tree.",
           },
         },
         required: ["order"],
@@ -312,13 +313,19 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "feature_create",
       description:
-        "Provision an isolated worktree for a feature: a fresh `co/feat-<slug>` branch cut from `origin/dev`, with its own checkout, so crew can work it in parallel with other features and never touch the main tree. Runs directly (no confirm gate) — it writes nothing to `dev` or `main`, only creates the feature's own branch and checkout. Requires the repo to have an `origin` remote with a `dev` branch (features integrate by pull request); it reports cleanly if that is missing rather than creating anything. Idempotent: creating an existing feature returns its worktree. After creating, dispatch orders into it by passing the same name as `dispatch_order`'s `feature`, then land it with feature_land.",
+        "Provision an isolated worktree for a feature: a fresh `<type>/<slug>` branch (e.g. `feat/user-auth`, `fix/stale-token`) cut from `origin/dev`, with its own checkout, so crew can work it in parallel with other features and never touch the main tree. Runs directly (no confirm gate) — it writes nothing to `dev` or `main`, only creates the feature's own branch and checkout. Requires the repo to have an `origin` remote with a `dev` branch (features integrate by pull request); it reports cleanly if that is missing rather than creating anything. Idempotent: creating an existing feature returns its worktree on the branch it already has. After creating, dispatch orders into it by passing the same name as `dispatch_order`'s `feature`, then land it with feature_land.",
       input_schema: {
         type: "object",
         properties: {
           name: {
             type: "string",
             description: "The feature name (a human handle, e.g. \"user auth\"). Slugged for the branch.",
+          },
+          type: {
+            type: "string",
+            enum: [...FEATURE_BRANCH_TYPES],
+            description:
+              "Optional Conventional Commits type for the branch prefix, chosen to fit the work (feat for new capability, fix for a bug, refactor, docs, chore, test, perf, build, ci, style). Defaults to feat.",
           },
           intent: {
             type: "string",
@@ -365,7 +372,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "feature_resolve_head",
       description:
-        "Dispatch a FRESH crew agent to unblock the current merge-queue HEAD when it is `blocked` by a rebase conflict or a red CI check on its pull request. The agent runs in the FEATURE'S OWN isolated worktree, on its `co/feat-<slug>` branch (never `dev`): it fetches, rebases onto the current `origin/dev` tip, resolves the conflict, fixes whatever the failing checks reported (the order names them and links their runs), and commits — it does NOT push, open a PR, or merge. Like every dispatch this is CONFIRM-GATED: it ARMS the resolver order (shown to the captain with the target worktree) and fires only when the captain types `confirm`; it launches nothing on its own. While the agent works, the head is `resolving`; when it finishes the head is automatically re-processed (rebase + push + a fresh read of the PR's checks) and becomes `ready` if green or `blocked`/`awaiting-checks` if not. Bounded to a few attempts per head; after the limit the head stays blocked for the captain to resolve by hand or abandon. Use this on a blocked head instead of resolving conflicts yourself.",
+        "Dispatch a FRESH crew agent to unblock the current merge-queue HEAD when it is `blocked` by a rebase conflict or a red CI check on its pull request. The agent runs in the FEATURE'S OWN isolated worktree, on its own feature branch (never `dev`): it fetches, rebases onto the current `origin/dev` tip, resolves the conflict, fixes whatever the failing checks reported (the order names them and links their runs), and commits — it does NOT push, open a PR, or merge. Like every dispatch this is CONFIRM-GATED: it ARMS the resolver order (shown to the captain with the target worktree) and fires only when the captain types `confirm`; it launches nothing on its own. While the agent works, the head is `resolving`; when it finishes the head is automatically re-processed (rebase + push + a fresh read of the PR's checks) and becomes `ready` if green or `blocked`/`awaiting-checks` if not. Bounded to a few attempts per head; after the limit the head stays blocked for the captain to resolve by hand or abandon. Use this on a blocked head instead of resolving conflicts yourself.",
       input_schema: { type: "object", properties: {}, additionalProperties: false },
     });
     tools.push({
@@ -636,7 +643,8 @@ export function makeExecutor(ctx: ExecutorContext) {
           const name = String(input.name ?? "").trim();
           if (!name) return err(id, "feature_create requires a non-empty name.");
           const intent = input.intent === undefined ? undefined : String(input.intent);
-          const res = await ctx.features.create(name, intent);
+          const type = input.type === undefined ? undefined : String(input.type);
+          const res = await ctx.features.create(name, intent, type);
           ctx.onNotice?.(
             res.created ? `provisioned worktree for feature ${res.feature.slug}` : `feature ${res.feature.slug} already provisioned`,
           );

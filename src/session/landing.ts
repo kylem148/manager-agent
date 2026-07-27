@@ -14,12 +14,11 @@ import {
 } from "./forge.js";
 import {
   branchExists,
-  featureBranch,
   featureSlug,
+  findFeatureWorktree,
   forgeOptions,
   git,
   isWorktreeDirty,
-  listWorktrees,
   resolveWorktreeOptions,
   runGit,
   teardownWorktree,
@@ -97,8 +96,10 @@ import {
  *
  * Safety posture: `main` is never read or written here. The local `dev` ref is
  * never read or written either — `origin/dev` is; the only local refs touched
- * are `co/feat-*` (rebase in prepare, worktree teardown after the merge) and
- * `refs/remotes/*` (via fetch). Deterministic plumbing plus gh — no model.
+ * are the feature branches co provisioned, resolved from their own worktrees
+ * and never from their names (rebase in prepare, worktree teardown after the
+ * merge), and `refs/remotes/*` (via fetch). Deterministic plumbing plus gh — no
+ * model.
  */
 
 export interface LandingOptions extends WorktreeOptions {
@@ -240,28 +241,32 @@ export interface LandResult {
  * exactly what each leaves behind.
  *
  * Preconditions are thrown, not classified: a missing prerequisite (no gh, not
- * authenticated, no `origin/dev`), a feature with no branch or no worktree, a
- * worktree not on its branch, or one with uncommitted changes is a
- * caller/lifecycle problem, not a landing outcome — and throwing before touching
- * anything trivially preserves every invariant. The queue turns such a throw
- * into a blocked head carrying the message; the tool layer reports it verbatim.
+ * authenticated, no `origin/dev`), a feature with no worktree, a worktree not on
+ * its branch, or one with uncommitted changes is a caller/lifecycle problem, not
+ * a landing outcome — and throwing before touching anything trivially preserves
+ * every invariant. The queue turns such a throw into a blocked head carrying the
+ * message; the tool layer reports it verbatim.
+ *
+ * The branch is read off the feature's registered worktree, never derived from
+ * its name: co lands the branch it actually provisioned, and a same-named branch
+ * it did not create is not reachable from here.
  */
 export async function prepareLanding(opts: LandingOptions, feature: string): Promise<PrepareResult> {
   const r = resolveWorktreeOptions(opts);
   const forge = forgeOptions(opts);
   const slug = featureSlug(feature);
-  const branch = featureBranch(feature);
 
+  const owned = await findFeatureWorktree(opts, feature);
+  if (!owned || !fs.existsSync(owned.path)) {
+    throw new Error(
+      `feature '${feature}' (${slug}) has no worktree under ${r.baseDir}; dispatch it first or run reconcile`,
+    );
+  }
+  const branch = owned.branch;
   if (!(await branchExists(r.repoPath, branch))) {
     throw new Error(`feature '${feature}' has no branch '${branch}' in ${r.repoPath}`);
   }
-  const entry = (await listWorktrees(r.repoPath)).find((w) => w.branch === `refs/heads/${branch}`);
-  if (!entry || !fs.existsSync(entry.path)) {
-    throw new Error(
-      `feature '${feature}' (${slug}) has no worktree for '${branch}'; dispatch it first or run reconcile`,
-    );
-  }
-  const worktreePath = entry.path;
+  const worktreePath = owned.path;
   // The rebase acts on the worktree's HEAD; make sure that IS the feature
   // branch (a crew could conceivably have detached or switched it).
   const head = await runGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
@@ -393,8 +398,16 @@ export async function executeLanding(
 ): Promise<LandResult> {
   const r = resolveWorktreeOptions(opts);
   const forge = forgeOptions(opts);
-  const branch = featureBranch(feature);
 
+  // Same rule as prepare: the branch is the one this feature's own worktree has
+  // checked out. No worktree, no landing.
+  const owned = await findFeatureWorktree(opts, feature);
+  if (!owned) {
+    throw new Error(
+      `feature '${feature}' has no worktree under ${r.baseDir}; re-provision it or run reconcile`,
+    );
+  }
+  const branch = owned.branch;
   if (!(await branchExists(r.repoPath, branch))) {
     throw new Error(`feature '${feature}' has no branch '${branch}' in ${r.repoPath}`);
   }
@@ -454,7 +467,7 @@ export async function executeLanding(
   }
 
   // The PR merged the branch on the forge; the ref stays, the checkout goes.
-  const teardown = await teardownWorktree(opts, feature, { keepBranch: true });
+  const teardown = await teardownWorktree(opts, feature, { keepBranch: true, branch });
   return {
     feature,
     branch,

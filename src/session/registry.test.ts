@@ -1501,7 +1501,7 @@ test("the fix is narrow: a busy pane we were HANDED still escalates to anchor lo
   }
 });
 
-test("feature dispatch end-to-end: real provision, crew cwd = worktree on co/feat-*, reuse on the second dispatch", async () => {
+test("feature dispatch end-to-end: real provision, crew cwd = worktree on the feature branch, reuse on the second dispatch", async () => {
   // The whole provision → dispatch-isolated loop against a real git repo: the
   // registry provisions through worktrees.ts for real, and the (stubbed) pane
   // launch bakes the worktree as the crew's cwd into the job script. We verify
@@ -1551,7 +1551,7 @@ test("feature dispatch end-to-end: real provision, crew cwd = worktree on co/fea
         assert.equal(j1.cwd, worktree, "the crew cwd is the provisioned worktree in the sibling base dir");
         // The real worktree exists, checked out on the feature branch (never main).
         const branchAtWorktree = runGit(worktree, ["rev-parse", "--abbrev-ref", "HEAD"]);
-        assert.equal(branchAtWorktree, "co/feat-auth", "the worktree is on the feature branch");
+        assert.equal(branchAtWorktree, "feat/auth", "the worktree is on the feature branch");
         // The generated job script cd's the crew into that worktree.
         const script1 = await fsp.readFile(`${j1.captureFile}.sh`, "utf8");
         assert.ok(script1.includes(`cd '${worktree}' ||`), "the crew is launched inside the worktree");

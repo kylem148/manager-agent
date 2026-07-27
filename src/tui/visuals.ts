@@ -237,8 +237,8 @@ export type DispatchTarget = { kind: "feature"; branch: string } | { kind: "main
 type Styling = Pick<EffectiveVisuals, "glyphs" | "color">;
 
 /**
- * The one-line destination label: `≈≈▸ dispatching → co/feat-slug`, or
- * `~~> dispatching -> co/feat-slug` in ASCII. This is the durable form — the
+ * The one-line destination label: `≈≈▸ dispatching → feat/slug`, or
+ * `~~> dispatching -> feat/slug` in ASCII. This is the durable form — the
  * session commits it to the transcript at EVERY visuals level, including `full`,
  * so the animation only ever adds motion to information that is already there
  * (and still there after the region clears).

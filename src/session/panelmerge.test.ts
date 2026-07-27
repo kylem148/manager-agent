@@ -254,7 +254,7 @@ test("e2e: the panel's [m] merges the head's PR, advances the queue, and the nex
     assert.equal(run(fx.repo, ["rev-list", "--merges", "--count", devAfterA]), "1", "as a merge commit");
     assert.equal(fx.forge.prs[0]!.state, "MERGED", "its PR is merged");
     assert.ok(!fs.existsSync(a.feature.worktreePath), "alpha's worktree was torn down");
-    assert.ok(branchExists(fx.repo, "co/feat-alpha"), "and its branch ref kept");
+    assert.ok(branchExists(fx.repo, "feat/alpha"), "and its branch ref kept");
 
     // The queue advanced AND the new head auto-processed against the new dev, so
     // its own [m] is already live without anything else happening.
@@ -332,8 +332,8 @@ test("e2e: a blocked head shows the block, offers no [m], and reaches the co", a
     fx.send("m");
     await settle();
     assert.equal(fx.originDev(), devBefore, "[m] on a blocked head merges nothing");
-    assert.equal(fx.forge.prFor("co/feat-right"), undefined, "a blocked head never opened a PR");
-    assert.ok(branchExists(fx.repo, "co/feat-right"), "right's branch is intact for a resolver");
+    assert.equal(fx.forge.prFor("feat/right"), undefined, "a blocked head never opened a PR");
+    assert.ok(branchExists(fx.repo, "feat/right"), "right's branch is intact for a resolver");
     assert.equal(fx.notices.length, 1, "and no second notice was minted");
   } finally {
     await fx.cleanup();
@@ -390,9 +390,9 @@ test("queueMergeNotice: silence on the happy path, a decision on a blocked head 
     merged: false,
     outcome: "failed",
     summary: "refused",
-    error: "'co/feat-x' has moved since prepare",
+    error: "'feat/x' has moved since prepare",
     head: { feature: "x", position: 1, isHead: true, status: "ready" },
   });
-  assert.match(refused ?? "", /REFUSED: 'co\/feat-x' has moved since prepare/);
+  assert.match(refused ?? "", /REFUSED: 'feat\/x' has moved since prepare/);
   assert.match(refused ?? "", /Nothing was written to dev/);
 });

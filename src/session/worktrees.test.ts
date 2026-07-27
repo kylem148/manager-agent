@@ -6,10 +6,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  FEATURE_BRANCH_TYPES,
   ensureRemoteDevBranch,
   featureBranch,
   featureSlug,
+  findFeatureWorktree,
+  listFeatureWorktrees,
+  listOwnedFeatureBranches,
+  normalizeFeatureType,
   provisionWorktree,
+  reconcileFeatures,
   reconcileWorktrees,
   teardownWorktree,
   defaultWorktreeBase,
@@ -91,13 +97,33 @@ function branchExists(repo: string, branch: string): boolean {
   return res.status === 0;
 }
 
-test("featureSlug normalizes names and featureBranch prefixes them", () => {
+/** Add a commit to a branch that has no checkout, with plumbing only — the
+ *  "unmerged work whose worktree is gone" state, built without a worktree. */
+function commitOnBranch(repo: string, branch: string): void {
+  const parent = run(repo, ["rev-parse", branch]);
+  const tree = run(repo, ["rev-parse", `${branch}^{tree}`]);
+  const sha = run(repo, ["commit-tree", "-p", parent, "-m", "unmerged work", tree]);
+  run(repo, ["update-ref", `refs/heads/${branch}`, sha]);
+}
+
+test("featureSlug normalizes names and featureBranch gives them a conventional prefix", () => {
   assert.equal(featureSlug("My Fancy Feature!"), "my-fancy-feature");
   assert.equal(featureSlug("auth"), "auth");
   assert.equal(featureSlug("  spaces  and__underscores  "), "spaces-and-underscores");
-  assert.equal(featureBranch("My Fancy Feature!"), "co/feat-my-fancy-feature");
-  // Nothing usable survives: refuse rather than mint `co/feat-`.
+  assert.equal(featureBranch("My Fancy Feature!"), "feat/my-fancy-feature");
+  assert.equal(featureBranch("stale token", "fix"), "fix/stale-token");
+  assert.equal(featureBranch("the docs", " DOCS "), "docs/the-docs", "case and space are tolerated");
+  // Nothing usable survives: refuse rather than mint `feat/`.
   assert.throws(() => featureSlug("!!!"), /empty slug/);
+});
+
+test("a branch type outside the Conventional Commits set is refused, not coerced", () => {
+  assert.equal(normalizeFeatureType(undefined), "feat", "the default is feat");
+  assert.equal(normalizeFeatureType(""), "feat");
+  for (const t of FEATURE_BRANCH_TYPES) assert.equal(normalizeFeatureType(t), t);
+  assert.throws(() => normalizeFeatureType("feature"), /unknown branch type/);
+  assert.throws(() => normalizeFeatureType("wip"), /unknown branch type/);
+  assert.throws(() => featureBranch("x", "nope"), /unknown branch type/);
 });
 
 test("defaultWorktreeBase is a sibling of the repo, outside its working tree", () => {
@@ -133,7 +159,7 @@ test("ensureRemoteDevBranch refuses cleanly when the remote has no dev branch", 
   }
 });
 
-test("provisionWorktree cuts co/feat-<slug> from origin/dev with build artifacts symlinked", async () => {
+test("provisionWorktree cuts <type>/<slug> from origin/dev with build artifacts symlinked", async () => {
   const { repo, base, opts, forge, cleanup } = await makeRepo();
   try {
     // Make origin/dev and main genuinely different, so "based off origin/dev"
@@ -145,7 +171,7 @@ test("provisionWorktree cuts co/feat-<slug> from origin/dev with build artifacts
     assert.notEqual(mainSha, devSha);
 
     const rec = await provisionWorktree(opts, "My Feature");
-    assert.equal(rec.branch, "co/feat-my-feature");
+    assert.equal(rec.branch, "feat/my-feature");
     assert.equal(rec.worktreePath, path.join(base, "my-feature"));
     assert.equal(rec.provisionStatus, "ready");
 
@@ -183,13 +209,119 @@ test("provisionWorktree is idempotent for a provisioned feature and rejects half
     assert.deepEqual(again, first, "re-provisioning an intact feature returns the same record");
 
     // A leftover branch with no worktree is a half-state: refuse, point at
-    // reconcile, and above all don't guess which side to destroy.
+    // reconcile, and above all don't guess which side to destroy. Both naming
+    // schemes count — an old `co/feat-*` ref blocks the same slug.
     run(repo, ["branch", "co/feat-leftover", "main"]);
     await assert.rejects(
       provisionWorktree(opts, "leftover"),
-      /already exists without a worktree/,
+      /is not a feature co provisioned/,
     );
     assert.ok(branchExists(repo, "co/feat-leftover"), "the refusal deleted nothing");
+    assert.ok(!branchExists(repo, "feat/leftover"), "and minted no second branch for the slug");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("provisionWorktree cuts the type the caller asked for, and refuses one it doesn't know", async () => {
+  const { repo, base, opts, cleanup } = await makeRepo();
+  try {
+    const rec = await provisionWorktree(opts, "Stale Token", { type: "fix" });
+    assert.equal(rec.branch, "fix/stale-token");
+    assert.equal(rec.worktreePath, path.join(base, "stale-token"), "the dir is the slug, type-free");
+    assert.equal(run(rec.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]), "fix/stale-token");
+
+    await assert.rejects(provisionWorktree(opts, "nope", { type: "wip" }), /unknown branch type/);
+    assert.ok(!fs.existsSync(path.join(base, "nope")), "a bad type creates nothing at all");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("ownership is the worktree, not the name: a human's feat/* branch is invisible to every lever", async () => {
+  const { root, repo, opts, cleanup } = await makeRepo();
+  try {
+    // The captain's own branch, named exactly as a feature would be, in their
+    // own worktree outside co's managed base.
+    const human = path.join(root, "captains-tree");
+    run(repo, ["worktree", "add", "-q", human, "-b", "feat/my-feature", "main"]);
+
+    assert.deepEqual(await listFeatureWorktrees(opts), [], "not one of co's worktrees");
+    assert.equal(await findFeatureWorktree(opts, "My Feature"), null);
+    assert.deepEqual(await listOwnedFeatureBranches(opts), [], "and not one of co's branches");
+
+    // The boot rebuild neither adopts it as a feature nor reports it at all.
+    const report = await reconcileFeatures(opts);
+    assert.deepEqual(report.records, []);
+    assert.deepEqual(report.anomalies, []);
+
+    // Teardown cannot reach it: no worktree of co's, so nothing to remove, and
+    // the branch it would consider is the legacy name, which does not exist.
+    const t = await teardownWorktree(opts, "My Feature");
+    assert.equal(t.worktreeRemoved, false);
+    assert.equal(t.branchDeleted, false);
+    assert.ok(branchExists(repo, "feat/my-feature"), "the captain's branch is untouched");
+    assert.ok(fs.existsSync(path.join(human, "file.txt")), "and so is their checkout");
+
+    // And co will not cut over it either — it refuses instead.
+    await assert.rejects(provisionWorktree(opts, "My Feature"), /is not a feature co provisioned/);
+    assert.ok(branchExists(repo, "feat/my-feature"));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a legacy co/feat-* worktree stays co's, is never renamed, and tears down on its own branch", async () => {
+  const { repo, base, opts, cleanup } = await makeRepo();
+  try {
+    // What an older build left behind: the checkout at <base>/<slug>, on the
+    // old branch name. Nothing marks it but its position.
+    await ensureRemoteDevBranch(opts);
+    await fsp.mkdir(base, { recursive: true });
+    const legacyPath = path.join(base, "prompt-fixes");
+    run(repo, ["worktree", "add", "-q", legacyPath, "-b", "co/feat-prompt-fixes", "origin/dev"]);
+
+    const owned = await findFeatureWorktree(opts, "prompt fixes");
+    assert.equal(owned?.branch, "co/feat-prompt-fixes", "recognised by its worktree, not its name");
+    assert.deepEqual((await listFeatureWorktrees(opts)).map((w) => w.slug), ["prompt-fixes"]);
+
+    // Re-provisioning returns it AS IT IS: no rename, no second branch.
+    const rec = await provisionWorktree(opts, "prompt fixes");
+    assert.equal(rec.branch, "co/feat-prompt-fixes");
+    assert.equal(rec.worktreePath, legacyPath);
+    assert.ok(!branchExists(repo, "feat/prompt-fixes"), "no conventional twin was minted");
+
+    // And teardown acts on the branch the worktree actually holds.
+    const t = await teardownWorktree(opts, "prompt fixes");
+    assert.equal(t.branch, "co/feat-prompt-fixes");
+    assert.equal(t.worktreeRemoved, true);
+    assert.equal(t.branchDeleted, true, "it is contained in origin/dev, so it is safe to drop");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a branch co cut is still known as co's once its worktree is gone; a lookalike never is", async () => {
+  const { repo, opts, cleanup } = await makeRepo();
+  try {
+    const mine = await provisionWorktree(opts, "orphan");
+    run(repo, ["branch", "co/feat-old-one", "main"]); // an older build's leftover
+    run(repo, ["branch", "feat/decoy", "main"]); // the captain's, same shape as ours
+
+    // Lose the checkout, keep the branch — the crashed-run case.
+    run(repo, ["worktree", "remove", "--force", mine.worktreePath]);
+
+    const owned = (await listOwnedFeatureBranches(opts)).map((o) => o.branch).sort();
+    assert.deepEqual(owned, ["co/feat-old-one", "feat/orphan"], "the marker and the legacy prefix, nothing else");
+
+    // The boot rebuild reports the unmerged work and says nothing about the decoy.
+    commitOnBranch(repo, "feat/orphan");
+    const report = await reconcileFeatures(opts);
+    assert.deepEqual(
+      report.anomalies.filter((a) => a.kind === "branch-without-worktree").map((a) => a.ref),
+      ["feat/orphan"],
+    );
+    assert.ok(branchExists(repo, "feat/decoy"), "and the captain's branch is left entirely alone");
   } finally {
     await cleanup();
   }

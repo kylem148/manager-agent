@@ -181,13 +181,13 @@ test("currentVisuals reads CO_VISUALS and takes the caller's PlainIO word for it
 // --- the branch label ---------------------------------------------------------
 
 test("the dispatch label names the feature branch, in glyphs or in ASCII", () => {
-  const target = { kind: "feature", branch: "co/feat-terminal-visuals" } as const;
+  const target = { kind: "feature", branch: "feat/terminal-visuals" } as const;
 
   const fancy = stripAnsi(dispatchLabel(target, { glyphs: "unicode", color: true }));
-  assert.equal(fancy, "  ≈≈▸ dispatching → co/feat-terminal-visuals");
+  assert.equal(fancy, "  ≈≈▸ dispatching → feat/terminal-visuals");
 
   const plain = stripAnsi(dispatchLabel(target, { glyphs: "ascii", color: false }));
-  assert.equal(plain, "  ~~> dispatching -> co/feat-terminal-visuals");
+  assert.equal(plain, "  ~~> dispatching -> feat/terminal-visuals");
   assert.ok(isPlainAscii(plain), "the fallback label is 7-bit ASCII");
 });
 
@@ -195,7 +195,7 @@ test("a bare-tree dispatch says so instead of inventing a branch name", () => {
   for (const glyphs of ["unicode", "ascii"] as const) {
     const label = stripAnsi(dispatchLabel({ kind: "main" }, { glyphs, color: glyphs === "unicode" }));
     assert.match(label, /the bare main tree \(no feature branch\)/);
-    assert.ok(!label.includes("co/feat-"), "no branch is named for the main tree");
+    assert.ok(!label.includes("feat/"), "no branch is named for the main tree");
   }
   assert.ok(isPlainAscii(stripAnsi(dispatchLabel({ kind: "main" }, { glyphs: "ascii", color: false }))));
 });
@@ -237,7 +237,7 @@ test("waveBand draws water in ASCII when the glyphs are unavailable", () => {
 // --- the dispatch flourish ----------------------------------------------------
 
 test("the flourish is two rows: rolling water over the destination label", () => {
-  const target = { kind: "feature", branch: "co/feat-waves" } as const;
+  const target = { kind: "feature", branch: "feat/waves" } as const;
   const spec = dispatchFlourish({ target, glyphs: "unicode", color: true });
   assert.equal(spec.rows, 2);
   // Open-ended: it covers the launch, so it has no frame count of its own.
@@ -247,7 +247,7 @@ test("the flourish is two rows: rolling water over the destination label", () =>
   const frame = spec.render(0, 80);
   assert.equal(frame.length, 2, "exactly the rows it reserved");
   for (const row of frame) assert.ok(visibleWidth(row) <= 80, "never wider than the terminal");
-  assert.match(stripAnsi(frame[1]!), /dispatching .* co\/feat-waves/, "the label row names the branch");
+  assert.match(stripAnsi(frame[1]!), /dispatching .* feat\/waves/, "the label row names the branch");
   assert.ok(stripAnsi(frame[0]!).includes("▸"), "the order runs out ahead of the swell");
 });
 
@@ -266,7 +266,7 @@ test("the flourish actually animates: consecutive frames differ", () => {
 
 test("the flourish has a strictly ASCII form", () => {
   const spec = dispatchFlourish({
-    target: { kind: "feature", branch: "co/feat-x" },
+    target: { kind: "feature", branch: "feat/x" },
     glyphs: "ascii",
     color: false,
   });
@@ -279,7 +279,7 @@ test("the flourish has a strictly ASCII form", () => {
 
 test("the flourish survives an absurdly narrow render without throwing or wrapping", () => {
   const spec = dispatchFlourish({
-    target: { kind: "feature", branch: "co/feat-x" },
+    target: { kind: "feature", branch: "feat/x" },
     glyphs: "unicode",
     color: true,
   });
@@ -451,13 +451,13 @@ test("a real dispatch flourish paints the destination branch in the region", () 
   void h.tui.question();
   const handle = h.tui.playAnimation(
     dispatchFlourish({
-      target: { kind: "feature", branch: "co/feat-terminal-visuals" },
+      target: { kind: "feature", branch: "feat/terminal-visuals" },
       glyphs: "unicode",
       color: true,
     }),
   );
   assert.equal(handle.animating, true);
-  assert.match(h.lastFramePlain(), /dispatching .* co\/feat-terminal-visuals/);
+  assert.match(h.lastFramePlain(), /dispatching .* feat\/terminal-visuals/);
   handle.stop();
   h.stop();
 });

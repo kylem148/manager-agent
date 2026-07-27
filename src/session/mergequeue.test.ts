@@ -55,7 +55,7 @@ function green(feature: string, commits = 1, checksSummary?: ChecksSummary): Pre
   return {
     kind: "green",
     feature,
-    branch: `co/feat-${feature}`,
+    branch: `feat/${feature}`,
     devSha: "dev0",
     featureSha: `feat-${feature}`,
     diff: "+work\n",
@@ -75,7 +75,7 @@ function conflict(feature: string): PrepareConflict {
   return {
     kind: "conflict",
     feature,
-    branch: `co/feat-${feature}`,
+    branch: `feat/${feature}`,
     devSha: "dev0",
     conflictFiles: ["file.txt"],
     detail: "could not apply",
@@ -85,7 +85,7 @@ function failed(feature: string): PrepareFailed {
   return {
     kind: "failed",
     feature,
-    branch: `co/feat-${feature}`,
+    branch: `feat/${feature}`,
     devSha: "dev0",
     featureSha: `feat-${feature}`,
     commits: [`c0 job: ${feature}`],
@@ -156,12 +156,12 @@ function makeHarness(): Harness {
     if (h.executeError) throw new Error(h.executeError);
     return {
       feature,
-      branch: `co/feat-${feature}`,
+      branch: `feat/${feature}`,
       mergeSha: `merge-${feature}`,
       previousDevSha: "dev0",
       pr: { number: 7, url: "https://github.com/acme/repo/pull/7" },
       teardown: {
-        branch: `co/feat-${feature}`,
+        branch: `feat/${feature}`,
         worktreeRemoved: true,
         branchDeleted: false,
         branchKeptReason: "kept by policy",
