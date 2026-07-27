@@ -86,7 +86,7 @@ test("the system prompt is sent as a block carrying a cache breakpoint", async (
   await provider.runTurn(turn([{ role: "user", content: "hi" }]));
 
   assert.deepEqual(sent[0]!.system, [
-    { type: "text", text: "system prompt", cache_control: { type: "ephemeral" } },
+    { type: "text", text: "system prompt", cache_control: { type: "ephemeral", ttl: "1h" } },
   ]);
 });
 
@@ -99,7 +99,11 @@ test("only the last tool definition closes the tools prefix", async () => {
   const tools = sent[0]!.tools as Array<Record<string, unknown>>;
   assert.equal(tools.length, 2);
   assert.equal(tools[0]!.cache_control, undefined);
-  assert.deepEqual(tools[1]!.cache_control, { type: "ephemeral" });
+  // The one-hour TTL is load-bearing, not incidental: under the five-minute
+  // default every pause longer than a thought expires this entry and the next
+  // turn re-writes the whole prefix. Asserted here so a silent revert to a bare
+  // `ephemeral` fails a test rather than quietly tripling the bill.
+  assert.deepEqual(tools[1]!.cache_control, { type: "ephemeral", ttl: "1h" });
 });
 
 test("a request never exceeds Bedrock's four cache breakpoints", async () => {

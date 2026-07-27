@@ -57,8 +57,25 @@ export interface StreamHandlers {
  * and do not promise this path caches — so the CO_DEBUG_TIMING counters below
  * are the standing check, not a nicety. If cache_read_input_tokens goes to zero
  * and stays there, something upstream of the breakpoints started changing.
+ *
+ * TTL is one hour, not the five-minute default, and that is the single biggest
+ * cost lever in the whole program. A co-manager is a thinking partner: the
+ * captain reads an answer, thinks for ten minutes, then replies. Under the
+ * default TTL every one of those pauses expires the entry and the next turn
+ * re-writes the whole ~22k-token prefix at 1.25x instead of reading it at 0.1x
+ * — a 12.5x swing on the dominant input term, paid several times a session.
+ * The hour costs a 2x write premium instead of 1.25x, which pays for itself
+ * from the second read onward; only a strictly one-turn session is worse off.
+ *
+ * `ttl` is a first-party API field that this legacy Bedrock path does not
+ * document, so it was measured rather than assumed (2026-07-27): a unique
+ * prefix written under ttl "1h" returned cache_creation=2216/read=0, and the
+ * same prefix seven minutes later — well past the five-minute default expiry —
+ * returned cache_creation=0/read=2216. Survival past an hour was not measured;
+ * what mattered was proving the entry is not on the default clock. If a future
+ * SDK or endpoint change rejects the field, drop back to a bare `ephemeral`.
  */
-const CACHE_CONTROL = { type: "ephemeral" as const };
+const CACHE_CONTROL = { type: "ephemeral" as const, ttl: "1h" as const };
 
 /**
  * How many content blocks back the lagging message breakpoint sits. Each
@@ -154,8 +171,9 @@ export class ModelProvider {
     // while the Mantle endpoint 404s ("model does not exist") for the same key
     // and every id format — our account isn't entitled to Mantle. This mirrors
     // Claude Code's own working setup (CLAUDE_CODE_USE_BEDROCK=1, Mantle off).
-    // Verified end-to-end against the live key on 2026-07-16. Don't switch to
-    // Mantle without re-confirming entitlement, or Opus 4.8 will break.
+    // Verified end-to-end against the live key on 2026-07-16, and re-confirmed
+    // 2026-07-27 (runtime ✓ / Mantle 404 for the same id). Don't switch to
+    // Mantle without re-confirming entitlement, or the model will break.
     //
     // Re-confirmed 2026-07-20, this time including the id form Anthropic's docs
     // actually publish for Mantle (bare `anthropic.claude-opus-4-8`, no geo
@@ -168,6 +186,16 @@ export class ModelProvider {
     // Mantle "for full feature parity" without enumerating what legacy lacks —
     // so treat feature support here as empirical, not promised. Prompt caching
     // was measured working on this path the same day (see CACHE_CONTROL below).
+    //
+    // The same holds for the Sonnet line, checked on 2026-07-27 while costing
+    // out a cheaper default: `us.anthropic.claude-sonnet-4-6` and
+    // `us.anthropic.claude-sonnet-5` both answer on runtime and both reject the
+    // un-prefixed `anthropic.claude-sonnet-*` form for on-demand throughput.
+    // Adaptive thinking, tools, and prompt caching were all exercised together
+    // on Sonnet 4.6 here (cache_read 3477 on the second identical call), so the
+    // whole turn shape this file builds is known-good on the cheaper models if
+    // that trade is ever worth making — the one thing that is NOT is
+    // effort=xhigh, which 400s below Opus 4.7 (see effortLevelsFor).
     this.client = new AnthropicBedrock({
       awsRegion: cfg.region,
       ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
@@ -177,6 +205,11 @@ export class ModelProvider {
   /** Effort currently sent with every turn. */
   get effort(): Effort | undefined {
     return this.cfg.effort;
+  }
+
+  /** The Bedrock model id every turn is sent to. Read by /effort and /status. */
+  get modelId(): string {
+    return this.cfg.modelId;
   }
 
   /**
