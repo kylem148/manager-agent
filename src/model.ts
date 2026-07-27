@@ -57,8 +57,25 @@ export interface StreamHandlers {
  * and do not promise this path caches — so the CO_DEBUG_TIMING counters below
  * are the standing check, not a nicety. If cache_read_input_tokens goes to zero
  * and stays there, something upstream of the breakpoints started changing.
+ *
+ * TTL is one hour, not the five-minute default, and that is the single biggest
+ * cost lever in the whole program. A co-manager is a thinking partner: the
+ * captain reads an answer, thinks for ten minutes, then replies. Under the
+ * default TTL every one of those pauses expires the entry and the next turn
+ * re-writes the whole ~22k-token prefix at 1.25x instead of reading it at 0.1x
+ * — a 12.5x swing on the dominant input term, paid several times a session.
+ * The hour costs a 2x write premium instead of 1.25x, which pays for itself
+ * from the second read onward; only a strictly one-turn session is worse off.
+ *
+ * `ttl` is a first-party API field that this legacy Bedrock path does not
+ * document, so it was measured rather than assumed (2026-07-27): a unique
+ * prefix written under ttl "1h" returned cache_creation=2216/read=0, and the
+ * same prefix seven minutes later — well past the five-minute default expiry —
+ * returned cache_creation=0/read=2216. Survival past an hour was not measured;
+ * what mattered was proving the entry is not on the default clock. If a future
+ * SDK or endpoint change rejects the field, drop back to a bare `ephemeral`.
  */
-const CACHE_CONTROL = { type: "ephemeral" as const };
+const CACHE_CONTROL = { type: "ephemeral" as const, ttl: "1h" as const };
 
 /**
  * How many content blocks back the lagging message breakpoint sits. Each
