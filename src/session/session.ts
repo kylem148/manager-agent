@@ -62,6 +62,7 @@ import {
 } from "./dispatchconfig.js";
 import { DispatchRegistry, readFileTail, type Job } from "./registry.js";
 import { FeatureManager } from "./features.js";
+import { FeatureStore } from "./featurestore.js";
 import type { MergeHeadResult } from "./mergequeue.js";
 import { DEFAULT_FEATURE_BRANCH_TYPE, defaultWorktreeBase, featureSlug } from "./worktrees.js";
 import { scrubCapture } from "./transport.js";
@@ -270,6 +271,12 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // report the captain relayed by hand is filed the same way a dispatched one is.
   const inbox = await ReviewInbox.load(paths);
 
+  // The durable half of a feature record: the one-line intents the co authored
+  // at create time. Everything else about a feature is rebuilt from git by the
+  // boot reconcile below; the description is the one thing git cannot recover,
+  // so it is read back from disk here and shown for recovered worktrees too.
+  const featureStore = await FeatureStore.load(paths);
+
   const system = await buildSystemPrompt(paths, cfg.research, {
     excludeTranscript: transcript.file,
     dispatch: dispatch
@@ -315,6 +322,11 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
                 headDetail: () => state.features?.headDetail() ?? null,
                 merge: () => panelMergeHead(state),
               },
+              // The features tab: every tracked worktree, not just the queued
+              // ones. Derived in memory from the registry + the queue + the
+              // stored intents, so this reads fresh at paint time like the other
+              // sources and costs no git call and no model call.
+              features: { list: () => state.features?.overview() ?? [] },
             }
           : {}),
       })
@@ -377,6 +389,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     state.features = new FeatureManager({
       registry: state.registry,
       repoPath: dispatch.repoPath,
+      store: featureStore,
       ...(io instanceof Tui ? { gateHost: io } : {}),
     });
   }

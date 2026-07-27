@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { checksLine, failedChecks, type ChecksPolicy } from "./checks.js";
 import type { CommandRunner } from "./forge.js";
 import { executeLanding, prepareLanding, type LandingOptions } from "./landing.js";
+import { FeatureStore } from "./featurestore.js";
 import { reviewLanding, type LandingGateHost, type LandingGateResult } from "./landinggate.js";
 import {
   MergeQueue,
@@ -84,6 +85,10 @@ export interface FeatureManagerOptions {
   /** How long the landing prepare waits on a PR's CI checks, and how often it
    *  looks. Defaults live in checks.ts; tests inject a no-op sleep. */
   checks?: ChecksPolicy;
+  /** Durable per-feature intents (featurestore.ts), loaded from the instance's
+   *  `.dispatch/features.json` at session start. Omit for an in-memory store —
+   *  the pre-persistence behaviour, and what tests get by default. */
+  store?: FeatureStore;
   /** Overrides for the git/gate seams (tests only). */
   deps?: Partial<FeatureManagerDeps>;
 }
@@ -94,8 +99,9 @@ export interface FeatureView {
   branch: string;
   worktreePath: string;
   provisionStatus: FeatureRecord["provisionStatus"];
-  /** The intent the co gave at create time, if any. Not persisted across a
-   *  restart — the co's own memory holds the durable intent. */
+  /** The intent the co gave at create time, if any. Persisted per slug
+   *  (featurestore.ts), so it survives a restart and is still there for a record
+   *  the boot reconcile rebuilt from the worktree on disk. */
   intent?: string;
   /** Jobs the registry has dispatched under this feature (id + status + label). */
   jobs: { id: string; status: string; label: string }[];
@@ -112,6 +118,68 @@ export interface FeatureView {
 export interface CreateResult {
   created: boolean;
   feature: FeatureView;
+}
+
+/**
+ * Where a feature stands right now, in ONE word, for the panel's features tab.
+ * Derived entirely from state the session already holds — the registry's jobs,
+ * the merge queue, the record's provision status. No git call, no model call,
+ * nothing that costs anything to compute at paint time.
+ *
+ * The merge-queue statuses keep their queue spellings so the two tabs agree
+ * about a feature that is in both.
+ */
+export type FeatureActivity =
+  /** A crew agent is running (or queued) in the worktree, and the feature is not
+   *  in the merge queue. */
+  | "working"
+  /** Tracked, nothing running, not enqueued: work in the worktree, or waiting to
+   *  be enqueued. The resting state. */
+  | "idle"
+  /** In the merge queue behind the head. */
+  | "queued"
+  /** The head, being rebased + build+tested right now. */
+  | "processing"
+  /** The head, green: its [m] is live in the queue tab. */
+  | "ready"
+  /** The head, blocked on a rebase conflict, a red build+test, or a missing
+   *  prerequisite. */
+  | "blocked"
+  /** The head, with a fresh crew agent resolving it in its own worktree. */
+  | "resolving"
+  /** The worktree is still being provisioned. */
+  | "provisioning"
+  /** Provisioning failed; there is no usable checkout. */
+  | "failed"
+  /** The worktree was torn down while the record was still tracked. Nothing in
+   *  the flow leaves a feature here today; it exists so the record's own
+   *  `removed` provision status can never masquerade as a provision failure. */
+  | "removed";
+
+/**
+ * One feature as the Ctrl-O features tab shows it: what it is, where it is, and
+ * what is happening to it. This is the overview the queue tab deliberately does
+ * NOT give — the queue holds only the features the captain has marked done, and
+ * everything still being worked is invisible there.
+ */
+export interface FeatureOverview {
+  /** The feature handle (the name it was created under, or its slug after a
+   *  restart rebuilt the record from the worktree). */
+  feature: string;
+  slug: string;
+  branch: string;
+  /** The stored one-line description, when the co gave one at create time. */
+  intent?: string;
+  status: FeatureActivity;
+  /** Whether a crew agent is running or queued in the worktree. Reported
+   *  separately from `status` because an enqueued feature's queue state is the
+   *  more useful chip, and a resolver agent working a blocked head must still be
+   *  visible. */
+  busy: boolean;
+  /** 1-based landing position, when the feature is in the merge queue. */
+  position?: number;
+  /** Present when blocked: conflict vs red build+test. */
+  blockedKind?: "conflict" | "failed";
 }
 
 export interface AbandonResult {
@@ -156,10 +224,12 @@ export class FeatureManager {
    *  and the head-only state machine; drives the EXISTING prepare + gate through
    *  the deps below. FeatureManager is its host (busy check + record cleanup). */
   private readonly queue: MergeQueue;
-  /** Intents keyed by slug, so status/list can echo the feature's purpose. Not
-   *  durable: reconcile can't recover an intent from a branch, so a restart
-   *  drops it (the co's memory is the durable record). */
-  private readonly intents = new Map<string, string>();
+  /** Intents keyed by slug, so status/list and the panel's features tab can show
+   *  what a feature is FOR. Durable: git can rebuild everything else about a
+   *  feature from its worktree, but not the line the co wrote, so that one field
+   *  is persisted under `.dispatch/features.json` (featurestore.ts) and read back
+   *  at session start. */
+  private readonly store: FeatureStore;
 
   constructor(opts: FeatureManagerOptions) {
     this.registry = opts.registry;
@@ -168,6 +238,7 @@ export class FeatureManager {
     this.run = opts.run;
     if (opts.gateHost) this.gateHost = opts.gateHost;
     this.checks = opts.checks;
+    this.store = opts.store ?? FeatureStore.ephemeral();
     this.deps = {
       provision: opts.deps?.provision ?? provisionWorktree,
       teardown: opts.deps?.teardown ?? teardownWorktree,
@@ -185,7 +256,9 @@ export class FeatureManager {
         isBusy: (feature) => this.isBusy(feature),
         forget: (feature) => {
           this.registry.removeFeature(feature);
-          this.intents.delete(safeSlug(feature));
+          // Fire-and-forget: the in-memory drop is synchronous, and the file
+          // rewrite never rejects (see FeatureStore.persist).
+          void this.store.forget(safeSlug(feature));
         },
       },
       deps: { prepare: this.deps.prepare, execute: this.deps.execute },
@@ -227,7 +300,7 @@ export class FeatureManager {
       .jobsForFeature(record.feature)
       .map((j) => ({ id: j.id, status: j.status, label: j.label }));
     const busy = this.isBusy(record.feature);
-    const intent = this.intents.get(record.slug);
+    const intent = this.store.intent(record.slug);
     const queue = this.queue.viewFor(record.feature);
     return {
       feature: record.feature,
@@ -259,13 +332,52 @@ export class FeatureManager {
       ...(type ? { type } : {}),
     });
     this.registry.upsertFeature(record);
-    if (intent && intent.trim()) this.intents.set(record.slug, intent.trim());
+    // Persisted before the view is built, so the create result already carries
+    // what a later restart will read back. A blank intent leaves whatever an
+    // earlier create stored alone (FeatureStore.setIntent).
+    if (intent) await this.store.setIntent(record.slug, intent);
     return { created: !alreadyReady, feature: this.toView(record) };
   }
 
   /** Every tracked feature, newest bookkeeping last. */
   list(): FeatureView[] {
     return this.registry.listFeatures().map((r) => this.toView(r));
+  }
+
+  /**
+   * Every tracked feature as the Ctrl-O features tab shows it — the at-a-glance
+   * overview of everything in flight, not just what is queued to land. Pure
+   * in-memory derivation (registry records + jobs + the queue snapshot + the
+   * stored intent), so the panel can call it fresh on every paint the way it
+   * already does for the queue and the inbox.
+   *
+   * Ordered the way the captain reads it: whatever is closest to landing first
+   * (the merge queue, in its own landing order), then everything still being
+   * worked, alphabetically — a stable order, so a row never moves under the eye
+   * because a job started somewhere else.
+   */
+  overview(): FeatureOverview[] {
+    const rows = this.registry.listFeatures().map((record) => {
+      const queue = this.queue.viewFor(record.feature);
+      const busy = this.isBusy(record.feature);
+      const intent = this.store.intent(record.slug);
+      return {
+        feature: record.feature,
+        slug: record.slug,
+        branch: record.branch,
+        ...(intent ? { intent } : {}),
+        status: featureActivity(record.provisionStatus, queue, busy),
+        busy,
+        ...(queue ? { position: queue.position } : {}),
+        ...(queue?.blockedKind ? { blockedKind: queue.blockedKind } : {}),
+      } satisfies FeatureOverview;
+    });
+    return rows.sort((a, b) => {
+      const pa = a.position ?? Number.MAX_SAFE_INTEGER;
+      const pb = b.position ?? Number.MAX_SAFE_INTEGER;
+      if (pa !== pb) return pa - pb;
+      return a.slug.localeCompare(b.slug);
+    });
   }
 
   /** One feature's full picture, or null if nothing is tracked under that
@@ -348,7 +460,7 @@ export class FeatureManager {
       // the checkout down); drop the record and its intent so list/status
       // reflect reality.
       this.registry.removeFeature(feature);
-      if (record) this.intents.delete(record.slug);
+      if (record) await this.store.forget(record.slug);
       return {
         feature,
         outcome: "merged",
@@ -402,7 +514,7 @@ export class FeatureManager {
       ...(record?.branch ? { branch: record.branch } : {}),
     });
     this.registry.removeFeature(feature);
-    if (record) this.intents.delete(record.slug);
+    if (record) await this.store.forget(record.slug);
     // Drop it from the merge queue too, so an abandoned feature never lingers as
     // a stale entry. If it was the head, this advances the queue and processes
     // the new head against the current dev tip.
@@ -584,12 +696,49 @@ export class FeatureManager {
    * anomalies (a branch holding unmerged work with no worktree, a stray dir) are
    * returned for surfacing, never acted on. Records already tracked are
    * overwritten by the fresh on-disk truth.
+   *
+   * A rebuilt record carries its description with it: the record comes from git,
+   * the intent comes from the persisted store (loaded at session start and keyed
+   * by the same slug the branch name yields), so `list`/`status`/`overview` show
+   * what a recovered feature is FOR and not just where it lives.
    */
   async reconcileAtBoot(): Promise<FeatureReconcileReport> {
     const report = await this.deps.reconcile(this.worktreeOptions());
     for (const record of report.records) this.registry.upsertFeature(record);
     return report;
   }
+}
+
+/**
+ * One feature's state as a single word, from what the session already knows.
+ *
+ * Precedence is deliberate. A half-provisioned worktree wins outright — there is
+ * no usable checkout, so nothing else about the feature is worth reading. Then
+ * the MERGE QUEUE, because once a feature is enqueued its queue state is the
+ * thing the captain is waiting on (a resolver agent working a blocked head shows
+ * as `resolving`, not as a generic `working`, which is the more useful of the
+ * two). A crew agent running outside the queue is `working`, and everything else
+ * is `idle`: created, maybe committed, not yet lined up to land. `busy` is
+ * carried alongside either way, so an agent is never invisible.
+ */
+export function featureActivity(
+  provisionStatus: FeatureRecord["provisionStatus"],
+  queue: QueueEntryView | null | undefined,
+  busy: boolean,
+): FeatureActivity {
+  if (provisionStatus === "provisioning") return "provisioning";
+  if (provisionStatus === "failed") return "failed";
+  if (provisionStatus === "removed") return "removed";
+  if (queue) {
+    switch (queue.status) {
+      case "queued": return "queued";
+      case "head-processing": return "processing";
+      case "ready": return "ready";
+      case "blocked": return "blocked";
+      case "resolving": return "resolving";
+    }
+  }
+  return busy ? "working" : "idle";
 }
 
 /** Slug a name without throwing (an empty/degenerate name just yields ""), so

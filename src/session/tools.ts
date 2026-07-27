@@ -330,7 +330,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
           intent: {
             type: "string",
             description:
-              "Optional one-line statement of what the feature is for, echoed back in feature_status/feature_list this session.",
+              "One line saying what the feature is for. Optional, but give it every time: it is stored with the feature (surviving a restart), echoed back by feature_status/feature_list, and shown as the feature's description beside its branch in the captain's Ctrl-O features tab — where the branch name says what KIND of work it is and this is the only thing that says what the work actually is.",
           },
         },
         required: ["name"],
