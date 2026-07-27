@@ -92,9 +92,10 @@ export interface FeatureManagerOptions {
   /** How long the landing prepare waits on a PR's CI checks, and how often it
    *  looks. Defaults live in checks.ts; tests inject a no-op sleep. */
   checks?: ChecksPolicy;
-  /** Durable per-feature intents (featurestore.ts), loaded from the instance's
-   *  `.dispatch/features.json` at session start. Omit for an in-memory store —
-   *  the pre-persistence behaviour, and what tests get by default. */
+  /** Durable per-feature prose — intents and authored PR messages
+   *  (featurestore.ts) — loaded from the instance's `.dispatch/features.json` at
+   *  session start. Omit for an in-memory store — the pre-persistence behaviour,
+   *  and what tests get by default. */
   store?: FeatureStore;
   /** Overrides for the git/gate seams (tests only). */
   deps?: Partial<FeatureManagerDeps>;
@@ -239,11 +240,12 @@ export class FeatureManager {
    *  and the head-only state machine; drives the EXISTING prepare + gate through
    *  the deps below. FeatureManager is its host (busy check + record cleanup). */
   private readonly queue: MergeQueue;
-  /** Intents keyed by slug, so status/list and the panel's features tab can show
-   *  what a feature is FOR. Durable: git can rebuild everything else about a
-   *  feature from its worktree, but not the line the co wrote, so that one field
-   *  is persisted under `.dispatch/features.json` (featurestore.ts) and read back
-   *  at session start. */
+  /** The co's authored prose keyed by slug: the intent, so status/list and the
+   *  panel's features tab can show what a feature is FOR, and the PR title/body
+   *  written at enqueue, which the queue hands to landing.ts on every head
+   *  processing. Durable: git can rebuild everything else about a feature from its
+   *  worktree, but not what the co wrote, so those fields are persisted under
+   *  `.dispatch/features.json` (featurestore.ts) and read back at session start. */
   private readonly store: FeatureStore;
 
   constructor(opts: FeatureManagerOptions) {

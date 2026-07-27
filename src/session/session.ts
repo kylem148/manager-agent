@@ -271,10 +271,12 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // report the captain relayed by hand is filed the same way a dispatched one is.
   const inbox = await ReviewInbox.load(paths);
 
-  // The durable half of a feature record: the one-line intents the co authored
-  // at create time. Everything else about a feature is rebuilt from git by the
-  // boot reconcile below; the description is the one thing git cannot recover,
-  // so it is read back from disk here and shown for recovered worktrees too.
+  // The durable half of a feature record: the one-line intents the co authored at
+  // create time, and the PR title/body it authored at enqueue. Everything else
+  // about a feature is rebuilt from git by the boot reconcile below; that prose is
+  // what git cannot recover, so it is read back from disk here — which is what
+  // lets a recovered worktree still show its description, and a head re-processed
+  // after a restart still open its pull request with the message the co wrote.
   const featureStore = await FeatureStore.load(paths);
 
   const system = await buildSystemPrompt(paths, cfg.research, {
