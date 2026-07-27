@@ -65,6 +65,7 @@ import {
 import { DispatchRegistry, readFileTail, type Job } from "./registry.js";
 import { FeatureManager } from "./features.js";
 import { FeatureStore } from "./featurestore.js";
+import { TaskStore } from "./taskstore.js";
 import type { MergeHeadResult } from "./mergequeue.js";
 import { DEFAULT_FEATURE_BRANCH_TYPE, defaultWorktreeBase, featureSlug } from "./worktrees.js";
 import { scrubCapture } from "./transport.js";
@@ -130,6 +131,10 @@ interface SessionState {
   /** The rolling record of filed crew reviews (the Ctrl-O Inbox tab). Loaded at
    *  session start, so it carries the previous sessions' reviews. */
   inbox: ReviewInbox;
+  /** The co's at-a-glance task table (the Ctrl-O Home tab). Loaded at session
+   *  start, so the panel shows the last table the co wrote before it says a word
+   *  this session. */
+  tasks: TaskStore;
   /** The job whose review turn is running right now, or null. Lets file_review
    *  default its jobId/feature to the run the co was just handed, so the co only
    *  has to name them when it files a review for something else. */
@@ -283,6 +288,11 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // after a restart still open its pull request with the message the co wrote.
   const featureStore = await FeatureStore.load(paths);
 
+  // The co's at-a-glance task table, painted by the panel's Home tab. Loaded
+  // whether or not the instance is linked — the table is the co's own and needs
+  // no repo — and a missing or corrupt file is simply an empty table.
+  const taskStore = await TaskStore.load(paths);
+
   // The spend meter. Loads before the first turn (including the cold-start
   // greeting, which is a real billed turn) and is otherwise silent all session.
   const costs = await CostLedger.load(paths);
@@ -313,6 +323,10 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
         // The Inbox tab reads the in-memory store fresh at paint time, so a
         // review filed mid-session shows without any subscription.
         inbox: { list: () => inbox.list() },
+        // The Home tab's task table, on the same rule: the co rewrites the whole
+        // table through the task_table tool and the next paint shows it. Wired
+        // whether or not the instance is linked, so Ctrl-O always has a Home.
+        tasks: { list: () => taskStore.list() },
         // The merge-queue panel tab only exists when the instance is linked (a
         // queue needs a repo). Read fresh at paint time via the FeatureManager,
         // which is created below; the closure is never called before then.
@@ -338,11 +352,17 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
                 // and leaves the checks, the gate and the queue untouched.
                 editPrMessage: (message) => panelEditPrMessage(state, message),
               },
-              // The features tab: every tracked worktree, not just the queued
-              // ones. Derived in memory from the registry + the queue + the
-              // stored intents, so this reads fresh at paint time like the other
-              // sources and costs no git call and no model call.
-              features: { list: () => state.features?.overview() ?? [] },
+              // The Home tab's worktree list: every tracked worktree, not just
+              // the queued ones. Derived in memory from the registry + the queue
+              // + the stored intents, so this reads fresh at paint time like the
+              // other sources and costs no git call and no model call. `refresh`
+              // is the one exception and the reason it exists: the dirty flag
+              // needs a `git status` per worktree, so the panel asks for it when
+              // the captain opens Home and never on a paint.
+              features: {
+                list: () => state.features?.overview() ?? [],
+                refresh: () => state.features?.refreshDirty() ?? Promise.resolve(),
+              },
             }
           : {}),
       })
@@ -365,6 +385,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     reviewQueue: [],
     queueNotices: [],
     inbox,
+    tasks: taskStore,
     reviewingJob: null,
     costs,
   };
@@ -638,6 +659,9 @@ async function drive(
     // Filing a review persists the record and owns the level-gated chat output.
     // Always wired: a review is filed whether the run was dispatched or relayed.
     onFileReview: (input) => fileReview(state, input),
+    // The task table the Home tab paints. Always wired for the same reason the
+    // inbox is: it is the co's own state and outlives any link to a repo.
+    tasks: state.tasks,
   });
 
   // Streaming render state. "mode" tracks whether the open transcript line is

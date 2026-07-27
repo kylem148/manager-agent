@@ -340,7 +340,17 @@ log. The full detail (rationale, history, design notes, done items) lives in
 aggressively: when an item is no longer a live next step, drop it from the table
 and let the logs carry the record. Default columns Task | Type | Status; render
 it at session start, after a crew review, and when next steps change, not every
-turn.`;
+turn.
+
+**The table is persisted, and the panel paints it.** Call \`task_table\` with the
+whole table whenever it changes — it replaces every row in one call (an empty
+list clears it), and the captain reads the result in the panel (Ctrl-O, Home
+tab), where it sits above the worktree list. That is where the table LIVES now,
+so keep the store current rather than only printing the table into the chat: a
+table you only spoke is one the captain cannot look at between turns. Update it
+in the same turn as the change it reflects — a crew review that moves an item on,
+a new next step, an item you have pruned — and keep printing it into the chat
+only when the captain actually wants to read it there.`;
 
 /**
  * The dispatch section, included only when the instance is linked to a repo.
@@ -430,7 +440,7 @@ checkpoint over everything it produced.
   work was done.
 - Always give the \`intent\` too: it is one plain line saying what the feature is
   FOR, it is stored with the feature (surviving a restart), and it is what the
-  captain reads beside every worktree in the Ctrl-O features tab. The branch name
+  captain reads beside every worktree in the Ctrl-O Home tab. The branch name
   says what KIND of work it is; the intent is the only thing that says what the
   work actually is.
 - Dispatch into a feature by passing its name as \`dispatch_order\`'s \`feature\`
