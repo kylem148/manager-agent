@@ -5,6 +5,7 @@ import {
   type LandingOptions,
   type PrepareResult,
 } from "./landing.js";
+import type { CommandRunner } from "./forge.js";
 import { resolveWorktreeOptions } from "./worktrees.js";
 
 /**
@@ -28,15 +29,22 @@ import { resolveWorktreeOptions } from "./worktrees.js";
  *   blocked ──holds the queue── until the captain resolves (re-enqueue to retry) or removes it.
  *
  * THE MERGE IS PANEL-NATIVE (D-20260724-12). mergeReadyHead performs the merge
- * outright: no gate is opened, nothing is awaited but git. The human act that
- * authorises it is the Ctrl-O panel's [m] keystroke on a ready head, and the
+ * outright: no gate is opened, nothing is awaited but git and gh. The human act
+ * that authorises it is the Ctrl-O panel's [m] keystroke on a ready head, and the
  * panel calls this directly — so the co's agent loop is never parked waiting on
  * a keypress. The old shape (a co tool call that opened a blocking review gate
  * and held the turn open until [m]) is gone; the queue no longer knows the Tui
  * exists. What guards the merge is unchanged and lives BELOW here: the head must
- * be `ready` (rebased onto the current dev tip with a green build+test on the
- * combined state), and executeLanding still pins to the exact tested featureSha
- * and CAS-writes dev, so a stale green fails loudly instead of landing.
+ * be `ready` (rebased onto the current `origin/dev` tip with a green build+test
+ * on the combined state and its PR open), and executeLanding pins the merge to
+ * the tested featureSha, the tested `origin/dev`, and that PR — so a stale green
+ * fails loudly instead of landing.
+ *
+ * THE MERGE ITSELF IS SERVER-SIDE (D-20260724-13). Nothing here writes `dev`;
+ * executeLanding merges the feature's pull request on GitHub with a merge commit
+ * and fetches afterwards. "Processing the head against the new dev tip" therefore
+ * means against the freshly-fetched `origin/dev` — a fetch is the only way the
+ * queue learns anything moved, and it is the only remote read it performs.
  *
  * STRICT SERIAL, HEAD-ONLY, NO SET-ASIDE (D-20260723-21): a blocked head keeps
  * its position and holds everything behind it. Nothing is set aside, nothing red
@@ -122,11 +130,14 @@ export interface QueueView {
 
 /**
  * The head's inline body for the Ctrl-O queue tab (D-20260724-12). A ready head
- * carries exactly what pressing [m] would land — the per-job commits, the full
- * patch against dev, and the build+test that passed on the combined state — so
- * the affordance and its evidence sit in one view. A blocked head carries why it
- * is not mergeable (and, for the two fixable flavours, what the resolver would
- * be sent at). Anything else has no body.
+ * carries exactly what pressing [m] would land — the PULL REQUEST co opened
+ * (title and body), the per-job commits it carries, and the build+test that
+ * passed on the combined state — so the affordance and its evidence sit in one
+ * view. Since D-20260724-13 that is the PR message rather than a bare patch:
+ * the patch lives on GitHub, where the captain can read, comment on and edit it,
+ * and what the panel needs to show is what will actually be merged there.
+ * A blocked head carries why it is not mergeable (and, for the two fixable
+ * flavours, what the resolver would be sent at). Anything else has no body.
  *
  * Structurally what the Tui's QueueHeadDetail declares; the Tui does not import
  * from the session layer, so the two are kept assignable rather than shared.
@@ -135,11 +146,13 @@ export type QueueHeadDetail =
   | {
       kind: "ready";
       feature: string;
-      /** The integration branch the merge writes (e.g. "dev"). */
+      /** The integration branch the PR merges into (e.g. "dev"). */
       target: string;
       commits: string[];
-      diff: string;
       buildTest?: BuildTestSummary;
+      /** The open PR [m] would merge. Absent only if a green somehow carried no
+       *  PR, which the ready gate below already excludes. */
+      pr?: { number: number; url: string; title: string; body: string };
     }
   | {
       kind: "blocked";
@@ -184,6 +197,10 @@ export interface MergeQueueOptions {
   repoPath: string;
   /** Combined build+test for the landing prepare (the head's gate to ready). */
   buildTestCommand: string;
+  /** The remote carrying the integration branch. Default "origin". */
+  remote?: string;
+  /** Injected runner for the remote/gh surface (tests); production omits it. */
+  run?: CommandRunner;
   host: MergeQueueHost;
   deps?: Partial<MergeQueueDeps>;
 }
@@ -223,6 +240,8 @@ export interface MergeHeadResult {
   /** Present on a merge: the merge commit and the branch it landed on. */
   mergeSha?: string;
   target?: string;
+  /** Present on a merge: the pull request that carried it. */
+  pr?: { number: number; url: string };
   /** The head AFTER the operation: on a merge, the next feature (already
    *  processed against the new dev tip); otherwise the same head. */
   head: QueueEntryView | null;
@@ -249,12 +268,16 @@ export class MergeQueue {
   private readonly entries: QueueEntry[] = [];
   private readonly repoPath: string;
   private readonly buildTestCommand: string;
+  private readonly remote: string | undefined;
+  private readonly run: CommandRunner | undefined;
   private readonly host: MergeQueueHost;
   private readonly deps: MergeQueueDeps;
 
   constructor(opts: MergeQueueOptions) {
     this.repoPath = opts.repoPath;
     this.buildTestCommand = opts.buildTestCommand;
+    this.remote = opts.remote;
+    this.run = opts.run;
     this.host = opts.host;
     this.deps = {
       prepare: opts.deps?.prepare ?? prepareLanding,
@@ -263,11 +286,17 @@ export class MergeQueue {
   }
 
   private landingOptions(): LandingOptions {
-    return { repoPath: this.repoPath, buildTestCommand: this.buildTestCommand };
+    return {
+      repoPath: this.repoPath,
+      buildTestCommand: this.buildTestCommand,
+      ...(this.remote ? { remote: this.remote } : {}),
+      ...(this.run ? { run: this.run } : {}),
+    };
   }
 
   private get targetBranch(): string {
-    return resolveWorktreeOptions({ repoPath: this.repoPath }).devBranch;
+    return resolveWorktreeOptions({ repoPath: this.repoPath, ...(this.remote ? { remote: this.remote } : {}) })
+      .devBranch;
   }
 
   /** Whether a feature is anywhere in the queue. */
@@ -331,8 +360,8 @@ export class MergeQueue {
         feature: head.feature,
         target,
         commits: p.commits,
-        diff: p.diff,
         ...(p.buildTest ? { buildTest: p.buildTest } : {}),
+        ...(p.pr ? { pr: { number: p.pr.number, url: p.pr.url, title: p.pr.title, body: p.pr.body } } : {}),
       };
     }
     if (head.status === "blocked") {
@@ -391,11 +420,13 @@ export class MergeQueue {
   }
 
   /**
-   * Process the head: rebase it onto the current dev tip and run the combined
-   * build+test, via the EXISTING prepareLanding. Green (with commits) -> ready;
-   * a rebase conflict, a red build+test, or any prepare precondition failure ->
-   * blocked. This is the only place the queue runs git, and it only ever touches
-   * the head. Callable directly to retry a blocked head after a manual fix.
+   * Process the head: fetch, rebase it onto the fresh `origin/dev` tip, run the
+   * combined build+test, push it and open/refresh its PR — via the EXISTING
+   * prepareLanding. Green (with commits) -> ready; a rebase conflict, a red
+   * build+test, or any prepare precondition failure (no gh, not authenticated,
+   * no `origin/dev`) -> blocked, carrying the message. This is the only place the
+   * queue runs git or gh, and it only ever touches the head. Callable directly to
+   * retry a blocked head after a manual fix.
    */
   async processHead(): Promise<ProcessHeadResult> {
     const head = await this.runProcessHead();
@@ -454,7 +485,7 @@ export class MergeQueue {
       case "green":
         if (result.commits.length === 0) {
           head.status = "blocked";
-          head.blockedReason = "no commits beyond dev; nothing to land (abandon it instead)";
+          head.blockedReason = "no commits beyond origin/dev; nothing to land (abandon it instead)";
         } else {
           head.status = "ready";
         }
@@ -563,8 +594,9 @@ export class MergeQueue {
    *
    * Only a `ready` (green) head merges; anything else is refused with the reason
    * and NOTHING is written. On a merge, executeLanding lands the head on dev
-   * (a --no-ff merge commit, per-job commits kept) and tears down the worktree +
-   * branch; the entry is dropped, the owner forgets it, and the NEW head is
+   * (its PR merged on GitHub with a merge commit, per-job commits kept) and tears
+   * down the worktree while KEEPING the branch ref; the entry is dropped, the
+   * owner forgets it, and the NEW head is
    * immediately processed against the just-moved dev tip — so by the time this
    * resolves, the next head's `[m]` is either already live (green) or the head is
    * blocked and the caller can escalate. On an executeLanding refusal the green
@@ -572,8 +604,9 @@ export class MergeQueue {
    * truth rather than the stale green that just failed.
    *
    * The merge reuses the head's ALREADY-computed green (from processHead) rather
-   * than re-running the build+test: executeLanding pins to that exact featureSha
-   * and CAS-writes dev, so a branch or a dev that moved since fails loudly.
+   * than re-running the build+test: executeLanding pins to that exact featureSha,
+   * the `origin/dev` it was tested against and the PR that was reviewed, so a
+   * branch or a dev that moved since fails loudly instead of merging untested work.
    */
   async mergeReadyHead(): Promise<MergeHeadResult> {
     const head = this.entries[0];
@@ -616,11 +649,18 @@ export class MergeQueue {
     const target = this.targetBranch;
     const green = head.prepared;
     let mergeSha: string;
+    let pr: { number: number; url: string } | undefined;
     try {
+      // Pin the merge to everything the green covered: the tested tip, the
+      // `origin/dev` it was tested against (a dev that moved makes the green
+      // stale — the catch below re-processes), and the PR that was reviewed.
       const landed = await this.deps.execute(this.landingOptions(), head.feature, {
         featureSha: green.featureSha,
+        devSha: green.devSha,
+        ...(green.pr ? { prNumber: green.pr.number } : {}),
       });
       mergeSha = landed.mergeSha;
+      pr = landed.pr;
     } catch (e) {
       // executeLanding refused (a stale green, a moved branch, dev checked out
       // somewhere). Nothing was written. The green is no longer trustworthy:
@@ -642,10 +682,11 @@ export class MergeQueue {
       };
     }
 
-    // The worktree/branch are gone (executeLanding tore them down). Drop the
-    // record and advance: the next feature becomes head and is processed against
-    // the dev tip this merge just moved, so its [m] is live (or its block is
-    // visible) the moment this returns.
+    // The worktree is gone and the branch ref kept (executeLanding tore only the
+    // checkout down). Drop the record and advance: the next feature becomes head
+    // and is processed against the `origin/dev` this merge just moved — fetched
+    // fresh by its own prepare — so its [m] is live (or its block is visible) the
+    // moment this returns.
     this.host.forget(head.feature);
     this.entries.shift();
     const next = await this.runProcessHead();
@@ -653,11 +694,12 @@ export class MergeQueue {
       merged: true,
       outcome: "merged",
       feature: head.feature,
-      summary: `merged ${head.feature}: ${mergeSha.slice(0, 7)} on ${target}${
+      summary: `merged ${head.feature}: ${pr ? `PR #${pr.number} → ` : ""}${target} (${mergeSha.slice(0, 7)})${
         next ? `; next head '${next.feature}' is ${next.status}` : "; the queue is now empty"
       }`,
       mergeSha,
       target,
+      ...(pr ? { pr } : {}),
       head: this.entries[0] ? this.toView(this.entries[0], 0) : null,
       queue: this.view(),
     };

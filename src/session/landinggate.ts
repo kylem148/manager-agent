@@ -11,11 +11,13 @@ import type { LandingGateOutcome, LandingPrepared, LandingReview } from "../tui/
 /**
  * The human landing gate: the review surface that sits between prepareLanding
  * and executeLanding. reviewLanding prepares a feature and presents the result
- * in the Tui's overlay (summary + paged diff + action bar); the merge happens
- * ONLY if the human presses [m] there over a green prepare. This module is the
- * single live call site of executeLanding, and it reaches it exclusively
- * through the LandingReview.execute callback the overlay fires on that
- * keystroke - there is no code path that merges without it.
+ * in the Tui's overlay (summary + the PR it opened + paged diff + action bar);
+ * the merge happens ONLY if the human presses [m] there over a green prepare.
+ * This module is the single live call site of executeLanding for the direct
+ * feature_land route, and it reaches it exclusively through the
+ * LandingReview.execute callback the overlay fires on that keystroke - there is
+ * no code path that merges without it. Since D-20260724-13 that merge is
+ * `gh pr merge --merge` on the feature's pull request, not a local write.
  *
  * The co's orchestration tools that trigger a review are a later slice; for
  * now callers (and tests) invoke reviewLanding directly.
@@ -80,12 +82,16 @@ export async function reviewLanding(
         throw new Error(`prepare was ${preparedResult.kind}, not green; nothing tested to merge`);
       }
       try {
-        landed = await executeLanding(opts, feature, { featureSha: preparedResult.featureSha });
+        landed = await executeLanding(opts, feature, {
+          featureSha: preparedResult.featureSha,
+          devSha: preparedResult.devSha,
+          ...(preparedResult.pr ? { prNumber: preparedResult.pr.number } : {}),
+        });
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
         throw e;
       }
-      return `landed ${feature}: ${landed.mergeSha.slice(0, 7)} on ${target}`;
+      return `merged PR #${landed.pr.number}: ${feature} → ${target} (${landed.mergeSha.slice(0, 7)})`;
     },
   });
   return { prepared: preparedResult, outcome, landed, error };
@@ -95,7 +101,12 @@ export async function reviewLanding(
 function toView(p: PrepareResult): LandingPrepared {
   switch (p.kind) {
     case "green":
-      return { kind: "green", commits: p.commits, diff: p.diff };
+      return {
+        kind: "green",
+        commits: p.commits,
+        diff: p.diff,
+        ...(p.pr ? { pr: { number: p.pr.number, url: p.pr.url, title: p.pr.title } } : {}),
+      };
     case "conflict":
       return { kind: "conflict", conflictFiles: p.conflictFiles, detail: p.detail };
     case "failed":

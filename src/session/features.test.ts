@@ -17,15 +17,24 @@ import {
 } from "./worktrees.js";
 import type { LandingGateHost } from "./landinggate.js";
 import type { LandingReview } from "../tui/tui.js";
+import { makeFakeForge, type FakeForge } from "./forgefake.test.js";
 
 /**
  * Tests for the co-facing feature levers (features.ts), against real throwaway
  * git repos — the levers are thin wrappers over git plumbing, so the subject is
- * what git ends up doing. The DispatchRegistry is real but built with
- * ghosttyAvailable: false (no panes needed here; the feature-scoped DISPATCH cwd
- * is proved in registry.test.ts) and a stub installHook so the suite never
- * mutates the developer's ~/.claude. The landing gate is a scripted host, the
- * same stand-in landinggate.test.ts uses for the human's [m]/[r] keystroke.
+ * what git ends up doing — with the whole remote surface (fetch, push, gh) served
+ * by the fake forge. No network, no gh binary, no GitHub account.
+ *
+ * `dev` here lives ONLY on the fake remote, and the fixture checks the local
+ * `dev` out in the primary tree: that is the captain's real setup, and it is
+ * exactly what the old local merge could not cope with. Every landing assertion
+ * reads `fx.originDev()`, because that is now the only dev co ever moves.
+ *
+ * The DispatchRegistry is real but built with ghosttyAvailable: false (no panes
+ * needed here; the feature-scoped DISPATCH cwd is proved in registry.test.ts)
+ * and a stub installHook so the suite never mutates the developer's ~/.claude.
+ * The landing gate is a scripted host, the same stand-in landinggate.test.ts
+ * uses for the human's [m]/[r] keystroke.
  */
 
 function run(cwd: string, args: string[]): string {
@@ -51,6 +60,11 @@ interface Fixture {
   base: string;
   registry: DispatchRegistry;
   features: FeatureManager;
+  forge: FakeForge;
+  /** The integration tip as the remote holds it — the only dev co moves. */
+  originDev: () => string;
+  /** WorktreeOptions for calling the plumbing directly in a test. */
+  opts: { repoPath: string; run: FakeForge["run"] };
   cleanup: () => Promise<void>;
 }
 
@@ -68,6 +82,11 @@ async function makeFixture(gateHost?: LandingGateHost): Promise<Fixture> {
   await fsp.writeFile(path.join(repo, "file.txt"), "hello\n", "utf8");
   run(repo, ["add", "."]);
   run(repo, ["commit", "-q", "-m", "init"]);
+  // The captain's checkout: dev exists locally and is checked out here. co must
+  // never write it — every landing goes to the remote through a PR.
+  run(repo, ["branch", "dev", "main"]);
+  run(repo, ["checkout", "-q", "dev"]);
+  const forge = makeFakeForge(repo, { dev: run(repo, ["rev-parse", "dev"]) });
 
   const paths = instancePaths(path.join(root, "home"), "inst");
   await fsp.mkdir(paths.captures, { recursive: true });
@@ -85,6 +104,7 @@ async function makeFixture(gateHost?: LandingGateHost): Promise<Fixture> {
   const features = new FeatureManager({
     registry,
     repoPath: repo,
+    run: forge.run,
     ...(gateHost ? { gateHost } : {}),
     buildTestCommand: "true",
   });
@@ -93,6 +113,9 @@ async function makeFixture(gateHost?: LandingGateHost): Promise<Fixture> {
     base: defaultWorktreeBase(repo),
     registry,
     features,
+    forge,
+    originDev: () => forge.branches.get("dev")!,
+    opts: { repoPath: repo, run: forge.run },
     cleanup: async () => {
       registry.stop();
       await fsp.rm(root, { recursive: true, force: true });
@@ -100,7 +123,7 @@ async function makeFixture(gateHost?: LandingGateHost): Promise<Fixture> {
   };
 }
 
-test("feature_create provisions a worktree off dev and registers the record; a second create is idempotent", async () => {
+test("feature_create provisions a worktree off origin/dev and registers the record; a second create is idempotent", async () => {
   const fx = await makeFixture();
   try {
     const res = await fx.features.create("User Auth", "add login");
@@ -109,11 +132,13 @@ test("feature_create provisions a worktree off dev and registers the record; a s
     assert.equal(res.feature.branch, "co/feat-user-auth");
     assert.equal(res.feature.provisionStatus, "ready");
     assert.equal(res.feature.intent, "add login");
-    // A real worktree exists on the feature branch, cut from dev; main is untouched.
+    // A real worktree exists on the feature branch, cut from origin/dev.
     assert.ok(fs.existsSync(res.feature.worktreePath));
     assert.equal(run(res.feature.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]), "co/feat-user-auth");
-    assert.ok(branchExists(fx.repo, "dev"), "dev was created off main");
-    assert.equal(run(fx.repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert.equal(run(res.feature.worktreePath, ["rev-parse", "HEAD"]), fx.originDev());
+    // The captain's own checkout is untouched: still on dev, still at its tip.
+    assert.equal(run(fx.repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "dev");
+    assert.equal(run(fx.repo, ["status", "--porcelain"]), "");
     // The registry now tracks it.
     assert.equal(fx.registry.getFeature("User Auth")?.slug, "user-auth");
 
@@ -194,7 +219,7 @@ test("feature_abandon keeps a committed-but-unmerged branch and reports why", as
     assert.equal(res.abandoned, true, "a CLEAN worktree (committed work) can be abandoned");
     assert.equal(res.teardown?.worktreeRemoved, true);
     assert.equal(res.teardown?.branchDeleted, false, "but the unmerged branch is KEPT");
-    assert.match(res.teardown?.branchKeptReason ?? "", /not merged into 'dev'/);
+    assert.match(res.teardown?.branchKeptReason ?? "", /not merged into 'origin\/dev'/);
     assert.ok(branchExists(fx.repo, created.feature.branch), "the branch survives to preserve the work");
   } finally {
     await fx.cleanup();
@@ -240,11 +265,17 @@ test("feature_land runs prepare, opens the gate, and merges on [m]; the record i
     assert.equal(res.outcome, "merged");
     assert.equal(res.prepared, "green");
     assert.ok(res.merged);
-    // The gate saw the real prepare; dev moved to the merge; teardown followed.
+    // The gate saw the real prepare, and it saw the PR it would merge.
     assert.equal(seen.length, 1);
     assert.equal(seen[0]!.feature, "ship-it");
-    assert.equal(run(fx.repo, ["rev-parse", "dev"]), res.merged.mergeSha);
-    assert.ok(!branchExists(fx.repo, created.feature.branch), "the branch is torn down after the merge");
+    const gated = seen[0]!.prepared;
+    assert.equal(gated.kind, "green");
+    if (gated.kind === "green") assert.equal(gated.pr?.number, res.merged.pr.number);
+    // origin/dev moved to the merge commit; the worktree went, the branch stayed.
+    assert.equal(fx.originDev(), res.merged.mergeSha);
+    assert.equal(fx.forge.prs[0]!.state, "MERGED");
+    assert.ok(!fs.existsSync(created.feature.worktreePath), "the worktree is torn down");
+    assert.ok(branchExists(fx.repo, created.feature.branch), "the branch ref is kept after a PR merge");
     assert.equal(fx.registry.getFeature("ship-it"), undefined, "the record is dropped after landing");
   } finally {
     await fx.cleanup();
@@ -257,12 +288,13 @@ test("feature_land opens the gate but [r] merges nothing and leaves the feature 
   try {
     const created = await fx.features.create("keep-me");
     await commitIn(created.feature.worktreePath, "k.txt", "k\n", "job: k");
-    const devBefore = run(fx.repo, ["rev-parse", "dev"]);
+    const devBefore = fx.originDev();
 
     const res = await fx.features.land("keep-me");
     assert.equal(res.outcome, "rejected");
     assert.equal(res.prepared, "green");
-    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devBefore, "rejection wrote nothing");
+    assert.equal(fx.originDev(), devBefore, "rejection merged nothing");
+    assert.equal(fx.forge.prs[0]!.state, "OPEN", "the PR stays open for another look");
     assert.ok(branchExists(fx.repo, created.feature.branch));
     assert.ok(fx.registry.getFeature("keep-me"), "a rejected feature stays tracked");
   } finally {
@@ -292,7 +324,7 @@ test("reconcileAtBoot rebuilds a record from an on-disk worktree with an empty r
   try {
     // Provision a worktree directly (as a prior session would have), bypassing
     // the manager so its registry starts empty — exactly the restart case.
-    const rec = await provisionWorktree({ repoPath: fx.repo }, "survivor");
+    const rec = await provisionWorktree(fx.opts, "survivor");
     assert.equal(fx.registry.getFeature("survivor"), undefined, "registry is empty before reconcile");
 
     const report = await fx.features.reconcileAtBoot();
@@ -313,12 +345,12 @@ test("reconcileAtBoot rebuilds a record from an on-disk worktree with an empty r
 test("reconcileFeatures surfaces a branch-without-worktree anomaly for unmerged work, destroying nothing", async () => {
   const fx = await makeFixture();
   try {
-    const rec = await provisionWorktree({ repoPath: fx.repo }, "orphan");
+    const rec = await provisionWorktree(fx.opts, "orphan");
     await commitIn(rec.worktreePath, "w.txt", "unmerged\n", "job: unmerged work");
     // Remove just the worktree, leaving the branch with unmerged commits.
     run(fx.repo, ["worktree", "remove", "--force", rec.worktreePath]);
 
-    const report = await reconcileFeatures({ repoPath: fx.repo });
+    const report = await reconcileFeatures(fx.opts);
     assert.equal(report.records.length, 0);
     assert.equal(report.anomalies.length, 1);
     assert.equal(report.anomalies[0]!.kind, "branch-without-worktree");
@@ -330,19 +362,20 @@ test("reconcileFeatures surfaces a branch-without-worktree anomaly for unmerged 
   }
 });
 
-test("reconcileFeatures flags a merged branch with no worktree as half-landed", async () => {
+test("reconcileFeatures says NOTHING about a landed branch whose worktree is gone: that is the resting state", async () => {
   const fx = await makeFixture();
   try {
-    // A fresh feature branch equals dev (no divergence): fully contained in dev.
-    const rec = await provisionWorktree({ repoPath: fx.repo }, "halfway");
+    // A branch contained in origin/dev with no worktree is exactly what every
+    // landed feature leaves behind now that refs are kept. Reporting it would
+    // mean flagging the whole history on every boot.
+    const rec = await provisionWorktree(fx.opts, "halfway");
     run(fx.repo, ["worktree", "remove", "--force", rec.worktreePath]);
 
-    const report = await reconcileFeatures({ repoPath: fx.repo });
+    const report = await reconcileFeatures(fx.opts);
     assert.equal(report.records.length, 0);
-    assert.equal(report.anomalies.length, 1);
-    assert.equal(report.anomalies[0]!.kind, "half-landed");
-    assert.equal(report.anomalies[0]!.ref, featureBranch("halfway"));
-    assert.ok(branchExists(fx.repo, rec.branch), "still not destroyed");
+    assert.deepEqual(report.anomalies, [], "a landed, kept branch is not an anomaly");
+    assert.equal(featureBranch("halfway"), rec.branch);
+    assert.ok(branchExists(fx.repo, rec.branch), "and it is certainly not destroyed");
   } finally {
     await fx.cleanup();
   }
@@ -357,7 +390,7 @@ test("reconcileFeatures flags a stray directory under the base and leaves it in 
     await fsp.mkdir(stray);
     await fsp.writeFile(path.join(stray, "junk.txt"), "junk\n", "utf8");
 
-    const report = await reconcileFeatures({ repoPath: fx.repo });
+    const report = await reconcileFeatures(fx.opts);
     const strayAnomaly = report.anomalies.find((a) => a.kind === "stray-directory");
     assert.ok(strayAnomaly, "the stray dir is surfaced");
     assert.equal(strayAnomaly.ref, stray);
@@ -370,12 +403,12 @@ test("reconcileFeatures flags a stray directory under the base and leaves it in 
 test("reconcileFeatures rebuilds a record AND surfaces an anomaly side by side", async () => {
   const fx = await makeFixture();
   try {
-    const live = await provisionWorktree({ repoPath: fx.repo }, "alive");
-    const gone = await provisionWorktree({ repoPath: fx.repo }, "gone");
+    const live = await provisionWorktree(fx.opts, "alive");
+    const gone = await provisionWorktree(fx.opts, "gone");
     await commitIn(gone.worktreePath, "g.txt", "x\n", "job: work");
     run(fx.repo, ["worktree", "remove", "--force", gone.worktreePath]);
 
-    const report = await reconcileFeatures({ repoPath: fx.repo });
+    const report = await reconcileFeatures(fx.opts);
     assert.deepEqual(
       report.records.map((r) => r.slug),
       ["alive"],
@@ -391,7 +424,7 @@ test("reconcileFeatures rebuilds a record AND surfaces an anomaly side by side",
 
 // --- serial merge queue (end to end, real git + scripted gate) ---------------
 
-test("merge queue: enqueue two, head processes to ready, the panel's [m] merges and the second advances onto the NEW dev", async () => {
+test("merge queue: enqueue two, head processes to ready, the panel's [m] merges its PR and the second advances onto the NEW origin/dev", async () => {
   // A gate host is wired but must never be touched: since D-20260724-12 a queue
   // head merges through the PANEL, not through the feature_land review gate.
   const seen: LandingReview[] = [];
@@ -401,7 +434,7 @@ test("merge queue: enqueue two, head processes to ready, the panel's [m] merges 
     const b = await fx.features.create("beta");
     await commitIn(a.feature.worktreePath, "a.txt", "a\n", "job: alpha");
     await commitIn(b.feature.worktreePath, "b.txt", "b\n", "job: beta");
-    const devStart = run(fx.repo, ["rev-parse", "dev"]);
+    const devStart = fx.originDev();
 
     // Enqueue alpha: it becomes head and is processed (rebase + build+test) to ready.
     const eA = await fx.features.enqueue("alpha");
@@ -417,16 +450,18 @@ test("merge queue: enqueue two, head processes to ready, the panel's [m] merges 
     assert.equal(eB.head?.feature, "alpha");
     assert.equal(eB.entry.position, 2);
     assert.equal(eB.entry.status, "queued");
-    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devStart, "dev has not moved yet");
+    assert.equal(fx.originDev(), devStart, "dev has not moved yet");
 
     // The captain presses [m] on the ready head in the panel.
     const m1 = await fx.features.mergeReadyHead();
     assert.equal(m1.merged, true);
     assert.equal(m1.feature, "alpha");
-    const devAfterA = run(fx.repo, ["rev-parse", "dev"]);
+    const devAfterA = fx.originDev();
     assert.equal(devAfterA, m1.mergeSha);
-    assert.notEqual(devAfterA, devStart, "dev advanced to alpha's merge");
-    assert.ok(!branchExists(fx.repo, "co/feat-alpha"), "alpha's worktree/branch torn down");
+    assert.notEqual(devAfterA, devStart, "origin/dev advanced to alpha's merge");
+    assert.equal(m1.pr?.number, 1, "the merge went through alpha's PR");
+    assert.ok(!fs.existsSync(a.feature.worktreePath), "alpha's worktree is torn down");
+    assert.ok(branchExists(fx.repo, "co/feat-alpha"), "alpha's branch ref is kept");
     assert.equal(fx.registry.getFeature("alpha"), undefined, "alpha's record dropped");
 
     // The queue advanced: beta is now head and was processed AGAINST the new dev.
@@ -439,15 +474,100 @@ test("merge queue: enqueue two, head processes to ready, the panel's [m] merges 
     assert.equal(m2.feature, "beta");
     assert.equal(m2.head, null, "the queue is now empty");
     assert.equal(fx.features.queueView().size, 0);
-    const devAfterB = run(fx.repo, ["rev-parse", "dev"]);
+    const devAfterB = fx.originDev();
     assert.equal(devAfterB, m2.mergeSha);
-    assert.equal(run(fx.repo, ["rev-parse", "dev^1"]), devAfterA, "beta merged on top of alpha's dev");
-    // Both features' work is on dev, as two serial merge commits; main untouched.
-    assert.equal(run(fx.repo, ["show", "dev:a.txt"]), "a");
-    assert.equal(run(fx.repo, ["show", "dev:b.txt"]), "b");
-    assert.equal(run(fx.repo, ["rev-list", "--merges", "--count", "dev"]), "2");
-    assert.equal(run(fx.repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert.equal(run(fx.repo, ["rev-parse", `${devAfterB}^1`]), devAfterA, "beta merged on top of alpha's dev");
+    // Both features' work is on origin/dev, as two serial merge commits.
+    assert.equal(run(fx.repo, ["show", `${devAfterB}:a.txt`]), "a");
+    assert.equal(run(fx.repo, ["show", `${devAfterB}:b.txt`]), "b");
+    assert.equal(run(fx.repo, ["rev-list", "--merges", "--count", devAfterB]), "2");
+    assert.equal(fx.forge.prs.length, 2, "one PR per feature, both merged");
+    assert.ok(fx.forge.prs.every((pr) => pr.state === "MERGED"));
+    // The captain's checkout never moved, and no gh call ever deleted a branch.
+    assert.equal(run(fx.repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "dev");
+    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devStart, "the LOCAL dev ref is never written");
+    assert.ok(!fx.forge.calls.some((c) => /--delete-branch|--squash|--rebase/.test(c)));
     assert.equal(seen.length, 0, "no review gate was ever opened: the merge is panel-native");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a head whose origin/dev moved under it is re-validated, not merged: refuse, re-fetch, re-rebase, re-test", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("late");
+    await commitIn(a.feature.worktreePath, "a.txt", "a\n", "job: late");
+    const enq = await fx.features.enqueue("late");
+    assert.equal(enq.enqueued, true);
+    if (!enq.enqueued) return;
+    assert.equal(enq.head?.status, "ready", "green against the origin/dev it was tested on");
+    const testedBase = fx.originDev();
+
+    // Someone else merges something into dev on GitHub while the head sits
+    // ready. The green now covers a combined state that was never built.
+    const tree = run(fx.repo, ["rev-parse", `${testedBase}^{tree}`]);
+    const moved = run(fx.repo, ["commit-tree", "-p", testedBase, "-m", "someone else landed", tree]);
+    fx.forge.branches.set("dev", moved);
+
+    const res = await fx.features.mergeReadyHead();
+    assert.equal(res.merged, false, "the stale green does not merge");
+    assert.equal(res.outcome, "failed");
+    assert.match(res.error ?? "", /'origin\/dev' moved since prepare/);
+    assert.equal(fx.originDev(), moved, "and nothing was merged into it");
+    assert.equal(fx.forge.prs[0]!.state, "OPEN");
+
+    // The refusal re-processed the head against the NEW tip: fetched, rebased
+    // and build+tested again, so what the panel offers next is honest.
+    assert.equal(res.head?.feature, "late");
+    assert.equal(res.head?.status, "ready", "green again, on the moved base this time");
+    const detail = fx.features.headDetail();
+    assert.equal(detail?.kind, "ready");
+    assert.equal(
+      run(fx.repo, ["merge-base", moved, "co/feat-late"]),
+      moved,
+      "the branch really sits on the moved origin/dev now",
+    );
+
+    // Now it merges, on top of what the other landing left.
+    const second = await fx.features.mergeReadyHead();
+    assert.equal(second.merged, true);
+    assert.equal(run(fx.repo, ["rev-parse", `${fx.originDev()}^1`]), moved);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a missing prerequisite blocks the head with the fix, and never crashes the tool call", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("needs-gh");
+    await commitIn(a.feature.worktreePath, "a.txt", "a\n", "job: a");
+    fx.forge.ghInstalled = false;
+
+    // enqueue must not throw: a prerequisite problem is a blocked head carrying
+    // the message the captain has to act on.
+    const enq = await fx.features.enqueue("needs-gh");
+    assert.equal(enq.enqueued, true);
+    if (!enq.enqueued) return;
+    assert.equal(enq.head?.status, "blocked");
+    assert.match(enq.head?.blockedReason ?? "", /GitHub CLI/);
+    assert.equal(enq.head?.blockedKind, undefined, "not a conflict or a red suite: no resolver for this");
+    assert.equal(fx.features.planResolveHead().ok, false, "and no agent is offered for it");
+
+    // [m] on it does nothing, and nothing was pushed or PR'd.
+    const m = await fx.features.mergeReadyHead();
+    assert.equal(m.merged, false);
+    assert.deepEqual(fx.forge.pushes, []);
+    assert.equal(fx.forge.prs.length, 0);
+
+    // Install gh: the same head re-processes to ready with no other change.
+    fx.forge.ghInstalled = true;
+    const retry = await fx.features.enqueue("needs-gh");
+    assert.equal(retry.enqueued, true);
+    if (!retry.enqueued) return;
+    assert.equal(retry.head?.status, "ready");
+    assert.equal(fx.forge.prs.length, 1, "and only now is a PR opened");
   } finally {
     await fx.cleanup();
   }
@@ -478,20 +598,21 @@ test("feature_merge_head merges NOTHING in a session that has a panel: [m] is th
     assert.equal(enq.enqueued, true);
     if (!enq.enqueued) return;
     assert.equal(enq.head?.status, "ready");
-    const devBefore = run(fx.repo, ["rev-parse", "dev"]);
+    const devBefore = fx.originDev();
 
     const res = await fx.features.mergeHead();
     assert.equal(res.merged, false, "the co's tool never merges when a panel exists");
     assert.equal(res.outcome, "panel");
     assert.match(res.summary, /\[m\]/, "it points the co at the panel affordance");
-    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devBefore, "dev did not move");
+    assert.equal(fx.originDev(), devBefore, "origin/dev did not move");
+    assert.equal(fx.forge.prs[0]!.state, "OPEN", "the PR is still waiting on the keystroke");
     assert.equal(seen.length, 0, "and no gate was opened to wait on");
     assert.equal(fx.features.queueView().head?.status, "ready", "the head is untouched and still ready");
 
     // The panel path still merges it, as the captain's keystroke would.
     const m = await fx.features.mergeReadyHead();
     assert.equal(m.merged, true);
-    assert.notEqual(run(fx.repo, ["rev-parse", "dev"]), devBefore);
+    assert.notEqual(fx.originDev(), devBefore);
   } finally {
     await fx.cleanup();
   }
@@ -504,20 +625,22 @@ test("feature_merge_head IS the merge in a session with no panel (the non-intera
     const a = await fx.features.create("headless");
     await commitIn(a.feature.worktreePath, "h.txt", "h\n", "job: h");
     await fx.features.enqueue("headless");
-    const devBefore = run(fx.repo, ["rev-parse", "dev"]);
+    const devBefore = fx.originDev();
 
     const res = await fx.features.mergeHead();
     assert.equal(res.merged, true, "with no panel the fallback merges directly");
     assert.equal(res.outcome, "merged");
-    assert.equal(run(fx.repo, ["rev-parse", "dev"]), res.mergeSha);
-    assert.notEqual(run(fx.repo, ["rev-parse", "dev"]), devBefore);
-    assert.ok(!branchExists(fx.repo, "co/feat-headless"), "teardown followed the merge");
+    assert.equal(fx.originDev(), res.mergeSha);
+    assert.notEqual(fx.originDev(), devBefore);
+    assert.equal(fx.forge.prs[0]!.state, "MERGED", "through the PR, like every other merge");
+    assert.ok(!fs.existsSync(a.feature.worktreePath), "teardown followed the merge");
+    assert.ok(branchExists(fx.repo, "co/feat-headless"), "and kept the branch ref");
   } finally {
     await fx.cleanup();
   }
 });
 
-test("headDetail feeds the panel the ready head's diff and build+test, then the blocked head's reason", async () => {
+test("headDetail feeds the panel the ready head's PR, commits and build+test evidence", async () => {
   const fx = await makeFixture();
   try {
     const a = await fx.features.create("detailed");
@@ -531,7 +654,10 @@ test("headDetail feeds the panel the ready head's diff and build+test, then the 
     assert.equal(ready.target, "dev");
     assert.equal(ready.commits.length, 1);
     assert.match(ready.commits[0] ?? "", /job: detail/);
-    assert.match(ready.diff, /\+detail/, "the real patch the [m] would land");
+    assert.equal(ready.pr?.number, 1, "the PR the [m] would merge");
+    assert.match(ready.pr?.url ?? "", /\/pull\/1$/);
+    assert.match(ready.pr?.body ?? "", /Build \+ test/, "with the evidence co composed");
+    assert.match(ready.pr?.body ?? "", /job: detail/, "and the commit list");
     assert.equal(ready.buildTest?.command, "true", "the build+test that passed is named");
     assert.ok((ready.buildTest?.ms ?? -1) >= 0, "and timed");
   } finally {
@@ -602,11 +728,12 @@ test("a real rebase conflict blocks the head and the panel merge refuses to land
     assert.match(eb.head?.blockedReason ?? "", /conflict/);
 
     // The blocked head holds the queue; the merge refuses and writes nothing.
-    const devBefore = run(fx.repo, ["rev-parse", "dev"]);
+    const devBefore = fx.originDev();
     const mr = await fx.features.mergeReadyHead();
     assert.equal(mr.merged, false);
     assert.equal(mr.outcome, "not-ready");
-    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devBefore, "a blocked head merges nothing");
+    assert.equal(fx.originDev(), devBefore, "a blocked head merges nothing");
+    assert.equal(fx.forge.prFor("co/feat-right"), undefined, "a conflicted head never opened a PR");
     assert.ok(branchExists(fx.repo, "co/feat-right"), "right's branch is intact for a fix");
     // The aborted rebase left right's worktree clean and on its branch.
     assert.equal(run(b.feature.worktreePath, ["status", "--porcelain"]), "");
@@ -643,7 +770,8 @@ test("the resolve path: a conflict-blocked head is fixed by a fresh agent in its
     assert.equal(plan.attempt, 1);
     assert.match(plan.order, /co\/feat-follow/, "the order names the feature branch");
     assert.match(plan.order, /NEVER check out, merge into, or push/i, "the order forbids touching dev");
-    assert.match(plan.order, /do not merge the feature yourself/i, "the order forbids self-merge");
+    assert.match(plan.order, /do not push the branch/i, "the order forbids pushing or PR'ing");
+    assert.match(plan.order, /git rebase origin\/dev/, "and names the remote-tracking base");
 
     // Fire (the confirm-gated dispatch would have launched); mark it resolving.
     const started = fx.features.beginResolveHead();
@@ -654,9 +782,9 @@ test("the resolve path: a conflict-blocked head is fixed by a fresh agent in its
     // Simulate the fresh agent's work IN follow's worktree: rebase onto dev and
     // resolve the conflict (keep both intents), commit — never touching dev.
     const wt = b.feature.worktreePath;
-    const devBefore = run(fx.repo, ["rev-parse", "dev"]);
-    // A rebase onto dev conflicts; the agent resolves file.txt and continues.
-    const reb = spawnSync("git", ["rebase", "dev"], { cwd: wt, encoding: "utf8" });
+    const devBefore = fx.originDev();
+    // A rebase onto origin/dev conflicts; the agent resolves file.txt and continues.
+    const reb = spawnSync("git", ["rebase", "origin/dev"], { cwd: wt, encoding: "utf8" });
     assert.notEqual(reb.status, 0, "the rebase really conflicts (as the block reported)");
     await fsp.writeFile(path.join(wt, "file.txt"), "from base\nfrom follow\n", "utf8");
     run(wt, ["add", "file.txt"]);
@@ -667,7 +795,9 @@ test("the resolve path: a conflict-blocked head is fixed by a fresh agent in its
     });
     assert.equal(cont.status, 0, "the agent completed the rebase");
     assert.equal(run(wt, ["status", "--porcelain"]), "", "the agent left the worktree clean");
-    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devBefore, "the agent never moved dev");
+    assert.equal(fx.originDev(), devBefore, "the agent never moved dev");
+    assert.deepEqual(fx.forge.pushes.filter((p) => p.startsWith("co/feat-follow")), [],
+      "and never pushed its branch: publishing is the queue's job");
 
     // The agent finished: re-process the head. It rebases cleanly now and the
     // build+test (`true`) is green, so it goes ready.
@@ -679,9 +809,10 @@ test("the resolve path: a conflict-blocked head is fixed by a fresh agent in its
     const merge = await fx.features.mergeReadyHead();
     assert.equal(merge.merged, true);
     assert.equal(merge.feature, "follow");
-    assert.notEqual(run(fx.repo, ["rev-parse", "dev"]), devBefore, "dev advanced on the merge");
-    assert.equal(run(fx.repo, ["show", "dev:file.txt"]), "from base\nfrom follow");
-    assert.ok(!branchExists(fx.repo, "co/feat-follow"), "teardown followed the merge");
+    assert.notEqual(fx.originDev(), devBefore, "origin/dev advanced on the merge");
+    assert.equal(run(fx.repo, ["show", `${fx.originDev()}:file.txt`]), "from base\nfrom follow");
+    assert.ok(!fs.existsSync(wt), "teardown followed the merge");
+    assert.ok(branchExists(fx.repo, "co/feat-follow"), "and kept the branch ref");
   } finally {
     await fx.cleanup();
   }

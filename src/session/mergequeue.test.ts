@@ -32,6 +32,13 @@ function green(feature: string, commits = 1): PrepareGreen {
     featureSha: `feat-${feature}`,
     diff: "+work\n",
     commits: Array.from({ length: commits }, (_, i) => `c${i} job: ${feature} slice ${i}`),
+    pr: {
+      number: 7,
+      url: `https://github.com/acme/repo/pull/7`,
+      title: `${feature} work`,
+      body: "why and what",
+      created: true,
+    },
   };
 }
 function conflict(feature: string): PrepareConflict {
@@ -88,14 +95,24 @@ function makeHarness(): Harness {
   };
 
   const fakeExecute: typeof executeLanding = async (_opts, feature, expect) => {
-    mergeCalls.push(`${feature}@${expect?.featureSha ?? "-"}`);
+    // The pin is recorded in full: the tested tip, the origin/dev it was tested
+    // against, and the PR the captain reviewed. All three are the safety story.
+    mergeCalls.push(
+      `${feature}@${expect?.featureSha ?? "-"}+${expect?.devSha ?? "-"}#${expect?.prNumber ?? "-"}`,
+    );
     if (h.executeError) throw new Error(h.executeError);
     return {
       feature,
       branch: `co/feat-${feature}`,
       mergeSha: `merge-${feature}`,
       previousDevSha: "dev0",
-      teardown: { branch: `co/feat-${feature}`, worktreeRemoved: true, branchDeleted: true },
+      pr: { number: 7, url: "https://github.com/acme/repo/pull/7" },
+      teardown: {
+        branch: `co/feat-${feature}`,
+        worktreeRemoved: true,
+        branchDeleted: false,
+        branchKeptReason: "kept by policy",
+      },
     };
   };
 
@@ -239,7 +256,11 @@ test("advance on merge: the head merges, the queue advances, the new head is pro
   // The queue advanced and processed the NEW head — bbb was prepared only now,
   // AFTER aaa landed and moved dev (advance-processes-against-new-dev). This is
   // what makes the next [m] live by the time the keystroke's merge resolves.
-  assert.deepEqual(h.mergeCalls, ["aaa@feat-aaa"], "one merge, pinned to the tested sha");
+  assert.deepEqual(
+    h.mergeCalls,
+    ["aaa@feat-aaa+dev0#7"],
+    "one merge, pinned to the tested tip, its base, and the reviewed PR",
+  );
   assert.deepEqual(h.prepareCalls, ["aaa", "bbb"], "bbb processed only after aaa merged");
   assert.equal(merge.head?.feature, "bbb");
   assert.equal(merge.head?.status, "ready");
@@ -261,7 +282,7 @@ test("mergeReadyHead reuses the head's already-computed green: exactly one prepa
   assert.equal(merge.merged, true);
   // The merge ran once, pinned to the prepared sha, and prepare was NOT re-run:
   // the panel's [m] must not pay for a second build+test.
-  assert.deepEqual(h.mergeCalls, ["solo@feat-solo"]);
+  assert.deepEqual(h.mergeCalls, ["solo@feat-solo+dev0#7"]);
   assert.deepEqual(h.prepareCalls, ["solo"], "no redundant re-prepare at merge time");
 });
 
@@ -342,7 +363,7 @@ test("a busy head is not processed until the crew frees it; merge is refused mea
 
 // --- what the panel reads and presses (D-20260724-12) ------------------------
 
-test("headDetail carries a ready head's commits, diff and build+test evidence", async () => {
+test("headDetail carries a ready head's PR, commits and build+test evidence", async () => {
   const h = makeHarness();
   h.prepareFn.set("aaa", () => ({
     ...green("aaa", 2),
@@ -357,7 +378,8 @@ test("headDetail carries a ready head's commits, diff and build+test evidence", 
   assert.equal(d.feature, "aaa");
   assert.equal(d.target, "dev");
   assert.equal(d.commits.length, 2, "the per-job commits the merge preserves");
-  assert.equal(d.diff, "+work\n", "the patch the [m] would land");
+  assert.equal(d.pr?.number, 7, "the PR the [m] would merge");
+  assert.equal(d.pr?.title, "aaa work");
   assert.deepEqual(d.buildTest, { command: "npm test", ms: 1500 }, "the evidence, stated not implied");
 });
 
@@ -400,7 +422,7 @@ test("mergeReadyHead needs no gate host and never waits on anything but git", as
   await h.queue.enqueue("aaa");
   const merge = await h.queue.mergeReadyHead();
   assert.equal(merge.merged, true, "a ready head merges outright");
-  assert.deepEqual(h.mergeCalls, ["aaa@feat-aaa"]);
+  assert.deepEqual(h.mergeCalls, ["aaa@feat-aaa+dev0#7"]);
   assert.equal(h.queue.view().size, 0);
 });
 

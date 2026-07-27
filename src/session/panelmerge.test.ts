@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fsp from "node:fs/promises";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { instancePaths } from "../paths.js";
@@ -12,6 +13,7 @@ import { queueMergeNotice } from "./session.js";
 import { defaultWorktreeBase } from "./worktrees.js";
 import { Tui, type InStream, type OutStream, type QueuePanelSource } from "../tui/tui.js";
 import { stripAnsi } from "../tui/wrap.js";
+import { makeFakeForge, type FakeForge } from "./forgefake.test.js";
 
 /**
  * END-TO-END for the panel-native merge (D-20260724-12): a REAL Tui wired to a
@@ -28,10 +30,15 @@ import { stripAnsi } from "../tui/wrap.js";
  * terminal; only the physical keyboard and the terminal's own repaint are out of
  * reach here.
  *
- * What it pins: the [m] merges the head onto local dev and nothing else does;
- * the worktree is torn down; the queue advances and the NEXT head auto-processes
- * so its own [m] is live; a blocked head offers no [m] and produces the notice
- * that reaches the co; and no remote, push or PR is ever involved.
+ * What it pins: the [m] merges the head's PULL REQUEST and nothing else does;
+ * the worktree is torn down while the branch ref is kept; the queue advances and
+ * the NEXT head auto-processes against the new `origin/dev` so its own [m] is
+ * live; a blocked head offers no [m] and produces the notice that reaches the
+ * co; and the LOCAL `dev` ref — checked out in the primary tree here, as it is
+ * in the captain's real repo — is never written by any of it.
+ *
+ * The forge is the in-memory fake (forgefake.test.ts): the merge commits are
+ * real git objects, but nothing leaves the machine.
  */
 
 process.setMaxListeners(0);
@@ -74,6 +81,9 @@ async function waitFor(what: string, cond: () => boolean, timeoutMs = 15_000): P
 
 interface Fixture {
   repo: string;
+  forge: FakeForge;
+  /** The integration tip as the remote holds it — the only dev that moves. */
+  originDev: () => string;
   features: FeatureManager;
   tui: Tui;
   /** Push raw bytes at the Tui exactly as a terminal would. */
@@ -103,6 +113,11 @@ async function makeFixture(): Promise<Fixture> {
   await fsp.writeFile(path.join(repo, "file.txt"), "base\n", "utf8");
   run(repo, ["add", "."]);
   run(repo, ["commit", "-q", "-m", "init"]);
+  // The captain's checkout: dev exists locally and IS checked out here — the
+  // state that made a local merge impossible and a PR merge irrelevant to.
+  run(repo, ["branch", "dev", "main"]);
+  run(repo, ["checkout", "-q", "dev"]);
+  const forge = makeFakeForge(repo, { dev: run(repo, ["rev-parse", "dev"]) });
 
   const paths = instancePaths(path.join(root, "home"), "inst");
   await fsp.mkdir(paths.captures, { recursive: true });
@@ -156,12 +171,15 @@ async function makeFixture(): Promise<Fixture> {
   features = new FeatureManager({
     registry,
     repoPath: repo,
+    run: forge.run,
     gateHost: tui,
     buildTestCommand: "true",
   });
 
   return {
     repo,
+    forge,
+    originDev: () => forge.branches.get("dev")!,
     features,
     tui,
     send: (bytes) => listener?.(bytes),
@@ -180,14 +198,15 @@ async function makeFixture(): Promise<Fixture> {
 
 const CTRL_O = "\x0f";
 
-test("e2e: the panel's [m] merges the head onto local dev, advances the queue, and the next head's [m] goes live", async () => {
+test("e2e: the panel's [m] merges the head's PR, advances the queue, and the next head's [m] goes live", async () => {
   const fx = await makeFixture();
   try {
     const a = await fx.features.create("alpha");
     const b = await fx.features.create("beta");
     await commitIn(a.feature.worktreePath, "a.txt", "a\n", "job: alpha slice");
     await commitIn(b.feature.worktreePath, "b.txt", "b\n", "job: beta slice");
-    const devStart = run(fx.repo, ["rev-parse", "dev"]);
+    const devStart = fx.originDev();
+    const localDevStart = run(fx.repo, ["rev-parse", "dev"]);
     const mainStart = run(fx.repo, ["rev-parse", "main"]);
 
     // Enqueue both. The head figures itself out; nothing asks the captain for
@@ -202,13 +221,13 @@ test("e2e: the panel's [m] merges the head onto local dev, advances the queue, a
     let frame = fx.frame();
     assert.match(frame, /alpha\s+\[ready\]/, "the head is ready in the panel");
     assert.match(frame, /2\.\s*beta\s+\[queued\]/, "beta waits behind it, unprocessed");
-    assert.match(frame, /press m to merge it onto dev/, "the [m] is simply present");
-    assert.match(frame, /1 commit · 1 file changed/, "with the merge's summary");
+    assert.match(frame, /press m to merge PR #1 into dev/, "the [m] is simply present");
+    assert.match(frame, /PR #1 → dev · 1 commit/, "with what it would merge");
     assert.match(frame, /build\+test green/, "and the build+test evidence");
     assert.match(frame, /job: alpha slice/, "the commit it would land");
-    assert.match(frame, /diff --git a\/a\.txt b\/a\.txt/, "and the real diff, inline");
-    assert.match(frame, /@@ -0,0 \+1 @@/, "hunks and all");
-    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devStart, "showing it merged nothing");
+    assert.match(frame, /pull\/1/, "the PR's URL, to read or edit it on GitHub");
+    assert.match(frame, /Merged with a merge commit/, "and the PR message co composed");
+    assert.equal(fx.originDev(), devStart, "showing it merged nothing");
 
     // THE KEYSTROKE. One byte, no tool call, nothing awaited by the co.
     fx.send("m");
@@ -219,33 +238,41 @@ test("e2e: the panel's [m] merges the head onto local dev, advances the queue, a
       () => !fx.frame().includes("merging") && /beta\s+\[ready\]/.test(fx.frame()),
     );
 
-    const devAfterA = run(fx.repo, ["rev-parse", "dev"]);
-    assert.notEqual(devAfterA, devStart, "dev advanced on the keypress alone");
-    assert.equal(run(fx.repo, ["show", "dev:a.txt"]), "a", "alpha's work is on dev");
-    assert.equal(run(fx.repo, ["rev-list", "--merges", "--count", "dev"]), "1", "as a merge commit");
-    assert.ok(!branchExists(fx.repo, "co/feat-alpha"), "alpha's branch/worktree were torn down");
+    const devAfterA = fx.originDev();
+    assert.notEqual(devAfterA, devStart, "origin/dev advanced on the keypress alone");
+    assert.equal(run(fx.repo, ["show", `${devAfterA}:a.txt`]), "a", "alpha's work is on dev");
+    assert.equal(run(fx.repo, ["rev-list", "--merges", "--count", devAfterA]), "1", "as a merge commit");
+    assert.equal(fx.forge.prs[0]!.state, "MERGED", "its PR is merged");
+    assert.ok(!fs.existsSync(a.feature.worktreePath), "alpha's worktree was torn down");
+    assert.ok(branchExists(fx.repo, "co/feat-alpha"), "and its branch ref kept");
 
     // The queue advanced AND the new head auto-processed against the new dev, so
     // its own [m] is already live without anything else happening.
     frame = fx.frame();
     assert.match(frame, /beta\s+\[ready\]/, "beta became head and processed itself");
     assert.ok(!frame.includes("alpha"), "alpha is gone from the panel");
-    assert.match(frame, /press m to merge it onto dev/, "beta's [m] is live now");
+    assert.match(frame, /press m to merge PR #2 into dev/, "beta's [m] is live now");
     assert.equal(fx.notices.length, 0, "a clean merge owes the co nothing: it is not in this loop");
 
     // Land beta the same way; the queue empties.
     fx.send("m");
     await waitFor("the second merge to land", () => /merge queue is empty/.test(fx.frame()));
-    assert.equal(run(fx.repo, ["rev-parse", "dev^1"]), devAfterA, "beta merged on top of alpha's dev");
-    assert.equal(run(fx.repo, ["show", "dev:b.txt"]), "b");
+    const devAfterB = fx.originDev();
+    assert.equal(run(fx.repo, ["rev-parse", `${devAfterB}^1`]), devAfterA, "beta merged on top of alpha");
+    assert.equal(run(fx.repo, ["show", `${devAfterB}:b.txt`]), "b");
     assert.equal(fx.features.queueView().size, 0, "the queue is empty");
+    assert.equal(run(fx.repo, ["rev-list", "--merges", "--count", devAfterB]), "2", "two merge commits");
 
-    // Local only, throughout: main never moved and there is no remote at all —
-    // no push, no PR, nothing left the machine.
-    assert.equal(run(fx.repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    // The captain's tree is exactly where they left it, throughout: still on
+    // dev, still at the same commit, with main untouched. co wrote no local ref.
+    assert.equal(run(fx.repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "dev");
+    assert.equal(run(fx.repo, ["rev-parse", "dev"]), localDevStart, "the local dev ref never moved");
+    assert.equal(run(fx.repo, ["status", "--porcelain"]), "", "and their working tree is untouched");
     assert.equal(run(fx.repo, ["rev-parse", "main"]), mainStart, "main was never touched");
-    assert.equal(run(fx.repo, ["remote"]), "", "no remote was ever configured, let alone pushed to");
-    assert.equal(run(fx.repo, ["rev-list", "--merges", "--count", "dev"]), "2", "two local merge commits");
+    // Every merge was a merge commit, and no branch was ever deleted remotely.
+    const merges = fx.forge.calls.filter((c) => c.startsWith("gh pr merge"));
+    assert.deepEqual(merges, ["gh pr merge 1 --merge", "gh pr merge 2 --merge"]);
+    assert.ok(!fx.forge.calls.some((c) => /--squash|--rebase|--delete-branch/.test(c)));
   } finally {
     await fx.cleanup();
   }
@@ -291,10 +318,11 @@ test("e2e: a blocked head shows the block, offers no [m], and reaches the co", a
     assert.match(notice, /type `confirm`/, "stating the resolver is still gated");
 
     // The keystroke does nothing at all on a blocked head.
-    const devBefore = run(fx.repo, ["rev-parse", "dev"]);
+    const devBefore = fx.originDev();
     fx.send("m");
     await settle();
-    assert.equal(run(fx.repo, ["rev-parse", "dev"]), devBefore, "[m] on a blocked head merges nothing");
+    assert.equal(fx.originDev(), devBefore, "[m] on a blocked head merges nothing");
+    assert.equal(fx.forge.prFor("co/feat-right"), undefined, "a blocked head never opened a PR");
     assert.ok(branchExists(fx.repo, "co/feat-right"), "right's branch is intact for a resolver");
     assert.equal(fx.notices.length, 1, "and no second notice was minted");
   } finally {

@@ -523,32 +523,53 @@ decision and nothing else.
 
 ### Landing work: one keystroke, `[m]`
 
-Finished features land on a local `dev` branch through a strictly serial merge
-queue, and the queue does the work itself. Only the front of the line is ever
-touched: it rebases onto the current `dev` tip and runs your build+test on that
-combined state (feature A green and feature B green does not make A+B green).
-When that comes back green, the **Ctrl-O queue tab** shows the head's diff, its
-commits and the build+test result, with a live `[m]` beside them.
+Finished features land in `dev` as **GitHub pull requests**, through a strictly
+serial merge queue that does the work itself. Only the front of the line is ever
+touched. The queue fetches, rebases the head onto the current `origin/dev` tip,
+and runs your build+test on that combined state (feature A green and feature B
+green does not make A+B green). Only if that is green does anything leave the
+machine: the rebased branch is pushed (force-with-lease — a rebase rewrites
+shas) and a PR into `dev` is opened, or the existing one refreshed. The **Ctrl-O
+queue tab** then shows that PR — its number and link, its title and description,
+the commits it carries and the build+test evidence — with a live `[m]` beside it.
 
 `[m]` is a state, not a prompt. It appears because the head is green, it stays
-there until you press it, and pressing it merges — the merge commit lands on
-`dev`, the feature's worktree and branch are torn down, the queue advances, and
+there until you press it, and pressing it runs `gh pr merge --merge`: the PR
+lands on `dev` as a **merge commit**, co fetches so it sees the moved
+`origin/dev`, the feature's local worktree is torn down, the queue advances, and
 the next feature rebases and tests itself against the `dev` you just moved, so
 its own `[m]` lights up when it goes green. Nothing is armed, nothing expires,
 and the co-manager is not involved in any of it: it never opens the merge, never
-waits on your keypress, and its agent loop is free the whole time.
+waits on your keypress, and its agent loop is free the whole time. The PR is a
+normal PR while it waits — retitle it, rewrite the description, comment on it,
+review the diff on GitHub. Re-processing only rewrites the fenced evidence block
+co owns; your edits stay.
 
 The co-manager is pulled in for exactly one case: a head that comes back
-**blocked** — a rebase conflict, or a red build+test. That head shows the block
+**blocked** — a rebase conflict, a red build+test, or a missing prerequisite
+(no `gh`, gh not authenticated, no `origin/dev`). That head shows the block
 instead of an `[m]` and holds the queue, and the co is told automatically, so
-you don't re-explain it. It can send a fresh crew agent into that feature's own
-worktree to rebase and fix it (never `dev`) — confirm-gated like every dispatch,
-and bounded to three attempts, after which it stays blocked for you to fix by
-hand or abandon.
+you don't re-explain it. For a conflict or a red build it can send a fresh crew
+agent into that feature's own worktree to rebase and fix it (never `dev`) —
+confirm-gated like every dispatch, and bounded to three attempts, after which it
+stays blocked for you to fix by hand or abandon.
 
-All of this is local. The merges are ordinary local commits on a local `dev`;
-nothing is fetched, pushed, or turned into a PR at any point, and `main` is
-never written by anything here.
+**Why a PR and not a local merge.** `dev` is normally checked out in your own
+tree, and git refuses to write a ref that is checked out; a local merge also
+means co holding the only copy of the integration branch. Merging on the forge
+removes the write entirely — co never touches your `dev` checkout, never writes
+the local `dev` ref, and learns that `dev` moved the same way you would, by
+fetching. Three rules are wired in rather than left to configuration: the merge
+is always `--merge` (a merge commit, so the feature branch stays visible in the
+graph and the crew's per-job commits survive), the branch ref is always **kept**
+(only the local worktree is torn down — `--delete-branch` is never passed), and
+the tested tip is the merged tip (the PR's head on GitHub is compared against the
+sha the build+test ran on, and a mismatch refuses the merge).
+
+Prerequisites: the `gh` CLI installed and authenticated, an `origin` remote, and
+a `dev` branch on it. co never creates `dev` — if it is missing it says so and
+stops. `main` is still never written by anything here: promoting `dev` → `main`
+is your own PR, by hand.
 
 The job — the `cd` into the repo, the agent command, the (possibly multi-line)
 order text, completion bookkeeping — is written to a **per-job script file**
@@ -687,7 +708,8 @@ src/
              visuals.ts
   session/   session.ts prompt.ts tools.ts reviewinbox.ts
              crewpanes.ts dispatchconfig.ts transport.ts registry.ts
-             worktrees.ts landing.ts landinggate.ts mergequeue.ts features.ts
+             worktrees.ts forge.ts landing.ts landinggate.ts mergequeue.ts
+             features.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
 ```
 
@@ -760,13 +782,17 @@ sweep and the split is pruned and the placement re-planned against the
 survivors. One dead worker costs one pruned id, never the whole layout.
 
 `worktrees.ts` is the git-worktree lifecycle harness for the
-parallel-dispatch feature: ensure a `dev` integration branch exists (created
-off `main`, create-only), provision a per-feature worktree on a fresh
-`co/feat-<slug>` branch cut from `dev` (with `node_modules`/`dist` symlinked
-from the primary tree so it builds without an install), tear a finished
-feature down (branch deletion is guarded by a merge-base check, so unmerged
-work is never destroyed), and a reconcile sweep that cleans zombies left by a
-crashed run. Feature worktrees live outside the repo, by default in a sibling
+parallel-dispatch feature: verify the `origin/dev` integration branch is
+reachable (verify only — co never creates `dev`, locally or on the remote),
+provision a per-feature worktree on a fresh `co/feat-<slug>` branch cut from
+`origin/dev` (with `node_modules`/`dist` symlinked from the primary tree so it
+builds without an install), tear a finished feature down (after a PR merge the
+worktree goes and the branch ref is kept; on an explicit abandon, branch
+deletion is guarded by a merge-base check against `origin/dev`, so unmerged
+work is never destroyed), and a reconcile sweep that cleans zombie checkouts
+left by a crashed run. The local `dev` ref is never read or written by any of
+it — the integration ref everything compares against is the remote-tracking
+`origin/dev`, advanced only by `git fetch`. Feature worktrees live outside the repo, by default in a sibling
 directory `<repo>-worktrees`. Deterministic plumbing; the registry consumes
 it for feature-scoped dispatch: a dispatch scoped to a feature provisions the
 worktree on first use (reused for every later dispatch to that feature),
@@ -775,45 +801,59 @@ transports (an agent binds to a checkout by being launched inside it), and
 records the job-to-feature link on the job. One live agent per worktree at a
 time; a plain dispatch keeps its repo cwd untouched.
 
-`landing.ts` is the landing engine that moves a finished feature onto `dev`,
+`forge.ts` is everything that talks to the remote: `git fetch`, `git push`,
+and the `gh` CLI. Its whole design is one injectable command runner, so the
+entire remote surface is unit-tested with no network, no gh binary and no
+GitHub account — production passes nothing and gets a plain `spawn`. It also
+encodes the rules rather than leaving them to callers: the merge is always
+`gh pr merge --merge`, `--delete-branch` is never passed, a force push always
+carries a lease on the sha actually observed, and a PR update rewrites only
+the fenced evidence block co owns so a captain's edits to the title or the
+description survive.
+
+`landing.ts` is the landing engine that lands a finished feature in `dev`,
 split in two so a human gate can sit between testing and merging.
-`prepareLanding` rebases the feature branch onto the current dev tip in its
-own worktree and runs the project's combined build+test there (injectable;
-the default is the repo's own typecheck + test scripts) — on the combined
-rebased state, because feature A green and feature B green does not make A+B
-green. It reports green (with the diff the gate will show), conflict (the
-rebase is aborted, the branch restored byte-for-byte), or failed (the branch
-is left rebased so a fix dispatch lands in the exact red state); dev is never
-written. `executeLanding` is the separate callable that does the merge: a
-`--no-ff` merge commit built with plumbing (commit-tree plus a compare-and-swap
-update-ref, so no checkout of dev ever exists and a concurrent move fails
-loudly), per-job commits preserved, then teardown through the existing guards.
-It refuses a stale green (dev moved since the prepare) and is pinned to the
-exact tested sha. Everything is local: the only ref it writes is `dev`, and no
-step anywhere fetches, pushes, or opens a PR.
+`prepareLanding` fetches, rebases the feature branch onto the fresh
+`origin/dev` tip in its own worktree, and runs the project's combined
+build+test there (injectable; the default is the repo's own typecheck + test
+scripts) — on the combined rebased state, because feature A green and feature B
+green does not make A+B green. Green publishes: it pushes the rebased branch
+and opens or refreshes the PR into `dev` with a composed message (commits +
+build+test evidence). Conflict (the rebase is aborted, the branch restored
+byte-for-byte) and failed (the branch is left rebased so a fix dispatch lands
+in the exact red state) publish nothing — an unbuildable state never reaches
+the forge. `executeLanding` is the separate callable that does the merge:
+`gh pr merge --merge`, a fetch, then teardown of the local worktree with the
+branch ref kept. It is pinned three ways — the tested tip, the `origin/dev` it
+was tested against, and the reviewed PR — so a stale green, a branch that grew
+commits, or a PR head someone else moved all fail loudly instead of merging
+something nobody tested. The local `dev` ref is never written.
 
 `landinggate.ts` is the human gate for the direct `feature_land` route:
 `reviewLanding` prepares a feature and presents the result in the panel as a
-summary (commits, changed-file count), the full paged diff, and an action bar.
-Pressing `m` there runs `executeLanding` pinned to the exact sha the review
-covered, so approval can never merge more than what was shown; `r`/Esc dismisses
-with no merge, leaving the branch and worktree intact. A conflict or failed
+summary (commits, changed-file count, the PR it opened), the full paged diff,
+and an action bar. Pressing `m` there merges that PR, pinned to the exact sha
+the review covered, so approval can never merge more than what was shown;
+`r`/Esc dismisses with no merge, leaving the PR open and the branch and
+worktree intact. A conflict or failed
 prepare opens the gate too, showing why the feature is not mergeable with `m`
 disabled. `main` stays human-only throughout.
 
-`mergequeue.ts` is the serial merge queue, and the normal route onto `dev`.
+`mergequeue.ts` is the serial merge queue, and the normal route into `dev`.
 Features the captain marks done join an ordered queue; only the HEAD is ever
-worked, and it works itself out — `prepareLanding` rebases it onto the current
-dev tip and build+tests it on that combined state, leaving it `ready`,
-`blocked` (a rebase conflict or a red build+test), or `resolving`. Everything
-behind the head sits untouched, so nothing is ever speculatively tested.
+worked, and it works itself out — `prepareLanding` rebases it onto the fresh
+`origin/dev` tip, build+tests it on that combined state and PRs it, leaving it
+`ready`, `blocked` (a rebase conflict, a red build+test, or a missing
+prerequisite), or `resolving`. Everything behind the head sits untouched, so
+nothing is ever speculatively tested or pushed.
 
 **The merge is panel-native, not a co tool call.** A `ready` head simply
-*carries* an `[m]` in the Ctrl-O queue tab, alongside its own diff, commit list
-and build+test result. Pressing it calls `mergeReadyHead` directly: the merge
-lands, the worktree and branch are torn down, the queue advances, and the new
-head is processed against the dev tip that merge just moved — so the next `[m]`
-is live (or the next block is on screen) by the time the key finishes. The
+*carries* an `[m]` in the Ctrl-O queue tab, alongside its pull request, commit
+list and build+test result. Pressing it calls `mergeReadyHead` directly: the PR
+merges, the worktree is torn down (the branch ref kept), the queue advances, and
+the new head is processed against the `origin/dev` that merge just moved — so
+the next `[m]` is live (or the next block is on screen) by the time the key
+finishes. The
 co-manager is not in that loop at any point: it opens nothing, waits on
 nothing, and is not blocked on the keystroke. It is engaged again only when a
 head comes back **blocked**, which reaches it automatically so it can offer the
@@ -823,8 +863,8 @@ pressed a key — coupling the agent loop to a human keypress.
 
 `features.ts` is the co-facing lever layer: the small verb set the model
 calls to drive the harness end to end. `feature_create` provisions a feature's
-worktree off dev and registers it (idempotent, no confirm gate — it writes
-nothing to dev or main); a dispatch can target a feature so the crew runs in
+worktree off `origin/dev` and registers it (idempotent, no confirm gate — it
+writes nothing to dev or main); a dispatch can target a feature so the crew runs in
 its worktree (provisioned on first use), and the arm banner names the target
 worktree or says plainly it targets the bare main tree. `feature_enqueue` marks
 a feature done and puts it in the merge queue, which is where landing normally
@@ -840,18 +880,20 @@ attempts, after which the head stays blocked for you.
 clean worktree down but refuses one with uncommitted changes and never
 force-deletes an unmerged branch. At session start a non-destructive reconcile
 (`reconcileFeatures`) rebuilds feature records from the on-disk worktrees so a
-feature survives a restart, and surfaces anomalies (a branch with no worktree,
-a half-landed branch, a stray directory) for the co to relay rather than acting
-on them. The co's reach stops at `dev`: it never touches `main` and there is no
-promote path.
+feature survives a restart, and surfaces anomalies (a branch holding unmerged
+work whose worktree is gone, a stray directory) for the co to relay rather than
+acting on them — a branch already contained in `origin/dev` with no worktree is
+not an anomaly at all, it is what every landed feature leaves behind now that
+refs are kept. The co's reach stops at the PR into `dev`: it never touches
+`main` and there is no promote path.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,
 and the Ctrl-O panel. The panel has three home tabs, cycled with Tab — the merge
 queue, the doc viewer, and the review inbox — each reading a small injected
 source, so the Tui never reaches into git, the filesystem, or the session layer
-itself. The queue tab renders the ready head's diff and build+test inline and
-owns the `[m]` that merges it, through an injected `merge` callback that is the
+itself. The queue tab renders the ready head's pull request and build+test
+inline and owns the `[m]` that merges it, through an injected `merge` callback that is the
 only thing the keystroke can reach; a pending `feature_land` review gets a
 fourth tab of its own for as long as it is pending, so the two merges never
 share a key. A doc and a filed review drill into the same paged body view.
