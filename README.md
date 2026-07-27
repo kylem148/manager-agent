@@ -625,6 +625,30 @@ stored. Either way co only ever writes the message when it CREATES the pull
 request — once it exists, the title and the description are yours, and
 re-processing rewrites nothing but the fenced evidence.
 
+**And you can rewrite it without leaving the terminal: `e`.** On the queue tab,
+beside the `[m]`, `e` opens the head PR's message in a small editor over the
+panel — line 1 the title, a blank line, then the description, the way you write a
+commit message. It is the input bar's editor, so there is nothing new to learn:
+the arrows move, Home/End and Ctrl-A/E/U/K work on the line you're on, Backspace
+and Delete do what they always do, long lines wrap for display only, and the view
+follows the cursor down a long description. The one difference is Enter, which
+inserts a newline here rather than sending: a description is prose, so **Ctrl-S**
+is what saves it. Esc cancels, and on a buffer you've changed the first Esc warns
+before the second discards.
+
+Saving writes the title and the description to GitHub with `gh pr edit`, and
+stores them with the feature at the same time — so a later re-processing can't
+resurrect the message you just replaced. Then it re-reads the pull request and
+repaints from that, not from what you typed: what the panel shows afterwards is
+what GitHub actually holds. co's fenced evidence block is never in the editor and
+never at risk — it is split off before the buffer is filled and spliced back on
+underneath, exactly once. If `gh` fails, the failure is printed in the popup with
+your text still in it, so an edit is never quietly lost.
+
+`e` is only there when the head actually has a pull request (it says so when it
+doesn't), and it merges nothing: `[m]` remains a separate, deliberate keystroke
+and the head's checks, its state and the queue's order are untouched by an edit.
+
 **co runs no build and no test.** It used to, on the combined rebased tree, from
 a command it had to guess — and a guess is wrong the moment the repo isn't npm.
 GitHub is already testing exactly the state that matters (a `pull_request`
@@ -669,7 +693,8 @@ has its own PR checked against it, so its `[m]` lights up when it goes green.
 Nothing is armed, nothing expires, and the co-manager is not involved in any of
 it: it never opens the merge, never waits on your keypress, and its agent loop is
 free the whole time. The PR is a normal PR while it waits — retitle it, rewrite
-the description, comment on it, review the diff on GitHub. Re-processing only
+the description (on GitHub, or with `e` without leaving the panel), comment on
+it, review the diff on GitHub. Re-processing only
 rewrites the fenced evidence block co owns; your edits stay.
 
 The co-manager is pulled in for exactly one case: a head that comes back
@@ -952,8 +977,8 @@ they want, so a cold start only loads what it uses.
 src/
   index.ts config.ts paths.ts ui.ts model.ts research.ts cost.ts
   cli/       auth.ts doctor.ts modelsdoctor.ts link.ts cost.ts
-  tui/       tui.ts markdown.ts wrap.ts keys.ts banner.ts commands.ts
-             visuals.ts
+  tui/       tui.ts editor.ts markdown.ts wrap.ts keys.ts banner.ts
+             commands.ts visuals.ts
   session/   session.ts prompt.ts tools.ts reviewinbox.ts
              crewpanes.ts dispatchconfig.ts transport.ts registry.ts
              worktrees.ts forge.ts checks.ts landing.ts landinggate.ts
@@ -1081,6 +1106,10 @@ the fenced evidence block co owns so a captain's edits to the title or the
 description survive. The fence reads both ways: `spliceEvidence` writes co's
 block into a body, `splitEvidence` takes it back out, which is how the panel gets
 a description it can paint without the markers or a second copy of the checks.
+`updatePrMessage` is the mirror of the evidence update — it rewrites the title
+and the prose and carries the existing block across byte-for-byte, so the two
+halves of a PR body can each be rewritten without the other ever being clobbered,
+and no path can leave a body with two fences or none.
 It is also where the merge gate is *read*: `readPrChecks`
 asks `gh pr checks --required` first (branch protection decides, exactly as it
 does for a human) and falls back to every check the PR reports. Two details of
@@ -1224,7 +1253,11 @@ older store written before the PR message existed reads back unchanged. It is a
 cache of authored prose and behaves like one: a missing or corrupt file is an
 empty store, a body is stripped of anything resembling co's evidence fence before
 it is written, and a write that can't land costs a description, never a create, a
-merge or a teardown.
+merge or a teardown. The one field that can be *erased* is the PR message, and
+only by the captain's own edit in the panel: an omitted field is still never
+touched (that is what makes a bare re-enqueue a retry), but a description they
+deliberately deleted is deleted, so it cannot come back the next time a pull
+request is created for that feature.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,
@@ -1237,7 +1270,10 @@ block — and owns the `[m]` that merges it, through an injected `merge`
 callback that is the only thing the keystroke can reach. It composes none of
 that: the title and description come off the PR, split from co's evidence fence
 by the source (`splitEvidence`), so the panel and the pull request cannot drift
-apart. The features tab is
+apart. `e` on that tab opens the same message in a popup EDITOR over it, through
+a second injected callback (`editPrMessage`) that is likewise the only thing that
+keystroke can reach — one buffer in `git commit` shape, prose only, saved with
+Ctrl-S and never merging anything. The features tab is
 read-only by construction (no selector, no `[m]`, it only pages), so the overview
 can never be the thing that merged something; a pending `feature_land` review
 gets a fifth tab of its own for as long as it is pending, so the two merges never
@@ -1246,7 +1282,14 @@ panel body is one selection surface: a left-drag highlights and copies out of an
 view over OSC 52 (the same escape the transcript's own drag-selection uses), and
 an open doc additionally binds `y` to copy its raw markdown whole.
 `keys.ts` is the pure decode table that maps both legacy control bytes and
-enhanced-protocol CSI-u sequences onto one set of bindings. `tui.ts` is
+enhanced-protocol CSI-u sequences onto one set of bindings. `editor.ts` is the
+buffer model under both text editors on the screen — the input bar and the PR
+message popup: the word wrap, the cursor↔(row, col) mapping that keeps a caret
+where it visually appears on a wrapped line, the viewport-follows-cursor rule,
+the editing verbs, and the `git commit`-shaped title/body split. Two editors on
+one screen must not disagree about where a line breaks or what Ctrl-U does, so
+the rules live in one pure, unit-tested module and both surfaces are thin
+key-routing layers over it. `tui.ts` is
 deliberately one large file: the render loop, input handling, and scroll state
 share mutable state, and splitting them across modules would mean exporting
 that state rather than encapsulating it.

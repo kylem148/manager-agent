@@ -110,6 +110,10 @@ export type Action =
   | { kind: "kill-to-start" } // Ctrl-U
   | { kind: "kill-to-end" } // Ctrl-K
   | { kind: "open-docs" } // Ctrl-O — open the in-session doc viewer overlay
+  /** Ctrl-S — commit an editor's buffer somewhere. The prompt has nothing to
+   *  save (Enter sends), so it ignores this; the panel's PR message editor binds
+   *  it, and it is decoded here so both encodings land on one action. */
+  | { kind: "save" }
   | { kind: "none" };
 
 const NONE: Action = { kind: "none" };
@@ -126,6 +130,7 @@ const CTRL_LETTERS: Record<number, Action> = {
   106: { kind: "newline" }, // j — the universal newline fallback; see below
   109: { kind: "submit" }, // m — Ctrl-M *is* Enter
   111: { kind: "open-docs" }, // o — open the doc viewer overlay
+  115: { kind: "save" }, // s — save an editor buffer (the panel's PR message)
 };
 
 /**

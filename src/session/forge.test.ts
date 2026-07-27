@@ -16,6 +16,7 @@ import {
   spliceEvidence,
   splitEvidence,
   updatePrEvidence,
+  updatePrMessage,
   viewPr,
   type CommandResult,
   type CommandRunner,
@@ -268,6 +269,72 @@ test("updatePrEvidence rewrites only the evidence block, never the captain's tit
   assert.ok(!edit.includes("old evidence"), "the stale evidence is gone");
   assert.ok(!edit.includes("--title"), "the title is never overwritten on an update");
   assert.equal(res.pr.title, "a title the captain chose");
+});
+
+test("updatePrMessage rewrites the title and the prose, and carries the evidence across untouched", async () => {
+  const evidence = "### Checks\n**green** — 2 checks passed.";
+  const body = `The first draft.\n\n${EVIDENCE_OPEN}\n${evidence}\n${EVIDENCE_CLOSE}\n`;
+  const h = harness([]);
+  const res = await updatePrMessage(
+    opts(h.run),
+    { number: 42, url: "u", title: "old title", body },
+    { title: "a better title", prose: "A better description.\n\nWith a second paragraph." },
+  );
+  const edit = h.calls.find((chk) => chk.startsWith("gh pr edit"))!;
+  assert.match(edit, /^gh pr edit 42 --title a better title --body /, "one edit, title and body together");
+  assert.ok(!edit.includes("The first draft."), "the old prose is gone");
+  assert.match(res.body, /A better description\./);
+  assert.match(res.body, /With a second paragraph\./);
+  // The block co owns is preserved exactly, and exactly once.
+  assert.equal(splitEvidence(res.body).evidence, evidence, "byte-for-byte the block that was there");
+  assert.equal(res.body.match(new RegExp(EVIDENCE_OPEN, "g"))?.length, 1, "one opening marker");
+  assert.equal(res.body.match(new RegExp(EVIDENCE_CLOSE, "g"))?.length, 1, "one closing marker");
+  assert.equal(res.title, "a better title");
+});
+
+test("updatePrMessage folds a multi-line title and refuses an empty one before sending", async () => {
+  const h = harness([]);
+  const res = await updatePrMessage(
+    opts(h.run),
+    { number: 42, url: "u", title: "t", body: "prose" },
+    { title: "  a title\nsplit over lines  ", prose: "p" },
+  );
+  assert.equal(res.title, "a title split over lines", "GitHub titles are one line");
+
+  const empty = harness([]);
+  await assert.rejects(
+    () =>
+      updatePrMessage(
+        opts(empty.run),
+        { number: 42, url: "u", title: "t", body: "prose" },
+        { title: "   ", prose: "p" },
+      ),
+    /needs a title/,
+  );
+  assert.deepEqual(empty.calls, [], "nothing was sent at all");
+});
+
+test("updatePrMessage adds no fence to a body that has none, and strips one out of the prose", async () => {
+  const h = harness([]);
+  const plain = await updatePrMessage(
+    opts(h.run),
+    { number: 42, url: "u", title: "t", body: "just prose, no block\n" },
+    { title: "t", prose: "still just prose" },
+  );
+  assert.equal(plain.body.includes(EVIDENCE_OPEN), false, "co's next processing splices one in, not this");
+  assert.equal(plain.body, "still just prose\n");
+
+  // Prose that arrives carrying a fence (a paste, a hand-edited store) is
+  // stripped, for the same reason an authored body is: a frozen copy of the
+  // checks would be stale the moment the head re-processes.
+  const smuggled = await updatePrMessage(
+    opts(harness([]).run),
+    { number: 42, url: "u", title: "t", body: `p\n\n${EVIDENCE_OPEN}\nreal\n${EVIDENCE_CLOSE}\n` },
+    { title: "t", prose: `mine\n\n${EVIDENCE_OPEN}\nfrozen and wrong\n${EVIDENCE_CLOSE}` },
+  );
+  assert.equal(splitEvidence(smuggled.body).evidence, "real", "the PR's own block wins");
+  assert.equal(splitEvidence(smuggled.body).prose, "mine");
+  assert.equal(smuggled.body.match(new RegExp(EVIDENCE_OPEN, "g"))?.length, 1, "never two fences");
 });
 
 test("an update with unchanged evidence sends nothing at all", async () => {

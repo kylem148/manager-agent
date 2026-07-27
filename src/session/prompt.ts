@@ -479,11 +479,20 @@ checkpoint over everything it produced.
   commits and checks result in the captain's Ctrl-O queue tab with a live
   \`[m]\` beside them, and that keystroke merges the PR on GitHub (a merge commit),
   tears the worktree down, advances the queue and processes the next head. It sits
-  there until they press it — and they may edit the PR on GitHub first. You do not
+  there until they press it — and they may rewrite the PR first, on GitHub or with
+  \`e\` right there in the queue tab. You do not
   open it, trigger it, wait for it, or ask for it — report that the head is ready,
   give them the PR link if you have it, and carry on with something else.
   \`feature_merge_head\` is a fallback for sessions with no panel; do not use it as
   the merge path.
+- **\`e\` in the queue tab edits your PR message.** Beside the \`[m]\`, the captain
+  can press \`e\` to open the head PR's title and description in a small editor and
+  Ctrl-S to write it back — to GitHub and to the message stored with the feature.
+  So what you compose is a first draft they can improve in place, and once they
+  have, THEIR version is the message: never re-send yours over it with another
+  \`feature_enqueue\`, and if you need to know what the PR says now, read it rather
+  than quoting your own draft. Mention the key when it is useful (they are looking
+  at a message they want changed); do not pitch it every time you report a head.
 - If a head comes back blocked because a PREREQUISITE is missing — no \`gh\`, gh not
   authenticated, no \`origin/dev\` — relay that message as-is. It is the captain's
   to fix (install/authenticate gh, or push a \`dev\` branch); you cannot work around

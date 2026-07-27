@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { checksLine, failedChecks, type ChecksPolicy } from "./checks.js";
-import type { CommandRunner } from "./forge.js";
+import { splitEvidence, updatePrMessage, viewPr, type CommandRunner } from "./forge.js";
 import {
   authoredPrBody,
   authoredPrTitle,
@@ -26,6 +26,7 @@ import {
   featureBranch,
   featureSlug,
   findFeatureWorktree,
+  forgeOptions,
   isWorktreeDirty,
   provisionWorktree,
   reconcileFeatures,
@@ -212,6 +213,19 @@ export type ResolveHeadPlan =
 export interface PrMessageOrigin {
   title: "authored" | "mechanical";
   body: "authored" | "mechanical";
+}
+
+/** What a captain's in-panel edit of the head PR's message left on the forge —
+ *  read back FROM GitHub after the write, so the panel repaints from the truth
+ *  rather than from the buffer that was typed (D-20260727-15). */
+export interface PrMessageEditResult {
+  feature: string;
+  prNumber: number;
+  url: string;
+  /** The title GitHub now holds. */
+  title: string;
+  /** The description GitHub now holds, with co's evidence fence split back off. */
+  prose: string;
 }
 
 export interface LandResult {
@@ -685,6 +699,74 @@ export class FeatureManager {
    *  else. Read fresh at paint time by the Tui's injected queue source. */
   headDetail(): QueueHeadDetail | null {
     return this.queue.headDetail();
+  }
+
+  /**
+   * REWRITE THE HEAD PR'S MESSAGE — the panel's `e` (D-20260727-15). The captain
+   * edits the title and the prose in a popup over the queue tab and presses
+   * Ctrl-S; this is the whole save.
+   *
+   * It writes in two places on purpose, and neither is optional:
+   *
+   *  1. THE PULL REQUEST, through `gh pr edit`. The open PR is the artifact that
+   *     merges, so it is the one that has to say the right thing. co's fenced
+   *     evidence block is carried across untouched by forge.updatePrMessage —
+   *     the captain never sees it and cannot delete it.
+   *  2. THE FEATURE STORE. The stored message is read on EVERY head processing,
+   *     so leaving it alone would let a superseded message come back the next
+   *     time a PR is created for this feature. `allowClear` is passed for the
+   *     same reason: a description the captain deleted must stay deleted.
+   *
+   * Then the PR is read back from the forge and the head's cached copy replaced
+   * with it, so what the panel repaints is what GitHub stored — not the buffer
+   * that was typed. If the write lands but the re-read fails (a network blip
+   * between two gh calls), the composed body stands in rather than failing an
+   * edit that already succeeded.
+   *
+   * Merges NOTHING and touches no checks, no gate and no queue order: the head's
+   * status, its `[m]`, and everything behind it are exactly as they were.
+   */
+  async editHeadPrMessage(message: {
+    title: string;
+    body: string;
+    /** The PR the caller MEANT — the one the editor was opened on. Pinned, so a
+     *  head that was re-prepared while the captain typed fails loudly instead of
+     *  having another pull request's message stamped onto it. */
+    prNumber?: number;
+  }): Promise<PrMessageEditResult> {
+    const head = this.queue.headPr();
+    if (!head) {
+      throw new Error("the merge-queue head has no open pull request; there is no message to edit.");
+    }
+    if (message.prNumber !== undefined && message.prNumber !== head.pr.number) {
+      throw new Error(
+        `the queue head's pull request changed while you were editing (#${message.prNumber} → ` +
+          `#${head.pr.number}); nothing was written — re-open the editor on the new one.`,
+      );
+    }
+    const title = authoredPrTitle(message.title);
+    if (!title) throw new Error("a pull request needs a title; line 1 of the editor is empty.");
+    const prose = authoredPrBody(message.body);
+
+    const forge = forgeOptions(this.worktreeOptions());
+    const written = await updatePrMessage(forge, head.pr, { title, prose });
+    const slug = this.findRecord(head.feature)?.slug ?? featureSlug(head.feature);
+    await this.store.setPrMessage(slug, { prTitle: title, prBody: prose }, { allowClear: true });
+
+    let fresh = written;
+    try {
+      fresh = await viewPr(forge, head.pr.number);
+    } catch {
+      // The edit is already on GitHub; a failed read-back is not a failed save.
+    }
+    this.queue.updateHeadPrMessage({ number: head.pr.number, title: fresh.title, body: fresh.body });
+    return {
+      feature: head.feature,
+      prNumber: head.pr.number,
+      url: fresh.url || head.pr.url,
+      title: fresh.title,
+      prose: splitEvidence(fresh.body).prose,
+    };
   }
 
   /**

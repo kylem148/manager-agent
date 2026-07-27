@@ -499,6 +499,39 @@ export async function updatePrEvidence(
   return { pr: { ...pr, body: nextBody }, bodyUpdated: true };
 }
 
+/**
+ * Rewrite a PR's HUMAN MESSAGE — its title and the prose around co's fenced
+ * evidence — leaving the evidence block exactly as it is. The captain's edit
+ * from the Ctrl-O queue tab lands here (D-20260727-15), and it is the mirror of
+ * updatePrEvidence above: that one rewrites only what co owns, this one rewrites
+ * only what the captain owns. Between them nothing can clobber the other half.
+ *
+ * The fence is handled in one place and one way. Whatever block the body carries
+ * is lifted off it, and the new prose is spliced back around THAT block, so a
+ * save preserves it byte for byte, exactly once. A body with no fence stays
+ * without one (co's next processing splices a fresh block in, as it always
+ * does), and prose that somehow arrives carrying a fence of its own has it
+ * stripped first — the same rule landing.ts applies to an authored body, for the
+ * same reason: a second, frozen copy of the checks would be stale the moment the
+ * head re-processes.
+ *
+ * Returns the PR with the body co just sent. The caller re-reads it from the
+ * forge afterwards: what GitHub stored is the truth to paint, not this.
+ */
+export async function updatePrMessage(
+  o: ForgeOptions,
+  pr: PullRequest,
+  message: { title: string; prose: string },
+): Promise<PullRequest> {
+  const title = message.title.replace(/\s+/g, " ").trim();
+  if (title === "") throw new Error(`a pull request needs a title; PR #${pr.number} was not edited`);
+  const existing = splitEvidence(pr.body).evidence;
+  const prose = splitEvidence(message.prose).prose;
+  const body = existing ? spliceEvidence(prose, existing) : prose.trim() === "" ? "" : `${prose.trim()}\n`;
+  await execOrThrow(o, "gh", ["pr", "edit", String(pr.number), "--title", title, "--body", body]);
+  return { ...pr, title, body };
+}
+
 // --- checks ------------------------------------------------------------------
 
 const CHECK_JSON_FIELDS = "name,state,bucket,link,workflow,description";
