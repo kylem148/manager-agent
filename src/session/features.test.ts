@@ -5,10 +5,11 @@ import fsp from "node:fs/promises";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { instancePaths } from "../paths.js";
+import { instancePaths, type InstancePaths } from "../paths.js";
 import { defaultDispatchConfig } from "./dispatchconfig.js";
 import { DispatchRegistry } from "./registry.js";
 import { FeatureManager } from "./features.js";
+import { FeatureStore } from "./featurestore.js";
 import {
   featureBranch,
   provisionWorktree,
@@ -68,10 +69,16 @@ interface Fixture {
   registry: DispatchRegistry;
   features: FeatureManager;
   forge: FakeForge;
+  /** The instance paths the fixture's state (captures, the feature store) lives
+   *  under — the same tier a real session writes to. */
+  paths: InstancePaths;
   /** The integration tip as the remote holds it — the only dev co moves. */
   originDev: () => string;
   /** WorktreeOptions for calling the plumbing directly in a test. */
   opts: { repoPath: string; run: FakeForge["run"] };
+  /** Build a FRESH manager over the SAME repo and the same on-disk instance
+   *  state, with an empty registry: a session restart, in one call. */
+  restart: () => Promise<FeatureManager>;
   cleanup: () => Promise<void>;
 }
 
@@ -103,31 +110,45 @@ async function makeFixture(gateHost?: LandingGateHost): Promise<Fixture> {
   const config = defaultDispatchConfig();
   config.repoPath = repo;
 
-  const registry = new DispatchRegistry({
-    paths,
-    config,
-    onComplete: () => {},
-    ghosttyAvailable: false,
-    pollIntervalMs: 10_000,
-    installHook: async () => ({ configDir: "/fake", changed: true }),
-  });
-  const features = new FeatureManager({
-    registry,
-    repoPath: repo,
-    run: forge.run,
-    ...(gateHost ? { gateHost } : {}),
-    checks: FAST_CHECKS,
-  });
+  const registries: DispatchRegistry[] = [];
+  const makeRegistry = (): DispatchRegistry => {
+    const r = new DispatchRegistry({
+      paths,
+      config,
+      onComplete: () => {},
+      ghosttyAvailable: false,
+      pollIntervalMs: 10_000,
+      installHook: async () => ({ configDir: "/fake", changed: true }),
+    });
+    registries.push(r);
+    return r;
+  };
+  // A real, file-backed intent store under the instance's .dispatch/ — the same
+  // one a session loads at start — so what a test writes is what a restart reads.
+  const makeManager = async (reg: DispatchRegistry): Promise<FeatureManager> =>
+    new FeatureManager({
+      registry: reg,
+      repoPath: repo,
+      run: forge.run,
+      store: await FeatureStore.load(paths),
+      ...(gateHost ? { gateHost } : {}),
+      checks: FAST_CHECKS,
+    });
+
+  const registry = makeRegistry();
+  const features = await makeManager(registry);
   return {
     repo,
     base: defaultWorktreeBase(repo),
     registry,
     features,
     forge,
+    paths,
     originDev: () => forge.branches.get("dev")!,
     opts: { repoPath: repo, run: forge.run },
+    restart: async () => makeManager(makeRegistry()),
     cleanup: async () => {
-      registry.stop();
+      for (const r of registries) r.stop();
       await fsp.rm(root, { recursive: true, force: true });
     },
   };
@@ -428,6 +449,73 @@ test("reconcileAtBoot rebuilds a record from an on-disk worktree with an empty r
     assert.equal(tracked.branch, "feat/survivor");
     assert.equal(tracked.worktreePath, rec.worktreePath);
     assert.equal(tracked.provisionStatus, "ready");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a feature's intent SURVIVES a restart: the record is rebuilt from git, the description from the store", async () => {
+  const fx = await makeFixture();
+  try {
+    await fx.features.create("User Auth", "passkey login for the web app");
+    await fx.features.create("checkout", "stripe checkout with saved cards");
+    // It is on disk, under the instance's .dispatch/ tier, before anything else
+    // happens — not flushed at exit, where a crash would lose it.
+    assert.ok(fs.existsSync(fx.paths.featureStore), "the intents are persisted immediately");
+
+    // A restart: a brand-new registry (empty) and a brand-new manager that
+    // re-reads the store from disk, over the same worktrees.
+    const next = await fx.restart();
+    assert.deepEqual(next.list(), [], "the fresh registry knows nothing yet");
+
+    const report = await next.reconcileAtBoot();
+    assert.equal(report.records.length, 2, "both worktrees are rebuilt from disk");
+
+    // The rebuilt record is keyed by slug (the human name isn't recoverable from
+    // a branch) and carries the description the previous session authored.
+    const auth = await next.status("user-auth");
+    assert.ok(auth, "addressable by slug after a restart");
+    assert.equal(auth.branch, "feat/user-auth");
+    assert.equal(auth.intent, "passkey login for the web app", "the intent survived");
+    // The original handle still resolves too, through the same slug match.
+    assert.equal((await next.status("User Auth"))?.intent, "passkey login for the web app");
+    assert.equal((await next.status("checkout"))?.intent, "stripe checkout with saved cards");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a feature created without an intent survives a restart too, with no description", async () => {
+  const fx = await makeFixture();
+  try {
+    await fx.features.create("nameless");
+    const next = await fx.restart();
+    await next.reconcileAtBoot();
+    const row = await next.status("nameless");
+    assert.ok(row);
+    assert.equal(row.feature, "nameless");
+    assert.equal(row.intent, undefined, "no intent, and nothing invented to fill the gap");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a landed feature's intent is dropped from the store, so the slug can be reused clean", async () => {
+  const fx = await makeFixture(approvingHost([]));
+  try {
+    const created = await fx.features.create("shortlived", "the first go at it");
+    await commitIn(created.feature.worktreePath, "f.txt", "work\n", "job: the work");
+    const res = await fx.features.land("shortlived");
+    assert.equal(res.outcome, "merged", res.summary);
+
+    // The record is gone and so is its description — nothing lingers to be
+    // attached to a later feature that happens to slug the same way.
+    const store = await FeatureStore.load(fx.paths);
+    assert.equal(store.intent("shortlived"), undefined);
+
+    const next = await fx.restart();
+    await next.reconcileAtBoot();
+    assert.deepEqual(next.list(), [], "nothing tracked, nothing described");
   } finally {
     await fx.cleanup();
   }

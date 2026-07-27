@@ -374,6 +374,7 @@ flat over time — small rewritten orientation files plus large append-only logs
         └── .dispatch/          crew-dispatch state (only after `co link`)
             ├── config.json        repo path, named agent commands, caps, pane layout, anchor
             ├── inbox.json         the last 20 crew reviews, newest first (Ctrl-O → Inbox)
+            ├── features.json      per-feature intents, keyed by slug
             └── captures/          per-job captured output the co reviews from
 ```
 
@@ -765,7 +766,7 @@ src/
   session/   session.ts prompt.ts tools.ts reviewinbox.ts
              crewpanes.ts dispatchconfig.ts transport.ts registry.ts
              worktrees.ts forge.ts checks.ts landing.ts landinggate.ts
-             mergequeue.ts features.ts
+             mergequeue.ts features.ts featurestore.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
 ```
 
@@ -985,6 +986,17 @@ acting on them — a branch already contained in `origin/dev` with no worktree i
 not an anomaly at all, it is what every landed feature leaves behind now that
 refs are kept. The co's reach stops at the PR into `dev`: it never touches
 `main` and there is no promote path.
+
+`featurestore.ts` is the durable half of a feature record. Git rebuilds
+everything else about a feature from its worktree, but not the line the co wrote
+to say what it is FOR, so intents are persisted per slug in
+`.dispatch/features.json` — beside the dispatch config and the review inbox,
+never inside the repo or the worktree — and read back at session start, so
+`feature_list`/`feature_status` still describe a recovered worktree. It is a
+cache of
+authored prose and behaves like one: a missing or corrupt file is an empty store,
+and a write that can't land costs a description, never a create, a merge or a
+teardown.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,

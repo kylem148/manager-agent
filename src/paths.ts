@@ -74,6 +74,12 @@ export interface InstancePaths {
    *  Lives beside the dispatch config because a review is the tail end of a
    *  dispatch; never written into the user's repo. */
   reviewInbox: string;
+  /** Per-feature metadata co authored and git cannot recover: the feature's
+   *  intent (its one-line description). Keyed by slug, read at startup so the
+   *  descriptions survive a restart. Lives beside the dispatch config for the
+   *  same reason the inbox does — feature worktrees are dispatch state — and is
+   *  never written into the user's repo. */
+  featureStore: string;
   /** Directory holding per-job capture files. */
   captures: string;
   /** Resolve a per-job capture file under .dispatch/captures/. */
@@ -108,6 +114,7 @@ export function instancePaths(home: string, name: string): InstancePaths {
     dispatch,
     dispatchConfig: path.join(dispatch, "config.json"),
     reviewInbox: path.join(dispatch, "inbox.json"),
+    featureStore: path.join(dispatch, "features.json"),
     captures,
     captureFile: (jobId) => path.join(captures, `${jobId}.log`),
     liveFile: (f) => path.join(memory, f),

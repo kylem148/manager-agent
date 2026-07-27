@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { checksLine, failedChecks, type ChecksPolicy } from "./checks.js";
 import type { CommandRunner } from "./forge.js";
 import { executeLanding, prepareLanding, type LandingOptions } from "./landing.js";
+import { FeatureStore } from "./featurestore.js";
 import { reviewLanding, type LandingGateHost, type LandingGateResult } from "./landinggate.js";
 import {
   MergeQueue,
@@ -84,6 +85,10 @@ export interface FeatureManagerOptions {
   /** How long the landing prepare waits on a PR's CI checks, and how often it
    *  looks. Defaults live in checks.ts; tests inject a no-op sleep. */
   checks?: ChecksPolicy;
+  /** Durable per-feature intents (featurestore.ts), loaded from the instance's
+   *  `.dispatch/features.json` at session start. Omit for an in-memory store —
+   *  the pre-persistence behaviour, and what tests get by default. */
+  store?: FeatureStore;
   /** Overrides for the git/gate seams (tests only). */
   deps?: Partial<FeatureManagerDeps>;
 }
@@ -94,8 +99,9 @@ export interface FeatureView {
   branch: string;
   worktreePath: string;
   provisionStatus: FeatureRecord["provisionStatus"];
-  /** The intent the co gave at create time, if any. Not persisted across a
-   *  restart — the co's own memory holds the durable intent. */
+  /** The intent the co gave at create time, if any. Persisted per slug
+   *  (featurestore.ts), so it survives a restart and is still there for a record
+   *  the boot reconcile rebuilt from the worktree on disk. */
   intent?: string;
   /** Jobs the registry has dispatched under this feature (id + status + label). */
   jobs: { id: string; status: string; label: string }[];
@@ -156,10 +162,12 @@ export class FeatureManager {
    *  and the head-only state machine; drives the EXISTING prepare + gate through
    *  the deps below. FeatureManager is its host (busy check + record cleanup). */
   private readonly queue: MergeQueue;
-  /** Intents keyed by slug, so status/list can echo the feature's purpose. Not
-   *  durable: reconcile can't recover an intent from a branch, so a restart
-   *  drops it (the co's memory is the durable record). */
-  private readonly intents = new Map<string, string>();
+  /** Intents keyed by slug, so status/list can show what a feature is FOR.
+   *  Durable: git can rebuild everything else about a feature from its worktree,
+   *  but not the line the co wrote, so that one field is persisted under
+   *  `.dispatch/features.json` (featurestore.ts) and read back at session
+   *  start. */
+  private readonly store: FeatureStore;
 
   constructor(opts: FeatureManagerOptions) {
     this.registry = opts.registry;
@@ -168,6 +176,7 @@ export class FeatureManager {
     this.run = opts.run;
     if (opts.gateHost) this.gateHost = opts.gateHost;
     this.checks = opts.checks;
+    this.store = opts.store ?? FeatureStore.ephemeral();
     this.deps = {
       provision: opts.deps?.provision ?? provisionWorktree,
       teardown: opts.deps?.teardown ?? teardownWorktree,
@@ -185,7 +194,9 @@ export class FeatureManager {
         isBusy: (feature) => this.isBusy(feature),
         forget: (feature) => {
           this.registry.removeFeature(feature);
-          this.intents.delete(safeSlug(feature));
+          // Fire-and-forget: the in-memory drop is synchronous, and the file
+          // rewrite never rejects (see FeatureStore.persist).
+          void this.store.forget(safeSlug(feature));
         },
       },
       deps: { prepare: this.deps.prepare, execute: this.deps.execute },
@@ -227,7 +238,7 @@ export class FeatureManager {
       .jobsForFeature(record.feature)
       .map((j) => ({ id: j.id, status: j.status, label: j.label }));
     const busy = this.isBusy(record.feature);
-    const intent = this.intents.get(record.slug);
+    const intent = this.store.intent(record.slug);
     const queue = this.queue.viewFor(record.feature);
     return {
       feature: record.feature,
@@ -259,7 +270,10 @@ export class FeatureManager {
       ...(type ? { type } : {}),
     });
     this.registry.upsertFeature(record);
-    if (intent && intent.trim()) this.intents.set(record.slug, intent.trim());
+    // Persisted before the view is built, so the create result already carries
+    // what a later restart will read back. A blank intent leaves whatever an
+    // earlier create stored alone (FeatureStore.setIntent).
+    if (intent) await this.store.setIntent(record.slug, intent);
     return { created: !alreadyReady, feature: this.toView(record) };
   }
 
@@ -348,7 +362,7 @@ export class FeatureManager {
       // the checkout down); drop the record and its intent so list/status
       // reflect reality.
       this.registry.removeFeature(feature);
-      if (record) this.intents.delete(record.slug);
+      if (record) await this.store.forget(record.slug);
       return {
         feature,
         outcome: "merged",
@@ -402,7 +416,7 @@ export class FeatureManager {
       ...(record?.branch ? { branch: record.branch } : {}),
     });
     this.registry.removeFeature(feature);
-    if (record) this.intents.delete(record.slug);
+    if (record) await this.store.forget(record.slug);
     // Drop it from the merge queue too, so an abandoned feature never lingers as
     // a stale entry. If it was the head, this advances the queue and processes
     // the new head against the current dev tip.
@@ -584,6 +598,11 @@ export class FeatureManager {
    * anomalies (a branch holding unmerged work with no worktree, a stray dir) are
    * returned for surfacing, never acted on. Records already tracked are
    * overwritten by the fresh on-disk truth.
+   *
+   * A rebuilt record carries its description with it: the record comes from git,
+   * the intent comes from the persisted store (loaded at session start and keyed
+   * by the same slug the branch name yields), so `list`/`status` show what a
+   * recovered feature is FOR and not just where it lives.
    */
   async reconcileAtBoot(): Promise<FeatureReconcileReport> {
     const report = await this.deps.reconcile(this.worktreeOptions());

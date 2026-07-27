@@ -422,6 +422,11 @@ checkpoint over everything it produced.
   new capability. So "stale token bug" becomes \`fix/stale-token-bug\`. The
   branches read like any developer's; nothing in the repo advertises how the
   work was done.
+- Always give the \`intent\` too: it is one plain line saying what the feature is
+  FOR, it is stored with the feature (surviving a restart), and it is what the
+  captain reads beside every worktree in the Ctrl-O features tab. The branch name
+  says what KIND of work it is; the intent is the only thing that says what the
+  work actually is.
 - Dispatch into a feature by passing its name as \`dispatch_order\`'s \`feature\`
   argument. The crew then runs inside that worktree (provisioned on first use if
   you skipped feature_create). The arm banner shows the target worktree path, or
