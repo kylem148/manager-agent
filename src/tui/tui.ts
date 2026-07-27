@@ -22,6 +22,12 @@
  *    SSH). The terminal's modifier-key override (hold Option in iTerm2, Fn in
  *    Terminal.app, Shift elsewhere) still works as a fallback, and CO_MOUSE=off
  *    disables capture entirely.
+ *    The Ctrl-O panel takes the whole keyboard AND swallows the mouse (only the
+ *    wheel scrolls there), so a drag can't select inside it. Getting text out of
+ *    a doc is a KEY instead: `y` copies the open doc's raw markdown through the
+ *    same OSC 52 path. Deliberately the source rather than the painted rows -
+ *    the point is to carry away the document, not a width-wrapped screenshot of
+ *    it.
  *  - PgUp/PgDn/Ctrl-Home/Ctrl-End scroll from the keyboard; ↑/↓ navigate INPUT
  *    HISTORY (this is the behavior users expect and the old bug conflated).
  *  - SIGWINCH re-wraps and repaints. Every exit path restores the terminal.
@@ -84,6 +90,22 @@ function countLines(text: string): number {
   const parts = text.split("\n");
   if (parts.length > 1 && parts[parts.length - 1] === "") parts.pop();
   return parts.length;
+}
+
+/**
+ * The OSC 52 clipboard-write sequence for `text`: `ESC ] 52 ; c ; <base64> BEL`.
+ *
+ * Terminal-native, so it reaches the system clipboard locally AND through
+ * SSH/tmux (given passthrough) with no pbcopy/xclip and no runtime dependency.
+ *
+ * It is write-only and UNACKNOWLEDGED: nothing comes back, so a terminal with
+ * clipboard access switched off (Terminal.app has no OSC 52 at all; iTerm2 and
+ * Ghostty gate it behind a setting) drops it in silence and we cannot tell.
+ * That is why the callers confirm what they *sent* and name the caveat rather
+ * than claiming the clipboard changed.
+ */
+export function osc52(text: string): string {
+  return `${ESC}]52;c;${Buffer.from(text, "utf8").toString("base64")}\x07`;
 }
 
 /**
@@ -1027,6 +1049,14 @@ interface PanelState {
    *  repo can have more features in flight than a small terminal has rows — so
    *  unlike the docs/inbox lists it pages rather than clipping. */
   featuresScroll: number;
+  /**
+   * The doc view's copy confirmation, shown in the footer in place of the key
+   * hints, or null. Sticky until the next panel key rather than timed out: it
+   * mirrors the transcript's finished selection, which stays highlighted as its
+   * own receipt until something dismisses it, and a copy is worth confirming
+   * for as long as the captain is still looking at what he copied.
+   */
+  copyNotice: string | null;
 }
 
 /**
@@ -2012,14 +2042,12 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * Copy `text` to the system clipboard via OSC 52. This is terminal-native, so
-   * it works through SSH/tmux (given passthrough) without shelling out to
-   * pbcopy/xclip. Empty selections are ignored.
+   * Copy `text` to the system clipboard via OSC 52 (see osc52 for the sequence
+   * and its silent-failure caveat). Empty selections are ignored.
    */
   private copyToClipboard(text: string): void {
     if (text === "") return;
-    const b64 = Buffer.from(text, "utf8").toString("base64");
-    this.out.write(`${ESC}]52;c;${b64}\x07`);
+    this.out.write(osc52(text));
   }
 
   /**
@@ -2656,7 +2684,8 @@ export class Tui implements SessionIO {
   // the DOCS tab lists docs/ (selectable by letter) and opens one rendered
   // through the SAME markdown renderer the transcript uses, refreshing live when
   // an agent writes it; the INBOX tab lists the filed crew reviews and opens
-  // one's full body on that same surface. The docs read only through the injected
+  // one's full body on that same surface, and an open doc adds `y` to copy its
+  // raw markdown to the system clipboard. The docs read only through the injected
   // DocSource (the sandboxed doc tool — the `.memory/` substrate is never listed
   // or reachable here); the queue, the features and the inbox read a fresh
   // in-memory snapshot from their sources at paint time. No step
@@ -2725,6 +2754,7 @@ export class Tui implements SessionIO {
       queueRows: [],
       queueSig: "",
       featuresScroll: 0,
+      copyNotice: null,
     };
     if (this.docs) {
       this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
@@ -2881,9 +2911,15 @@ export class Tui implements SessionIO {
     try {
       const content = await this.docs.read(name);
       if (!this.panel || this.panel.view.kind !== "doc" || this.panel.view.name !== name) return; // moved on
+      const changed = this.panel.view.content !== content;
       const rows = renderMarkdownDoc(content, this.cols);
       const scroll = Math.min(this.panel.view.scroll, Math.max(0, rows.length - this.overlayViewport()));
       this.panel.view = { kind: "doc", name, content, rows, scroll, error: null };
+      // A copy receipt is only true of the text it was taken from. This is the
+      // one refresh path no keystroke passes through (an agent rewrote the doc
+      // under the captain), so retire the receipt here rather than let it vouch
+      // for content that has since moved on.
+      if (changed) this.panel.copyNotice = null;
       this.paint();
     } catch {
       // Deleted out from under us: drop back to the list rather than show stale.
@@ -3078,6 +3114,14 @@ export class Tui implements SessionIO {
 
   private dispatchOverlay(input: OverlayInput): void {
     if (!this.panel) return;
+    // A standing copy confirmation is dismissed by the next key, whatever it is,
+    // the way any real keystroke clears the transcript's copied-selection
+    // highlight. Cleared BEFORE routing so `y` re-sets it on the way through and
+    // a repeat copy still reads as a fresh receipt.
+    if (this.panel.copyNotice !== null) {
+      this.panel.copyNotice = null;
+      this.paint();
+    }
     // Ctrl-O toggles the panel shut from any view — the same key that opened it.
     // It takes each view's OWN escape exit rather than a second, divergent close
     // path, so it inherits their rules (notably the review view's mid-merge
@@ -3206,8 +3250,45 @@ export class Tui implements SessionIO {
       this.overlayScrollInput(input);
       return;
     }
+    // `y` yanks the whole doc, checked before the paging surface so the copy can
+    // never be shadowed by a scroll key. It is the ONLY action on this view, and
+    // it lives here rather than in overlayScrollInput so the filed-review body -
+    // which shares that paging surface - keeps the key space it already had.
+    if (input.ch === "y") { this.copyDoc(); return; }
     if (input.ch === "q") { this.closePanel(); return; }
     this.overlayScrollInput(input);
+  }
+
+  /**
+   * `y` on an open doc: copy it to the system clipboard via OSC 52.
+   *
+   * The RAW markdown, not the rows on screen. What the captain wants back is the
+   * document he authored - a command cheat-sheet he can paste somewhere useful -
+   * and the painted version is ANSI-styled and hard-wrapped to whatever width
+   * this terminal happens to be, which pastes as junk. `content` is verbatim
+   * what DocSource.read returned, so the clipboard gets the file.
+   *
+   * Nothing here touches mouse reporting, the Kitty flags or the alt screen: the
+   * copy is one escape sequence written mid-frame, which moves no cursor and
+   * disturbs no mode. It is the same mechanism the transcript's drag-selection
+   * already uses, so a doc copies exactly the way a selection does.
+   */
+  private copyDoc(): void {
+    if (!this.panel || this.panel.view.kind !== "doc") return;
+    const { content, error } = this.panel.view;
+    if (error !== null || content === "") {
+      this.panel.copyNotice = "nothing to copy";
+      this.paint();
+      return;
+    }
+    this.copyToClipboard(content);
+    const n = countLines(content);
+    // OSC 52 is unacknowledged, so this names what was SENT and warns about the
+    // one way it silently fails. The moment the key is pressed is the only place
+    // that caveat is worth spending a footer on.
+    this.panel.copyNotice =
+      `copied ${n} line${n === 1 ? "" : "s"} · if nothing pastes, allow clipboard access (OSC 52)`;
+    this.paint();
   }
 
   /** The drilled review view (full paged diff): m/r act, Backspace returns to the
@@ -3784,6 +3865,14 @@ export class Tui implements SessionIO {
       v?.kind === "queue" || v?.kind === "features" || v?.kind === "docs" || v?.kind === "inbox";
     const tabHint = onHomeTab && this.panelTabs().length > 1 ? "Tab/i switch · " : "";
 
+    // Built before the hints: the doc view sizes its hint run against whatever
+    // the indicator leaves, so the copy key isn't the thing that gets clipped.
+    let right = "";
+    if (total > vp) {
+      const below = total - (start + vp);
+      right = below > 0 ? `${below} more below ` : "end ";
+    }
+
     let left: string;
     if (v?.kind === "review") {
       left = " " + this.reviewActionBar() + " ";
@@ -3805,16 +3894,34 @@ export class Tui implements SessionIO {
       left = ` ${c.dim("space/b page · " + tabHint + "Esc close")} `;
     } else if (v?.kind === "docs" || v?.kind === "inbox") {
       left = ` 1-9/a-z open · ${tabHint}Esc close `;
+    } else if (v?.kind === "doc") {
+      const notice = this.panel?.copyNotice;
+      if (notice) {
+        // The receipt replaces the hints while it stands, and takes the position
+        // indicator's room too when it needs it: the indicator is one keypress
+        // from coming back, whereas a half-printed "71 mo" is just debris. The
+        // caveat is the part that must survive a narrow terminal, so the lead-in
+        // is what shortens.
+        const terse = notice.replace("if nothing pastes, allow", "allow");
+        const fits = 2 + visibleWidth(notice) <= w;
+        left = ` ${c.cyan(fits ? notice : terse)} `;
+        right = "";
+      } else {
+        // `y` is the only ACTION key on a doc, so it leads and is coloured the
+        // way the queue tab leads with its [m]. Where the full run won't fit
+        // beside the scroll indicator the paging tail is dropped rather than
+        // letting clip() eat the end: a hint that's always truncated away is a
+        // hint nobody discovers, and space/b is the paging key that matters.
+        const long = " copy · space/b page · j/k line · g/G ends · Backspace back · Esc close ";
+        const short = " copy · space/b page · Backspace back · Esc close ";
+        const fits = 1 + 1 + visibleWidth(long) + visibleWidth(right) <= w;
+        left = " " + c.cyan("y") + (fits ? long : short);
+      }
     } else {
-      // a doc or a filed review: the shared paging surface
+      // a filed review body: the shared paging surface, no actions of its own
       left = " space/b page · j/k line · g/G ends · Backspace back · Esc close ";
     }
 
-    let right = "";
-    if (total > vp) {
-      const below = total - (start + vp);
-      right = below > 0 ? `${below} more below ` : "end ";
-    }
     const fill = Math.max(0, w - visibleWidth(left) - visibleWidth(right));
     return this.clip(left + c.dim("─".repeat(fill)) + c.dim(right), w);
   }

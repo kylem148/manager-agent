@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   Tui,
+  osc52,
   renderMarkdownDoc,
   type DocSource,
   type FeaturePanelEntry,
@@ -104,6 +105,9 @@ interface Harness {
   send(bytes: string): void;
   lastFrame(): string;
   lastFramePlain(): string;
+  /** Every byte written to the terminal, for assertions about sequences that
+   *  are NOT a frame (the OSC 52 clipboard write rides alongside one). */
+  writes(): string[];
   stop(): void;
 }
 
@@ -142,6 +146,7 @@ function harness(
     send: (bytes) => listener?.(bytes),
     lastFrame: () => writes[writes.length - 1] ?? "",
     lastFramePlain: () => stripAnsi(writes[writes.length - 1] ?? ""),
+    writes: () => writes,
     stop: () => tui.stop(),
   };
 }
@@ -328,6 +333,204 @@ test("Backspace in a doc returns to the list; Esc from a doc closes entirely", a
   h.send(ESC); // Esc from the list closes
   h.send("done\r");
   assert.equal(await answer, "done");
+  h.stop();
+});
+
+// --- copying a doc out (y / OSC 52) ------------------------------------------
+//
+// The panel owns the whole keyboard AND swallows the mouse (only the wheel gets
+// through), so no drag can select inside it and the terminal's own click-drag is
+// off while mouse reporting is on. Getting a doc out is therefore a KEY. What it
+// must put on the clipboard is the RAW markdown the captain authored, not the
+// ANSI-styled, width-wrapped rows on screen.
+
+/** Pull the payload out of the OSC 52 write among a run of terminal writes, or
+ *  null if nothing asked for the clipboard. */
+function clipboardPayload(writes: string[]): string | null {
+  for (const w of writes) {
+    const m = /\x1b]52;c;([A-Za-z0-9+/=]*)\x07/.exec(w);
+    if (m) return Buffer.from(m[1]!, "base64").toString("utf8");
+  }
+  return null;
+}
+
+test("osc52 wraps base64 in the clipboard-write sequence", () => {
+  assert.equal(osc52("hi"), `\x1b]52;c;${Buffer.from("hi").toString("base64")}\x07`);
+  // Non-ASCII survives the round trip as UTF-8, so a doc with a box-drawing
+  // table or a curly quote copies as itself.
+  const text = "héllo — ✓";
+  const m = /\x1b]52;c;(.*)\x07/.exec(osc52(text));
+  assert.equal(Buffer.from(m![1]!, "base64").toString("utf8"), text);
+});
+
+test("y on an open doc copies its RAW markdown, not the rendered rows", async () => {
+  const source = "# Cheat sheet\n\n- `co link` registers a repo\n- `co pane` picks the pane\n";
+  const docs = fakeDocs({ "cheatsheet.md": source });
+  const h = harness(docs, 72, 16);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1"); // open cheatsheet.md
+  await settle();
+  // The screen shows it rendered: the markers are styling, not literal text.
+  assert.ok(!h.lastFramePlain().includes("# Cheat sheet"), "rendered on screen");
+
+  const before = h.writes().length;
+  h.send("y");
+  await settle();
+  const copied = clipboardPayload(h.writes().slice(before));
+  assert.equal(copied, source, "the clipboard gets the file, byte for byte");
+  h.stop();
+});
+
+test("the doc footer advertises y, and the copy confirms with the OSC 52 caveat", async () => {
+  const docs = fakeDocs({ "plan.md": "# Plan\n\nline one\nline two\n" });
+  const h = harness(docs, 100, 16);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  assert.match(h.lastFramePlain(), /y copy/, "the key is discoverable before it's pressed");
+
+  h.send("y");
+  await settle();
+  const confirmed = h.lastFramePlain();
+  assert.match(confirmed, /copied 4 lines/, "the receipt names what was sent");
+  // OSC 52 is unacknowledged, so the caveat has to ride with the confirmation.
+  assert.match(confirmed, /allow clipboard access/, "the silent-failure caveat is surfaced");
+
+  // Sticky until the next key, then the hints come back.
+  h.send("j");
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("copied 4 lines"), "the next key dismisses it");
+  assert.match(h.lastFramePlain(), /y copy/, "the hints return");
+  h.stop();
+});
+
+test("a live rewrite of the copied doc retires the receipt, which no longer vouches for it", async () => {
+  const docs = fakeDocs({ "plan.md": "# Plan\n\noriginal body\n" });
+  const h = harness(docs, 100, 16);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  h.send("y");
+  await settle();
+  assert.match(h.lastFramePlain(), /copied 3 lines/);
+
+  // An agent rewrites the doc: the clipboard still holds the OLD text, so the
+  // confirmation must not keep standing over the new content.
+  docs.set("plan.md", "# Plan\n\nrewritten body\n");
+  docs.emit("plan.md");
+  await settle();
+  const after = h.lastFramePlain();
+  assert.match(after, /rewritten body/, "the refresh landed");
+  assert.ok(!after.includes("copied 3 lines"), "the stale receipt is gone");
+  assert.match(after, /y copy/, "and the hints are back");
+  h.stop();
+});
+
+test("on a narrow terminal the copy hint survives and the scroll indicator still fits", async () => {
+  const long = Array.from({ length: 100 }, (_, i) => `line ${i + 1}`).join("\n");
+  const docs = fakeDocs({ "long.md": long });
+  const h = harness(docs, 72, 12);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  const footer = h.lastFramePlain();
+  // The hint run is shortened rather than clipped, so BOTH the new key and the
+  // position indicator survive a width that couldn't hold the full run.
+  assert.match(footer, /y copy/, "the copy key is still advertised");
+  assert.match(footer, /more below/, "and the scroll indicator wasn't pushed off");
+
+  // The receipt keeps the caveat at a width that can't hold the full sentence:
+  // the lead-in shortens, the "allow clipboard access" part never does.
+  const narrow = harness(docs, 56, 12);
+  narrow.tui.question();
+  narrow.send(CTRL_O);
+  await settle();
+  narrow.send("1");
+  await settle();
+  narrow.send("y");
+  await settle();
+  const receipt = narrow.lastFramePlain();
+  assert.match(receipt, /allow clipboard access \(OSC 52\)/, "the caveat survives");
+  assert.ok(!receipt.includes("if nothing pastes"), "the lead-in is what gave way");
+  narrow.stop();
+  h.stop();
+});
+
+test("y stays scoped to a doc: it copies nothing from a filed review body", async () => {
+  const entry: InboxPanelEntry = {
+    level: "L1",
+    verdict: "rework",
+    headline: "auth middleware never ran",
+    body: "Went wrong: the middleware is registered after the route.",
+    timestamp: "2026-07-24T11:05:00.000Z",
+    jobId: "job-003",
+  };
+  const h = harness(undefined, 72, 16, undefined, { list: () => [entry] });
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1"); // drill into the filed review
+  await settle();
+  assert.match(h.lastFramePlain(), /inbox · L1 rework/, "in a filed review body");
+
+  const before = h.writes().length;
+  h.send("y");
+  await settle();
+  assert.equal(clipboardPayload(h.writes().slice(before)), null, "no clipboard write");
+  // And the inbox body's own footer is untouched by the doc view's new key.
+  assert.ok(!h.lastFramePlain().includes("y copy"), "the hint is the doc view's alone");
+  h.stop();
+});
+
+test("y on a doc that failed to load says so instead of copying an empty string", async () => {
+  const docs = fakeDocs({ "gone.md": "# Gone\n" });
+  const h = harness(docs, 72, 16);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  docs.remove("gone.md"); // deleted between the list and the open
+  h.send("1");
+  await settle();
+
+  const before = h.writes().length;
+  h.send("y");
+  await settle();
+  assert.equal(clipboardPayload(h.writes().slice(before)), null, "nothing reaches the clipboard");
+  assert.match(h.lastFramePlain(), /nothing to copy/);
+  h.stop();
+});
+
+test("y does not disturb paging, back, or close on a doc", async () => {
+  const body = Array.from({ length: 100 }, (_, i) => `line ${i + 1}`).join("\n");
+  const docs = fakeDocs({ "plan.md": body });
+  const h = harness(docs, 72, 12);
+  const answer = h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("1");
+  await settle();
+  h.send("y"); // copy, then keep navigating with the confirmation standing
+  await settle();
+  h.send(" "); // space still pages (same top-of-page marker as the paging test)
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("line 1line 2"), "space paged past the top");
+  h.send("g"); // g still returns to the top
+  await settle();
+  assert.match(h.lastFramePlain(), /line 1line 2/, "g returns to the top");
+  h.send("\x7f"); // Backspace still returns to the list
+  await settle();
+  assert.match(h.lastFramePlain(), /1\)\s*plan\.md/);
+  h.send(ESC);
+  h.send("done\r");
+  assert.equal(await answer, "done", "and the prompt never saw any of it");
   h.stop();
 });
 
