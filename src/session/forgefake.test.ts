@@ -18,6 +18,13 @@ import type { CommandResult, CommandRunner } from "./forge.js";
  *    refs with real git exactly as it does in production.
  *  - `git push` honours `--force-with-lease`: a lease that no longer matches
  *    fails, the way it would against a branch someone else moved.
+ *  - `gh pr checks` reproduces gh's REAL contract, which is the whole reason the
+ *    checks gate can be tested at all: with `--json` gh prints the list and exits
+ *    0 EVEN WHEN CHECKS FAILED (the verdict is in the buckets, never the exit
+ *    code), and it exits 1 with "no checks reported on the '<branch>' branch" on
+ *    stderr when there is nothing to report — the ungated case. `--required`
+ *    filters to the checks branch protection marks required, and says "no
+ *    required checks reported" when there are none.
  *  - `gh pr merge --merge` builds a REAL two-parent merge commit in the repo
  *    (commit-tree over the base and head shas) and moves the fake `origin/dev`
  *    to it. So a test can assert the resulting topology — two parents, per-job
@@ -29,6 +36,17 @@ import type { CommandResult, CommandRunner } from "./forge.js";
  * Any git command that is NOT about the remote (rev-parse, merge-base, …) is
  * delegated to real git in the repo, so the fake never has to model git itself.
  */
+
+/** One check on a fake PR, in gh's own vocabulary. */
+export interface FakeCheck {
+  name: string;
+  bucket: "pass" | "fail" | "pending" | "skipping" | "cancel";
+  state?: string;
+  link?: string;
+  workflow?: string;
+  /** True when branch protection marks it required — what `--required` filters to. */
+  required?: boolean;
+}
 
 export interface FakePr {
   number: number;
@@ -57,6 +75,20 @@ export interface FakeForge {
   hasRemote: boolean;
   /** When set, `gh pr merge` fails with this message. */
   mergeError: string | null;
+  /** When set, `gh pr checks` fails with this message (a broken read, NOT the
+   *  no-checks case — that is simply an empty/absent checks list). */
+  checksError: string | null;
+  /** The checks each PR reports, by PR number. A PR with no entry falls back to
+   *  `defaultChecks`; an empty list either way is the UNGATED case, where gh says
+   *  "no checks reported" and exits 1. */
+  checks: Map<number, FakeCheck[]>;
+  /** What a PR with no explicit entry reports. Null (the default) models a repo
+   *  with NO CI at all — the ungated case — because that is the state a fixture
+   *  that says nothing about checks is really in. */
+  defaultChecks: FakeCheck[] | null;
+  /** Fired on every `gh pr checks` read, with the PR number — the seam a test
+   *  uses to flip a pending check to green between polls. */
+  onChecksRead?: (number: number) => void;
   prFor(branch: string): FakePr | undefined;
 }
 
@@ -91,6 +123,9 @@ export function makeFakeForge(repo: string, seed: { dev?: string } = {}): FakeFo
     ghAuthed: true,
     hasRemote: true,
     mergeError: null,
+    checksError: null,
+    checks: new Map(),
+    defaultChecks: null,
     prFor: (branch) => f.prs.find((p) => p.head === branch && p.state === "OPEN"),
   };
   if (seed.dev) f.branches.set("dev", seed.dev);
@@ -195,6 +230,32 @@ export function makeFakeForge(repo: string, seed: { dev?: string } = {}): FakeFo
     }
 
     if (args[1] === "view") return ok(JSON.stringify(prJson(pr, fields)));
+
+    if (args[1] === "checks") {
+      f.onChecksRead?.(pr.number);
+      if (f.checksError) return fail(f.checksError, 1);
+      const required = args.includes("--required");
+      const all = f.checks.get(pr.number) ?? f.defaultChecks ?? [];
+      const runs = required ? all.filter((chk) => chk.required) : all;
+      if (runs.length === 0) {
+        // gh's real shape: exit 1, nothing on stdout, the reason on stderr.
+        const what = required && all.length > 0 ? "no required checks" : "no checks";
+        return fail(`${what} reported on the '${pr.head}' branch`, 1);
+      }
+      // Exit 0 even when a check FAILED — gh's actual --json behaviour.
+      return ok(
+        JSON.stringify(
+          runs.map((chk) => ({
+            name: chk.name,
+            bucket: chk.bucket,
+            state: chk.state ?? chk.bucket.toUpperCase(),
+            link: chk.link ?? "",
+            workflow: chk.workflow ?? "",
+            description: "",
+          })),
+        ),
+      );
+    }
 
     if (args[1] === "merge") {
       if (f.mergeError) return fail(f.mergeError);

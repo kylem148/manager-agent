@@ -529,33 +529,69 @@ decision and nothing else.
 Finished features land in `dev` as **GitHub pull requests**, through a strictly
 serial merge queue that does the work itself. Only the front of the line is ever
 touched. The queue fetches, rebases the head onto the current `origin/dev` tip,
-and runs your build+test on that combined state (feature A green and feature B
-green does not make A+B green). Only if that is green does anything leave the
-machine: the rebased branch is pushed (force-with-lease — a rebase rewrites
-shas) and a PR into `dev` is opened, or the existing one refreshed. The **Ctrl-O
-queue tab** then shows that PR — its number and link, its title and description,
-the commits it carries and the build+test evidence — with a live `[m]` beside it.
+pushes the rebased branch (force-with-lease — a rebase rewrites shas), opens a PR
+into `dev` (or reuses the open one), and then **reads that PR's real GitHub
+checks**. The **Ctrl-O queue tab** shows the PR — its number and link, its title
+and description, the commits it carries and what its CI said — with a live `[m]`
+beside it once the checks are green.
 
-`[m]` is a state, not a prompt. It appears because the head is green, it stays
-there until you press it, and pressing it runs `gh pr merge --merge`: the PR
-lands on `dev` as a **merge commit**, co fetches so it sees the moved
-`origin/dev`, the feature's local worktree is torn down, the queue advances, and
-the next feature rebases and tests itself against the `dev` you just moved, so
-its own `[m]` lights up when it goes green. Nothing is armed, nothing expires,
-and the co-manager is not involved in any of it: it never opens the merge, never
-waits on your keypress, and its agent loop is free the whole time. The PR is a
-normal PR while it waits — retitle it, rewrite the description, comment on it,
-review the diff on GitHub. Re-processing only rewrites the fenced evidence block
-co owns; your edits stay.
+**co runs no build and no test.** It used to, on the combined rebased tree, from
+a command it had to guess — and a guess is wrong the moment the repo isn't npm.
+GitHub is already testing exactly the state that matters (a `pull_request`
+workflow runs against a merge of the PR head and its base, which is the tree the
+rebase produced) and already blocks the merge on the result, so co reads that
+verdict instead of reproducing it. What co still owns is the *textual* half of
+the gate — the rebase onto the current `origin/dev`, because that is git's
+question, not CI's, and feature A green plus feature B green does not make A+B
+green.
+
+Four things the checks read can say, and what each does to the head:
+
+| checks | head | what you see |
+| ------ | ---- | ------------ |
+| all green (required checks if branch protection defines any, else every check) | `ready` | a live `[m]` |
+| any red | `blocked` | the failing checks by name, with links to their runs |
+| still running | `awaiting-checks` | what it is waiting on; no `[m]` yet |
+| **none at all** | `ready`, flagged **ungated** | "no CI checks on its PR — merging is your judgment, not a green" |
+
+That last row is deliberate. A repo with no CI is not an error and not a red: co
+has nothing to verify against, says exactly that in the panel and on the PR, and
+leaves the merge to you. A *broken* read is different — gh missing, gh
+unauthenticated, GitHub returning an error — and that blocks the head with gh's
+own message rather than quietly passing as ungated.
+
+The wait on pending checks is bounded (five minutes by default, re-read every
+ten seconds). When it runs out the head sits in `awaiting-checks` rather than
+hanging or claiming a verdict; re-enqueuing it reads the checks again.
+
+`[m]` is a state, not a prompt. It appears because the head's checks are green
+(or it is ungated), it stays there until you press it, and pressing it runs
+`gh pr merge --merge`: the PR lands on `dev` as a **merge commit**, co fetches so
+it sees the moved `origin/dev`, the feature's local worktree is torn down, the
+queue advances, and the next feature rebases onto the `dev` you just moved and
+has its own PR checked against it, so its `[m]` lights up when it goes green.
+Nothing is armed, nothing expires, and the co-manager is not involved in any of
+it: it never opens the merge, never waits on your keypress, and its agent loop is
+free the whole time. The PR is a normal PR while it waits — retitle it, rewrite
+the description, comment on it, review the diff on GitHub. Re-processing only
+rewrites the fenced evidence block co owns; your edits stay.
 
 The co-manager is pulled in for exactly one case: a head that comes back
-**blocked** — a rebase conflict, a red build+test, or a missing prerequisite
+**blocked** — a rebase conflict, a red CI check, or a missing prerequisite
 (no `gh`, gh not authenticated, no `origin/dev`). That head shows the block
 instead of an `[m]` and holds the queue, and the co is told automatically, so
-you don't re-explain it. For a conflict or a red build it can send a fresh crew
+you don't re-explain it. For a conflict or a red check it can send a fresh crew
 agent into that feature's own worktree to rebase and fix it (never `dev`) —
 confirm-gated like every dispatch, and bounded to three attempts, after which it
-stays blocked for you to fix by hand or abandon.
+stays blocked for you to fix by hand or abandon. The order that agent gets names
+the failing checks and links their runs; it does not name a build command,
+because co does not know one.
+
+One consequence of the gate being GitHub's: a red state now reaches the forge.
+It has to — the checks that judge it are the forge's, and they cannot run on a PR
+that does not exist. So a blocked-by-checks head has already pushed and opened
+its PR, which is also where you read what went wrong. Nothing red ever *merges*;
+that is still guaranteed, by the queue's ready gate and by the pins below.
 
 **Why a PR and not a local merge.** `dev` is normally checked out in your own
 tree, and git refuses to write a ref that is checked out; a local merge also
@@ -566,8 +602,8 @@ fetching. Three rules are wired in rather than left to configuration: the merge
 is always `--merge` (a merge commit, so the feature branch stays visible in the
 graph and the crew's per-job commits survive), the branch ref is always **kept**
 (only the local worktree is torn down — `--delete-branch` is never passed), and
-the tested tip is the merged tip (the PR's head on GitHub is compared against the
-sha the build+test ran on, and a mismatch refuses the merge).
+the checked tip is the merged tip (the PR's head on GitHub is compared against
+the sha the checks ran on, and a mismatch refuses the merge).
 
 Prerequisites: the `gh` CLI installed and authenticated, an `origin` remote, and
 a `dev` branch on it. co never creates `dev` — if it is missing it says so and
@@ -711,8 +747,8 @@ src/
              visuals.ts
   session/   session.ts prompt.ts tools.ts reviewinbox.ts
              crewpanes.ts dispatchconfig.ts transport.ts registry.ts
-             worktrees.ts forge.ts landing.ts landinggate.ts mergequeue.ts
-             features.ts
+             worktrees.ts forge.ts checks.ts landing.ts landinggate.ts
+             mergequeue.ts features.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
 ```
 
@@ -812,25 +848,49 @@ encodes the rules rather than leaving them to callers: the merge is always
 `gh pr merge --merge`, `--delete-branch` is never passed, a force push always
 carries a lease on the sha actually observed, and a PR update rewrites only
 the fenced evidence block co owns so a captain's edits to the title or the
-description survive.
+description survive. It is also where the merge gate is *read*: `readPrChecks`
+asks `gh pr checks --required` first (branch protection decides, exactly as it
+does for a human) and falls back to every check the PR reports. Two details of
+gh's real contract are encoded here because both are easy to get backwards, and
+both were verified against the binary: with `--json`, gh exits **0 even for
+failing checks** (the verdict is in the per-check `bucket`, never the exit
+code), and it exits **1 with "no checks reported"** when there is nothing to
+report — which is the *ungated* case, not a failure. Any other nonzero exit is a
+real fault and throws.
+
+`checks.ts` is the policy over that read: bucket counting into one verdict
+(`passed` / `failed` / `pending` / `none`, where a red beats a pending and a
+skipped check does not block, as on the forge), and the bounded poll that waits
+out checks still running. Two deadlines, because "still running" and "not there
+at all" are different questions: pending checks are waited on up to the timeout,
+while "no checks reported" is only waited on for a short grace window, and only
+right after a push — the one moment GitHub might not have registered a workflow
+run yet. Everything is injectable (timeout, interval, grace, and the sleep
+itself), so the whole poll is unit-tested without wall-clock.
 
 `landing.ts` is the landing engine that lands a finished feature in `dev`,
-split in two so a human gate can sit between testing and merging.
+split in two so a human gate can sit between checking and merging.
 `prepareLanding` fetches, rebases the feature branch onto the fresh
-`origin/dev` tip in its own worktree, and runs the project's combined
-build+test there (injectable; the default is the repo's own typecheck + test
-scripts) — on the combined rebased state, because feature A green and feature B
-green does not make A+B green. Green publishes: it pushes the rebased branch
-and opens or refreshes the PR into `dev` with a composed message (commits +
-build+test evidence). Conflict (the rebase is aborted, the branch restored
-byte-for-byte) and failed (the branch is left rebased so a fix dispatch lands
-in the exact red state) publish nothing — an unbuildable state never reaches
-the forge. `executeLanding` is the separate callable that does the merge:
-`gh pr merge --merge`, a fetch, then teardown of the local worktree with the
-branch ref kept. It is pinned three ways — the tested tip, the `origin/dev` it
-was tested against, and the reviewed PR — so a stale green, a branch that grew
-commits, or a PR head someone else moved all fail loudly instead of merging
-something nobody tested. The local `dev` ref is never written.
+`origin/dev` tip in its own worktree, pushes it, opens or reuses its PR, and
+reads that PR's checks. The rebase comes first because feature A green and
+feature B green does not make A+B green, and GitHub's `pull_request` workflows
+test a merge of the PR head with its base — so the checks that gate the merge
+see the tree `dev` will hold. Four outcomes: `green` (checks passed, or the PR
+has none at all — a ready head flagged **ungated**), `conflict` (the rebase is
+aborted and the branch restored byte-for-byte; nothing is pushed and no PR is
+touched), `failed` (a check went red), and `pending` (the bounded wait ran out
+with CI still running). Unlike the old local build+test, `failed` and `pending`
+have *already* published — the checks that judge them are the forge's and cannot
+run on a PR that does not exist — and the branch is deliberately left rebased so
+a fix dispatch lands in the exact state CI failed on. The evidence block is
+written twice for the same reason: once when the PR is created, saying the
+checks are the gate, and once more with what they said. `executeLanding` is the
+separate callable that does the merge: `gh pr merge --merge`, a fetch, then
+teardown of the local worktree with the branch ref kept. It is pinned three
+ways — the checked tip, the `origin/dev` it was checked against, and the
+reviewed PR — so a stale green, a branch that grew commits, or a PR head someone
+else moved all fail loudly instead of merging something nobody checked. The
+local `dev` ref is never written.
 
 `landinggate.ts` is the human gate for the direct `feature_land` route:
 `reviewLanding` prepares a feature and presents the result in the panel as a
@@ -838,21 +898,22 @@ summary (commits, changed-file count, the PR it opened), the full paged diff,
 and an action bar. Pressing `m` there merges that PR, pinned to the exact sha
 the review covered, so approval can never merge more than what was shown;
 `r`/Esc dismisses with no merge, leaving the PR open and the branch and
-worktree intact. A conflict or failed
-prepare opens the gate too, showing why the feature is not mergeable with `m`
-disabled. `main` stays human-only throughout.
+worktree intact. A conflict, a red check or a still-pending check opens the gate
+too, showing why the feature is not mergeable with `m` disabled. `main` stays
+human-only throughout.
 
 `mergequeue.ts` is the serial merge queue, and the normal route into `dev`.
 Features the captain marks done join an ordered queue; only the HEAD is ever
 worked, and it works itself out — `prepareLanding` rebases it onto the fresh
-`origin/dev` tip, build+tests it on that combined state and PRs it, leaving it
-`ready`, `blocked` (a rebase conflict, a red build+test, or a missing
-prerequisite), or `resolving`. Everything behind the head sits untouched, so
-nothing is ever speculatively tested or pushed.
+`origin/dev` tip, pushes it, PRs it and reads that PR's checks, leaving it
+`ready` (green, or ungated when the PR reports no checks), `awaiting-checks`
+(CI still running — a wait, not a failure), `blocked` (a rebase conflict, a red
+check, or a missing prerequisite), or `resolving`. Everything behind the head
+sits untouched, so nothing is ever speculatively pushed.
 
 **The merge is panel-native, not a co tool call.** A `ready` head simply
 *carries* an `[m]` in the Ctrl-O queue tab, alongside its pull request, commit
-list and build+test result. Pressing it calls `mergeReadyHead` directly: the PR
+list and checks result. Pressing it calls `mergeReadyHead` directly: the PR
 merges, the worktree is torn down (the branch ref kept), the queue advances, and
 the new head is processed against the `origin/dev` that merge just moved — so
 the next `[m]` is live (or the next block is on screen) by the time the key
@@ -895,7 +956,7 @@ the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,
 and the Ctrl-O panel. The panel has three home tabs, cycled with Tab — the merge
 queue, the doc viewer, and the review inbox — each reading a small injected
 source, so the Tui never reaches into git, the filesystem, or the session layer
-itself. The queue tab renders the ready head's pull request and build+test
+itself. The queue tab renders the ready head's pull request and checks
 inline and owns the `[m]` that merges it, through an injected `merge` callback that is the
 only thing the keystroke can reach; a pending `feature_land` review gets a
 fourth tab of its own for as long as it is pending, so the two merges never

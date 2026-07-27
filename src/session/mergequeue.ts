@@ -1,7 +1,7 @@
+import { checksLine, type ChecksPolicy, type ChecksSummary } from "./checks.js";
 import {
   executeLanding,
   prepareLanding,
-  type BuildTestSummary,
   type LandingOptions,
   type PrepareResult,
 } from "./landing.js";
@@ -12,7 +12,7 @@ import { resolveWorktreeOptions } from "./worktrees.js";
  * The serial merge-queue engine (decisions D-20260723-14/-21/-22): the layer
  * that turns "the captain marked these features done" into an ordered, one-at-a-
  * time landing onto `dev`. It sits ON TOP of the proven landing machinery and
- * adds no git of its own — every rebase, build+test, merge, and teardown is the
+ * adds no git of its own — every rebase, checks read, merge, and teardown is the
  * EXISTING code (prepareLanding for processing, executeLanding for the merge).
  * What this module owns is the state machine and the ordering.
  *
@@ -23,9 +23,14 @@ import { resolveWorktreeOptions } from "./worktrees.js";
  * head is ever handed to prepareLanding.
  *
  * THE LIFECYCLE of a single feature through the queue:
- *   queued ──processHead──▶ head-processing ──▶ ready   (rebase clean, build+test green)
- *                                            └─▶ blocked (rebase conflict OR build+test red)
+ *   queued ──processHead──▶ head-processing ──▶ ready   (rebase clean, PR checks green
+ *                                            │           — or the PR has no checks at
+ *                                            │           all: ready but UNGATED)
+ *                                            ├─▶ awaiting-checks (CI still running)
+ *                                            └─▶ blocked (rebase conflict OR a red check)
  *   ready ──mergeReadyHead──▶ (merged: gone from the queue; the next feature becomes head)
+ *   awaiting-checks ──holds the queue── until it is re-processed (re-enqueue) and CI has
+ *                                       reported; it is a wait, not a failure.
  *   blocked ──holds the queue── until the captain resolves (re-enqueue to retry) or removes it.
  *
  * THE MERGE IS PANEL-NATIVE (D-20260724-12). mergeReadyHead performs the merge
@@ -35,10 +40,10 @@ import { resolveWorktreeOptions } from "./worktrees.js";
  * a keypress. The old shape (a co tool call that opened a blocking review gate
  * and held the turn open until [m]) is gone; the queue no longer knows the Tui
  * exists. What guards the merge is unchanged and lives BELOW here: the head must
- * be `ready` (rebased onto the current `origin/dev` tip with a green build+test
- * on the combined state and its PR open), and executeLanding pins the merge to
- * the tested featureSha, the tested `origin/dev`, and that PR — so a stale green
- * fails loudly instead of landing.
+ * be `ready` (rebased onto the current `origin/dev` tip, its PR open, and that
+ * PR's checks green — or absent, an ungated ready), and executeLanding pins the
+ * merge to the checked featureSha, the `origin/dev` it was checked against, and
+ * that PR — so a stale green fails loudly instead of landing.
  *
  * THE MERGE ITSELF IS SERVER-SIDE (D-20260724-13). Nothing here writes `dev`;
  * executeLanding merges the feature's pull request on GitHub with a merge commit
@@ -54,9 +59,17 @@ import { resolveWorktreeOptions } from "./worktrees.js";
  * WHY the head is re-processed against the NEW dev tip after each merge: feature
  * A green and feature B green does not make A+B green — B may compile only
  * against code A changed. So when A merges and B becomes head, B is rebased onto
- * the dev A just moved and build+tested on that combined tree before it is ever
- * offered for merge. This is exactly prepareLanding's contract; the queue just
- * calls it at the right moments.
+ * the dev A just moved and its PR's checks run on that combined tree before it is
+ * ever offered for merge. This is exactly prepareLanding's contract; the queue
+ * just calls it at the right moments.
+ *
+ * CO RUNS NO BUILD OR TEST HERE, or anywhere (D-20260727-1). The head's semantic
+ * gate is the PULL REQUEST'S OWN GitHub checks, read off the forge after the
+ * rebase and push. A PR with no checks at all is not an error and not a block:
+ * the head goes ready, flagged UNGATED, and the captain's judgment is the only
+ * gate there is. Checks still running leave the head "awaiting-checks", which
+ * holds the queue exactly as a block does but is a WAIT, not a failure — a
+ * re-process reads them again.
  *
  * WHAT this module does NOT do: touch `main` at all, reach for a terminal (it
  * has no UI and no host to open one — it EXPOSES state the panel renders and a
@@ -68,18 +81,30 @@ import { resolveWorktreeOptions } from "./worktrees.js";
 /**
  * Where a queued feature stands. Only the head is ever anything but "queued".
  *
+ * "awaiting-checks" (D-20260727-1) is the head after its PR is open and pushed
+ * but its CI has not reported yet. It holds the queue like any other non-ready
+ * head, offers no [m], and is NOT a failure — re-processing it simply reads the
+ * checks again.
+ *
  * "resolving" (D-20260723-24) is the head while a FRESH crew agent we dispatched
  * is fixing it in its own worktree (rebasing onto the dev tip, resolving the
- * conflict, driving build+test green). It is a busy state: the head holds the
- * queue and merges nothing until the agent finishes and the head is re-processed.
+ * conflict, getting the PR's checks green). It is a busy state: the head holds
+ * the queue and merges nothing until the agent finishes and the head is
+ * re-processed.
  */
-export type QueueStatus = "queued" | "head-processing" | "ready" | "blocked" | "resolving";
+export type QueueStatus =
+  | "queued"
+  | "head-processing"
+  | "awaiting-checks"
+  | "ready"
+  | "blocked"
+  | "resolving";
 
 /**
  * Why a blocked head is blocked, kept apart from the human-readable reason so the
  * UI and the resolver path can branch on it. "conflict": the rebase onto the dev
  * tip hit merge conflicts (a fresh agent can resolve these). "failed": the rebase
- * was clean but the combined build+test came back red.
+ * was clean but a CI check on the PR came back red.
  */
 export type BlockedKind = "conflict" | "failed";
 
@@ -113,9 +138,14 @@ export interface QueueEntryView {
   /** Commits awaiting merge on a ready head (0 is possible but is treated as
    *  nothing-to-land and reported blocked, so a ready head always has > 0). */
   commitsReady?: number;
+  /** Present on a READY head whose PR reported no CI checks at all: it is
+   *  mergeable, but nothing verified it. Never silently dropped. */
+  ungated?: boolean;
+  /** Present when status is "awaiting-checks": how many are still running. */
+  checksPending?: number;
   /** Present when status is "blocked". */
   blockedReason?: string;
-  /** Present when status is "blocked": conflict vs red build+test. */
+  /** Present when status is "blocked": conflict vs a red CI check. */
   blockedKind?: BlockedKind;
   /** Resolver attempts spent so far on this head (0 until the first dispatch). */
   resolveAttempts?: number;
@@ -131,13 +161,14 @@ export interface QueueView {
 /**
  * The head's inline body for the Ctrl-O queue tab (D-20260724-12). A ready head
  * carries exactly what pressing [m] would land — the PULL REQUEST co opened
- * (title and body), the per-job commits it carries, and the build+test that
- * passed on the combined state — so the affordance and its evidence sit in one
- * view. Since D-20260724-13 that is the PR message rather than a bare patch:
- * the patch lives on GitHub, where the captain can read, comment on and edit it,
- * and what the panel needs to show is what will actually be merged there.
- * A blocked head carries why it is not mergeable (and, for the two fixable
- * flavours, what the resolver would be sent at). Anything else has no body.
+ * (title and body), the per-job commits it carries, and what that PR's CI checks
+ * said — so the affordance and its evidence sit in one view. Since D-20260724-13
+ * that is the PR message rather than a bare patch: the patch lives on GitHub,
+ * where the captain can read, comment on and edit it, and what the panel needs
+ * to show is what will actually be merged there. An awaiting head carries what
+ * it is waiting on. A blocked head carries why it is not mergeable (and, for the
+ * two fixable flavours, what the resolver would be sent at). Anything else has
+ * no body.
  *
  * Structurally what the Tui's QueueHeadDetail declares; the Tui does not import
  * from the session layer, so the two are kept assignable rather than shared.
@@ -149,9 +180,20 @@ export type QueueHeadDetail =
       /** The integration branch the PR merges into (e.g. "dev"). */
       target: string;
       commits: string[];
-      buildTest?: BuildTestSummary;
+      /** What the PR's checks said. `checks.ungated` marks the case the panel
+       *  must not render as a plain green: there was no CI to gate on. */
+      checks?: ChecksSummary;
       /** The open PR [m] would merge. Absent only if a green somehow carried no
        *  PR, which the ready gate below already excludes. */
+      pr?: { number: number; url: string; title: string; body: string };
+    }
+  | {
+      kind: "awaiting";
+      feature: string;
+      target: string;
+      commits: string[];
+      /** The last read: which checks are still running. */
+      checks?: ChecksSummary;
       pr?: { number: number; url: string; title: string; body: string };
     }
   | {
@@ -163,10 +205,10 @@ export type QueueHeadDetail =
       /** conflict: the paths left unmerged, and git's own account. */
       conflictFiles?: string[];
       detail?: string;
-      /** failed: the red build+test's exit code and output tail. */
-      exitCode?: number;
-      output?: string;
-      buildTest?: BuildTestSummary;
+      /** failed: the checks read, so the panel can name what went red and link
+       *  the run. The PR is where the failure is actually read. */
+      checks?: ChecksSummary;
+      pr?: { number: number; url: string; title: string; body: string };
       resolveAttempts?: number;
       maxResolveAttempts?: number;
     };
@@ -195,8 +237,9 @@ export interface MergeQueueDeps {
 
 export interface MergeQueueOptions {
   repoPath: string;
-  /** Combined build+test for the landing prepare (the head's gate to ready). */
-  buildTestCommand: string;
+  /** How long the head's processing waits on its PR's CI checks, and how often
+   *  it looks. Defaults live in checks.ts. */
+  checks?: ChecksPolicy;
   /** The remote carrying the integration branch. Default "origin". */
   remote?: string;
   /** Injected runner for the remote/gh surface (tests); production omits it. */
@@ -267,7 +310,7 @@ export interface RemoveResult {
 export class MergeQueue {
   private readonly entries: QueueEntry[] = [];
   private readonly repoPath: string;
-  private readonly buildTestCommand: string;
+  private readonly checks: ChecksPolicy | undefined;
   private readonly remote: string | undefined;
   private readonly run: CommandRunner | undefined;
   private readonly host: MergeQueueHost;
@@ -275,7 +318,7 @@ export class MergeQueue {
 
   constructor(opts: MergeQueueOptions) {
     this.repoPath = opts.repoPath;
-    this.buildTestCommand = opts.buildTestCommand;
+    this.checks = opts.checks;
     this.remote = opts.remote;
     this.run = opts.run;
     this.host = opts.host;
@@ -288,7 +331,7 @@ export class MergeQueue {
   private landingOptions(): LandingOptions {
     return {
       repoPath: this.repoPath,
-      buildTestCommand: this.buildTestCommand,
+      ...(this.checks ? { checks: this.checks } : {}),
       ...(this.remote ? { remote: this.remote } : {}),
       ...(this.run ? { run: this.run } : {}),
     };
@@ -333,6 +376,10 @@ export class MergeQueue {
     };
     if (entry.status === "ready" && entry.prepared?.kind === "green") {
       view.commitsReady = entry.prepared.commits.length;
+      if (entry.prepared.checks?.ungated) view.ungated = true;
+    }
+    if (entry.status === "awaiting-checks" && entry.prepared?.kind === "pending") {
+      view.checksPending = entry.prepared.checks.pending;
     }
     if (entry.blockedReason) view.blockedReason = entry.blockedReason;
     if (entry.blockedKind) view.blockedKind = entry.blockedKind;
@@ -342,26 +389,41 @@ export class MergeQueue {
 
   /**
    * The head's full detail for the panel's inline body: what a ready head would
-   * land (commits + diff + the build+test that passed) or why a blocked one
-   * can't. This is the whole substance behind the panel's `[m]`: the captain
-   * reads exactly what the merge covers, in the same place the key lives.
-   * Returns null when the head is neither ready nor blocked (empty queue, or a
-   * head still processing / being resolved — those need no body beyond the list
-   * row's state chip).
+   * land (its PR, commits, and what the checks said), what an awaiting head is
+   * waiting on, or why a blocked one can't merge. This is the whole substance
+   * behind the panel's `[m]`: the captain reads exactly what the merge covers, in
+   * the same place the key lives. Returns null when the head has no body (empty
+   * queue, or a head still processing / being resolved — those need no body
+   * beyond the list row's state chip).
    */
   headDetail(): QueueHeadDetail | null {
     const head = this.entries[0];
     if (!head) return null;
     const target = this.targetBranch;
     const p = head.prepared;
+    const prOf = (r: PrepareResult): { number: number; url: string; title: string; body: string } | undefined =>
+      "pr" in r && r.pr ? { number: r.pr.number, url: r.pr.url, title: r.pr.title, body: r.pr.body } : undefined;
+
     if (head.status === "ready" && p?.kind === "green") {
+      const pr = prOf(p);
       return {
         kind: "ready",
         feature: head.feature,
         target,
         commits: p.commits,
-        ...(p.buildTest ? { buildTest: p.buildTest } : {}),
-        ...(p.pr ? { pr: { number: p.pr.number, url: p.pr.url, title: p.pr.title, body: p.pr.body } } : {}),
+        ...(p.checks ? { checks: p.checks } : {}),
+        ...(pr ? { pr } : {}),
+      };
+    }
+    if (head.status === "awaiting-checks" && p?.kind === "pending") {
+      const pr = prOf(p);
+      return {
+        kind: "awaiting",
+        feature: head.feature,
+        target,
+        commits: p.commits,
+        checks: p.checks,
+        ...(pr ? { pr } : {}),
       };
     }
     if (head.status === "blocked") {
@@ -378,9 +440,9 @@ export class MergeQueue {
         detail.conflictFiles = p.conflictFiles;
         detail.detail = p.detail;
       } else if (p?.kind === "failed") {
-        detail.exitCode = p.exitCode;
-        detail.output = p.output;
-        if (p.buildTest) detail.buildTest = p.buildTest;
+        detail.checks = p.checks;
+        const pr = prOf(p);
+        if (pr) detail.pr = pr;
       }
       return detail;
     }
@@ -395,9 +457,9 @@ export class MergeQueue {
    *
    * Re-enqueuing the head is also the RETRY lever for a blocked head: if the
    * enqueued feature is the head and not already green, it is (re)processed, so a
-   * captain who has resolved a conflict or fixed a red build can re-run the head
+   * captain who has resolved a conflict or fixed a red check can re-run the head
    * without a dedicated tool. A head already "ready" is left as-is (no wasted
-   * build+test).
+   * checks read).
    */
   async enqueue(feature: string): Promise<EnqueueResult> {
     const alreadyQueued = this.has(feature);
@@ -421,9 +483,9 @@ export class MergeQueue {
 
   /**
    * Process the head: fetch, rebase it onto the fresh `origin/dev` tip, run the
-   * combined build+test, push it and open/refresh its PR — via the EXISTING
+   * push it, open/refresh its PR and read that PR's checks — via the EXISTING
    * prepareLanding. Green (with commits) -> ready; a rebase conflict, a red
-   * build+test, or any prepare precondition failure (no gh, not authenticated,
+   * a red CI check, or any prepare precondition failure (no gh, not authenticated,
    * no `origin/dev`) -> blocked, carrying the message. This is the only place the
    * queue runs git or gh, and it only ever touches the head. Callable directly to
    * retry a blocked head after a manual fix.
@@ -500,7 +562,12 @@ export class MergeQueue {
       case "failed":
         head.status = "blocked";
         head.blockedKind = "failed";
-        head.blockedReason = `build+test failed (exit ${result.exitCode})`;
+        head.blockedReason = `PR #${result.pr.number}: ${checksLine(result.checks)}`;
+        break;
+      case "pending":
+        // Not a block: CI is simply still running. The head holds the queue and
+        // offers no [m], and re-processing reads the checks again.
+        head.status = "awaiting-checks";
         break;
     }
     return head;
@@ -508,7 +575,7 @@ export class MergeQueue {
 
   /**
    * Whether the head is a blocked feature a fresh resolver agent can be sent at:
-   * blocked by a rebase conflict or a red build+test (not a lifecycle problem,
+   * blocked by a rebase conflict or a red CI check (not a lifecycle problem,
    * which has no blockedKind), and not already past the retry bound. This is the
    * gate the resolve tool checks before arming a dispatch, so a doomed resolve is
    * refused up front rather than after a wasted confirm.
@@ -522,7 +589,7 @@ export class MergeQueue {
     if (head.status !== "blocked" || !head.blockedKind) {
       return {
         ok: false,
-        reason: `head '${head.feature}' is ${head.status}, not blocked by a conflict or a red build+test; nothing for a resolver to do.`,
+        reason: `head '${head.feature}' is ${head.status}, not blocked by a conflict or a red CI check; nothing for a resolver to do.`,
       };
     }
     const spent = head.resolveAttempts ?? 0;
@@ -604,7 +671,7 @@ export class MergeQueue {
    * truth rather than the stale green that just failed.
    *
    * The merge reuses the head's ALREADY-computed green (from processHead) rather
-   * than re-running the build+test: executeLanding pins to that exact featureSha,
+   * than re-reading the checks: executeLanding pins to that exact featureSha,
    * the `origin/dev` it was tested against and the PR that was reviewed, so a
    * branch or a dev that moved since fails loudly instead of merging untested work.
    */
@@ -741,10 +808,23 @@ export class MergeQueue {
     const where = alreadyQueued ? "already queued" : "queued";
     if (i !== 0) return `${feature} ${where} at position ${i + 1}; head is '${this.entries[0]!.feature}'`;
     switch (e.status) {
-      case "ready":
-        return `head '${feature}' is ready to merge (${e.prepared?.kind === "green" ? e.prepared.commits.length : 0} commit(s)); the captain lands it with [m] in the Ctrl-O queue tab — you are not in that loop, do not wait on it`;
+      case "ready": {
+        const green = e.prepared?.kind === "green" ? e.prepared : undefined;
+        const gate = green?.checks?.ungated
+          ? `; NOTE: its pull request reports NO CI checks, so nothing verified it — this is an UNGATED merge on the captain's judgment, and you should say so`
+          : green?.checks
+            ? ` with ${checksLine(green.checks)}`
+            : "";
+        return `head '${feature}' is ready to merge (${green?.commits.length ?? 0} commit(s))${gate}; the captain lands it with [m] in the Ctrl-O queue tab — you are not in that loop, do not wait on it`;
+      }
+      case "awaiting-checks": {
+        const pending = e.prepared?.kind === "pending" ? e.prepared.checks : undefined;
+        return `head '${feature}' is WAITING on its pull request's CI checks${
+          pending ? ` (${checksLine(pending)})` : ""
+        }; it holds the queue and has no [m] until they report. Nothing is wrong and nothing is needed from you — feature_enqueue re-reads them when you want a fresh look`;
+      }
       case "blocked": {
-        const kind = e.blockedKind === "conflict" ? "rebase conflict" : e.blockedKind === "failed" ? "red build+test" : "not mergeable";
+        const kind = e.blockedKind === "conflict" ? "rebase conflict" : e.blockedKind === "failed" ? "failed CI checks" : "not mergeable";
         const spent = e.resolveAttempts ?? 0;
         const resolveHint =
           e.blockedKind && spent < MAX_RESOLVE_ATTEMPTS

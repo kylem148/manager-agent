@@ -1,11 +1,7 @@
 import fs from "node:fs";
+import { checksLine, failedChecks, type ChecksPolicy } from "./checks.js";
 import type { CommandRunner } from "./forge.js";
-import {
-  DEFAULT_BUILD_TEST_COMMAND,
-  executeLanding,
-  prepareLanding,
-  type LandingOptions,
-} from "./landing.js";
+import { executeLanding, prepareLanding, type LandingOptions } from "./landing.js";
 import { reviewLanding, type LandingGateHost, type LandingGateResult } from "./landinggate.js";
 import {
   MergeQueue,
@@ -42,7 +38,7 @@ import {
  *
  * This module is deliberately thin. All the real machinery lives below it:
  * worktrees.ts (git plumbing), the DispatchRegistry (the feature-record map +
- * feature-scoped dispatch), landing.ts (rebase + build+test), and landinggate.ts
+ * feature-scoped dispatch), landing.ts (rebase + PR + checks), and landinggate.ts
  * (the human [m] gate). FeatureManager wraps those into the small verb set the
  * model calls, keeps a single source of truth (the registry's feature map), and
  * returns plain JSON-serializable results so the executor can hand them straight
@@ -59,7 +55,7 @@ import {
  */
 
 /** Test seams so the levers can be unit-tested against a stubbed-Ghostty
- *  registry + real git without reaching for a live Tui or a real build+test. */
+ *  registry + real git without reaching for a live Tui or a real forge. */
 export interface FeatureManagerDeps {
   provision: typeof provisionWorktree;
   teardown: typeof teardownWorktree;
@@ -85,9 +81,9 @@ export interface FeatureManagerOptions {
   /** The human landing gate (the Tui). Absent off a real terminal (PlainIO):
    *  feature_land then reports that landing needs an interactive session. */
   gateHost?: LandingGateHost;
-  /** Combined build+test for the landing prepare; defaults to the repo's own
-   *  typecheck+test. Injectable so tests run a fast fake. */
-  buildTestCommand?: string;
+  /** How long the landing prepare waits on a PR's CI checks, and how often it
+   *  looks. Defaults live in checks.ts; tests inject a no-op sleep. */
+  checks?: ChecksPolicy;
   /** Overrides for the git/gate seams (tests only). */
   deps?: Partial<FeatureManagerDeps>;
 }
@@ -108,7 +104,8 @@ export interface FeatureView {
   busy: boolean;
   /** The feature's place in the serial merge queue, when it is enqueued: its
    *  position, whether it is the head, and its queue status (queued /
-   *  head-processing / ready / blocked). Absent when the feature isn't queued. */
+   *  head-processing / awaiting-checks / ready / blocked). Absent when the
+   *  feature isn't queued. */
   queue?: QueueEntryView;
 }
 
@@ -153,7 +150,7 @@ export class FeatureManager {
   private readonly remote: string | undefined;
   private readonly run: CommandRunner | undefined;
   private readonly gateHost?: LandingGateHost;
-  private readonly buildTestCommand: string;
+  private readonly checks: ChecksPolicy | undefined;
   private readonly deps: FeatureManagerDeps;
   /** The serial merge queue (mergequeue.ts). Owns the ordered "done" features
    *  and the head-only state machine; drives the EXISTING prepare + gate through
@@ -170,7 +167,7 @@ export class FeatureManager {
     this.remote = opts.remote;
     this.run = opts.run;
     if (opts.gateHost) this.gateHost = opts.gateHost;
-    this.buildTestCommand = opts.buildTestCommand ?? DEFAULT_BUILD_TEST_COMMAND;
+    this.checks = opts.checks;
     this.deps = {
       provision: opts.deps?.provision ?? provisionWorktree,
       teardown: opts.deps?.teardown ?? teardownWorktree,
@@ -181,7 +178,7 @@ export class FeatureManager {
     };
     this.queue = new MergeQueue({
       repoPath: this.repoPath,
-      buildTestCommand: this.buildTestCommand,
+      ...(this.checks ? { checks: this.checks } : {}),
       ...(this.remote ? { remote: this.remote } : {}),
       ...(this.run ? { run: this.run } : {}),
       host: {
@@ -212,9 +209,9 @@ export class FeatureManager {
     };
   }
 
-  /** The worktree options plus the build+test — what the landing engine takes. */
+  /** The worktree options plus the checks policy — what the landing engine takes. */
   private landingOptions(): LandingOptions {
-    return { ...this.worktreeOptions(), buildTestCommand: this.buildTestCommand };
+    return { ...this.worktreeOptions(), ...(this.checks ? { checks: this.checks } : {}) };
   }
 
   /** Find a tracked record by feature name OR slug — the two handles a caller
@@ -279,7 +276,7 @@ export class FeatureManager {
 
   /**
    * Land a feature: run the landing prepare (fetch, rebase onto `origin/dev`,
-   * build+test on the combined state, push, open/refresh its PR) and open the
+   * push, open/refresh its PR, read that PR's checks) and open the
    * Ctrl-O gate on the result. The gate IS the confirmation — there is no separate
    * prompt, and the merge (`gh pr merge --merge`) fires only if the human presses
    * [m] over a green prepare. On a merge the feature's worktree is torn down and
@@ -408,7 +405,7 @@ export class FeatureManager {
   //
   // The "mark done" flow (D-20260723-14/-21/-23): features the captain declares
   // done join an ordered queue; only the head is processed at a time (rebase +
-  // build+test via the EXISTING landing prepare); a green head simply CARRIES a
+  // PR checks via the EXISTING landing prepare); a green head simply CARRIES a
   // live [m] in the Ctrl-O panel (D-20260724-12) until the captain presses it; on
   // merge the queue advances and the next feature is processed against the new
   // dev tip. The co is not in that loop — it engages only on a blocked head.
@@ -418,7 +415,7 @@ export class FeatureManager {
    * Enqueue a feature as "done" (mark-done). No confirm gate — enqueue is the
    * trigger, and the only gate in the flow is the merge keystroke on the head.
    * When the feature becomes the head, it is processed immediately (rebase onto
-   * the current dev tip + combined build+test); a green head then simply carries
+   * the current dev tip, pushed, PR'd, and its PR's checks read); a green head then simply carries
    * a live [m] in the panel until the captain presses it. Re-enqueuing a blocked
    * head is the retry lever. Reports not-found for a feature never created.
    */
@@ -473,7 +470,7 @@ export class FeatureManager {
     const summary = !head
       ? "the merge queue is empty; nothing to merge."
       : head.status === "ready"
-        ? `head '${head.feature}' is ready and its [m] is already live in the captain's Ctrl-O queue tab (with the diff and the build+test result). Merging is their keystroke, not a tool call — say it's ready and move on; do NOT wait for it.`
+        ? `head '${head.feature}' is ready and its [m] is already live in the captain's Ctrl-O queue tab (with its pull request and what its CI checks said). Merging is their keystroke, not a tool call — say it's ready and move on; do NOT wait for it.`
         : `head '${head.feature}' is ${head.status}${
             head.blockedReason ? ` (${head.blockedReason})` : ""
           }; there is no [m] to press until it is green.`;
@@ -493,7 +490,7 @@ export class FeatureManager {
   }
 
   /** The head's inline body for the panel's queue tab: a ready head's commits +
-   *  diff + build+test evidence, or a blocked head's reason. Null for anything
+   *  PR + checks evidence, or a blocked head's reason. Null for anything
    *  else. Read fresh at paint time by the Tui's injected queue source. */
   headDetail(): QueueHeadDetail | null {
     return this.queue.headDetail();
@@ -501,12 +498,16 @@ export class FeatureManager {
 
   /**
    * Plan a fresh-agent resolve of the blocked head (D-20260723-24). Checks the
-   * head is resolvable (blocked by a conflict or a red build+test, under the retry
+   * head is resolvable (blocked by a conflict or a red CI check, under the retry
    * bound) and, if so, drafts the crew ORDER scoped to the feature's OWN worktree
-   * and branch: rebase onto the current dev tip, resolve the conflict, make the
-   * combined build+test pass, commit — never touching dev. Returns the plan (which
+   * and branch: rebase onto the current dev tip, resolve the conflict, fix
+   * whatever CI called out, commit — never touching dev. Returns the plan (which
    * the tool arms as a confirm-gated, feature-scoped dispatch) or a refusal. This
    * does NOT dispatch or change queue state; beginResolveHead does that at fire.
+   *
+   * The order NAMES the failing checks (and links them) when the block is a red
+   * check: co cannot run the suite itself, so the one useful thing it can hand a
+   * resolver is exactly what GitHub said went wrong.
    */
   planResolveHead(): ResolveHeadPlan {
     const gate = this.queue.canResolveHead();
@@ -514,13 +515,19 @@ export class FeatureManager {
     const record = this.findRecord(gate.feature);
     const branch = record?.branch ?? featureBranch(gate.feature);
     const target = resolveWorktreeOptions(this.worktreeOptions()).devBranch;
+    const detail = this.queue.headDetail();
+    const blocked = detail?.kind === "blocked" ? detail : undefined;
     const order = buildResolveOrder({
       feature: gate.feature,
       branch,
       target,
       kind: gate.kind,
-      buildTestCommand: this.buildTestCommand,
       reason: this.queue.viewFor(gate.feature)?.blockedReason ?? "",
+      ...(blocked?.pr ? { prNumber: blocked.pr.number, prUrl: blocked.pr.url } : {}),
+      failedChecks: blocked?.checks
+        ? failedChecks(blocked.checks).map((r) => (r.link ? `${r.name} (${r.link})` : r.name))
+        : [],
+      ...(blocked?.checks ? { checksSummary: checksLine(blocked.checks) } : {}),
     });
     return {
       ok: true,
@@ -588,23 +595,41 @@ function safeSlug(name: string): string {
  * the feature's OWN worktree (the dispatch is feature-scoped, so cwd is already
  * that checkout on its branch). The mandate is narrow and load-bearing: rebase
  * the feature branch onto the current dev tip, resolve whatever blocked it, get
- * the combined build+test green, and commit — all on the feature branch, NEVER
+ * the pull request's checks green, and commit — all on the feature branch, NEVER
  * touching dev. The queue re-processes the head after the agent finishes, so the
  * agent doesn't merge anything; it only makes the branch mergeable.
+ *
+ * The order does NOT name a build or test command, because co does not know one
+ * and no longer pretends to (D-20260727-1). What it hands over instead is what
+ * CI actually reported — the failing check names and their run links — and the
+ * instruction to verify the way the repo verifies. The agent is in the repo; it
+ * can read the workflow.
  */
 function buildResolveOrder(opts: {
   feature: string;
   branch: string;
   target: string;
   kind: "conflict" | "failed";
-  buildTestCommand: string;
   reason: string;
+  /** The failing checks, "name (link)", when the block is a red check. */
+  failedChecks: string[];
+  /** One line of what the checks read said. */
+  checksSummary?: string;
+  prNumber?: number;
+  prUrl?: string;
 }): string {
-  const { feature, branch, target, kind, buildTestCommand, reason } = opts;
+  const { feature, branch, target, kind, reason, failedChecks: failing, checksSummary } = opts;
+  const prRef = opts.prNumber ? `PR #${opts.prNumber}${opts.prUrl ? ` (${opts.prUrl})` : ""}` : "its pull request";
   const diagnosis =
     kind === "conflict"
       ? `Rebasing ${branch} onto origin/${target} hit merge conflicts.`
-      : `${branch} rebases onto origin/${target} cleanly, but the combined build+test is failing.`;
+      : `${branch} rebases onto origin/${target} cleanly, but the CI checks on ${prRef} are failing.`;
+  const verify =
+    kind === "conflict"
+      ? `3. Verify the branch the way this repo verifies (read its CI workflow and run the same commands locally). ` +
+        `The merge gate is ${prRef}'s own checks, so match what they run.`
+      : `3. Fix what CI reported. Read the failing runs above, reproduce them locally the way this repo does ` +
+        `(its CI workflow names the commands), and fix until they would pass.`;
   const lines = [
     `You are resolving a blocked merge-queue head for the feature "${feature}".`,
     ``,
@@ -612,20 +637,23 @@ function buildResolveOrder(opts: {
     ``,
     `Situation: ${diagnosis}`,
     ...(reason ? [`Queue diagnosis: ${reason}`] : []),
+    ...(checksSummary ? [`Checks: ${checksSummary}`] : []),
+    ...(failing.length > 0 ? [``, `Failing checks:`, ...failing.map((c) => `- ${c}`)] : []),
     ``,
     `Do this, in order:`,
     `1. \`git fetch origin\`, then rebase ${branch} onto the current remote tip: \`git rebase origin/${target}\`.`,
     `2. Resolve any conflicts so the rebase completes cleanly. Keep both sides' intent; do not drop work.`,
-    `3. Make the combined build+test pass: run \`${buildTestCommand}\` and fix whatever is red until it is green.`,
+    verify,
     `4. Commit your resolution on ${branch} (the rebase's conflict resolutions plus any fixes). Leave the worktree clean.`,
     ``,
     `HARD RULES:`,
     `- NEVER check out, merge into, or push ${target} (dev) or main. You only ever touch ${branch} in this worktree.`,
     `- Do not push the branch and do not open or merge a pull request. The queue pushes ${branch} and opens its PR`,
-    `  itself once the rebased branch is green, and the captain merges that PR. Your job ends at a clean, green commit.`,
+    `  itself, and the captain merges that PR once its checks are green. Your job ends at a clean commit.`,
     `- Leave the worktree clean (no uncommitted changes) so the queue can re-process it.`,
     ``,
-    `When \`${buildTestCommand}\` passes on the rebased branch and everything is committed, you are done.`,
+    `When the rebase is clean, what CI called out is fixed, and everything is committed, you are done. The queue`,
+    `re-pushes the branch and re-reads ${prRef}'s checks; those are the verdict, not your own say-so.`,
   ];
   return lines.join("\n");
 }

@@ -18,6 +18,13 @@ import {
 import type { LandingGateHost } from "./landinggate.js";
 import type { LandingReview } from "../tui/tui.js";
 import { makeFakeForge, type FakeForge } from "./forgefake.test.js";
+import type { ChecksPolicy } from "./checks.js";
+
+/** No wall-clock in a unit test: the checks poll sleeps instantly and neither
+ *  deadline buys a second look. With no checks seeded on the fake forge, every
+ *  head here comes back green-but-UNGATED, which is exactly what a repo with no
+ *  CI looks like. */
+const FAST_CHECKS: ChecksPolicy = { timeoutMs: 0, graceMs: 0, intervalMs: 1, sleep: async () => {} };
 
 /**
  * Tests for the co-facing feature levers (features.ts), against real throwaway
@@ -70,7 +77,7 @@ interface Fixture {
 
 /** A real repo + registry + FeatureManager. The manager operates on the repo's
  *  DEFAULT worktree base (a sibling dir) so it matches what the registry's
- *  provision path uses; `base` is that dir. buildTestCommand is a fast `true`. */
+ *  provision path uses; `base` is that dir. The checks poll never sleeps. */
 async function makeFixture(gateHost?: LandingGateHost): Promise<Fixture> {
   const root = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "co-feat-")));
   const repo = path.join(root, "repo");
@@ -87,6 +94,9 @@ async function makeFixture(gateHost?: LandingGateHost): Promise<Fixture> {
   run(repo, ["branch", "dev", "main"]);
   run(repo, ["checkout", "-q", "dev"]);
   const forge = makeFakeForge(repo, { dev: run(repo, ["rev-parse", "dev"]) });
+  // Every PR in these fixtures reports one passing check, so the ordinary path is
+  // an ordinary green. The no-checks (ungated) path has its own tests.
+  forge.defaultChecks = [{ name: "ci", bucket: "pass" }];
 
   const paths = instancePaths(path.join(root, "home"), "inst");
   await fsp.mkdir(paths.captures, { recursive: true });
@@ -106,7 +116,7 @@ async function makeFixture(gateHost?: LandingGateHost): Promise<Fixture> {
     repoPath: repo,
     run: forge.run,
     ...(gateHost ? { gateHost } : {}),
-    buildTestCommand: "true",
+    checks: FAST_CHECKS,
   });
   return {
     repo,
@@ -436,7 +446,7 @@ test("merge queue: enqueue two, head processes to ready, the panel's [m] merges 
     await commitIn(b.feature.worktreePath, "b.txt", "b\n", "job: beta");
     const devStart = fx.originDev();
 
-    // Enqueue alpha: it becomes head and is processed (rebase + build+test) to ready.
+    // Enqueue alpha: it becomes head and is processed (rebase + PR + checks) to ready.
     const eA = await fx.features.enqueue("alpha");
     assert.equal(eA.enqueued, true);
     if (!eA.enqueued) return;
@@ -518,7 +528,7 @@ test("a head whose origin/dev moved under it is re-validated, not merged: refuse
     assert.equal(fx.forge.prs[0]!.state, "OPEN");
 
     // The refusal re-processed the head against the NEW tip: fetched, rebased
-    // and build+tested again, so what the panel offers next is honest.
+    // and its checks read again, so what the panel offers next is honest.
     assert.equal(res.head?.feature, "late");
     assert.equal(res.head?.status, "ready", "green again, on the moved base this time");
     const detail = fx.features.headDetail();
@@ -640,7 +650,7 @@ test("feature_merge_head IS the merge in a session with no panel (the non-intera
   }
 });
 
-test("headDetail feeds the panel the ready head's PR, commits and build+test evidence", async () => {
+test("headDetail feeds the panel the ready head's PR, commits and checks evidence", async () => {
   const fx = await makeFixture();
   try {
     const a = await fx.features.create("detailed");
@@ -656,10 +666,11 @@ test("headDetail feeds the panel the ready head's PR, commits and build+test evi
     assert.match(ready.commits[0] ?? "", /job: detail/);
     assert.equal(ready.pr?.number, 1, "the PR the [m] would merge");
     assert.match(ready.pr?.url ?? "", /\/pull\/1$/);
-    assert.match(ready.pr?.body ?? "", /Build \+ test/, "with the evidence co composed");
+    assert.match(ready.pr?.body ?? "", /### Checks/, "with the evidence co composed");
     assert.match(ready.pr?.body ?? "", /job: detail/, "and the commit list");
-    assert.equal(ready.buildTest?.command, "true", "the build+test that passed is named");
-    assert.ok((ready.buildTest?.ms ?? -1) >= 0, "and timed");
+    assert.equal(ready.checks?.verdict, "passed", "the checks that passed are stated");
+    assert.deepEqual(ready.checks?.runs.map((r) => r.name), ["ci"], "and named");
+    assert.equal(ready.checks?.ungated, false);
   } finally {
     await fx.cleanup();
   }
@@ -800,7 +811,7 @@ test("the resolve path: a conflict-blocked head is fixed by a fresh agent in its
       "and never pushed its branch: publishing is the queue's job");
 
     // The agent finished: re-process the head. It rebases cleanly now and the
-    // build+test (`true`) is green, so it goes ready.
+    // its PR's one check passes, so it goes ready.
     const done = await fx.features.onResolveDone("follow");
     assert.equal(done.head?.feature, "follow");
     assert.equal(done.head?.status, "ready", "the resolved head is ready to merge");

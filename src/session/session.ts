@@ -802,7 +802,7 @@ async function armResolve(
   // Tag the armed order as a resolver so fireDispatch drives the queue's
   // resolving/re-process transitions instead of a plain review-on-completion.
   if (state.armed) state.armed.resolve = true;
-  const kindWord = plan.kind === "conflict" ? "a rebase conflict" : "a red build+test";
+  const kindWord = plan.kind === "conflict" ? "a rebase conflict" : "failed CI checks";
   return {
     armed: true,
     summary:
@@ -1028,8 +1028,8 @@ export function queueMergeNotice(res: MergeHeadResult): string | null {
       head.blockedKind === "conflict"
         ? "a rebase conflict"
         : head.blockedKind === "failed"
-          ? "a red build+test"
-          : "a lifecycle problem (not a conflict or a red suite)";
+          ? "a red CI check on its pull request"
+          : "a lifecycle problem (not a conflict or a red check)";
     const merged = res.merged
       ? `The captain merged the merge-queue head '${res.feature}' themselves, with [m] in the Ctrl-O panel. ` +
         `You were not involved and nothing is waiting on you. The queue advanced and the new head`
@@ -1037,7 +1037,7 @@ export function queueMergeNotice(res: MergeHeadResult): string | null {
     return (
       `SYSTEM: ${merged} '${head.feature}' is BLOCKED by ${kind}: ${head.blockedReason ?? "not mergeable"}. ` +
       `It holds the queue and has no [m] until it is green again.\n\n` +
-      `Tell the captain in one line what is blocked and why. If it is a conflict or a red build+test, offer ` +
+      `Tell the captain in one line what is blocked and why. If it is a conflict or a red CI check, offer ` +
       `feature_resolve_head — it ARMS a fresh crew agent in that feature's own worktree and runs only when ` +
       `they type \`confirm\`; it is bounded to a few attempts. If it is neither, say what you'd do instead ` +
       `(fix by hand, or feature_abandon). Do not try to merge anything yourself, and never tell them to press ` +
@@ -1092,7 +1092,7 @@ async function drainReviews(state: SessionState): Promise<void> {
     const job = state.reviewQueue.shift()!;
 
     // A resolver agent finishing on the current resolving head: re-process the
-    // head now (rebase + build+test on its just-fixed worktree) so it becomes
+    // head now (rebase + push + a fresh read of its PR's checks) so it becomes
     // ready if green or blocked again if not, and fold the outcome into the
     // review turn so the co reports what the queue now shows. One agent per
     // feature, so the resolving head's only in-flight agent is its resolver.

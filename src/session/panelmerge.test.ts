@@ -14,6 +14,13 @@ import { defaultWorktreeBase } from "./worktrees.js";
 import { Tui, type InStream, type OutStream, type QueuePanelSource } from "../tui/tui.js";
 import { stripAnsi } from "../tui/wrap.js";
 import { makeFakeForge, type FakeForge } from "./forgefake.test.js";
+import type { ChecksPolicy } from "./checks.js";
+
+/** No wall-clock in a unit test: the checks poll sleeps instantly and neither
+ *  deadline buys a second look. With no checks seeded on the fake forge, every
+ *  head here comes back green-but-UNGATED, which is exactly what a repo with no
+ *  CI looks like. */
+const FAST_CHECKS: ChecksPolicy = { timeoutMs: 0, graceMs: 0, intervalMs: 1, sleep: async () => {} };
 
 /**
  * END-TO-END for the panel-native merge (D-20260724-12): a REAL Tui wired to a
@@ -66,7 +73,7 @@ const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 5));
 
 /**
  * Wait for a condition, polling. The [m] path is REAL git — a rebase, a
- * build+test, a merge, then the next head's whole prepare — so it settles on
+ * checks read, a merge, then the next head's whole prepare — so it settles on
  * git's schedule, not on a fixed sleep. Polling for the outcome is both honest
  * (it waits for the actual thing) and fast (it returns the moment it happens).
  */
@@ -118,6 +125,9 @@ async function makeFixture(): Promise<Fixture> {
   run(repo, ["branch", "dev", "main"]);
   run(repo, ["checkout", "-q", "dev"]);
   const forge = makeFakeForge(repo, { dev: run(repo, ["rev-parse", "dev"]) });
+  // Every PR in these fixtures reports one passing check, so the ordinary path is
+  // an ordinary green. The no-checks (ungated) path has its own tests.
+  forge.defaultChecks = [{ name: "ci", bucket: "pass" }];
 
   const paths = instancePaths(path.join(root, "home"), "inst");
   await fsp.mkdir(paths.captures, { recursive: true });
@@ -173,7 +183,7 @@ async function makeFixture(): Promise<Fixture> {
     repoPath: repo,
     run: forge.run,
     gateHost: tui,
-    buildTestCommand: "true",
+    checks: FAST_CHECKS,
   });
 
   return {
@@ -223,7 +233,7 @@ test("e2e: the panel's [m] merges the head's PR, advances the queue, and the nex
     assert.match(frame, /2\.\s*beta\s+\[queued\]/, "beta waits behind it, unprocessed");
     assert.match(frame, /press m to merge PR #1 into dev/, "the [m] is simply present");
     assert.match(frame, /PR #1 → dev · 1 commit/, "with what it would merge");
-    assert.match(frame, /build\+test green/, "and the build+test evidence");
+    assert.match(frame, /checks green · 1 check passed/, "and what its CI checks said");
     assert.match(frame, /job: alpha slice/, "the commit it would land");
     assert.match(frame, /pull\/1/, "the PR's URL, to read or edit it on GitHub");
     assert.match(frame, /Merged with a merge commit/, "and the PR message co composed");
@@ -367,11 +377,11 @@ test("queueMergeNotice: silence on the happy path, a decision on a blocked head 
       isHead: true,
       status: "blocked",
       blockedKind: "failed",
-      blockedReason: "build+test failed (exit 2)",
+      blockedReason: "PR #7: 1 of 2 checks failed: test (ubuntu)",
     },
   });
-  assert.match(blocked ?? "", /BLOCKED by a red build\+test/);
-  assert.match(blocked ?? "", /build\+test failed \(exit 2\)/);
+  assert.match(blocked ?? "", /BLOCKED by a red CI check/);
+  assert.match(blocked ?? "", /1 of 2 checks failed: test \(ubuntu\)/);
   assert.match(blocked ?? "", /feature_resolve_head/);
 
   // A refused merge: also the co's business.

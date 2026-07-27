@@ -6,13 +6,15 @@ import {
   checkForgePrereqs,
   checkRemotePrereqs,
   devRef,
+  ensurePr,
   findOpenPr,
   mergePr,
-  openOrUpdatePr,
   pushFeatureBranch,
+  readPrChecks,
   remoteBranchSha,
   remoteDevSha,
   spliceEvidence,
+  updatePrEvidence,
   viewPr,
   type CommandResult,
   type CommandRunner,
@@ -207,12 +209,12 @@ test("findOpenPr asks for the open PR from the branch into dev, and reads null f
   assert.equal(pr?.headRefOid, "h");
 });
 
-test("openOrUpdatePr CREATES with the composed title and body when none is open", async () => {
+test("ensurePr CREATES with the composed title and body when none is open", async () => {
   const h = harness([
     { match: /^gh pr list/, result: { stdout: "[]" } },
     { match: /^gh pr create/, result: { stdout: "https://github.com/acme/repo/pull/12\n" } },
   ]);
-  const res = await openOrUpdatePr(opts(h.run), {
+  const res = await ensurePr(opts(h.run), {
     branch: "co/feat-a",
     title: "add auth",
     body: "prose",
@@ -225,7 +227,7 @@ test("openOrUpdatePr CREATES with the composed title and body when none is open"
   assert.match(create, /prose[\s\S]*co:evidence[\s\S]*EV/);
 });
 
-test("openOrUpdatePr UPDATES only the evidence block, never the captain's title or prose", async () => {
+test("ensurePr returns an already-open PR UNTOUCHED — its body is the captain's until evidence lands", async () => {
   const captainBody = `The captain rewrote this description.\n\n${EVIDENCE_OPEN}\nold evidence\n${EVIDENCE_CLOSE}\n`;
   const h = harness([
     {
@@ -237,13 +239,26 @@ test("openOrUpdatePr UPDATES only the evidence block, never the captain's title 
       },
     },
   ]);
-  const res = await openOrUpdatePr(opts(h.run), {
+  const res = await ensurePr(opts(h.run), {
     branch: "co/feat-a",
     title: "co would have called it this",
     body: "co's original prose",
-    evidence: "fresh evidence",
+    evidence: "co would have written this",
   });
   assert.equal(res.created, false);
+  assert.equal(res.pr.number, 5);
+  assert.equal(res.pr.body, captainBody, "nothing is rewritten just by looking it up");
+  assert.ok(!h.calls.some((c) => c.startsWith("gh pr edit")), "and nothing is sent");
+});
+
+test("updatePrEvidence rewrites only the evidence block, never the captain's title or prose", async () => {
+  const captainBody = `The captain rewrote this description.\n\n${EVIDENCE_OPEN}\nold evidence\n${EVIDENCE_CLOSE}\n`;
+  const h = harness([]);
+  const res = await updatePrEvidence(
+    opts(h.run),
+    { number: 5, url: "u", title: "a title the captain chose", body: captainBody },
+    "fresh evidence",
+  );
   assert.equal(res.bodyUpdated, true);
   const edit = h.calls.find((c) => c.startsWith("gh pr edit"))!;
   assert.match(edit, /^gh pr edit 5 --body /);
@@ -256,17 +271,55 @@ test("openOrUpdatePr UPDATES only the evidence block, never the captain's title 
 
 test("an update with unchanged evidence sends nothing at all", async () => {
   const body = `prose\n\n${EVIDENCE_OPEN}\nsame\n${EVIDENCE_CLOSE}\n`;
-  const h = harness([
-    { match: /^gh pr list/, result: { stdout: JSON.stringify([{ number: 5, url: "u", title: "t", body }]) } },
-  ]);
-  const res = await openOrUpdatePr(opts(h.run), {
-    branch: "co/feat-a",
-    title: "t",
-    body: "prose",
-    evidence: "same",
-  });
+  const h = harness([]);
+  const res = await updatePrEvidence(opts(h.run), { number: 5, url: "u", title: "t", body }, "same");
   assert.equal(res.bodyUpdated, false);
   assert.ok(!h.calls.some((c) => c.startsWith("gh pr edit")), "no edit call");
+});
+
+test("readPrChecks asks for the REQUIRED checks first and gates on those alone", async () => {
+  const h = harness([
+    {
+      match: /^gh pr checks 5 --json .* --required/,
+      result: { stdout: JSON.stringify([{ name: "build", bucket: "pass", state: "SUCCESS" }]) },
+    },
+  ]);
+  const res = await readPrChecks(opts(h.run), 5);
+  assert.equal(res.requiredOnly, true);
+  assert.deepEqual(res.runs?.map((r) => r.name), ["build"]);
+  assert.equal(h.calls.filter((c) => c.startsWith("gh pr checks")).length, 1, "no second read needed");
+  assert.match(h.calls[0]!, /^gh pr checks 5 --json name,state,bucket,link,workflow,description --required$/);
+});
+
+test("readPrChecks falls back to ALL checks when branch protection defines none", async () => {
+  const h = harness([
+    {
+      match: /--required/,
+      result: { code: 1, stderr: "no required checks reported on the 'co/feat-a' branch" },
+    },
+    {
+      match: /^gh pr checks 5/,
+      result: { stdout: JSON.stringify([{ name: "test", bucket: "fail", state: "FAILURE" }]) },
+    },
+  ]);
+  const res = await readPrChecks(opts(h.run), 5);
+  assert.equal(res.requiredOnly, false);
+  assert.deepEqual(res.runs?.map((r) => r.bucket), ["fail"]);
+});
+
+test("readPrChecks reports NO CHECKS as null, not as an error — gh exits 1 for both", async () => {
+  const h = harness([
+    { match: /^gh pr checks/, result: { code: 1, stderr: "no checks reported on the 'co/feat-a' branch" } },
+  ]);
+  const res = await readPrChecks(opts(h.run), 5);
+  assert.equal(res.runs, null, "null is the ungated case; the caller must not treat it as red");
+});
+
+test("readPrChecks throws on any OTHER nonzero gh exit, so a broken read is never an ungated pass", async () => {
+  const h = harness([
+    { match: /^gh pr checks/, result: { code: 1, stderr: "HTTP 401: Bad credentials" } },
+  ]);
+  await assert.rejects(readPrChecks(opts(h.run), 5), /gh pr checks 5.*401/);
 });
 
 test("spliceEvidence replaces a fenced block and appends when the fence is gone", () => {

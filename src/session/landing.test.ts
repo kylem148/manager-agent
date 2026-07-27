@@ -5,31 +5,37 @@ import fsp from "node:fs/promises";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { CHECKS_GRACE_MS, CHECKS_INTERVAL_MS, CHECKS_TIMEOUT_MS, type ChecksPolicy } from "./checks.js";
 import {
-  DEFAULT_BUILD_TEST_COMMAND,
   executeLanding,
   prepareLanding,
   type LandingOptions,
   type PrepareGreen,
 } from "./landing.js";
 import { provisionWorktree } from "./worktrees.js";
-import { makeFakeForge, type FakeForge } from "./forgefake.test.js";
+import { makeFakeForge, type FakeCheck, type FakeForge } from "./forgefake.test.js";
 
 /**
  * Tests for the landing engine, against real throwaway git repos (the local half
  * IS git plumbing; faking git would prove nothing) with the REMOTE half — fetch,
- * push, and every gh call — served by the fake forge. Nothing here reaches the
- * network, needs the gh binary, or needs a GitHub account, and the build+test is
- * a tiny injected `sh` command so nothing recurses into a real suite.
+ * push, and every gh call, `gh pr checks` included — served by the fake forge.
+ * Nothing here reaches the network, needs the gh binary, or needs a GitHub
+ * account, and co runs no build or test of its own to recurse into.
  *
  * Every test asserts the hard invariants alongside its subject:
  *  - the LOCAL `dev` ref never moves. The fixture deliberately CHECKS DEV OUT in
  *    the primary tree, which is the state that made the old local merge
  *    impossible; the whole point of the PR flow is that this is now irrelevant.
  *  - `main` is never moved.
- *  - nothing is pushed and no PR is touched unless the combined build+test went
- *    green.
+ *  - nothing is pushed and no PR is opened when the REBASE fails; a red CI check,
+ *    by contrast, necessarily has a PR — it is the PR's own checks that went red.
  */
+
+/** No wall-clock in a unit test: the poll sleeps instantly and neither deadline
+ *  gives the loop a second look unless a test asks for one. */
+const FAST: ChecksPolicy = { timeoutMs: 0, graceMs: 0, intervalMs: 1, sleep: async () => {} };
+
+const pass = (name: string, required = false): FakeCheck => ({ name, bucket: "pass", required });
 
 function run(cwd: string, args: string[]): string {
   const res = spawnSync("git", args, { cwd, encoding: "utf8" });
@@ -45,7 +51,7 @@ interface Fixture {
   base: string;
   forge: FakeForge;
   /** LandingOptions wired to this repo and the fake forge. */
-  opts(buildTestCommand?: string): LandingOptions;
+  opts(checks?: ChecksPolicy): LandingOptions;
   cleanup(): Promise<void>;
 }
 
@@ -72,11 +78,11 @@ async function makeRepo(): Promise<Fixture> {
     repo,
     base,
     forge,
-    opts: (buildTestCommand = "true") => ({
+    opts: (checks = FAST) => ({
       repoPath: repo,
       baseDir: base,
       run: forge.run,
-      buildTestCommand,
+      checks,
     }),
     cleanup: () => fsp.rm(root, { recursive: true, force: true }),
   };
@@ -105,19 +111,19 @@ function provision(f: Fixture, feature: string): ReturnType<typeof provisionWork
   return provisionWorktree({ repoPath: f.repo, baseDir: f.base, run: f.forge.run }, feature);
 }
 
-/** Prepare with a green fake and assert it came back green. */
-async function prepareGreen(
-  f: Fixture,
-  feature: string,
-  buildTestCommand = "true",
-): Promise<PrepareGreen> {
-  const res = await prepareLanding(f.opts(buildTestCommand), feature);
+/** Prepare and assert it came back green. */
+async function prepareGreen(f: Fixture, feature: string, checks?: ChecksPolicy): Promise<PrepareGreen> {
+  const res = await prepareLanding(f.opts(checks), feature);
   assert.equal(res.kind, "green", `expected green, got ${JSON.stringify(res)}`);
   return res as PrepareGreen;
 }
 
-test("the default build+test is the repo's own typecheck + test scripts", () => {
-  assert.equal(DEFAULT_BUILD_TEST_COMMAND, "npm run typecheck && npm test");
+test("the checks wait is bounded by default: a real timeout, a real interval, a real grace", () => {
+  // Bounded, not infinite — a stuck workflow must leave a WAITING head, not hang
+  // whoever called prepare. The numbers are policy; that they are finite is not.
+  assert.ok(CHECKS_TIMEOUT_MS > 0 && Number.isFinite(CHECKS_TIMEOUT_MS));
+  assert.ok(CHECKS_INTERVAL_MS > 0 && CHECKS_INTERVAL_MS < CHECKS_TIMEOUT_MS);
+  assert.ok(CHECKS_GRACE_MS > 0 && CHECKS_GRACE_MS <= CHECKS_TIMEOUT_MS);
 });
 
 test("prepareLanding rebases onto origin/dev, pushes, and opens the PR — the local dev ref never moves", async () => {
@@ -144,7 +150,7 @@ test("prepareLanding rebases onto origin/dev, pushes, and opens the PR — the l
     const pr = f.forge.prFor("co/feat-alpha")!;
     assert.equal(pr.base, "dev");
     assert.equal(pr.title, "job: alpha work", "a one-commit feature takes that commit's subject");
-    assert.match(pr.body, /Build \+ test/);
+    assert.match(pr.body, /### Checks/);
     assert.match(pr.body, /job: alpha work/, "the commit list is in the PR body");
     assert.match(pr.body, /merge commit/, "the PR states how it will be merged");
 
@@ -210,7 +216,7 @@ test("executeLanding merges the PR as a merge commit, keeps the branch, and remo
   }
 });
 
-test("serial landing: B rebases onto the A-updated origin/dev and its build+test sees the combined state", async () => {
+test("serial landing: B rebases onto the A-updated origin/dev, so its checks run on the combined state", async () => {
   const f = await makeRepo();
   try {
     // Both features cut from the same origin/dev tip, before either lands.
@@ -226,11 +232,13 @@ test("serial landing: B rebases onto the A-updated origin/dev and its build+test
       devSha: greenA.devSha,
     });
 
-    // B's prepare must rebase onto the origin/dev A just moved — and its
-    // build+test runs on the COMBINED state: this fake only passes if A's file
-    // is present in B's worktree alongside B's own.
-    const greenB = await prepareGreen(f, "bbb", "test -f a.txt && test -f b.txt");
+    // B's prepare must rebase onto the origin/dev A just moved, so the tree its
+    // PR's checks run against holds BOTH features — the combined state. co runs
+    // nothing itself; what it owes is that rebase, so that is what is asserted.
+    const greenB = await prepareGreen(f, "bbb");
     assert.equal(greenB.devSha, landedA.mergeSha, "B was rebased onto the A-updated tip");
+    assert.equal(run(b.worktreePath, ["cat-file", "-e", `${greenB.featureSha}:a.txt`]), "");
+    assert.equal(run(b.worktreePath, ["cat-file", "-e", `${greenB.featureSha}:b.txt`]), "");
     const landedB = await executeLanding(f.opts(), "bbb", {
       featureSha: greenB.featureSha,
       devSha: greenB.devSha,
@@ -281,28 +289,45 @@ test("two features touching the same line: the second reports conflict, pushes n
   }
 });
 
-test("a red build+test returns failed, pushes nothing, opens no PR, and leaves the work intact", async () => {
+test("a red CI check returns failed, names what went red, and leaves the work intact", async () => {
   const f = await makeRepo();
   try {
     const rec = await provision(f, "redone");
     await commitIn(rec.worktreePath, "red.txt", "red\n", "job: red work");
     const originDev = f.forge.branches.get("dev")!;
+    // The PR does not exist yet, so seed the checks by branch: the fake keys them
+    // on the PR number, which is 1 for the first PR this repo opens.
+    f.forge.checks.set(1, [
+      pass("lint"),
+      { name: "test (ubuntu)", bucket: "fail", link: "https://github.com/acme/repo/runs/9" },
+    ]);
 
-    const res = await prepareLanding(f.opts("echo boom went the suite >&2; exit 3"), "redone");
+    const res = await prepareLanding(f.opts(), "redone");
     assert.equal(res.kind, "failed");
     if (res.kind !== "failed") return;
-    assert.equal(res.exitCode, 3);
-    assert.match(res.output, /boom went the suite/);
+    assert.equal(res.checks.verdict, "failed");
+    assert.equal(res.checks.failed, 1);
+    assert.deepEqual(
+      res.checks.runs.filter((r) => r.bucket === "fail").map((r) => r.name),
+      ["test (ubuntu)"],
+      "the failing check is named, so the resolver can be pointed at it",
+    );
     assert.equal(res.devSha, originDev);
 
-    // Nothing published; the branch is left REBASED but holds all the work, and
-    // the worktree is clean — the exact red state, ready for a fix dispatch.
-    assert.deepEqual(f.forge.pushes, [], "red never reaches the remote");
-    assert.equal(f.forge.prs.length, 0);
+    // A red CHECK is the PR's own verdict, so unlike the old local build+test the
+    // branch IS published and the PR IS open — that is where the failure is read.
+    assert.equal(f.forge.pushes.length, 1);
+    assert.equal(res.pr.number, 1);
+    assert.match(f.forge.prs[0]!.body, /\*\*red\*\*/, "the PR states the red verdict");
+    assert.match(f.forge.prs[0]!.body, /test \(ubuntu\)/, "and names the failing check");
+
+    // The branch is left REBASED holding all the work, worktree clean — the exact
+    // state a fix dispatch needs.
     assert.ok(branchExists(f.repo, rec.branch));
     assert.equal(res.featureSha, sha(f.repo, rec.branch));
     assert.match(run(f.repo, ["log", "--format=%s", rec.branch]), /job: red work/);
     assert.equal(run(rec.worktreePath, ["status", "--porcelain"]), "");
+    assert.equal(f.forge.branches.get("dev"), originDev, "nothing merged");
   } finally {
     await f.cleanup();
   }
@@ -477,6 +502,7 @@ test("re-processing an unchanged green updates the PR's evidence without a secon
     assert.equal(first.pushed, true);
     assert.equal(first.pr!.created, true);
 
+    const editsBefore = f.forge.calls.filter((c) => c.startsWith("gh pr edit")).length;
     const second = await prepareGreen(f, "again");
     assert.equal(second.featureSha, first.featureSha, "an unmoved origin/dev rebases to the same tip");
     assert.equal(second.pushed, false, "the remote already has this sha");
@@ -484,6 +510,217 @@ test("re-processing an unchanged green updates the PR's evidence without a secon
     assert.equal(second.pr!.created, false);
     assert.equal(f.forge.pushes.length, 1);
     assert.equal(f.forge.prs.length, 1);
+    // The evidence carries no timings, so an unchanged re-read rewrites nothing.
+    assert.equal(
+      f.forge.calls.filter((c) => c.startsWith("gh pr edit")).length,
+      editsBefore,
+      "identical evidence sends no edit at all",
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+// --- the checks gate ---------------------------------------------------------
+
+test("NO CI checks at all: the head is green but UNGATED — never an error, never a false red", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "nocichecks");
+    await commitIn(rec.worktreePath, "n.txt", "n\n", "job: n");
+    // The fake reports what gh reports for a repo with no CI: exit 1, nothing on
+    // stdout, "no checks reported on the '<branch>' branch" on stderr. This is
+    // the regression that mattered — co used to treat "cannot verify" as red and
+    // wedge the queue behind a head that was perfectly fine.
+    assert.equal(f.forge.checks.size, 0);
+
+    const res = await prepareLanding(f.opts(), "nocichecks");
+    assert.equal(res.kind, "green", `expected an ungated green, got ${JSON.stringify(res)}`);
+    if (res.kind !== "green") return;
+    assert.equal(res.checks?.verdict, "none");
+    assert.equal(res.checks?.ungated, true, "and it is FLAGGED, not silently passed off as green");
+    assert.equal(res.checks?.total, 0);
+    assert.equal(res.pr?.number, 1, "it still published and opened its PR");
+
+    // The PR says so in words, so the captain reads it where they read the PR.
+    assert.match(f.forge.prs[0]!.body, /\*\*ungated\*\*/);
+    assert.match(f.forge.prs[0]!.body, /no CI checks reported/);
+    assert.match(f.forge.prs[0]!.body, /human judgment call/);
+
+    // And it really is mergeable: an ungated head is a READY head.
+    const landed = await executeLanding(f.opts(), "nocichecks", {
+      featureSha: res.featureSha,
+      devSha: res.devSha,
+      prNumber: res.pr!.number,
+    });
+    assert.equal(f.forge.branches.get("dev"), landed.mergeSha);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a green check set makes a plain green, and the PR states what passed", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "greenish");
+    await commitIn(rec.worktreePath, "g.txt", "g\n", "job: g");
+    f.forge.checks.set(1, [pass("build"), pass("test"), { name: "docs", bucket: "skipping" }]);
+
+    const res = await prepareGreen(f, "greenish");
+    assert.equal(res.checks?.verdict, "passed");
+    assert.equal(res.checks?.ungated, false);
+    assert.equal(res.checks?.passed, 2);
+    assert.equal(res.checks?.skipped, 1, "a skipped check is not blocking, as on the forge");
+    assert.match(f.forge.prs[0]!.body, /\*\*green\*\*/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("REQUIRED checks win when branch protection defines them; everything else is ignored", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "required");
+    await commitIn(rec.worktreePath, "r.txt", "r\n", "job: r");
+    // A red check that is NOT required must not block: GitHub itself would let
+    // this merge, and co mirrors the protected-branch rule rather than inventing
+    // a stricter one.
+    f.forge.checks.set(1, [
+      pass("build", true),
+      { name: "flaky-nightly", bucket: "fail" },
+    ]);
+
+    const res = await prepareGreen(f, "required");
+    assert.equal(res.checks?.requiredOnly, true);
+    assert.equal(res.checks?.total, 1, "only the required check was gated on");
+    assert.deepEqual(res.checks?.runs.map((r) => r.name), ["build"]);
+    assert.ok(
+      f.forge.calls.some((c) => c.startsWith("gh pr checks") && c.includes("--required")),
+      "the required read is tried first",
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("no REQUIRED checks: the gate falls back to every check the PR reports", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "unprotected");
+    await commitIn(rec.worktreePath, "u.txt", "u\n", "job: u");
+    f.forge.checks.set(1, [pass("build"), { name: "test", bucket: "fail" }]);
+
+    const res = await prepareLanding(f.opts(), "unprotected");
+    assert.equal(res.kind, "failed", "an unprotected repo is still gated on its CI");
+    if (res.kind !== "failed") return;
+    assert.equal(res.checks.requiredOnly, false);
+    assert.equal(res.checks.total, 2);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("checks still running: prepare comes back pending, not green and not failed", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "slowci");
+    await commitIn(rec.worktreePath, "s.txt", "s\n", "job: s");
+    f.forge.checks.set(1, [pass("lint"), { name: "test", bucket: "pending" }]);
+
+    const res = await prepareLanding(f.opts(), "slowci");
+    assert.equal(res.kind, "pending");
+    if (res.kind !== "pending") return;
+    assert.equal(res.checks.verdict, "pending");
+    assert.equal(res.checks.pending, 1);
+    assert.equal(res.checks.timedOut, true, "the wait is bounded, and it says when it ran out");
+    assert.equal(res.pr.number, 1, "the PR is open and waiting; nothing was rolled back");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("the bounded wait POLLS: a pending check that turns green inside the window is a green", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "polled");
+    await commitIn(rec.worktreePath, "p.txt", "p\n", "job: p");
+    f.forge.checks.set(1, [{ name: "test", bucket: "pending" }]);
+
+    let reads = 0;
+    f.forge.onChecksRead = () => {
+      reads++;
+      // Third look: CI finished.
+      if (reads >= 3) f.forge.checks.set(1, [pass("test")]);
+    };
+    const res = await prepareGreen(f, "polled", {
+      timeoutMs: 60_000,
+      intervalMs: 1,
+      graceMs: 0,
+      sleep: async () => {},
+    });
+    assert.equal(res.checks?.verdict, "passed");
+    assert.ok(reads >= 3, `it looked again rather than giving up once (${reads} reads)`);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("checks that have not APPEARED yet after a push are waited for, then called ungated", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "lateci");
+    await commitIn(rec.worktreePath, "l.txt", "l\n", "job: l");
+    let reads = 0;
+    f.forge.onChecksRead = () => {
+      reads++;
+      // GitHub registers the workflow run a beat after the push.
+      if (reads >= 4) f.forge.checks.set(1, [pass("build")]);
+    };
+
+    const res = await prepareGreen(f, "lateci", {
+      timeoutMs: 60_000,
+      intervalMs: 1,
+      graceMs: 30_000,
+      sleep: async () => {},
+    });
+    assert.equal(res.checks?.verdict, "passed", "a slow-to-appear check is not 'no CI'");
+    assert.equal(res.checks?.ungated, false);
+    assert.ok(reads >= 4, `the grace window kept looking (${reads} reads)`);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a BROKEN checks read throws — it is never mistaken for an ungated pass", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "ghbroke");
+    await commitIn(rec.worktreePath, "b.txt", "b\n", "job: b");
+    f.forge.checksError = "HTTP 503: Service unavailable (api.github.com)";
+
+    await assert.rejects(prepareLanding(f.opts(), "ghbroke"), /gh pr checks .*503/);
+    assert.equal(f.forge.prs[0]?.state, "OPEN", "the PR it opened is left alone");
+    assert.equal(f.forge.branches.get("dev"), sha(f.repo, "dev"), "and nothing merged");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("co runs no build or test of its own: every command it issues is git or gh", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "noruns");
+    await commitIn(rec.worktreePath, "x.txt", "x\n", "job: x");
+    f.forge.checks.set(1, [pass("build")]);
+    await prepareGreen(f, "noruns");
+
+    // The forge runner sees every command the engine issues. There is no longer
+    // any path that shells out to a project build or test — that was the whole
+    // point of the change, so it is asserted rather than assumed.
+    for (const call of f.forge.calls) {
+      assert.ok(/^(git|gh) /.test(call), `unexpected non-git/gh command: ${call}`);
+    }
+    assert.ok(!f.forge.calls.some((c) => /npm|yarn|pnpm|make|sh -c/.test(c)));
   } finally {
     await f.cleanup();
   }

@@ -8,12 +8,33 @@ import {
   type InStream,
   type LandingReview,
   type OutStream,
+  type PanelChecks,
   type QueueHeadDetail,
   type QueueMergeResult,
   type QueuePanelSource,
   type QueuePanelView,
 } from "./tui.js";
 import { stripAnsi } from "./wrap.js";
+
+/** A checks summary for the panel, counted from the runs so a test only states
+ *  the verdict and the checks it cares about. */
+function panelChecks(
+  verdict: PanelChecks["verdict"],
+  runs: { name: string; bucket: string; link?: string }[] = [],
+): PanelChecks {
+  return {
+    verdict,
+    ungated: verdict === "none",
+    requiredOnly: false,
+    total: runs.length,
+    passed: runs.filter((r) => r.bucket === "pass").length,
+    failed: runs.filter((r) => r.bucket === "fail" || r.bucket === "cancel").length,
+    pending: runs.filter((r) => r.bucket === "pending").length,
+    skipped: runs.filter((r) => r.bucket === "skipping").length,
+    runs,
+    ms: 10,
+  };
+}
 
 /**
  * End-to-end tests for the Ctrl-O panel: the doc surface, and the merge review
@@ -516,14 +537,41 @@ test("a conflict prepare shows the paths and why, with [m] disabled", async () =
   h.stop();
 });
 
-test("a failed prepare shows the exit code and output, with [m] disabled", async () => {
+test("a red-checks prepare names the failing check and links it, with [m] disabled", async () => {
   const h = harness(undefined, 60, 12);
-  const review = fakeReview({ kind: "failed", exitCode: 3, output: "boom went the suite" });
+  const review = fakeReview({
+    kind: "failed",
+    reason: "PR #7: 1 of 2 checks failed: test (ubuntu)",
+    checks: panelChecks("failed", [
+      { name: "build", bucket: "pass" },
+      { name: "test (ubuntu)", bucket: "fail", link: "https://ci.example/9" },
+    ]),
+  });
   const p = openReview(h, review);
   const frame = h.lastFramePlain();
-  assert.match(frame, /build\+test failed on the rebased state \(exit 3\)/);
-  assert.match(frame, /boom went the suite/, "the suite's own output is shown");
-  assert.match(frame, /m disabled \(build\+test red\)/);
+  assert.match(frame, /CI checks failed/);
+  assert.match(frame, /1 of 2 checks failed: test \(ubuntu\)/, "the reason names the check");
+  assert.match(frame, /ci\.example\/9/, "and links the run that says why");
+  assert.match(frame, /m disabled \(checks red\)/);
+  h.send("m");
+  assert.equal(review.calls, 0);
+  h.send("r");
+  assert.equal(await p, "rejected");
+  h.stop();
+});
+
+test("a still-pending prepare says so and disables [m] — waiting is not a failure", async () => {
+  const h = harness(undefined, 60, 12);
+  const review = fakeReview({
+    kind: "pending",
+    reason: "PR #7: 1 of 1 checks still running: test",
+    checks: panelChecks("pending", [{ name: "test", bucket: "pending" }]),
+  });
+  const p = openReview(h, review);
+  const frame = h.lastFramePlain();
+  assert.match(frame, /have not reported yet/);
+  assert.match(frame, /still running: test/);
+  assert.match(frame, /m disabled \(checks pending\)/);
   h.send("m");
   assert.equal(review.calls, 0);
   h.send("r");
@@ -637,9 +685,12 @@ test("stopping the Tui with a review pending settles it as rejected", async () =
 
 /** A queue source whose snapshot the test swaps between paints, to prove the
  *  panel reads the queue fresh (no cached view). */
-function fakeQueue(initial: QueuePanelView): QueuePanelSource & { set(v: QueuePanelView): void } {
+function fakeQueue(
+  initial: QueuePanelView,
+  detail: QueueHeadDetail | null = null,
+): QueuePanelSource & { set(v: QueuePanelView): void } {
   let cur = initial;
-  return { view: () => cur, set: (v) => (cur = v) };
+  return { view: () => cur, headDetail: () => detail, set: (v) => (cur = v) };
 }
 
 const emptyQueue: QueuePanelView = { size: 0, head: null, entries: [] };
@@ -703,7 +754,10 @@ const READY_DETAIL: QueueHeadDetail = {
   feature: "head-a",
   target: "dev",
   commits: ["abc1234 job: the only slice"],
-  buildTest: { command: "npm run typecheck && npm test", ms: 12_400 },
+  checks: panelChecks("passed", [
+    { name: "build", bucket: "pass" },
+    { name: "test", bucket: "pass" },
+  ]),
   pr: {
     number: 42,
     url: "https://github.com/acme/repo/pull/42",
@@ -725,8 +779,8 @@ test("Ctrl-O opens the queue tab first when a queue is wired; an empty queue say
 });
 
 /** Open the panel over a one-shot queue snapshot and return the painted frame. */
-async function renderQueue(view: QueuePanelView): Promise<string> {
-  const h = harness(undefined, 72, 20, fakeQueue(view));
+async function renderQueue(view: QueuePanelView, detail: QueueHeadDetail | null = null): Promise<string> {
+  const h = harness(undefined, 72, 20, fakeQueue(view, detail));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -759,7 +813,7 @@ test("the queue tab renders a head being processed", async () => {
   assert.match(frame, /proc\s+\[processing\]/, "a head being prepared shows processing");
 });
 
-test("the queue tab distinguishes a conflict block from a red build+test block", async () => {
+test("the queue tab distinguishes a conflict block from a red-checks block", async () => {
   const conflictFrame = await renderQueue({
     size: 1,
     head: null,
@@ -788,13 +842,78 @@ test("the queue tab distinguishes a conflict block from a red build+test block",
         isHead: true,
         status: "blocked",
         blockedKind: "failed",
-        blockedReason: "build+test failed (exit 2)",
+        blockedReason: "PR #7: 1 of 2 checks failed: test (ubuntu)",
         resolveAttempts: 1,
       },
     ],
   });
-  assert.match(redFrame, /red\s+\[blocked: build\+test\]/, "a red block is labelled build+test, distinct from conflict");
+  assert.match(redFrame, /red\s+\[blocked: checks\]/, "a red block is labelled checks, distinct from conflict");
+  assert.match(redFrame, /1 of 2 checks failed/, "the reason names what CI said");
   assert.match(redFrame, /resolver attempts: 1/, "spent attempts are surfaced");
+});
+
+test("an UNGATED ready head is drawn as ungated, never as a green — the captain is the only gate", async () => {
+  const frame = await renderQueue(
+    {
+      size: 1,
+      head: null,
+      entries: [
+        { feature: "solo", position: 1, isHead: true, status: "ready", commitsReady: 2, ungated: true },
+      ],
+    },
+    {
+      kind: "ready",
+      feature: "solo",
+      target: "dev",
+      commits: ["abc1234 job: solo"],
+      checks: panelChecks("none", []),
+      pr: { number: 3, url: "https://github.com/acme/repo/pull/3", title: "solo", body: "" },
+    },
+  );
+  // The regression this guards: a repo with no CI must not look like a repo
+  // whose CI passed. It is mergeable, and it says why nothing verified it.
+  assert.match(frame, /solo\s+\[ready: ungated\]/, "the chip says ungated, not ready");
+  assert.match(frame, /no CI checks on its PR/, "the list row says why");
+  assert.match(frame, /UNGATED/, "and the body leads with it");
+  assert.match(frame, /your judgment/);
+  assert.ok(!/checks green/.test(frame), "nothing claims a green that never happened");
+});
+
+test("a head awaiting CI says what it is waiting on, and offers no [m]", async () => {
+  const q = mergeableQueue(
+    {
+      size: 1,
+      head: null,
+      entries: [
+        { feature: "slow", position: 1, isHead: true, status: "awaiting-checks", checksPending: 2 },
+      ],
+    },
+    {
+      kind: "awaiting",
+      feature: "slow",
+      target: "dev",
+      commits: ["abc1234 job: slow"],
+      checks: panelChecks("pending", [
+        { name: "build", bucket: "pass" },
+        { name: "test (ubuntu)", bucket: "pending", link: "https://ci.example/1" },
+        { name: "e2e", bucket: "pending" },
+      ]),
+      pr: { number: 4, url: "https://github.com/acme/repo/pull/4", title: "slow", body: "" },
+    },
+  );
+  const h = harness(undefined, 72, 30, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /slow\s+\[awaiting checks\]/);
+  assert.match(frame, /waiting on 2 CI checks/);
+  assert.match(frame, /WAITING on CI/);
+  assert.match(frame, /test \(ubuntu\)/, "the pending checks are named");
+  assert.ok(!/press m/.test(frame), "no [m] is offered on a head that is not ready");
+  h.send("m");
+  assert.equal(q.calls, 0, "and pressing it does nothing");
+  h.stop();
 });
 
 test("the queue tab shows a resolving head with its attempt", async () => {
@@ -817,7 +936,7 @@ test("the queue tab shows a resolving head with its attempt", async () => {
 // dead no-op on anything that isn't green; and nothing anywhere is awaiting the
 // keystroke — there is no promise to settle and no review to reject.
 
-test("a ready head renders its PR and build+test inline, with a live [m]", async () => {
+test("a ready head renders its PR and checks inline, with a live [m]", async () => {
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
   const h = harness(undefined, 72, 30, q);
   h.tui.question();
@@ -828,7 +947,7 @@ test("a ready head renders its PR and build+test inline, with a live [m]", async
   assert.match(frame, /press m to merge PR #42 into dev/, "the affordance names what it does");
   assert.match(frame, /PR #42 → dev · 1 commit/, "the summary counts the merge");
   assert.match(frame, /pull\/42/, "the PR's URL is there to open or edit it");
-  assert.match(frame, /build\+test green · npm run typecheck && npm test · 12\.4s/, "the evidence is stated");
+  assert.match(frame, /checks green · 2 checks passed/, "the evidence is stated");
   assert.match(frame, /abc1234 job: the only slice/, "the commit list is inline");
   assert.match(frame, /hello from the feature/, "and so is the PR message — no drill needed");
   assert.match(frame, /m\s*merge/, "the footer offers the key");

@@ -15,6 +15,10 @@ import { spawn } from "node:child_process";
  * fixture repo pretending to be GitHub. Production passes nothing and gets
  * `spawnCommand`; tests pass a fake and assert on the exact argv.
  *
+ * It is also where co READS the merge gate rather than being it (D-20260727-1):
+ * `gh pr checks` reports what GitHub's own CI made of the PR, and that is the
+ * only build/test verdict in the whole flow. co runs no suite of its own.
+ *
  * HARD RULES encoded here, not left to callers:
  *  - the merge is ALWAYS `gh pr merge --merge` — a MERGE COMMIT. Never --squash,
  *    never --rebase: the feature-branch topology is the point (D-20260723-9), and
@@ -81,13 +85,46 @@ export interface PullRequest {
   state?: string;
 }
 
-/** What openOrUpdatePr did, so a caller can report it honestly. */
-export interface PrUpsertResult {
+/** What ensurePr did, so a caller can report it honestly. */
+export interface PrEnsureResult {
   pr: PullRequest;
-  /** True when this call created the PR; false when it updated an existing one. */
+  /** True when this call created the PR; false when one was already open. */
   created: boolean;
-  /** True when an existing PR's body was refreshed with new evidence. */
+}
+
+/** What updatePrEvidence did. */
+export interface PrEvidenceResult {
+  pr: PullRequest;
+  /** True when the body actually changed and was sent; false when the evidence
+   *  was already identical and nothing was written. */
   bodyUpdated: boolean;
+}
+
+/** gh's own bucketing of one check's state, straight off `gh pr checks --json`:
+ *  it collapses the many GitHub states into five. */
+export type CheckBucket = "pass" | "fail" | "pending" | "skipping" | "cancel";
+
+/** One CI check on a pull request, as gh reports it. */
+export interface CheckRun {
+  name: string;
+  bucket: CheckBucket;
+  /** GitHub's raw state (SUCCESS, FAILURE, IN_PROGRESS, …). */
+  state: string;
+  /** Where a human reads the run. Surfaced so a red check is one click away. */
+  link?: string;
+  workflow?: string;
+  description?: string;
+}
+
+/** One read of a PR's checks. */
+export interface PrChecksRead {
+  /** Every check the gate should consider, or NULL when the forge reported no
+   *  checks at all on this PR. Null is not an error: a repo with no CI is
+   *  ungated, and that is a state to surface, not to fail on. */
+  runs: CheckRun[] | null;
+  /** True when branch protection defines required checks and these are only
+   *  those; false when this is every check reported on the PR. */
+  requiredOnly: boolean;
 }
 
 /** The remote-tracking ref for the integration branch (`origin/dev`). Every
@@ -367,49 +404,139 @@ export function spliceEvidence(body: string, evidence: string): string {
 }
 
 /**
- * Open the feature's PR, or refresh the one that is already open.
+ * Make sure the feature has an open PR into the integration branch, and return
+ * it. Creating one writes the whole message co composes: title, description, and
+ * the fenced evidence block. An already-open PR is returned UNTOUCHED — its
+ * title and prose are the captain's, and its evidence is refreshed separately by
+ * updatePrEvidence once there is something new to say.
  *
- * On CREATE co writes the whole message: title, description, and the fenced
- * evidence block. On UPDATE it rewrites ONLY the fenced block — the title and
- * the surrounding prose stay exactly as the captain left them, because a head
- * that re-processes (dev moved, a fix landed) must refresh its evidence without
- * reverting a human's edits. If the evidence is already identical, nothing is
- * sent at all.
+ * The split exists because the PR has to exist BEFORE its verdict is known: the
+ * checks that gate the merge run on the forge, against this PR, so co opens it
+ * first and writes the result into it afterwards (D-20260727-1).
  */
-export async function openOrUpdatePr(
+export async function ensurePr(
   o: ForgeOptions,
   spec: { branch: string; title: string; body: string; evidence: string },
-): Promise<PrUpsertResult> {
+): Promise<PrEnsureResult> {
   const existing = await findOpenPr(o, spec.branch);
-  if (!existing) {
-    const body = spliceEvidence(spec.body, spec.evidence);
-    const out = await execOrThrow(o, "gh", [
-      "pr",
-      "create",
-      "--base",
-      o.devBranch,
-      "--head",
-      spec.branch,
-      "--title",
-      spec.title,
-      "--body",
-      body,
-    ]);
-    const created = (await findOpenPr(o, spec.branch)) ?? {
-      number: prNumberFromUrl(out) ?? 0,
-      url: out.trim().split(/\s+/).pop() ?? "",
-      title: spec.title,
-      body,
-    };
-    return { pr: created, created: true, bodyUpdated: true };
-  }
+  if (existing) return { pr: existing, created: false };
 
-  const nextBody = spliceEvidence(existing.body, spec.evidence);
-  if (nextBody.trim() === existing.body.trim()) {
-    return { pr: existing, created: false, bodyUpdated: false };
+  const body = spliceEvidence(spec.body, spec.evidence);
+  const out = await execOrThrow(o, "gh", [
+    "pr",
+    "create",
+    "--base",
+    o.devBranch,
+    "--head",
+    spec.branch,
+    "--title",
+    spec.title,
+    "--body",
+    body,
+  ]);
+  const created = (await findOpenPr(o, spec.branch)) ?? {
+    number: prNumberFromUrl(out) ?? 0,
+    url: out.trim().split(/\s+/).pop() ?? "",
+    title: spec.title,
+    body,
+  };
+  return { pr: created, created: true };
+}
+
+/**
+ * Rewrite ONLY the fenced evidence block inside a PR's body. The title and the
+ * surrounding prose stay exactly as the captain left them, because a head that
+ * re-processes (dev moved, a fix landed, checks finished) must refresh its
+ * evidence without reverting a human's edits. If the evidence is already
+ * identical, nothing is sent at all.
+ */
+export async function updatePrEvidence(
+  o: ForgeOptions,
+  pr: PullRequest,
+  evidence: string,
+): Promise<PrEvidenceResult> {
+  const nextBody = spliceEvidence(pr.body, evidence);
+  if (nextBody.trim() === pr.body.trim()) return { pr, bodyUpdated: false };
+  await execOrThrow(o, "gh", ["pr", "edit", String(pr.number), "--body", nextBody]);
+  return { pr: { ...pr, body: nextBody }, bodyUpdated: true };
+}
+
+// --- checks ------------------------------------------------------------------
+
+const CHECK_JSON_FIELDS = "name,state,bucket,link,workflow,description";
+
+/**
+ * gh's message when there is nothing to report — either the PR has no checks at
+ * all, or (`--required`) branch protection defines none. gh exits 1 for this,
+ * exactly as it does for a real fault, so the MESSAGE is the only way to tell
+ * "nothing to gate on" from "gh broke". Everything else nonzero is a fault and
+ * is thrown, so co can never mistake a broken read for an ungated PR.
+ */
+const NO_CHECKS = /no (?:required )?checks reported/i;
+
+const BUCKETS = new Set<string>(["pass", "fail", "pending", "skipping", "cancel"]);
+
+function parseCheck(raw: unknown): CheckRun | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const name = typeof o.name === "string" ? o.name.trim() : "";
+  if (!name) return null;
+  // An unrecognised bucket (a newer gh) counts as PENDING, never as a pass: the
+  // worst it can cost is a bounded wait, where the other default would be a
+  // green co never actually saw.
+  const bucket =
+    typeof o.bucket === "string" && BUCKETS.has(o.bucket) ? (o.bucket as CheckBucket) : "pending";
+  return {
+    name,
+    bucket,
+    state: typeof o.state === "string" ? o.state : "",
+    ...(typeof o.link === "string" && o.link ? { link: o.link } : {}),
+    ...(typeof o.workflow === "string" && o.workflow ? { workflow: o.workflow } : {}),
+    ...(typeof o.description === "string" && o.description ? { description: o.description } : {}),
+  };
+}
+
+/** One `gh pr checks` read. Null means gh said there is nothing to report. */
+async function readChecks(
+  o: ForgeOptions,
+  number: number,
+  required: boolean,
+): Promise<CheckRun[] | null> {
+  const args = ["pr", "checks", String(number), "--json", CHECK_JSON_FIELDS];
+  if (required) args.push("--required");
+  const res = await exec(o, "gh", args);
+  const out = res.stdout.trim();
+  if (out) {
+    // With --json, gh prints the list and exits 0 even when checks FAILED — the
+    // verdict is in the buckets, never in the exit code.
+    const parsed = parseJson(out, `the checks on PR #${number}`);
+    if (!Array.isArray(parsed)) {
+      throw new Error(`gh returned no readable check list for PR #${number}`);
+    }
+    return parsed.map(parseCheck).filter((c): c is CheckRun => c !== null);
   }
-  await execOrThrow(o, "gh", ["pr", "edit", String(existing.number), "--body", nextBody]);
-  return { pr: { ...existing, body: nextBody }, created: false, bodyUpdated: true };
+  if (res.code === 0) return null;
+  if (NO_CHECKS.test(res.stderr)) return null;
+  throw new Error(
+    `\`gh pr checks ${number}${required ? " --required" : ""}\` exited ${res.code}: ` +
+      `${res.stderr.trim() || res.stdout.trim() || "no output"}`,
+  );
+}
+
+/**
+ * What GitHub's CI makes of this PR, right now — the semantic half of the merge
+ * gate, the way a protected branch reads it (D-20260727-1).
+ *
+ * REQUIRED CHECKS WIN. If branch protection on the base defines required checks,
+ * those alone decide, because those alone are what GitHub itself would block the
+ * merge on. Only when there are none does this fall back to every check reported
+ * on the PR, so a repo with CI but no protection rules is still gated on its CI.
+ * A PR with no checks at all comes back `runs: null` — ungated, not failed.
+ */
+export async function readPrChecks(o: ForgeOptions, number: number): Promise<PrChecksRead> {
+  const required = await readChecks(o, number, true);
+  if (required && required.length > 0) return { runs: required, requiredOnly: true };
+  return { runs: await readChecks(o, number, false), requiredOnly: false };
 }
 
 /** The PR number out of a `gh pr create` URL ("…/pull/42"). Only a fallback:

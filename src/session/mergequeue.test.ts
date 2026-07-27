@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MergeQueue, MAX_RESOLVE_ATTEMPTS } from "./mergequeue.js";
+import type { ChecksSummary } from "./checks.js";
 import type {
   executeLanding,
   PrepareConflict,
   PrepareFailed,
   PrepareGreen,
+  PreparePending,
   PrepareResult,
   prepareLanding,
 } from "./landing.js";
@@ -23,7 +25,33 @@ import type {
  * terminal exists — which is exactly what these tests pin down.
  */
 
-function green(feature: string, commits = 1): PrepareGreen {
+/** A checks summary in whatever shape a test needs. `runs` carries the names a
+ *  surface is expected to echo back. */
+function checks(partial: Partial<ChecksSummary> & Pick<ChecksSummary, "verdict">): ChecksSummary {
+  const runs = partial.runs ?? [];
+  return {
+    ungated: partial.verdict === "none",
+    requiredOnly: false,
+    total: runs.length,
+    passed: runs.filter((r) => r.bucket === "pass").length,
+    failed: runs.filter((r) => r.bucket === "fail" || r.bucket === "cancel").length,
+    pending: runs.filter((r) => r.bucket === "pending").length,
+    skipped: runs.filter((r) => r.bucket === "skipping").length,
+    ms: 12,
+    ...partial,
+    runs,
+  };
+}
+
+const PR = {
+  number: 7,
+  url: `https://github.com/acme/repo/pull/7`,
+  title: "work",
+  body: "why and what",
+  created: true,
+};
+
+function green(feature: string, commits = 1, checksSummary?: ChecksSummary): PrepareGreen {
   return {
     kind: "green",
     feature,
@@ -32,14 +60,16 @@ function green(feature: string, commits = 1): PrepareGreen {
     featureSha: `feat-${feature}`,
     diff: "+work\n",
     commits: Array.from({ length: commits }, (_, i) => `c${i} job: ${feature} slice ${i}`),
-    pr: {
-      number: 7,
-      url: `https://github.com/acme/repo/pull/7`,
-      title: `${feature} work`,
-      body: "why and what",
-      created: true,
-    },
+    checks:
+      checksSummary ??
+      checks({ verdict: "passed", runs: [{ name: "build", bucket: "pass", state: "SUCCESS" }] }),
+    pr: { ...PR, title: `${feature} work` },
   };
+}
+
+/** A green head whose PR reported NO checks: mergeable, but nothing verified it. */
+function ungated(feature: string, commits = 1): PrepareGreen {
+  return green(feature, commits, checks({ verdict: "none", runs: [] }));
 }
 function conflict(feature: string): PrepareConflict {
   return {
@@ -58,8 +88,31 @@ function failed(feature: string): PrepareFailed {
     branch: `co/feat-${feature}`,
     devSha: "dev0",
     featureSha: `feat-${feature}`,
-    exitCode: 2,
-    output: "boom went the suite",
+    commits: [`c0 job: ${feature}`],
+    checks: checks({
+      verdict: "failed",
+      runs: [
+        { name: "build", bucket: "pass", state: "SUCCESS" },
+        { name: "test (ubuntu)", bucket: "fail", state: "FAILURE", link: "https://ci/9" },
+      ],
+    }),
+    pr: { ...PR, title: `${feature} work` },
+  };
+}
+function pending(feature: string): PreparePending {
+  return {
+    kind: "pending",
+    feature,
+    branch: `co/feat-${feature}`,
+    devSha: "dev0",
+    featureSha: `feat-${feature}`,
+    commits: [`c0 job: ${feature}`],
+    checks: checks({
+      verdict: "pending",
+      timedOut: true,
+      runs: [{ name: "test", bucket: "pending", state: "IN_PROGRESS" }],
+    }),
+    pr: { ...PR, title: `${feature} work` },
   };
 }
 
@@ -118,7 +171,6 @@ function makeHarness(): Harness {
 
   h.queue = new MergeQueue({
     repoPath: "/fake/repo",
-    buildTestCommand: "true",
     host: { isBusy: (f) => busy.has(f), forget: (f) => forgotten.push(f) },
     deps: { prepare: fakePrepare, execute: fakeExecute },
   });
@@ -213,12 +265,59 @@ test("a rebase conflict blocks the head and it holds the queue", async () => {
   assert.equal(h.queue.headFeature(), "aaa", "the blocked head still holds the queue");
 });
 
-test("a red build+test blocks the head", async () => {
+test("a red CI check blocks the head, and the reason names the check", async () => {
   const h = makeHarness();
   h.prepareFn.set("aaa", () => failed("aaa"));
   const a = await h.queue.enqueue("aaa");
   assert.equal(a.head?.status, "blocked");
-  assert.match(a.head?.blockedReason ?? "", /build\+test failed \(exit 2\)/);
+  assert.equal(a.head?.blockedKind, "failed");
+  assert.match(a.head?.blockedReason ?? "", /PR #7/);
+  assert.match(a.head?.blockedReason ?? "", /test \(ubuntu\)/);
+});
+
+test("checks still running leave the head AWAITING, not blocked and not ready", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => pending("aaa"));
+  const a = await h.queue.enqueue("aaa");
+  assert.equal(a.head?.status, "awaiting-checks");
+  assert.equal(a.head?.checksPending, 1);
+  assert.equal(a.head?.blockedKind, undefined, "waiting on CI is not a block");
+  assert.equal(a.head?.blockedReason, undefined);
+  assert.match(a.summary, /WAITING on its pull request's CI checks/);
+
+  // It holds the queue: no [m], nothing behind it is touched.
+  const behind = await h.queue.enqueue("bbb");
+  assert.equal(behind.entry.status, "queued");
+  assert.deepEqual(h.prepareCalls, ["aaa"], "nothing behind an awaiting head is prepared");
+  const m = await h.queue.mergeReadyHead();
+  assert.equal(m.merged, false);
+  assert.equal(m.outcome, "not-ready");
+  assert.equal(h.mergeCalls.length, 0);
+
+  // Re-enqueuing it is the re-read lever, and CI having finished makes it ready.
+  h.prepareFn.set("aaa", () => green("aaa"));
+  const again = await h.queue.enqueue("aaa");
+  assert.equal(again.head?.status, "ready");
+});
+
+test("a head whose PR reports NO checks is READY, flagged ungated, and merges", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => ungated("aaa"));
+  const a = await h.queue.enqueue("aaa");
+  // The anti-regression: co could not verify it, and that is a state to report,
+  // never an error and never a red that wedges the queue.
+  assert.equal(a.head?.status, "ready");
+  assert.equal(a.head?.ungated, true);
+  assert.match(a.summary, /UNGATED/);
+  assert.match(a.summary, /NO CI checks/);
+
+  const d = h.queue.headDetail();
+  assert.equal(d?.kind, "ready");
+  if (d?.kind !== "ready") return;
+  assert.equal(d.checks?.ungated, true, "the panel is told, so it can colour it differently");
+
+  const m = await h.queue.mergeReadyHead();
+  assert.equal(m.merged, true, "an ungated head is mergeable — the captain is the gate");
 });
 
 test("a green head with no commits is blocked as nothing-to-land, not offered for merge", async () => {
@@ -281,7 +380,7 @@ test("mergeReadyHead reuses the head's already-computed green: exactly one prepa
   const merge = await h.queue.mergeReadyHead();
   assert.equal(merge.merged, true);
   // The merge ran once, pinned to the prepared sha, and prepare was NOT re-run:
-  // the panel's [m] must not pay for a second build+test.
+  // the panel's [m] must not pay for a second checks read.
   assert.deepEqual(h.mergeCalls, ["solo@feat-solo+dev0#7"]);
   assert.deepEqual(h.prepareCalls, ["solo"], "no redundant re-prepare at merge time");
 });
@@ -363,12 +462,9 @@ test("a busy head is not processed until the crew frees it; merge is refused mea
 
 // --- what the panel reads and presses (D-20260724-12) ------------------------
 
-test("headDetail carries a ready head's PR, commits and build+test evidence", async () => {
+test("headDetail carries a ready head's PR, commits and checks evidence", async () => {
   const h = makeHarness();
-  h.prepareFn.set("aaa", () => ({
-    ...green("aaa", 2),
-    buildTest: { command: "npm test", ms: 1500 },
-  }));
+  h.prepareFn.set("aaa", () => green("aaa", 2));
   await h.queue.enqueue("aaa");
 
   const d = h.queue.headDetail();
@@ -380,7 +476,20 @@ test("headDetail carries a ready head's PR, commits and build+test evidence", as
   assert.equal(d.commits.length, 2, "the per-job commits the merge preserves");
   assert.equal(d.pr?.number, 7, "the PR the [m] would merge");
   assert.equal(d.pr?.title, "aaa work");
-  assert.deepEqual(d.buildTest, { command: "npm test", ms: 1500 }, "the evidence, stated not implied");
+  assert.equal(d.checks?.verdict, "passed", "the evidence, stated not implied");
+  assert.deepEqual(d.checks?.runs.map((r) => r.name), ["build"]);
+});
+
+test("headDetail carries an awaiting head's PR and what it is still waiting on", async () => {
+  const h = makeHarness();
+  h.prepareFn.set("aaa", () => pending("aaa"));
+  await h.queue.enqueue("aaa");
+  const d = h.queue.headDetail();
+  assert.equal(d?.kind, "awaiting");
+  if (d?.kind !== "awaiting") return;
+  assert.equal(d.pr?.number, 7);
+  assert.equal(d.checks?.verdict, "pending");
+  assert.deepEqual(d.checks?.runs.map((r) => r.name), ["test"]);
 });
 
 test("headDetail carries a blocked head's kind and detail, and no ready body", async () => {
@@ -402,8 +511,13 @@ test("headDetail carries a blocked head's kind and detail, and no ready body", a
   assert.equal(df?.kind, "blocked");
   if (df?.kind !== "blocked") return;
   assert.equal(df.blockedKind, "failed");
-  assert.equal(df.exitCode, 2);
-  assert.match(df.output ?? "", /boom went the suite/);
+  assert.equal(df.checks?.verdict, "failed");
+  assert.deepEqual(
+    df.checks?.runs.filter((r) => r.bucket === "fail").map((r) => r.name),
+    ["test (ubuntu)"],
+    "the panel can name what went red and link the run",
+  );
+  assert.equal(df.pr?.number, 7, "and point at the PR where it is read");
 });
 
 test("headDetail is null for a head that is merely processing or being resolved", async () => {
@@ -439,7 +553,7 @@ test("a conflict-blocked head carries blockedKind 'conflict'; a red one carries 
   hf.prepareFn.set("aaa", () => failed("aaa"));
   const f1 = await hf.queue.enqueue("aaa");
   assert.equal(f1.head?.status, "blocked");
-  assert.equal(f1.head?.blockedKind, "failed", "a red build+test is flagged as failed");
+  assert.equal(f1.head?.blockedKind, "failed", "a red CI check is flagged as failed");
 });
 
 test("a lifecycle-blocked head (thrown prepare) has NO blockedKind and can't be resolved", async () => {
