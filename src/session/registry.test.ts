@@ -1298,6 +1298,208 @@ test("when the anchor pane itself is gone and no worker survives, the dispatch f
   }
 });
 
+// --- link durability: an orphaned launch failure never costs the layout -----
+//
+// The other way a launch can fail with NOTHING dead: Ghostty makes the split and
+// hands back a pane id, but that pane's surface command never runs, so the job
+// script never creates its capture and the launch probe times out. The transport
+// reaps the stray pane and reports the failure against its id — an id that was
+// never committed to the layout. Read as a dead TRACKED pane it would escape to
+// the anchor-loss path and null the whole layout, telling the captain to re-run
+// `co pane` while the anchor and every worker are perfectly healthy. These prove
+// it stays a single-dispatch failure instead.
+
+/** A Ghostty stub whose splits succeed but whose new panes optionally never run
+ *  their job (`startFails`), reproducing the orphaned-launch failure. Every pane
+ *  probes alive; `close` scripts are recorded so the reap can be asserted. */
+function stubGhosttyWithDeadSplits(): {
+  setStartFails: (v: boolean) => void;
+  closes: () => string[];
+  launches: () => string[];
+  teardown: () => void;
+} {
+  const closes: string[] = [];
+  const launches: string[] = [];
+  let split = 0;
+  let startFails = false;
+  setGhosttyAvailableForTest(true);
+  setOsaRunnerForTest(async (s) => {
+    if (s.includes("exists (first terminal")) return "true"; // nothing is closed
+    if (s.includes("close ")) {
+      closes.push(s);
+      return "";
+    }
+    launches.push(s);
+    if (s.includes("split ")) {
+      // The split itself SUCCEEDS — Ghostty creates the pane and returns its id.
+      // Only its surface command fails to run, so the capture never appears.
+      if (!startFails) await touchCaptureFromScript(s);
+      return `pane-${++split}`;
+    }
+    await touchCaptureFromScript(s);
+    const tm = s.match(/first terminal whose id = "([^"]+)"/);
+    return tm ? tm[1]! : "anchor-1";
+  });
+  return {
+    setStartFails: (v) => (startFails = v),
+    closes: () => closes,
+    launches: () => launches,
+    teardown: () => {
+      setGhosttyAvailableForTest(null);
+      setOsaRunnerForTest(null);
+    },
+  };
+}
+
+/** Shared config for the orphan-path tests. */
+function orphanTestConfig(rootPath: string) {
+  const config = defaultDispatchConfig();
+  config.repoPath = rootPath;
+  config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+  config.pane = { directionSequence: ["right", "down"], cap: 4 };
+  config.agents = [{ name: "fake", command: `sh -c 'echo HI'` }];
+  config.defaultAgent = "fake";
+  return config;
+}
+
+test("a split whose new pane never runs the job fails one dispatch and leaves the layout intact", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  const { setStartFails, closes, launches, teardown } = stubGhosttyWithDeadSplits();
+  try {
+    let anchorLost = 0;
+    await withRegistry(
+      {
+        paths,
+        config: orphanTestConfig(paths.root),
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        paneStartTimeoutMs: 150, // don't spend the transport's real 4s budget
+        onAnchorLost: () => anchorLost++,
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one"); // takeover anchor-1
+        const j2 = await reg.dispatch("two"); // split anchor-1 → pane-1
+        assert.equal(j1.paneId, "anchor-1");
+        assert.equal(j2.paneId, "pane-1");
+
+        // The next split is created but its job never starts in it.
+        setStartFails(true);
+        const j3 = await reg.dispatch("three");
+
+        assert.equal(j3.status, "failed", "the dispatch itself fails");
+        assert.equal(j3.paneId, undefined, "nothing was placed");
+        // The whole point of the fix: a healthy link is not reported as broken.
+        assert.equal(reg.paneReady, true, "the layout survives an orphaned launch failure");
+        assert.equal(anchorLost, 0, "the anchor was never reported lost");
+        assert.doesNotMatch(j3.error ?? "", /co pane/, "no spurious re-run `co pane`");
+        assert.match(j3.error ?? "", /crew link is fine/, "it says the link is fine");
+        assert.equal(closes().length, 1, "the orphan pane it created was reaped");
+        assert.ok(
+          closes()[0]!.includes('id = "pane-2"'),
+          `the reaped pane is the one the failed split made, got:\n${closes()[0]}`,
+        );
+
+        // And the link really is intact: the next working dispatch still splits
+        // the newest LIVING TRACKED pane (pane-1). The orphan was never tracked,
+        // so it neither became a split origin nor displaced one.
+        setStartFails(false);
+        const j4 = await reg.dispatch("four");
+        assert.equal(j4.status, "running", "the very next dispatch launches normally");
+        assert.equal(j4.paneId, "pane-3", "a fresh worker was spawned");
+        const lastSplit = launches().filter((s) => s.includes("split target direction")).pop()!;
+        assert.ok(
+          lastSplit.includes('first terminal whose id = "pane-1"'),
+          `j4 must split the newest living tracked pane (pane-1), got:\n${lastSplit}`,
+        );
+      },
+    );
+  } finally {
+    teardown();
+    await cleanup();
+  }
+});
+
+test("an orphaned launch failure is bounded: one split attempt, then a clean failure", async () => {
+  // No retry storm. Pruning cannot help here (the id was never tracked), so a
+  // retry would just create and abandon another pane, forever.
+  const { paths, cleanup } = await tmpInstance();
+  const { setStartFails, closes, launches, teardown } = stubGhosttyWithDeadSplits();
+  try {
+    let anchorLost = 0;
+    await withRegistry(
+      {
+        paths,
+        config: orphanTestConfig(paths.root),
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        paneStartTimeoutMs: 150,
+        onAnchorLost: () => anchorLost++,
+      },
+      async (reg) => {
+        await reg.dispatch("one"); // takeover anchor-1
+        setStartFails(true); // every split from here creates a pane that won't run
+
+        const j2 = await reg.dispatch("two");
+        assert.equal(j2.status, "failed");
+        const splits = launches().filter((s) => s.includes("split target direction"));
+        assert.equal(splits.length, 1, "exactly one split was attempted, not a retry loop");
+        assert.equal(closes().length, 1, "exactly one stray pane was created and reaped");
+        assert.equal(reg.paneReady, true, "and the layout is still intact");
+        assert.equal(anchorLost, 0);
+      },
+    );
+  } finally {
+    teardown();
+    await cleanup();
+  }
+});
+
+test("the fix is narrow: a busy pane we were HANDED still escalates to anchor loss", async () => {
+  // The boundary. A takeover targets a pane we did not create; if the job never
+  // starts there the pane is real, still open, and owned by something else — that
+  // is NOT an orphan, and the pre-existing escalation must be untouched.
+  const { paths, cleanup } = await tmpInstance();
+  const closes: string[] = [];
+  setGhosttyAvailableForTest(true);
+  setOsaRunnerForTest(async (s) => {
+    if (s.includes("exists (first terminal")) return "true";
+    if (s.includes("close ")) {
+      closes.push(s);
+      return "";
+    }
+    // The paste "succeeds" but whatever owns the anchor swallowed it: no capture.
+    return "anchor-1";
+  });
+  try {
+    let anchorLost = 0;
+    await withRegistry(
+      {
+        paths,
+        config: orphanTestConfig(paths.root),
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        paneStartTimeoutMs: 150,
+        onAnchorLost: () => anchorLost++,
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one"); // takeover anchor-1, which is busy
+        assert.equal(j1.status, "failed");
+        assert.match(j1.error ?? "", /co pane/, "a busy handed pane still names the fix");
+        assert.equal(anchorLost, 1, "and still reports anchor loss exactly once");
+        assert.equal(reg.paneReady, false, "the anchor is dropped, exactly as before");
+        assert.deepEqual(closes, [], "nothing was created, so nothing is reaped");
+      },
+    );
+  } finally {
+    setGhosttyAvailableForTest(null);
+    setOsaRunnerForTest(null);
+    await cleanup();
+  }
+});
+
 test("feature dispatch end-to-end: real provision, crew cwd = worktree on co/feat-*, reuse on the second dispatch", async () => {
   // The whole provision → dispatch-isolated loop against a real git repo: the
   // registry provisions through worktrees.ts for real, and the (stubbed) pane
