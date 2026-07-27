@@ -487,8 +487,8 @@ test("a feature's intent SURVIVES a restart: the record is rebuilt from git, the
     assert.deepEqual(
       overview.map((f) => [f.feature, f.intent, f.status, f.branch]),
       [
-        ["checkout", "stripe checkout with saved cards", "idle", "co/feat-checkout"],
-        ["user-auth", "passkey login for the web app", "idle", "co/feat-user-auth"],
+        ["checkout", "stripe checkout with saved cards", "idle", "feat/checkout"],
+        ["user-auth", "passkey login for the web app", "idle", "feat/user-auth"],
       ],
       "every tracked worktree, described, alphabetical while none is queued",
     );
@@ -555,7 +555,7 @@ test("the features overview lists queued and unqueued side by side, closest-to-l
     assert.equal(rows[1]!.position, undefined);
     assert.equal(rows[1]!.intent, "still being worked");
     // Every row names the branch, so the tab can be read without the co.
-    assert.deepEqual(rows.map((r) => r.branch), ["co/feat-zeta-queued", "co/feat-alpha-idle"]);
+    assert.deepEqual(rows.map((r) => r.branch), ["feat/zeta-queued", "feat/alpha-idle"]);
 
     // A blocked/resolving head reports as such, with its kind, so the tab agrees
     // with the queue tab about the same feature.
