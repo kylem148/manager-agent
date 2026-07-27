@@ -1,8 +1,10 @@
 # dependencies
-node_modules/
+# no trailing slash: feature worktrees symlink these back to the primary
+# checkout, and a dir-only pattern doesn't match a symlink
+node_modules
 
 # build output
-dist/
+dist
 *.tsbuildinfo
 
 # secrets — never commit
