@@ -935,3 +935,4 @@ provider abstractions (`ModelProvider`, `SearchProvider`, `Fetcher`) and the
 
 MIT
 Conflict-test marker: ALPHA channel.
+Conflict-test marker: BETA channel.
