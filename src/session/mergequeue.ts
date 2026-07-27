@@ -5,7 +5,7 @@ import {
   type LandingOptions,
   type PrepareResult,
 } from "./landing.js";
-import type { CommandRunner } from "./forge.js";
+import { splitEvidence, type CommandRunner } from "./forge.js";
 import { resolveWorktreeOptions } from "./worktrees.js";
 
 /**
@@ -185,7 +185,7 @@ export type QueueHeadDetail =
       checks?: ChecksSummary;
       /** The open PR [m] would merge. Absent only if a green somehow carried no
        *  PR, which the ready gate below already excludes. */
-      pr?: { number: number; url: string; title: string; body: string };
+      pr?: HeadPullRequest;
     }
   | {
       kind: "awaiting";
@@ -194,7 +194,7 @@ export type QueueHeadDetail =
       commits: string[];
       /** The last read: which checks are still running. */
       checks?: ChecksSummary;
-      pr?: { number: number; url: string; title: string; body: string };
+      pr?: HeadPullRequest;
     }
   | {
       kind: "blocked";
@@ -208,10 +208,35 @@ export type QueueHeadDetail =
       /** failed: the checks read, so the panel can name what went red and link
        *  the run. The PR is where the failure is actually read. */
       checks?: ChecksSummary;
-      pr?: { number: number; url: string; title: string; body: string };
+      pr?: HeadPullRequest;
       resolveAttempts?: number;
       maxResolveAttempts?: number;
     };
+
+/**
+ * The head's pull request as the panel reads it: what it IS (number, url), and
+ * the MESSAGE it carries — the title and description that will land on `dev`
+ * (D-20260727-10).
+ *
+ * `title` and `prose` are the composed message itself, not a second rendering of
+ * it: they come off the PR, which is what landing.ts composed (composePrMessage)
+ * and what the captain may since have edited on GitHub. The panel therefore
+ * shows what the PR actually says, and there is no second set of title/body
+ * rules anywhere to drift from these.
+ */
+export interface HeadPullRequest {
+  number: number;
+  url: string;
+  /** The PR title, verbatim. */
+  title: string;
+  /** The whole body as GitHub holds it, evidence fence and all. */
+  body: string;
+  /** The body with co's fenced evidence block removed — the human description,
+   *  which is what the panel paints. The evidence inside the fence is rendered
+   *  from the structured `checks`/`commits` instead, so it is never shown twice
+   *  and the HTML comment markers never reach the screen. */
+  prose: string;
+}
 
 /** The side effects the queue needs from its owner (FeatureManager): the busy
  *  check that must gate any git on a worktree, and the record cleanup a merge
@@ -401,8 +426,13 @@ export class MergeQueue {
     if (!head) return null;
     const target = this.targetBranch;
     const p = head.prepared;
-    const prOf = (r: PrepareResult): { number: number; url: string; title: string; body: string } | undefined =>
-      "pr" in r && r.pr ? { number: r.pr.number, url: r.pr.url, title: r.pr.title, body: r.pr.body } : undefined;
+    // The message is taken off the PR and split, never recomposed: the title and
+    // prose the panel paints are the ones the pull request carries.
+    const prOf = (r: PrepareResult): HeadPullRequest | undefined => {
+      if (!("pr" in r) || !r.pr) return undefined;
+      const { number, url, title, body } = r.pr;
+      return { number, url, title, body, prose: splitEvidence(body).prose };
+    };
 
     if (head.status === "ready" && p?.kind === "green") {
       const pr = prOf(p);

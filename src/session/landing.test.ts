@@ -8,12 +8,14 @@ import path from "node:path";
 import { CHECKS_GRACE_MS, CHECKS_INTERVAL_MS, CHECKS_TIMEOUT_MS, type ChecksPolicy } from "./checks.js";
 import {
   composePrBody,
+  composePrMessage,
   composePrTitle,
   executeLanding,
   prepareLanding,
   type LandingOptions,
   type PrepareGreen,
 } from "./landing.js";
+import { splitEvidence } from "./forge.js";
 import { provisionWorktree } from "./worktrees.js";
 import { makeFakeForge, type FakeCheck, type FakeForge } from "./forgefake.test.js";
 
@@ -148,6 +150,45 @@ test("the PR message reads like a person's: a conventional title and a plain bod
   // Nothing in it advertises how the work was produced.
   for (const body of [one, many]) {
     assert.doesNotMatch(body, /co[- ]?manager|\bcrew\b|dispatch|worktree|Co-Authored-By|Generated with/i);
+  }
+});
+
+test("composePrMessage is the one composition: the same title and body, in one call", () => {
+  // The seam anything showing the message back reuses (the Ctrl-O queue tab).
+  // If it ever stopped agreeing with the two rules below, the panel and the pull
+  // request would say different things about the same head.
+  for (const [feature, commits, branch] of [
+    ["user auth", ["abc1234 feat(auth): add login"], "feat/user-auth"],
+    ["Stale Token", ["a one", "b two"], "fix/stale-token"],
+    ["prompt fixes", ["a one", "b two"], undefined],
+  ] as const) {
+    const msg = composePrMessage({ feature, commits: [...commits], ...(branch ? { branch } : {}) });
+    assert.equal(msg.title, composePrTitle(feature, [...commits], branch));
+    assert.equal(msg.body, composePrBody({ feature, commits: [...commits] }));
+  }
+});
+
+test("the PR carries composePrMessage's output verbatim, and the fence is the only thing around it", async () => {
+  // What the panel reads back off the head is this: the composed title, and the
+  // composed body with co's evidence spliced in beside it. Pinning it here is
+  // what makes showing the message in the queue tab a REUSE rather than a second
+  // rendering of the same rules (D-20260727-10).
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "twin");
+    await commitIn(rec.worktreePath, "a.txt", "a\n", "job: first slice");
+    await commitIn(rec.worktreePath, "b.txt", "b\n", "job: second slice");
+    const res = await prepareGreen(f, "twin");
+    const expected = composePrMessage({ feature: "twin", commits: res.commits, branch: res.branch });
+
+    assert.equal(res.pr?.title, expected.title, "the PR title IS the composed title");
+    const parts = splitEvidence(res.pr?.body ?? "");
+    assert.equal(parts.prose, expected.body.trim(), "and outside the fence, the composed body");
+    assert.match(parts.evidence, /### Checks/, "with co's block inside the fence, not in the prose");
+    assert.match(parts.evidence, /job: first slice/, "the commit list lives there too");
+    assert.doesNotMatch(parts.prose, /### Checks|<!--/, "so the prose is clean enough to paint as-is");
+  } finally {
+    await f.cleanup();
   }
 });
 

@@ -592,9 +592,14 @@ serial merge queue that does the work itself. Only the front of the line is ever
 touched. The queue fetches, rebases the head onto the current `origin/dev` tip,
 pushes the rebased branch (force-with-lease — a rebase rewrites shas), opens a PR
 into `dev` (or reuses the open one), and then **reads that PR's real GitHub
-checks**. The **Ctrl-O queue tab** shows the PR — its number and link, its title
-and description, the commits it carries and what its CI said — with a live `[m]`
-beside it once the checks are green.
+checks**. The **Ctrl-O queue tab** shows the PR in two blocks — the evidence (its
+number and link, and what its CI said) and, under a rule of its own, the PR's own
+**message**: the title, the description, and the commits it carries — with a live
+`[m]` beside it once the checks are green. The message is the one on GitHub, read
+back off the pull request and rendered the way the transcript renders markdown,
+so what you decide the merge on is what the merge will say. co's fenced evidence
+block is split off before painting: those markers are HTML comments GitHub hides,
+and what they wrap is the checks and commits already shown beside them.
 
 **co runs no build and no test.** It used to, on the combined rebased tree, from
 a command it had to guess — and a guess is wrong the moment the repo isn't npm.
@@ -950,7 +955,10 @@ encodes the rules rather than leaving them to callers: the merge is always
 `gh pr merge --merge`, `--delete-branch` is never passed, a force push always
 carries a lease on the sha actually observed, and a PR update rewrites only
 the fenced evidence block co owns so a captain's edits to the title or the
-description survive. It is also where the merge gate is *read*: `readPrChecks`
+description survive. The fence reads both ways: `spliceEvidence` writes co's
+block into a body, `splitEvidence` takes it back out, which is how the panel gets
+a description it can paint without the markers or a second copy of the checks.
+It is also where the merge gate is *read*: `readPrChecks`
 asks `gh pr checks --required` first (branch protection decides, exactly as it
 does for a human) and falls back to every check the PR reports. Two details of
 gh's real contract are encoded here because both are easy to get backwards, and
@@ -1075,9 +1083,13 @@ the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,
 and the Ctrl-O panel. The panel has four home tabs, cycled with Tab — the merge
 queue, the features overview, the doc viewer, and the review inbox — each reading
 a small injected source, so the Tui never reaches into git, the filesystem, or
-the session layer itself. The queue tab renders the ready head's pull request and
-checks inline and owns the `[m]` that merges it, through an injected `merge`
-callback that is the only thing the keystroke can reach; the features tab is
+the session layer itself. The queue tab renders the ready head's pull request —
+its checks evidence, then its message (title, description, commits) as its own
+block — and owns the `[m]` that merges it, through an injected `merge`
+callback that is the only thing the keystroke can reach. It composes none of
+that: the title and description come off the PR, split from co's evidence fence
+by the source (`splitEvidence`), so the panel and the pull request cannot drift
+apart. The features tab is
 read-only by construction (no selector, no `[m]`, it only pages), so the overview
 can never be the thing that merged something; a pending `feature_land` review
 gets a fifth tab of its own for as long as it is pending, so the two merges never

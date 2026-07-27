@@ -323,10 +323,10 @@ export type QueueHeadDetail =
       /** What the PR's own CI checks said: the merge's evidence, including the
        *  ungated case (no checks at all). */
       checks?: PanelChecks;
-      /** The open pull request [m] merges — title and body shown inline, so the
+      /** The open pull request [m] merges — its message shown inline, so the
        *  captain reads what will land where the key that lands it lives. The
        *  patch itself is on GitHub (that is where they can comment on it). */
-      pr?: { number: number; url: string; title: string; body: string };
+      pr?: PanelPullRequest;
     }
   | {
       kind: "awaiting";
@@ -335,7 +335,7 @@ export type QueueHeadDetail =
       commits: string[];
       /** The last read: which checks are still running. */
       checks?: PanelChecks;
-      pr?: { number: number; url: string; title: string; body: string };
+      pr?: PanelPullRequest;
     }
   | {
       kind: "blocked";
@@ -349,10 +349,31 @@ export type QueueHeadDetail =
       /** failed: the checks read, so the panel can name what went red and link
        *  the run that says why. */
       checks?: PanelChecks;
-      pr?: { number: number; url: string; title: string; body: string };
+      pr?: PanelPullRequest;
       resolveAttempts?: number;
       maxResolveAttempts?: number;
     };
+
+/**
+ * The head's pull request as the panel paints it. Structurally the session's
+ * HeadPullRequest — declared here, like QueuePanelEntry, so the Tui never
+ * depends on the session layer.
+ *
+ * `title` + `prose` ARE the composed message the PR carries (D-20260727-10); the
+ * Tui never derives either. `prose` is the description with co's fenced evidence
+ * block already removed by the source, because those markers are HTML comments
+ * GitHub hides and a terminal would print, and what is inside them is the checks
+ * and commits this view already renders from `checks`/`commits`. A source that
+ * doesn't split falls back to the raw `body`, which is what the panel painted
+ * before there was anywhere to split it.
+ */
+export interface PanelPullRequest {
+  number: number;
+  url: string;
+  title: string;
+  body: string;
+  prose?: string;
+}
 
 /** What a panel-driven merge did, for the flash line. Rejection of the promise
  *  is handled too, so a thrown callback can't wedge the panel mid-merge. */
@@ -739,12 +760,25 @@ function checkRunRows(checks: PanelChecks | undefined): string[] {
  * The queue head's inline body (D-20260724-12): everything the captain needs to
  * decide the [m] that sits right there in the same view.
  *
- * A READY head renders the PULL REQUEST it would merge (D-20260724-13) — its
- * number and URL, its title, what that PR's CI checks said, the per-job commit
- * list, and the PR description co composed. The patch is not repeated here: it
- * lives on GitHub at that URL, which is also where the captain can edit the
- * message or comment on it before pressing [m]. An AWAITING head renders what it
- * is still waiting on. A BLOCKED head renders why it cannot merge (and offers no
+ * A READY head renders the PULL REQUEST it would merge (D-20260724-13) in two
+ * blocks, deliberately separated:
+ *
+ *   1. THE EVIDENCE — the PR's number and URL and what its CI checks said. This
+ *      is the gate, so it leads and stays near the [m].
+ *   2. THE MESSAGE (D-20260727-10) — under its own rule: the PR's title, its
+ *      description prose, and the commits it carries. This is what the merge
+ *      ACCOMPLISHES, which is the other half of the decision and the half the
+ *      panel used to bury in a raw body dump.
+ *
+ * The message is rendered, not echoed: the prose goes through the same markdown
+ * renderer the transcript and the doc viewer use, so it reads on screen the way
+ * it reads on GitHub. The patch is still not repeated here — it lives at that
+ * URL, which is also where the captain edits the message or comments on it
+ * before pressing [m].
+ *
+ * An AWAITING head renders the same two blocks, with what it is still waiting on
+ * in place of a verdict — its PR exists and says what it will land, and the only
+ * missing thing is CI. A BLOCKED head renders why it cannot merge (and offers no
  * [m] anywhere): the conflicted paths and git's account, or the checks that went
  * red with links to their runs. Every line is wrapped, so nothing is clipped out
  * of a merge decision.
@@ -795,10 +829,7 @@ export function renderQueueHeadDetail(detail: QueueHeadDetail, width: number): s
         c.dim(` · ${detail.commits.length} commit${detail.commits.length === 1 ? "" : "s"}`),
     ),
   );
-  if (pr) {
-    rows.push(...wrap("  " + pr.title));
-    rows.push(...wrap("  " + c.dim(pr.url)));
-  }
+  if (pr) rows.push(...wrap("  " + c.dim(pr.url)));
   if (detail.kind === "awaiting") {
     rows.push(...wrap("  " + c.yellow("WAITING on CI") + " " + c.dim("— no [m] until the checks report")));
     rows.push(...wrap("  " + c.yellow(checksPhrase(detail.checks))));
@@ -809,17 +840,59 @@ export function renderQueueHeadDetail(detail: QueueHeadDetail, width: number): s
   } else {
     rows.push(...wrap("  " + c.green(checksPhrase(detail.checks))));
   }
-  rows.push("");
-  for (const cl of detail.commits) {
+  rows.push(...renderPrMessage(pr, detail.commits, detail.target, width));
+  return rows;
+}
+
+/**
+ * The pull request's own message, as the panel shows it back (D-20260727-10):
+ * the title, the description prose, and the commits it carries — under a rule of
+ * its own, so it never reads as more checks evidence.
+ *
+ * Nothing here is composed. The title and prose come off the PR (landing.ts
+ * composed them; the captain may have rewritten them since on GitHub), and the
+ * commit list is the same array the merge preserves. The prose is painted
+ * through renderMarkdownDoc — the renderer the transcript, the doc viewer and a
+ * filed review all use — so a description reads the same wherever it appears,
+ * and it is the prose ONLY: the source strips co's evidence fence, whose checks
+ * and commits are already drawn above and beside this.
+ */
+function renderPrMessage(
+  pr: PanelPullRequest | undefined,
+  commits: string[],
+  target: string,
+  width: number,
+): string[] {
+  const wrap = (s: string): string[] => (s === "" ? [""] : wrapLine(s, width));
+  const rows: string[] = [""];
+  // No PR (a source that carries none) means no message to show — the commits
+  // still are what would land, so they render on their own rather than under a
+  // rule announcing a pull request that isn't there.
+  if (pr) {
+    rows.push(...wrap(c.dim("── pull request ──")), "");
+    rows.push(...wrap("  " + c.bold(pr.title)));
+    const prose = (pr.prose ?? pr.body).trim();
+    if (prose === "") {
+      rows.push(...wrap("  " + c.dim("(no description)")));
+    } else {
+      rows.push("");
+      // Indented by the same two columns as everything else in this body; the
+      // renderer lays the prose out inside what that leaves.
+      for (const r of renderMarkdownDoc(prose, Math.max(20, width - 2))) {
+        rows.push(r === "" ? "" : "  " + r);
+      }
+    }
+    rows.push("");
+  }
+  if (commits.length === 0) {
+    rows.push(...wrap("  " + c.yellow(`no commits beyond ${target}; nothing to land`)));
+    return rows;
+  }
+  rows.push(...wrap("  " + c.dim(`commits (${commits.length})`)));
+  for (const cl of commits) {
     const sp = cl.indexOf(" ");
     const styled = sp === -1 ? c.dim(cl) : c.dim(cl.slice(0, sp)) + " " + cl.slice(sp + 1);
-    rows.push(...wrap("  " + styled));
-  }
-  if (pr && pr.body.trim() !== "") {
-    rows.push("");
-    rows.push(...wrap(c.dim("── pull request ──")));
-    rows.push("");
-    for (const l of pr.body.split("\n")) rows.push(...wrap("  " + l));
+    rows.push(...wrap("    " + styled));
   }
   return rows;
 }
@@ -3795,7 +3868,7 @@ export class Tui implements SessionIO {
         ? `b:${d.feature}:${d.blockedKind ?? "-"}:${d.reason.length}:${(d.detail ?? "").length}:${checksKey(d.checks)}`
         : `${d.kind === "ready" ? "r" : "w"}:${d.feature}:${d.commits.length}:${d.pr?.number ?? -1}:${
             d.pr?.body.length ?? 0
-          }:${checksKey(d.checks)}`;
+          }:${d.pr?.prose?.length ?? -1}:${checksKey(d.checks)}`;
     const entries = view.entries
       .map(
         (e) =>

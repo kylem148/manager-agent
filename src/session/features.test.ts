@@ -11,6 +11,7 @@ import { DispatchRegistry } from "./registry.js";
 import { FeatureManager, featureActivity } from "./features.js";
 import { FeatureStore } from "./featurestore.js";
 import type { QueueEntryView } from "./mergequeue.js";
+import { composePrMessage } from "./landing.js";
 import {
   featureBranch,
   provisionWorktree,
@@ -915,6 +916,19 @@ test("headDetail feeds the panel the ready head's PR, commits and checks evidenc
     assert.match(ready.pr?.url ?? "", /\/pull\/1$/);
     assert.match(ready.pr?.body ?? "", /### Checks/, "with the evidence co composed");
     assert.match(ready.pr?.body ?? "", /job: detail/, "and the commit list");
+    // The message the panel paints, straight off the PR: the title composed for
+    // it, and the description with co's fenced evidence split away (the panel
+    // draws checks and commits from the structured fields beside it). Composed
+    // in exactly one place — landing.ts — and read back here, never re-derived.
+    const composed = composePrMessage({
+      feature: "detailed",
+      commits: ready.commits,
+      branch: "feat/detailed",
+    });
+    assert.equal(ready.pr?.title, composed.title, "the title IS the composed title");
+    assert.equal(ready.pr?.prose, composed.body.trim(), "and the prose IS the composed body");
+    assert.doesNotMatch(ready.pr?.prose ?? "", /co:evidence|### Checks|### Commits/,
+      "with nothing of the evidence block left in it to paint");
     assert.equal(ready.checks?.verdict, "passed", "the checks that passed are stated");
     assert.deepEqual(ready.checks?.runs.map((r) => r.name), ["ci"], "and named");
     assert.equal(ready.checks?.ungated, false);
