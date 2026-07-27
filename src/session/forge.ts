@@ -403,6 +403,44 @@ export function spliceEvidence(body: string, evidence: string): string {
   return body.trim() ? `${body.trimEnd()}\n\n${block}\n` : `${block}\n`;
 }
 
+/** The human message and co's evidence, separated. */
+export interface PrBodyParts {
+  /** Everything OUTSIDE the fence: the description co composed plus whatever the
+   *  captain has written around it. The prose that says what the PR is FOR. */
+  prose: string;
+  /** What is inside the fence, without the markers. Empty when the body carries
+   *  no fence at all (a captain who replaced the whole description before co
+   *  re-processed the head). */
+  evidence: string;
+}
+
+/**
+ * The inverse of spliceEvidence: split a PR body back into the human message and
+ * co's regenerated block. What it exists for is DISPLAY — the panel shows the
+ * message a PR carries, and the raw body is the wrong thing to paint: the fence
+ * markers are HTML comments GitHub hides and a terminal would print, and the
+ * evidence inside them is checks + commits the panel already renders natively
+ * from the structured detail (D-20260727-10).
+ *
+ * Splitting here rather than in the Tui keeps ONE definition of the fence: the
+ * markers are this module's, the same constants spliceEvidence writes, so the
+ * reader and the writer can never drift apart.
+ *
+ * Prose from both sides of the fence is rejoined as paragraphs, because a
+ * captain may write above it, below it, or both.
+ */
+export function splitEvidence(body: string): PrBodyParts {
+  const start = body.indexOf(EVIDENCE_OPEN);
+  const end = body.indexOf(EVIDENCE_CLOSE);
+  if (start === -1 || end === -1 || end < start) return { prose: body.trim(), evidence: "" };
+  const before = body.slice(0, start).trim();
+  const after = body.slice(end + EVIDENCE_CLOSE.length).trim();
+  return {
+    prose: [before, after].filter(Boolean).join("\n\n"),
+    evidence: body.slice(start + EVIDENCE_OPEN.length, end).trim(),
+  };
+}
+
 /**
  * Make sure the feature has an open PR into the integration branch, and return
  * it. Creating one writes the whole message co composes: title, description, and

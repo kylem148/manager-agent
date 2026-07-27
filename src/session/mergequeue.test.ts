@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MergeQueue, MAX_RESOLVE_ATTEMPTS } from "./mergequeue.js";
+import { EVIDENCE_CLOSE, EVIDENCE_OPEN } from "./forge.js";
 import type { ChecksSummary } from "./checks.js";
 import type {
   executeLanding,
@@ -478,6 +479,25 @@ test("headDetail carries a ready head's PR, commits and checks evidence", async 
   assert.equal(d.pr?.title, "aaa work");
   assert.equal(d.checks?.verdict, "passed", "the evidence, stated not implied");
   assert.deepEqual(d.checks?.runs.map((r) => r.name), ["build"]);
+});
+
+test("headDetail hands the panel the PR's message with co's evidence fence split off", async () => {
+  // The panel paints the prose; the checks and commits inside the fence it draws
+  // from the structured detail instead, so neither is shown twice and the HTML
+  // comment markers never reach a terminal (D-20260727-10).
+  const h = makeHarness();
+  const body =
+    `Aaa, in 2 commits.\n\n${EVIDENCE_OPEN}\n### Checks\n**green** — 1 check passed.\n${EVIDENCE_CLOSE}\n`;
+  h.prepareFn.set("aaa", () => ({ ...green("aaa", 2), pr: { ...PR, title: "aaa work", body } }));
+  await h.queue.enqueue("aaa");
+
+  const d = h.queue.headDetail();
+  assert.equal(d?.kind, "ready");
+  if (d?.kind !== "ready") return;
+  assert.equal(d.pr?.body, body, "the raw body is still carried, verbatim");
+  assert.equal(d.pr?.prose, "Aaa, in 2 commits.", "and the human half is split out for display");
+  assert.ok(!d.pr?.prose.includes("co:evidence"), "no fence marker survives into the prose");
+  assert.ok(!d.pr?.prose.includes("### Checks"), "and neither does co's block");
 });
 
 test("headDetail carries an awaiting head's PR and what it is still waiting on", async () => {

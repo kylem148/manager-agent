@@ -337,10 +337,11 @@ export async function prepareLanding(opts: LandingOptions, feature: string): Pro
   const push = await pushFeatureBranch(forge, branch, featureSha);
   const evidenceOf = (checks?: ChecksSummary): string =>
     composeEvidence({ commits, devSha, featureSha, devRef: r.devRef, ...(checks ? { checks } : {}) });
+  const message = composePrMessage({ feature, commits, branch });
   const ensured = await ensurePr(forge, {
     branch,
-    title: composePrTitle(feature, commits, branch),
-    body: composePrBody({ feature, commits }),
+    title: message.title,
+    body: message.body,
     evidence: evidenceOf(),
   });
 
@@ -481,6 +482,31 @@ export async function executeLanding(
 }
 
 // --- the PR message ----------------------------------------------------------
+
+/** The human half of a pull request: what co writes into it, and what the panel
+ *  reads back out of it. */
+export interface PrMessage {
+  title: string;
+  body: string;
+}
+
+/**
+ * The whole composed message for a feature's PR, in ONE call. The rules live in
+ * composePrTitle/composePrBody below; this is the seam that keeps them reachable
+ * as a unit, so the message a head carries is composed in exactly one place and
+ * anything that wants to show it back (the Ctrl-O queue tab, D-20260727-10) can
+ * reuse the composition instead of re-deriving it and drifting.
+ */
+export function composePrMessage(opts: {
+  feature: string;
+  commits: string[];
+  branch?: string;
+}): PrMessage {
+  return {
+    title: composePrTitle(opts.feature, opts.commits, opts.branch),
+    body: composePrBody({ feature: opts.feature, commits: opts.commits }),
+  };
+}
 
 /**
  * The PR title, written the way a person would write it. A single-commit branch

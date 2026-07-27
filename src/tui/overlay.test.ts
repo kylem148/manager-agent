@@ -1397,6 +1397,126 @@ test("a ready head renders its PR and checks inline, with a live [m]", async () 
   h.stop();
 });
 
+test("a ready head shows the PR's own message — title, description, commits — and never co's fence", async () => {
+  // The loop this closes: the composed message is what actually goes to GitHub,
+  // and the panel used to dump the raw body (fence markers, a second copy of the
+  // checks and commits) or nothing at all. Now it paints the message and lets
+  // the evidence block above it be the evidence (D-20260727-10).
+  const body = [
+    "Checkout flow, in 2 commits.",
+    "",
+    "<!-- co:evidence -->",
+    "### Checks",
+    "**green** — 1 check passed.",
+    "",
+    "### Commits (2)",
+    "- `abc1234` job: card form",
+    "- `def5678` job: totals",
+    "<!-- /co:evidence -->",
+  ].join("\n");
+  const q = fakeQueue(
+    {
+      size: 1,
+      head: null,
+      entries: [{ feature: "checkout", position: 1, isHead: true, status: "ready", commitsReady: 2 }],
+    },
+    {
+      kind: "ready",
+      feature: "checkout",
+      target: "dev",
+      commits: ["abc1234 job: card form", "def5678 job: totals"],
+      checks: panelChecks("passed", [{ name: "ci", bucket: "pass" }]),
+      pr: {
+        number: 9,
+        url: "https://github.com/acme/repo/pull/9",
+        title: "feat: checkout flow",
+        body,
+        prose: "Checkout flow, in 2 commits.",
+      },
+    },
+  );
+  const h = harness(undefined, 72, 30, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+
+  assert.match(frame, /── pull request ──/, "the message gets a block of its own");
+  assert.match(frame, /feat: checkout flow/, "the PR title is shown back");
+  assert.match(frame, /Checkout flow, in 2 commits\./, "and the description prose");
+  assert.match(frame, /commits \(2\)/, "with the commits it carries");
+  assert.match(frame, /abc1234 job: card form/);
+  assert.match(frame, /def5678 job: totals/);
+  assert.match(frame, /checks green/, "the checks evidence is still there, above and separate");
+  // The fence is co's plumbing: HTML comments GitHub hides, wrapping checks and
+  // a commit list this view already draws itself. None of it belongs on screen.
+  assert.ok(!frame.includes("co:evidence"), "no fence marker is painted");
+  assert.ok(!frame.includes("### Checks"), "and no raw markdown out of the block it fences");
+  assert.ok(!frame.includes("- `abc1234`"), "the commits are not painted twice");
+  h.stop();
+});
+
+test("a head awaiting CI still shows what its PR will land — only the verdict is missing", async () => {
+  const q = fakeQueue(
+    {
+      size: 1,
+      head: null,
+      entries: [{ feature: "slow", position: 1, isHead: true, status: "awaiting-checks", checksPending: 1 }],
+    },
+    {
+      kind: "awaiting",
+      feature: "slow",
+      target: "dev",
+      commits: ["abc1234 job: the slice"],
+      checks: panelChecks("pending", [{ name: "ci", bucket: "pending" }]),
+      pr: {
+        number: 11,
+        url: "https://github.com/acme/repo/pull/11",
+        title: "feat: slow thing",
+        body: "Slow thing.",
+        prose: "Slow thing.",
+      },
+    },
+  );
+  const h = harness(undefined, 72, 30, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /WAITING on CI/, "the wait still leads");
+  assert.match(frame, /feat: slow thing/, "and the message is readable while it waits");
+  assert.match(frame, /Slow thing\./);
+  assert.match(frame, /commits \(1\)/);
+  h.stop();
+});
+
+test("a PR with no description says so rather than showing an empty block", async () => {
+  const q = fakeQueue(
+    {
+      size: 1,
+      head: null,
+      entries: [{ feature: "bare", position: 1, isHead: true, status: "ready", commitsReady: 1 }],
+    },
+    {
+      kind: "ready",
+      feature: "bare",
+      target: "dev",
+      commits: ["abc1234 job: bare"],
+      checks: panelChecks("passed", [{ name: "ci", bucket: "pass" }]),
+      pr: { number: 12, url: "https://github.com/acme/repo/pull/12", title: "feat: bare", body: "", prose: "" },
+    },
+  );
+  const h = harness(undefined, 72, 30, q);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /feat: bare/, "the title is still the title");
+  assert.match(frame, /\(no description\)/, "an empty description is stated, not blank");
+  assert.match(frame, /abc1234 job: bare/, "and the commits still show what lands");
+  h.stop();
+});
+
 test("[m] merges the ready head directly, once, and the panel shows the advance", async () => {
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
   const h = harness(undefined, 72, 20, q);

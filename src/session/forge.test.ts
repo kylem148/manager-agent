@@ -14,6 +14,7 @@ import {
   remoteBranchSha,
   remoteDevSha,
   spliceEvidence,
+  splitEvidence,
   updatePrEvidence,
   viewPr,
   type CommandResult,
@@ -331,6 +332,32 @@ test("spliceEvidence replaces a fenced block and appends when the fence is gone"
   const rewritten = spliceEvidence("the captain replaced the whole body", "new");
   assert.match(rewritten, /the captain replaced the whole body/);
   assert.match(rewritten, /new/);
+});
+
+test("splitEvidence undoes spliceEvidence: the human message back on one side, co's block on the other", () => {
+  // The round trip is the property that matters: whatever co spliced in comes
+  // back out whole, and the prose is left exactly as its author wrote it.
+  const prose = "User auth, in 2 commits.";
+  const evidence = "### Checks\n**green** — 2 checks passed.";
+  const parts = splitEvidence(spliceEvidence(prose, evidence));
+  assert.equal(parts.prose, prose, "the description survives verbatim");
+  assert.equal(parts.evidence, evidence, "and so does the block, without its markers");
+  // The markers themselves never come back out — they are HTML comments GitHub
+  // hides, and anything painting the prose would print them literally.
+  assert.ok(!parts.prose.includes(EVIDENCE_OPEN) && !parts.prose.includes(EVIDENCE_CLOSE));
+  assert.ok(!parts.evidence.includes(EVIDENCE_OPEN) && !parts.evidence.includes(EVIDENCE_CLOSE));
+
+  // A captain who writes on BOTH sides of the fence keeps both halves, as
+  // paragraphs — the fence is co's region, not a divider in their text.
+  const both = splitEvidence(`above\n\n${EVIDENCE_OPEN}\nblock\n${EVIDENCE_CLOSE}\n\nbelow`);
+  assert.equal(both.prose, "above\n\nbelow");
+  assert.equal(both.evidence, "block");
+
+  // No fence at all (a body the captain replaced wholesale, or a PR co never
+  // wrote): it is ALL prose, and nothing is invented as evidence.
+  const bare = splitEvidence("just a description");
+  assert.equal(bare.prose, "just a description");
+  assert.equal(bare.evidence, "");
 });
 
 test("mergePr merges with a MERGE COMMIT and never squashes, rebases or deletes the branch", async () => {
