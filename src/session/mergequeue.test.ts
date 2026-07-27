@@ -4,6 +4,7 @@ import { MergeQueue, MAX_RESOLVE_ATTEMPTS } from "./mergequeue.js";
 import { EVIDENCE_CLOSE, EVIDENCE_OPEN } from "./forge.js";
 import type { ChecksSummary } from "./checks.js";
 import type {
+  AuthoredPrMessage,
   executeLanding,
   PrepareConflict,
   PrepareFailed,
@@ -131,6 +132,11 @@ interface Harness {
   executeError: string | null;
   busy: Set<string>;
   forgotten: string[];
+  /** The stored PR messages the host serves, as the FeatureStore would. */
+  authored: Map<string, AuthoredPrMessage>;
+  /** What each prepare was handed as the feature's authored message —
+   *  `<feature>:<title|-></body|->` — so a test can see it was looked up fresh. */
+  authoredSeen: string[];
 }
 
 function makeHarness(): Harness {
@@ -139,11 +145,14 @@ function makeHarness(): Harness {
   const mergeCalls: string[] = [];
   const busy = new Set<string>();
   const forgotten: string[] = [];
-  const h = { prepareFn, prepareCalls, mergeCalls, busy, forgotten } as Harness;
+  const authored = new Map<string, AuthoredPrMessage>();
+  const authoredSeen: string[] = [];
+  const h = { prepareFn, prepareCalls, mergeCalls, busy, forgotten, authored, authoredSeen } as Harness;
   h.executeError = null;
 
-  const fakePrepare: typeof prepareLanding = async (_opts, feature) => {
+  const fakePrepare: typeof prepareLanding = async (_opts, feature, message) => {
     prepareCalls.push(feature);
+    authoredSeen.push(`${feature}:${message?.title ?? "-"}/${message?.body ?? "-"}`);
     const fn = prepareFn.get(feature) ?? (() => green(feature));
     return fn();
   };
@@ -172,7 +181,11 @@ function makeHarness(): Harness {
 
   h.queue = new MergeQueue({
     repoPath: "/fake/repo",
-    host: { isBusy: (f) => busy.has(f), forget: (f) => forgotten.push(f) },
+    host: {
+      isBusy: (f) => busy.has(f),
+      forget: (f) => forgotten.push(f),
+      prMessage: (f) => authored.get(f),
+    },
     deps: { prepare: fakePrepare, execute: fakeExecute },
   });
   return h;
@@ -229,6 +242,45 @@ test("enqueue processes the head to ready; later features stay queued (head-only
     h.queue.view().entries.map((e) => [e.feature, e.status]),
     [["aaa", "ready"], ["bbb", "queued"]],
   );
+});
+
+test("the head's authored PR message is looked up on EVERY processing, never captured at enqueue", async () => {
+  // The queue carries no message of its own: it asks its host for the feature's
+  // stored one each time it prepares the head. That is what makes a retry, a
+  // resolver run and the advance after a merge all compose the PR the co wrote.
+  const h = makeHarness();
+  h.authored.set("aaa", { title: "Add passkey login", body: "Why it matters." });
+
+  // The first enqueue blocks — no PR is opened at all, so the message has to
+  // still be there when a later processing finally opens one.
+  h.prepareFn.set("aaa", () => conflict("aaa"));
+  await h.queue.enqueue("aaa");
+  assert.equal(h.queue.view().head?.status, "blocked");
+  assert.equal(h.authoredSeen[0], "aaa:Add passkey login/Why it matters.");
+
+  // The co revises the message between processings; the next one uses the new
+  // text, because the lookup is fresh rather than a copy taken at enqueue.
+  h.authored.set("aaa", { title: "Add passkey login and recovery codes", body: "Why it matters." });
+  await h.queue.enqueue("aaa");
+  assert.equal(h.authoredSeen[1], "aaa:Add passkey login and recovery codes/Why it matters.");
+
+  // The retry that finally goes green passes nothing of its own, and still
+  // composes with the stored message.
+  h.prepareFn.set("aaa", () => green("aaa"));
+  await h.queue.enqueue("aaa");
+  assert.equal(h.queue.view().head?.status, "ready");
+  assert.equal(h.authoredSeen[2], "aaa:Add passkey login and recovery codes/Why it matters.");
+
+  // And the head the QUEUE processes on its own — the one promoted by a merge,
+  // with no enqueue call anywhere near it — is looked up the same way. This one
+  // has no stored message, so prepare is handed nothing and the mechanical
+  // composition applies.
+  await h.queue.enqueue("bbb");
+  const merged = await h.queue.mergeReadyHead();
+  assert.equal(merged.merged, true);
+  assert.equal(merged.head?.feature, "bbb");
+  assert.equal(h.authoredSeen[3], "bbb:-/-");
+  assertHeadOnly(h.queue);
 });
 
 test("enqueue is idempotent: re-enqueuing a ready head keeps its place and does not re-process", async () => {

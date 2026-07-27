@@ -7,6 +7,7 @@ import {
   pushFeatureBranch,
   remoteDevSha,
   requireForge,
+  splitEvidence,
   updatePrEvidence,
   viewPr,
   findOpenPr,
@@ -252,8 +253,18 @@ export interface LandResult {
  * The branch is read off the feature's registered worktree, never derived from
  * its name: co lands the branch it actually provisioned, and a same-named branch
  * it did not create is not reachable from here.
+ *
+ * `authored` is the PR message the co wrote for this feature at enqueue time
+ * (stored per slug in featurestore.ts and handed down by the queue). Each field
+ * falls back independently to the mechanical composition below, and it is only
+ * ever used to CREATE the pull request — an open PR's title and prose are the
+ * captain's, and nothing here rewrites them.
  */
-export async function prepareLanding(opts: LandingOptions, feature: string): Promise<PrepareResult> {
+export async function prepareLanding(
+  opts: LandingOptions,
+  feature: string,
+  authored?: AuthoredPrMessage,
+): Promise<PrepareResult> {
   const r = resolveWorktreeOptions(opts);
   const forge = forgeOptions(opts);
   const slug = featureSlug(feature);
@@ -337,7 +348,7 @@ export async function prepareLanding(opts: LandingOptions, feature: string): Pro
   const push = await pushFeatureBranch(forge, branch, featureSha);
   const evidenceOf = (checks?: ChecksSummary): string =>
     composeEvidence({ commits, devSha, featureSha, devRef: r.devRef, ...(checks ? { checks } : {}) });
-  const message = composePrMessage({ feature, commits, branch });
+  const message = composePrMessage({ feature, commits, branch, ...(authored ? { authored } : {}) });
   const ensured = await ensurePr(forge, {
     branch,
     title: message.title,
@@ -491,25 +502,80 @@ export interface PrMessage {
 }
 
 /**
+ * A PR message the CO WROTE, rather than one composed from the branch's shape.
+ *
+ * The co knows what a feature is for and what the crew actually built, so it is
+ * the natural author of the pull request's message; the mechanical composition
+ * below only ever knew the commit subjects and the feature handle, which reads
+ * like the machine boilerplate it is. The co attaches this at `feature_enqueue`
+ * — the single, once-per-landing moment a feature is declared done — and the
+ * harness stores it per feature and consumes it here. No model call happens
+ * anywhere in the queue.
+ *
+ * Both fields are optional and INDEPENDENT: whichever half is missing falls back
+ * to the mechanical composition for that half alone.
+ */
+export interface AuthoredPrMessage {
+  title?: string;
+  body?: string;
+}
+
+/**
  * The whole composed message for a feature's PR, in ONE call. The rules live in
  * composePrTitle/composePrBody below; this is the seam that keeps them reachable
  * as a unit, so the message a head carries is composed in exactly one place and
  * anything that wants to show it back (the Ctrl-O queue tab, D-20260727-10) can
  * reuse the composition instead of re-deriving it and drifting.
+ *
+ * An authored message (`opts.authored`) wins per field; the mechanical rules are
+ * the fallback for whatever it does not carry, so this stays the one composition
+ * either way.
  */
 export function composePrMessage(opts: {
   feature: string;
   commits: string[];
   branch?: string;
+  authored?: AuthoredPrMessage;
 }): PrMessage {
+  const title = authoredPrTitle(opts.authored?.title);
+  const body = authoredPrBody(opts.authored?.body);
   return {
-    title: composePrTitle(opts.feature, opts.commits, opts.branch),
-    body: composePrBody({ feature: opts.feature, commits: opts.commits }),
+    title: title ?? composePrTitle(opts.feature, opts.commits, opts.branch),
+    body: body ? `${body}\n` : composePrBody({ feature: opts.feature, commits: opts.commits }),
   };
 }
 
 /**
- * The PR title, written the way a person would write it. A single-commit branch
+ * Normalise an authored PR title: one line, collapsed whitespace, trimmed —
+ * undefined when there is nothing usable. A title is a single line on GitHub, so
+ * a stray newline is folded rather than passed through to gh.
+ */
+export function authoredPrTitle(raw?: string): string | undefined {
+  const line = (raw ?? "").replace(/\s+/g, " ").trim();
+  return line === "" ? undefined : line;
+}
+
+/**
+ * Normalise an authored PR body to the human prose the evidence fence is
+ * appended to, or "" when there is nothing usable.
+ *
+ * The fence strip is the load-bearing part. co's evidence block is regenerated on
+ * every prepare and spliced onto the body (forge.ts spliceEvidence), so evidence
+ * that leaked INTO the authored prose would be a second, frozen copy of the
+ * checks and commits — stale the moment the head re-processes. Stripping it here,
+ * with the same splitter the panel reads bodies back through, means the stored
+ * message can only ever be prose. Applied at both ends: when the message is
+ * stored, and again here, so a hand-edited store cannot smuggle a fence in.
+ */
+export function authoredPrBody(raw?: string): string {
+  return splitEvidence(raw ?? "").prose.trim();
+}
+
+/**
+ * The MECHANICAL PR title — the fallback for a feature the co did not author a
+ * title for, and unchanged by that arrival.
+ *
+ * Written the way a person would write it. A single-commit branch
  * takes that commit's own subject (already a Conventional Commits line); a
  * multi-commit branch has no single honest subject, so it is titled
  * `<type>: <feature>` from the branch's own conventional type. Written once, at
@@ -536,8 +602,9 @@ function branchType(branch?: string): string {
   return FEATURE_BRANCH_TYPES.find((t) => t === prefix) ?? DEFAULT_FEATURE_BRANCH_TYPE;
 }
 
-/** The PR description: a plain one-line summary of what the branch does, the way
- *  a developer opening a PR would write it. Everything volatile — the commit
+/** The MECHANICAL PR description — the fallback for a feature the co did not
+ *  author a body for: a plain one-line summary of what the branch does, the way a
+ *  developer opening a PR would write it. Everything volatile — the commit
  *  list, the checks result — lives in the evidence block below, so a
  *  re-processed head refreshes the numbers without touching this prose (or any
  *  the captain has since added around it). */

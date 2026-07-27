@@ -1,7 +1,14 @@
 import fs from "node:fs";
 import { checksLine, failedChecks, type ChecksPolicy } from "./checks.js";
 import type { CommandRunner } from "./forge.js";
-import { executeLanding, prepareLanding, type LandingOptions } from "./landing.js";
+import {
+  authoredPrBody,
+  authoredPrTitle,
+  executeLanding,
+  prepareLanding,
+  type AuthoredPrMessage,
+  type LandingOptions,
+} from "./landing.js";
 import { FeatureStore } from "./featurestore.js";
 import { reviewLanding, type LandingGateHost, type LandingGateResult } from "./landinggate.js";
 import {
@@ -198,6 +205,14 @@ export type ResolveHeadPlan =
   | { ok: true; feature: string; kind: "conflict" | "failed"; attempt: number; maxAttempts: number; order: string }
   | { ok: false; reason: string };
 
+/** Where each half of the enqueued feature's PR message comes from: the co's own
+ *  authored text, or landing.ts's mechanical composition. Reported by enqueue so
+ *  a bare re-enqueue visibly reuses what was authored earlier. */
+export interface PrMessageOrigin {
+  title: "authored" | "mechanical";
+  body: "authored" | "mechanical";
+}
+
 export interface LandResult {
   feature: string;
   outcome: LandingGateResult["outcome"];
@@ -260,6 +275,7 @@ export class FeatureManager {
           // rewrite never rejects (see FeatureStore.persist).
           void this.store.forget(safeSlug(feature));
         },
+        prMessage: (feature) => this.authoredPrMessage(feature),
       },
       deps: { prepare: this.deps.prepare, execute: this.deps.execute },
     });
@@ -272,6 +288,23 @@ export class FeatureManager {
     return this.registry
       .jobsForFeature(feature)
       .some((j) => j.status === "running" || j.status === "queued");
+  }
+
+  /**
+   * The PR message the co authored for a feature, in landing.ts's vocabulary.
+   * Read from the durable store by slug, so it survives a restart and is found
+   * again for a record the boot reconcile rebuilt from the worktree. Undefined
+   * (or a half-empty message) simply leaves landing.ts's mechanical composition
+   * to fill that half in.
+   */
+  private authoredPrMessage(feature: string): AuthoredPrMessage | undefined {
+    const slug = this.findRecord(feature)?.slug ?? safeSlug(feature);
+    const stored = slug ? this.store.prMessage(slug) : undefined;
+    if (!stored) return undefined;
+    return {
+      ...(stored.prTitle ? { title: stored.prTitle } : {}),
+      ...(stored.prBody ? { body: stored.prBody } : {}),
+    };
   }
 
   private worktreeOptions(): WorktreeOptions {
@@ -539,9 +572,22 @@ export class FeatureManager {
    * the current dev tip, pushed, PR'd, and its PR's checks read); a green head then simply carries
    * a live [m] in the panel until the captain presses it. Re-enqueuing a blocked
    * head is the retry lever. Reports not-found for a feature never created.
+   *
+   * THE PR MESSAGE IS AUTHORED HERE. Enqueue is the one, once-per-landing moment
+   * the co declares a feature done, so it is where the co attaches the pull
+   * request's title and description — the alternative was landing.ts's mechanical
+   * composition, which only ever knew the commit subjects. `message` is stored
+   * per feature (durably, so it survives a restart) and consumed by every later
+   * head processing; each field is an independent override, and OMITTING one
+   * leaves whatever is stored intact. A bare re-enqueue after a resolver run
+   * therefore reuses the co's message rather than reverting to the fallback.
    */
-  async enqueue(name: string): Promise<
-    ({ enqueued: true } & EnqueueResult) | { enqueued: false; feature: string; reason: string }
+  async enqueue(
+    name: string,
+    message?: { prTitle?: string; prBody?: string },
+  ): Promise<
+    | ({ enqueued: true; prMessage: PrMessageOrigin } & EnqueueResult)
+    | { enqueued: false; feature: string; reason: string }
   > {
     const record = this.findRecord(name);
     if (!record) {
@@ -551,8 +597,30 @@ export class FeatureManager {
         reason: `no feature '${name}' is tracked; create it with feature_create first.`,
       };
     }
+    // Stored BEFORE the queue processes the head, because processing is what
+    // opens the PR — the message has to be on disk by the time it is read back.
+    // Normalised on the way in: a one-line title, and prose with any evidence
+    // fence stripped, so co's regenerated block can never be frozen into the
+    // authored body.
+    const prTitle = authoredPrTitle(message?.prTitle);
+    const prBody = authoredPrBody(message?.prBody);
+    await this.store.setPrMessage(record.slug, {
+      ...(prTitle ? { prTitle } : {}),
+      ...(prBody ? { prBody } : {}),
+    });
     const res = await this.queue.enqueue(record.feature);
-    return { enqueued: true, ...res };
+    return { enqueued: true, prMessage: this.prMessageOrigin(record.slug), ...res };
+  }
+
+  /** Whether the head's PR message is the co's own or landing.ts's mechanical
+   *  fallback — reported back on enqueue so the co can see at a glance that the
+   *  message it wrote (this call or an earlier one) is the one in play. */
+  private prMessageOrigin(slug: string): PrMessageOrigin {
+    const stored = this.store.prMessage(slug);
+    return {
+      title: stored?.prTitle ? "authored" : "mechanical",
+      body: stored?.prBody ? "authored" : "mechanical",
+    };
   }
 
   /**

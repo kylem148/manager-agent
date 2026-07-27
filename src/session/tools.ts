@@ -353,11 +353,21 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "feature_enqueue",
       description:
-        "Mark a feature done and add it to the serial merge queue. This is how a finished feature gets in line to land in `dev`, as a GitHub pull request. There is NO confirm gate on enqueue — call it as soon as the captain says a feature is done. Features land ONE AT A TIME in queue order: only the head is processed (fetched, rebased onto the current `origin/dev` tip, pushed, PR'd into `dev`, and gated on that PR's own GitHub CI checks — co runs no build or test itself), and only the head can merge. When the enqueued feature becomes the head it is processed immediately, so the result tells you whether the head is `ready` (its checks passed — or its PR reports no checks at all, in which case `ungated` is set and NOTHING verified it: report it as a human-judgment merge, not a green), `awaiting-checks` (CI is still running; this is a WAIT, not a failure — nothing is needed from you, and re-calling feature_enqueue re-reads them), `blocked` (a rebase conflict, a red CI check, or a missing prerequisite such as gh not being installed/authenticated — the result's `blockedKind` says which of the first two; it holds the queue until resolved or removed), `resolving` (a fresh crew agent is fixing it in its worktree), or still `queued`. A `ready` head needs NOTHING from you: its pull request, commits, checks result and a live [m] are already showing in the captain's Ctrl-O queue tab, and they merge that PR with the keystroke whenever they choose (they may edit the PR on GitHub first). Say it is ready, hand over the PR link if you have it, and move on — never call a tool to merge it and never wait for the keypress. On a blocked head you can dispatch a fresh resolver agent with feature_resolve_head, re-call feature_enqueue to retry after a manual fix, or feature_abandon it. Idempotent: enqueuing an already-queued feature keeps its position.",
+        "Mark a feature done and add it to the serial merge queue, and WRITE ITS PULL REQUEST MESSAGE. This is how a finished feature gets in line to land in `dev`, as a GitHub pull request. There is NO confirm gate on enqueue — call it as soon as the captain says a feature is done. You know what this feature is for and what the crew built, so you are the one who writes its PR: pass `prTitle` and `prBody` describing what the PR accomplishes and why. Omit them only when the mechanical fallback (the commit subject, or `<type>: <feature>`) genuinely says enough. Features land ONE AT A TIME in queue order: only the head is processed (fetched, rebased onto the current `origin/dev` tip, pushed, PR'd into `dev`, and gated on that PR's own GitHub CI checks — co runs no build or test itself), and only the head can merge. When the enqueued feature becomes the head it is processed immediately, so the result tells you whether the head is `ready` (its checks passed — or its PR reports no checks at all, in which case `ungated` is set and NOTHING verified it: report it as a human-judgment merge, not a green), `awaiting-checks` (CI is still running; this is a WAIT, not a failure — nothing is needed from you, and re-calling feature_enqueue re-reads them), `blocked` (a rebase conflict, a red CI check, or a missing prerequisite such as gh not being installed/authenticated — the result's `blockedKind` says which of the first two; it holds the queue until resolved or removed), `resolving` (a fresh crew agent is fixing it in its worktree), or still `queued`. A `ready` head needs NOTHING from you: its pull request, commits, checks result and a live [m] are already showing in the captain's Ctrl-O queue tab, and they merge that PR with the keystroke whenever they choose (they may edit the PR on GitHub first). Say it is ready, hand over the PR link if you have it, and move on — never call a tool to merge it and never wait for the keypress. On a blocked head you can dispatch a fresh resolver agent with feature_resolve_head, re-call feature_enqueue to retry after a manual fix, or feature_abandon it. Idempotent: enqueuing an already-queued feature keeps its position, and a re-enqueue with no prTitle/prBody keeps the message you already wrote — so you only pass them again to CHANGE the message.",
       input_schema: {
         type: "object",
         properties: {
           name: { type: "string", description: "The feature to enqueue (name or slug). Must already be created." },
+          prTitle: {
+            type: "string",
+            description:
+              "The pull request's title: one concise imperative line saying what this PR does (e.g. \"Add passkey login to the web app\"). Write it as a developer would — no bot voice, no attribution, nothing about how the work was produced. Omitted, the title falls back to the branch's commit subject.",
+          },
+          prBody: {
+            type: "string",
+            description:
+              "The pull request's description: short human prose (a paragraph, or a few lines) on what the PR accomplishes and why — the context a reviewer wants and the diff does not show. Plain markdown, no headings ceremony, no attribution or co-provenance boilerplate, and never a commit list or a checks summary (co appends those itself). Omitted, the description falls back to a one-line mechanical summary.",
+          },
         },
         required: ["name"],
         additionalProperties: false,
@@ -661,7 +671,15 @@ export function makeExecutor(ctx: ExecutorContext) {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
           const name = String(input.name ?? "").trim();
           if (!name) return err(id, "feature_enqueue requires a non-empty name.");
-          const res = await ctx.features.enqueue(name);
+          // Each half of the PR message is an independent override: an omitted
+          // field leaves whatever this feature already has stored, so a retry
+          // enqueue never wipes a message the co wrote earlier.
+          const prTitle = input.prTitle === undefined ? undefined : String(input.prTitle);
+          const prBody = input.prBody === undefined ? undefined : String(input.prBody);
+          const res = await ctx.features.enqueue(name, {
+            ...(prTitle === undefined ? {} : { prTitle }),
+            ...(prBody === undefined ? {} : { prBody }),
+          });
           if (res.enqueued) ctx.onNotice?.(`enqueued feature ${name} for landing`);
           return ok(id, res);
         }

@@ -12,6 +12,9 @@ import { FeatureManager, featureActivity } from "./features.js";
 import { FeatureStore } from "./featurestore.js";
 import type { QueueEntryView } from "./mergequeue.js";
 import { composePrMessage } from "./landing.js";
+import { splitEvidence } from "./forge.js";
+import { makeExecutor, newSideEffects, toolDefinitions } from "./tools.js";
+import type { ResearchConfig } from "../config.js";
 import {
   featureBranch,
   provisionWorktree,
@@ -526,6 +529,7 @@ test("a landed feature's intent is dropped from the store, so the slug can be re
     // attached to a later feature that happens to slug the same way.
     const store = await FeatureStore.load(fx.paths);
     assert.equal(store.intent("shortlived"), undefined);
+    assert.equal(store.prMessage("shortlived"), undefined, "its PR message goes with it");
 
     const next = await fx.restart();
     await next.reconcileAtBoot();
@@ -932,6 +936,251 @@ test("headDetail feeds the panel the ready head's PR, commits and checks evidenc
     assert.equal(ready.checks?.verdict, "passed", "the checks that passed are stated");
     assert.deepEqual(ready.checks?.runs.map((r) => r.name), ["ci"], "and named");
     assert.equal(ready.checks?.ungated, false);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("feature_enqueue writes the pull request: the co's own title and body, with the fence on top", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("passkeys", "passkey login for the web app");
+    await commitIn(a.feature.worktreePath, "auth.ts", "login\n", "job: passkey ceremony");
+
+    const title = "Add passkey login to the web app";
+    const body = "Passwords were the last thing keeping the support queue busy, so login goes through a passkey now.";
+    const enq = await fx.features.enqueue("passkeys", { prTitle: title, prBody: body });
+    assert.equal(enq.enqueued, true);
+    if (!enq.enqueued) return;
+    assert.equal(enq.head?.status, "ready");
+    assert.deepEqual(enq.prMessage, { title: "authored", body: "authored" }, "the co wrote both halves");
+
+    // The pull request carries them verbatim; co's block is the only thing added.
+    const pr = fx.forge.prFor("feat/passkeys")!;
+    assert.equal(pr.title, title);
+    const parts = splitEvidence(pr.body);
+    assert.equal(parts.prose, body);
+    assert.match(parts.evidence, /### Checks/, "the evidence still regenerates");
+    assert.match(parts.evidence, /job: passkey ceremony/, "with the commit list inside the fence");
+    assert.doesNotMatch(parts.prose, /### Checks|### Commits|<!--/, "and none of it in the prose");
+
+    // The mechanical composition is NOT what the captain reads, which is the point.
+    const detail = fx.features.headDetail();
+    assert.equal(detail?.kind, "ready");
+    if (detail?.kind !== "ready") return;
+    const mechanical = composePrMessage({ feature: "passkeys", commits: detail.commits, branch: "feat/passkeys" });
+    assert.notEqual(pr.title, mechanical.title);
+    assert.equal(detail.pr?.title, title, "and the panel paints the message off the PR");
+    assert.equal(detail.pr?.prose, body);
+
+    // Persisted the moment it is given, keyed by slug, under .dispatch/.
+    const store = await FeatureStore.load(fx.paths);
+    assert.deepEqual(store.prMessage("passkeys"), { prTitle: title, prBody: body });
+    assert.equal(store.intent("passkeys"), "passkey login for the web app", "beside the intent, not instead of it");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("with no message given, the pull request falls back to the mechanical composition", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("plain");
+    await commitIn(a.feature.worktreePath, "p.txt", "p\n", "job: the plain slice");
+    await commitIn(a.feature.worktreePath, "q.txt", "q\n", "job: the other slice");
+
+    const enq = await fx.features.enqueue("plain");
+    assert.equal(enq.enqueued, true);
+    if (!enq.enqueued) return;
+    assert.deepEqual(enq.prMessage, { title: "mechanical", body: "mechanical" });
+
+    const detail = fx.features.headDetail();
+    assert.equal(detail?.kind, "ready");
+    if (detail?.kind !== "ready") return;
+    const expected = composePrMessage({ feature: "plain", commits: detail.commits, branch: "feat/plain" });
+    const pr = fx.forge.prFor("feat/plain")!;
+    assert.equal(pr.title, expected.title, "the old rules still apply when nothing was authored");
+    assert.equal(splitEvidence(pr.body).prose, expected.body.trim());
+
+    // Nothing is stored for a feature whose message was never authored.
+    assert.equal((await FeatureStore.load(fx.paths)).prMessage("plain"), undefined);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a re-enqueue with no message reuses the one co wrote — across a restart and a resolver run", async () => {
+  const fx = await makeFixture();
+  try {
+    const base = await fx.features.create("base");
+    const follow = await fx.features.create("recovery");
+    await commitIn(base.feature.worktreePath, "file.txt", "from base\n", "job: base");
+    await commitIn(follow.feature.worktreePath, "file.txt", "from recovery\n", "job: recovery codes");
+
+    // Land base so dev holds the conflicting change.
+    await fx.features.enqueue("base");
+    assert.equal((await fx.features.mergeReadyHead()).merged, true);
+
+    // The co authors the message on the enqueue that BLOCKS: the rebase
+    // conflicts, so no PR is opened at all. The message has to survive to
+    // whenever the PR is finally opened, or the authored text is lost for good.
+    const title = "Add recovery codes to the login flow";
+    const body = "A lost device must not be a lost account, so enrolment now hands out one-time codes.";
+    const first = await fx.features.enqueue("recovery", { prTitle: title, prBody: body });
+    assert.equal(first.enqueued, true);
+    if (!first.enqueued) return;
+    assert.equal(first.head?.status, "blocked");
+    assert.equal(first.head?.blockedKind, "conflict");
+    assert.equal(fx.forge.prFor("feat/recovery"), undefined, "a conflicted head opened no PR");
+
+    // A restart: a brand-new manager, an empty registry and queue, and a store
+    // re-read from disk. Everything about the feature comes back from disk here.
+    const next = await fx.restart();
+    await next.reconcileAtBoot();
+
+    // The resolver's work, in the feature's own worktree: rebase and resolve.
+    const wt = follow.feature.worktreePath;
+    const reb = spawnSync("git", ["rebase", "origin/dev"], { cwd: wt, encoding: "utf8" });
+    assert.notEqual(reb.status, 0, "the rebase really conflicts (as the block reported)");
+    await fsp.writeFile(path.join(wt, "file.txt"), "from base\nfrom recovery\n", "utf8");
+    run(wt, ["add", "file.txt"]);
+    assert.equal(
+      spawnSync("git", ["rebase", "--continue"], {
+        cwd: wt,
+        encoding: "utf8",
+        env: { ...process.env, GIT_EDITOR: "true" },
+      }).status,
+      0,
+      "the agent completed the rebase",
+    );
+
+    // The retry passes NO message. The PR opens for the first time here, and it
+    // opens with what the previous session's co wrote.
+    const retry = await next.enqueue("recovery");
+    assert.equal(retry.enqueued, true);
+    if (!retry.enqueued) return;
+    assert.equal(retry.head?.status, "ready");
+    assert.deepEqual(retry.prMessage, { title: "authored", body: "authored" }, "not reverted to mechanical");
+
+    const pr = fx.forge.prFor("feat/recovery")!;
+    assert.equal(pr.title, title);
+    assert.equal(splitEvidence(pr.body).prose, body);
+    assert.deepEqual((await FeatureStore.load(fx.paths)).prMessage("recovery"), { prTitle: title, prBody: body });
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("each half of the PR message overrides on its own; omitting one keeps what is stored", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("halves");
+    await commitIn(a.feature.worktreePath, "h.txt", "h\n", "job: halves");
+
+    await fx.features.enqueue("halves", { prTitle: "First title", prBody: "First body." });
+    // A body-only re-enqueue replaces the body and leaves the title alone; a
+    // title-only one does the reverse.
+    const second = await fx.features.enqueue("halves", { prBody: "Second body, better argued." });
+    assert.equal(second.enqueued, true);
+    if (!second.enqueued) return;
+    assert.deepEqual(second.prMessage, { title: "authored", body: "authored" });
+    assert.deepEqual((await FeatureStore.load(fx.paths)).prMessage("halves"), {
+      prTitle: "First title",
+      prBody: "Second body, better argued.",
+    });
+
+    await fx.features.enqueue("halves", { prTitle: "Second title" });
+    assert.deepEqual((await FeatureStore.load(fx.paths)).prMessage("halves"), {
+      prTitle: "Second title",
+      prBody: "Second body, better argued.",
+    });
+
+    // The PR itself was opened by the FIRST enqueue and is a human artifact from
+    // then on: co refreshes only its fenced evidence, never the title or the
+    // prose the captain may have edited on GitHub.
+    const pr = fx.forge.prFor("feat/halves")!;
+    assert.equal(pr.title, "First title", "an open PR's title is not rewritten");
+    assert.equal(splitEvidence(pr.body).prose, "First body.");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("an authored body can never smuggle co's evidence fence into the stored message", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("fenced");
+    await commitIn(a.feature.worktreePath, "f.txt", "f\n", "job: fenced work");
+
+    await fx.features.enqueue("fenced", {
+      prTitle: "Split the migration runner out of boot",
+      prBody:
+        "Boot did too much.\n\n<!-- co:evidence -->\n### Checks\n**green** — stale, frozen, wrong.\n<!-- /co:evidence -->\n\nThe runner is its own module now.",
+    });
+
+    const stored = (await FeatureStore.load(fx.paths)).prMessage("fenced");
+    assert.equal(stored?.prBody, "Boot did too much.\n\nThe runner is its own module now.");
+    assert.doesNotMatch(stored?.prBody ?? "", /co:evidence|### Checks/, "nothing of the fence is stored");
+
+    // And the PR carries exactly one evidence block: co's own, regenerated.
+    const pr = fx.forge.prFor("feat/fenced")!;
+    const parts = splitEvidence(pr.body);
+    assert.equal(parts.prose, "Boot did too much.\n\nThe runner is its own module now.");
+    assert.match(parts.evidence, /job: fenced work/, "the live block, with this head's commits");
+    assert.doesNotMatch(parts.evidence, /stale, frozen, wrong/);
+    assert.equal(pr.body.match(/<!-- co:evidence -->/g)?.length, 1, "exactly one fence in the body");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("the feature_enqueue TOOL declares the message and threads it to the pull request", async () => {
+  // The schema and description are what actually reach the model, so they are
+  // pinned here beside the behaviour they promise.
+  const def = toolDefinitions({ dispatch: true }).find((t) => t.name === "feature_enqueue")!;
+  const props = def.input_schema.properties as Record<string, { type?: string; description?: string }>;
+  assert.equal(props.prTitle?.type, "string");
+  assert.equal(props.prBody?.type, "string");
+  assert.deepEqual(def.input_schema.required, ["name"], "both halves are optional");
+  assert.match(props.prTitle?.description ?? "", /concise imperative line/);
+  assert.match(props.prBody?.description ?? "", /what the PR accomplishes and why/);
+  assert.match(def.description, /pass `prTitle` and `prBody`/, "the description tells co to write it");
+  assert.match(def.description, /keeps the message you already wrote/, "and that omitting preserves it");
+
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("tooled");
+    await commitIn(a.feature.worktreePath, "t.txt", "t\n", "job: tooled");
+    const execute = makeExecutor({
+      paths: fx.paths,
+      research: {} as ResearchConfig,
+      effects: newSideEffects(),
+      features: fx.features,
+    });
+    let n = 0;
+    const call = (input: Record<string, unknown>) =>
+      execute({ type: "tool_use", id: `t${++n}`, name: "feature_enqueue", input });
+
+    const res = await call({
+      name: "tooled",
+      prTitle: "Let co author the PR message",
+      prBody: "The mechanical title only ever knew the commit subject.",
+    });
+    assert.ok(!res.is_error, String(res.content));
+    const out = JSON.parse(String(res.content));
+    assert.equal(out.enqueued, true);
+    assert.deepEqual(out.prMessage, { title: "authored", body: "authored" });
+    const pr = fx.forge.prFor("feat/tooled")!;
+    assert.equal(pr.title, "Let co author the PR message");
+    assert.equal(splitEvidence(pr.body).prose, "The mechanical title only ever knew the commit subject.");
+
+    // The retry shape — same tool, name only — keeps what was authored.
+    const again = JSON.parse(String((await call({ name: "tooled" })).content));
+    assert.deepEqual(again.prMessage, { title: "authored", body: "authored" });
+    assert.deepEqual((await FeatureStore.load(fx.paths)).prMessage("tooled"), {
+      prTitle: "Let co author the PR message",
+      prBody: "The mechanical title only ever knew the commit subject.",
+    });
   } finally {
     await fx.cleanup();
   }
