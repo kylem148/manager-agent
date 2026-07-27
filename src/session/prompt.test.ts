@@ -18,6 +18,11 @@ import type { ResearchConfig } from "../config.js";
  * The ungated nudge is pinned for the same reason. co gates on the PR's real
  * checks now, so a repo with no CI workflow lands everything ungated; the only
  * thing that tells the captain WHY, and offers the fix, is this prose.
+ *
+ * So is the pull request template, and the report contract that feeds it. The PR
+ * body is the permanent record of a feature and co writes it without ever seeing
+ * the diff, so the shape it writes to and the material the crew is told to hand
+ * back are one mechanism, pinned together.
  */
 
 async function makeInstance(): Promise<{ paths: InstancePaths; cleanup: () => Promise<void> }> {
@@ -81,17 +86,115 @@ test("enqueue is where co writes the PR message, in the house style", async () =
     const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
     assert.match(prompt, /feature_enqueue\(name, prTitle, prBody\)/, "the lever carries the message");
     assert.match(prompt, /You write the pull request's message/);
-    assert.match(prompt, /concise imperative line/, "the title rule");
-    assert.match(prompt, /what the PR accomplishes and why/, "the body rule");
+    assert.match(prompt, /Writing the pull request message/, "and the template it is written to");
     assert.match(
       prompt,
-      /no bot voice,\s+no attribution, nothing about co or the crew/,
+      /No bot voice, no attribution, nothing about how the work was\s+produced/,
       "the house PR style: no co provenance anywhere in it (D-20260724-17)",
     );
     assert.match(
       prompt,
-      /a re-enqueue with no message keeps the one you wrote/,
+      /The rule is about the ACTOR, not the\s+vocabulary: never name who performed the work/,
+      "said again for the body, and as the distinction that keeps it from over-firing",
+    );
+    assert.match(
+      prompt,
+      /crew reports the suite is\s+green/,
+      "with the actor phrasing it forbids",
+    );
+    assert.match(
+      prompt,
+      /co-manager composes the PR body but never sees the diff/,
+      "and the product noun as SUBJECT it allows",
+    );
+    assert.match(prompt, /"`tsc --noEmit` clean"/, "with behaviour standing in for the actor");
+    assert.match(
+      prompt,
+      /a re-enqueue with\s+no message keeps the one you wrote/,
       "so a retry never silently reverts to the mechanical fallback",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the PR body is the five-section template, verification separated from claim", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    // The section list is the whole point of the template, and its ORDER is part
+    // of it, so it is pinned as a sequence rather than five loose matches.
+    assert.match(
+      prompt,
+      /`## What`[\s\S]*`## Why`[\s\S]*`## How`[\s\S]*`## Testing`[\s\S]*`## Other Notes`/,
+      "five sections, in order",
+    );
+    assert.match(prompt, /One line, imperative, specific/, "the title rule");
+    assert.match(prompt, /Drop a section you would leave empty/, "no scaffolding on a trivial change");
+    // The form constraint is the whole reason the body stays readable, so the
+    // caps are pinned as numbers and not just as "keep it short".
+    assert.match(
+      prompt,
+      /Bullets only, no paragraphs anywhere in the body/,
+      "sections are lists, never prose",
+    );
+    assert.match(
+      prompt,
+      /Three bullets to a section\s+is typical, five is the absolute maximum/,
+      "with hard caps, so a section cannot grow back into a paragraph",
+    );
+    assert.match(
+      prompt,
+      /one short\s+sentence on one line/,
+      "and a bullet cannot become a paragraph on its own",
+    );
+    assert.match(
+      prompt,
+      /deliberate trade\s+for a body a reviewer will actually read, not an oversight/,
+      "the lost detail is a known cost, not a gap for someone to restore prose over",
+    );
+    assert.match(prompt, /roads not taken/, "How is where the abandoned approaches go");
+    assert.match(
+      prompt,
+      /what was ACTUALLY DONE to verify the change/,
+      "Testing is a record of verification, not a to-do list",
+    );
+    assert.match(
+      prompt,
+      /never turn "tests\s+pass" into\s+"verified"/,
+      "co never saw the diff, so the crew's report stays a report",
+    );
+    assert.match(
+      prompt,
+      /verification record unavailable/,
+      "and with no record it says so rather than inventing checks",
+    );
+    assert.match(
+      prompt,
+      /Never duplicate the harness's appended evidence block/,
+      "the commit list and the checks result are the harness's, not the body's",
+    );
+    assert.ok(!prompt.includes("no headings ceremony"), "the old short-prose instruction is gone");
+
+    const unlinked = await buildSystemPrompt(paths, RESEARCH);
+    assert.ok(!unlinked.includes("## Other Notes"), "the template rides with the dispatch section");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("every order makes the crew close its report with the material the PR needs", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    // Unlinked too: the checklist is the orders protocol, which every session has.
+    const prompt = await buildSystemPrompt(paths, RESEARCH);
+    assert.match(prompt, /\*\*Close the report\*\*/);
+    assert.match(prompt, /diffstat \(files changed, insertions, deletions\)/);
+    assert.match(prompt, /verification it\s+actually ran, with the real output/);
+    assert.match(
+      prompt,
+      /approaches it tried and abandoned,\s+with the reason each was dropped/,
+      "the How section's material has to come from somewhere",
     );
   } finally {
     await cleanup();
