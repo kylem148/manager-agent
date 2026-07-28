@@ -172,6 +172,127 @@ test("a caret dragged down a tall buffer keeps the window under it", () => {
   assert.equal(scroll, 7, "twelve rows down a six-row window has moved seven");
 });
 
+// --- the selection model -----------------------------------------------------
+//
+// A selection is an anchor plus the caret, in BUFFER OFFSETS. That is the whole
+// design decision worth pinning: offsets survive a re-wrap, so the same
+// characters stay selected at any width, which is why the popup can keep a
+// selection across a terminal resize where the panel's cell-based one cannot.
+
+test("a selection is ordered whichever way it was made, and empty until it moves", () => {
+  const e = editor("hello world");
+  assert.equal(e.selection, null, "nothing is selected to start with");
+  e.anchorAt(6);
+  assert.equal(e.selection, null, "an anchor sitting on the caret selects nothing");
+  e.extendTo(11);
+  assert.deepEqual(e.selection, { start: 6, end: 11 });
+  assert.equal(e.selectedText(), "world");
+
+  const back = editor("hello world");
+  back.anchorAt(11);
+  back.extendTo(6);
+  assert.deepEqual(back.selection, { start: 6, end: 11 }, "direction is not information");
+  assert.equal(back.selectedText(), "world");
+});
+
+test("select all takes the buffer; on an empty buffer it selects nothing at all", () => {
+  const e = editor("a title\n\nsome prose");
+  e.selectAll();
+  assert.deepEqual(e.selection, { start: 0, end: 19 });
+  assert.equal(e.selectedText(), "a title\n\nsome prose", "line breaks included");
+  assert.equal(e.cursor, 19, "and the caret is at the end");
+
+  const empty = editor("");
+  empty.selectAll();
+  assert.equal(empty.selection, null, "no phantom selection over no text");
+});
+
+test("typing, backspace and Delete all replace the selection", () => {
+  const typed = editor("hello world");
+  typed.anchorAt(0);
+  typed.extendTo(5);
+  typed.insert("goodbye");
+  assert.equal(typed.text, "goodbye world");
+  assert.equal(typed.cursor, 7, "the caret is after what replaced it");
+  assert.equal(typed.selection, null, "and the selection is spent");
+
+  const back = editor("hello world");
+  back.anchorAt(5);
+  back.extendTo(11);
+  back.backspace();
+  assert.equal(back.text, "hello", "backspace takes the selection, not one character");
+
+  const del = editor("hello world");
+  del.anchorAt(0);
+  del.extendTo(6);
+  del.deleteForward();
+  assert.equal(del.text, "world", "and so does Delete");
+});
+
+test("clear all empties the buffer and hands back what it took", () => {
+  const e = editor("a title\n\nsome prose");
+  assert.equal(e.clearAll(), "a title\n\nsome prose", "the caller can put it on the clipboard");
+  assert.equal(e.text, "");
+  assert.equal(e.cursor, 0);
+  assert.equal(e.selection, null);
+  assert.equal(e.dirty, true, "and emptying a buffer is an edit");
+});
+
+test("every movement verb collapses the selection", () => {
+  for (const move of [
+    (e: TextEditor) => e.left(),
+    (e: TextEditor) => e.right(),
+    (e: TextEditor) => e.home(),
+    (e: TextEditor) => e.end(),
+    (e: TextEditor) => e.moveRow(1, 8),
+    (e: TextEditor) => e.moveRow(-1, 8),
+  ]) {
+    const e = editor("hello world");
+    e.selectAll();
+    move(e);
+    assert.equal(e.selection, null, `${move} left a selection standing`);
+    assert.equal(e.text, "hello world", "and moving never changes the text");
+  }
+});
+
+test("the kill keys stay line-scoped even with everything selected", () => {
+  const e = editor("title\n\nbody line");
+  e.anchorAt(0);
+  e.extendTo(11); // everything selected, caret inside "body line"
+  assert.equal(e.selectedText(), "title\n\nbody");
+  e.killToEnd();
+  assert.equal(e.text, "title\n\nbody", "Ctrl-K is the line's end, never the buffer's");
+});
+
+test("offsetAt maps a visual (row, col) back to the character under it", () => {
+  // "hello world" at width 8 wraps into "hello " / "world".
+  const e = editor("hello world");
+  assert.equal(e.offsetAt(0, 0, 8), 0);
+  assert.equal(e.offsetAt(0, 3, 8), 3);
+  assert.equal(e.offsetAt(1, 0, 8), 6, "row 1 starts after the wrap point");
+  assert.equal(e.offsetAt(1, 5, 8), 11, "the end of the last row is the end of the buffer");
+  assert.equal(e.offsetAt(1, 99, 8), 11, "a click past the end of a row lands at its end");
+  assert.equal(e.offsetAt(99, 0, 8), 6, "and a click below the last row lands on the last row");
+});
+
+test("offsetAt never lands past a hard line break", () => {
+  const e = editor("ab\ncd");
+  assert.equal(e.offsetAt(0, 5, 40), 2, "the caret stops before the newline, not on the next line");
+  assert.equal(e.offsetAt(1, 0, 40), 3);
+});
+
+test("a selection made at one width means the same text at another", () => {
+  const e = editor("hello world");
+  // Select "world" by pointing at it in an 8-column layout...
+  e.anchorAt(e.offsetAt(1, 0, 8));
+  e.extendTo(e.offsetAt(1, 5, 8));
+  assert.equal(e.selectedText(), "world");
+  // ...and the same offsets still name "world" once the buffer is re-wrapped to
+  // 40 columns, which is what a terminal resize does under an open popup.
+  assert.deepEqual(e.layout(40).segs, ["hello world"]);
+  assert.equal(e.selectedText(), "world", "the selection tracks the text, not the cells");
+});
+
 // --- the git-commit split ----------------------------------------------------
 
 test("line 1 is the title, the blank line is a separator, the rest is the body", () => {

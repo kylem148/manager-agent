@@ -138,6 +138,21 @@ export function scrollToCursor(
   return Math.max(0, Math.min(next, max));
 }
 
+/**
+ * A selected span of the buffer, as buffer offsets: `start` inclusive, `end`
+ * exclusive, always ordered.
+ *
+ * OFFSETS, NOT SCREEN CELLS. The panel's own drag-selection stores (row, col)
+ * pairs and has to be thrown away on a resize, because a re-wrap moves the text
+ * under it. A selection anchored in the buffer survives re-wrapping for free:
+ * the same characters stay selected at any width, which is what lets the popup
+ * keep a selection across a resize instead of dropping it.
+ */
+export interface SelectedSpan {
+  start: number;
+  end: number;
+}
+
 /** A pull request's human message, as the editor's one buffer splits into it. */
 export interface EditedMessage {
   title: string;
@@ -177,14 +192,24 @@ export function joinMessage(title: string, body: string): string {
 }
 
 /**
- * A text buffer with a cursor, and the editing verbs both editors bind keys to.
- * Mutable and deliberately small: it holds the text, the caret and the original
- * text (for the dirty check), and nothing about how any of it is drawn.
+ * A text buffer with a cursor and a selection, and the editing verbs an editor
+ * binds keys to. Mutable and deliberately small: it holds the text, the caret,
+ * the selection anchor and the original text (for the dirty check), and nothing
+ * about how any of it is drawn.
+ *
+ * Only the PR message popup runs on this class. The prompt input bar keeps its
+ * own buffer in tui.ts and shares the pure layout functions above. That is the
+ * seam that lets the popup grow a selection model, a select-all and a clear-all
+ * with no way for any of it to reach the prompt line.
  */
 export class TextEditor {
   private buf: string;
   private cur: number;
   private readonly initial: string;
+  /** Where a selection was anchored (a drag's press point, or 0 after select
+   *  all), or null when nothing is selected. The other end is always the caret,
+   *  so a selection and the caret can never disagree about where the focus is. */
+  private anchor: number | null = null;
 
   /** Opens on `text` with the caret at the very start — the title, which is what
    *  a captain retitling a PR reaches for first. */
@@ -219,41 +244,149 @@ export class TextEditor {
     return splitMessage(this.buf);
   }
 
+  // --- selection --------------------------------------------------------------
+  //
+  // A selection is an anchor plus the caret. Every movement verb collapses it
+  // (the conventional rule: an arrow key means "go here", not "keep that"), and
+  // every insertion or deletion replaces it. Nothing here paints: the caller
+  // asks for the span and highlights whatever rows it falls across.
+
+  /** The selected span, ordered, or null when nothing is selected. An anchor
+   *  sitting exactly on the caret selects nothing and reads as null. */
+  get selection(): SelectedSpan | null {
+    if (this.anchor === null || this.anchor === this.cur) return null;
+    return this.anchor < this.cur
+      ? { start: this.anchor, end: this.cur }
+      : { start: this.cur, end: this.anchor };
+  }
+
+  /** The selected text, or "" when nothing is selected. */
+  selectedText(): string {
+    const sel = this.selection;
+    return sel ? this.buf.slice(sel.start, sel.end) : "";
+  }
+
+  /** Drop the selection, leaving the caret exactly where it is. */
+  clearSelection(): void {
+    this.anchor = null;
+  }
+
+  /** Anchor a fresh selection at `offset` and put the caret there: a drag's
+   *  press. Until the caret moves off it, nothing is selected. */
+  anchorAt(offset: number): void {
+    this.cur = this.clampOffset(offset);
+    this.anchor = this.cur;
+  }
+
+  /** Move the caret to `offset`, keeping the anchor: a drag's motion. With no
+   *  anchor (a drag that began off the text) this is a plain caret move. */
+  extendTo(offset: number): void {
+    if (this.anchor === null) this.anchor = this.cur;
+    this.cur = this.clampOffset(offset);
+  }
+
+  /** Select the whole buffer, caret at the end. A no-op on an empty buffer:
+   *  there is nothing to select, and a phantom selection would highlight rows
+   *  with no text in them. */
+  selectAll(): void {
+    if (this.buf === "") return;
+    this.anchor = 0;
+    this.cur = this.buf.length;
+  }
+
+  /** Delete the selection and leave the caret where it started. Returns false
+   *  when nothing was selected, so a caller can fall through to its own verb. */
+  deleteSelection(): boolean {
+    const sel = this.selection;
+    this.anchor = null;
+    if (!sel) return false;
+    this.buf = this.buf.slice(0, sel.start) + this.buf.slice(sel.end);
+    this.cur = sel.start;
+    return true;
+  }
+
+  /** Empty the buffer whole, returning what was removed so the caller can put it
+   *  on the clipboard first, which is what makes clear-all safe on one key. */
+  clearAll(): string {
+    const had = this.buf;
+    this.buf = "";
+    this.cur = 0;
+    this.anchor = null;
+    return had;
+  }
+
   /**
-   * Insert at the caret and advance it.
+   * The buffer offset at visual (row, col) for a buffer wrapped to `width`: the
+   * mouse's question, and the inverse of layout()'s caret mapping. Clamped into
+   * the row, so a click past the end of a short row lands at that row's end
+   * rather than on the line below, and a click below the last row lands at the
+   * end of the buffer.
+   */
+  offsetAt(row: number, col: number, width: number): number {
+    const starts = inputRowStarts(this.buf, Math.max(1, width));
+    const r = Math.max(0, Math.min(starts.length - 1, Math.floor(row)));
+    const start = starts[r]!;
+    const stop = starts[r + 1] ?? this.buf.length;
+    // A hard-broken row owns its terminating "\n"; the caret belongs before it.
+    const end = stop > start && this.buf[stop - 1] === "\n" ? stop - 1 : stop;
+    return Math.max(start, Math.min(end, start + Math.max(0, Math.floor(col))));
+  }
+
+  private clampOffset(offset: number): number {
+    return Math.max(0, Math.min(this.buf.length, Math.floor(offset)));
+  }
+
+  // --- editing ----------------------------------------------------------------
+
+  /**
+   * Insert at the caret and advance it, REPLACING the selection when there is
+   * one, which is what makes "select all, then paste" the one-gesture way to
+   * swap a whole description out.
    *
-   * CR/CRLF is normalised to LF, and every other C0 control is dropped: a paste
+   * CR/CRLF is normalised to LF, a tab becomes one space (the column math here
+   * is one char per column, and dropping the tab outright would silently eat a
+   * pasted body's indentation), and every other C0 control is dropped: a paste
    * carries whatever its source had, and an ESC or a BEL sitting in the buffer
    * is a character no row can render — and, written back to a pull request,
    * junk nobody typed.
    */
   insert(text: string): void {
-    const t = text.replace(/\r\n?/g, "\n").replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, "");
+    const t = text
+      .replace(/\r\n?/g, "\n")
+      .replace(/\t/g, " ")
+      .replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, "");
     if (t === "") return;
+    this.deleteSelection();
     this.buf = this.buf.slice(0, this.cur) + t + this.buf.slice(this.cur);
     this.cur += t.length;
   }
 
-  /** Delete the character before the caret. At a line boundary that is the
-   *  newline itself, which joins the two lines — the conventional behaviour. */
+  /** Delete the selection if there is one, else the character before the caret.
+   *  At a line boundary that is the newline itself, which joins the two lines:
+   *  the conventional behaviour. */
   backspace(): void {
+    if (this.deleteSelection()) return;
     if (this.cur === 0) return;
     this.buf = this.buf.slice(0, this.cur - 1) + this.buf.slice(this.cur);
     this.cur--;
   }
 
-  /** Delete the character after the caret (the Delete key). At the end of a line
-   *  that is the newline, which pulls the next line up. */
+  /** Delete the selection if there is one, else the character after the caret
+   *  (the Delete key). At the end of a line that is the newline, which pulls the
+   *  next line up. */
   deleteForward(): void {
+    if (this.deleteSelection()) return;
     if (this.cur >= this.buf.length) return;
     this.buf = this.buf.slice(0, this.cur) + this.buf.slice(this.cur + 1);
   }
 
   left(): void {
+    this.anchor = null;
     if (this.cur > 0) this.cur--;
   }
 
   right(): void {
+    this.anchor = null;
     if (this.cur < this.buf.length) this.cur++;
   }
 
@@ -273,20 +406,28 @@ export class TextEditor {
   }
 
   home(): void {
+    this.anchor = null;
     this.cur = this.lineStart();
   }
 
   end(): void {
+    this.anchor = null;
     this.cur = this.lineEnd();
   }
 
+  /** Ctrl-U. Line-scoped, and it stays line-scoped with a selection standing:
+   *  the selection is simply dropped first, so this key means one thing however
+   *  it is reached. Clearing the whole buffer is clearAll's job, on its own key. */
   killToStart(): void {
+    this.anchor = null;
     const start = this.lineStart();
     this.buf = this.buf.slice(0, start) + this.buf.slice(this.cur);
     this.cur = start;
   }
 
+  /** Ctrl-K, line-scoped for the same reason. */
   killToEnd(): void {
+    this.anchor = null;
     this.buf = this.buf.slice(0, this.cur) + this.buf.slice(this.lineEnd());
   }
 
@@ -300,6 +441,7 @@ export class TextEditor {
   moveRow(delta: 1 | -1, width: number): boolean {
     const { segs, starts, cursorRow, cursorCol } = this.layout(width);
     const target = cursorRow + delta;
+    this.anchor = null; // an arrow key means "go here", not "keep that"
     if (target < 0 || target >= segs.length) return false;
     const start = starts[target];
     if (start === undefined) {

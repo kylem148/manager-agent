@@ -239,6 +239,22 @@ test("Ctrl-U kills to the start of the current line only", async () => {
   h.stop();
 });
 
+test("the PR editor's buffer-scoped keys do nothing at all to the prompt line", async () => {
+  // Ctrl-G/X/Y are bound by the popup's editor. They were unbound bytes here
+  // before that, and they stay unbound: no text typed, no buffer cleared, no
+  // clipboard write. This is the guard on "the prompt line did not change".
+  const h = harness();
+  const answer = h.tui.question();
+  h.send("keep this line");
+  h.send("\x07"); // Ctrl-G
+  h.send("\x18"); // Ctrl-X
+  h.send("\x19"); // Ctrl-Y
+  assert.ok(!h.allOutput().includes("\x1b]52;"), "nothing was sent to the clipboard");
+  h.send("\r");
+  assert.equal(await answer, "keep this line", "the line is exactly what was typed");
+  h.stop();
+});
+
 test("Ctrl-K kills to the end of the current line only", async () => {
   const h = harness();
   const answer = h.tui.question();
