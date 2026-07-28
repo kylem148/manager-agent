@@ -698,16 +698,23 @@ export async function ensureRemoteDevBranch(
 
 /**
  * Provision a feature: a new worktree at `<baseDir>/<slug>` on a fresh
- * `<type>/<slug>` branch cut from the freshly-fetched `origin/dev`, with build
- * artifacts symlinked from the primary tree. Verifies the remote integration
- * branch first, so a repo that can't support the flow fails here with a clear
- * message instead of halfway through a landing. `type` is a Conventional
- * Commits type (default feat) and is validated before anything is created.
+ * `<type>/<slug>` branch cut from the freshly-fetched `origin/dev`, with its own
+ * dependencies installed into it. Verifies the remote integration branch first,
+ * so a repo that can't support the flow fails here with a clear message instead
+ * of halfway through a landing. `type` is a Conventional Commits type (default
+ * feat) and is validated before anything is created.
+ *
+ * NOTHING IS EVER LINKED OUT OF THE WORKTREE. Neither node_modules/ nor dist/ is
+ * a symlink into the primary tree, whether the install runs or not — see the
+ * module header for what that link cost. The install is the only artifact this
+ * creates directly, and a `prepare` script (this repo has one) may build dist/
+ * inside the worktree as part of it; both are the worktree's own directories.
  *
  * Idempotent for an already-provisioned feature: the existing worktree is
  * returned AS IT IS — on whatever branch it holds, including a `co/feat-*` one
- * an older build cut — and its artifacts are re-linked. Nothing is renamed and
- * no second branch is minted for a feature that already has a checkout.
+ * an older build cut — and its dependencies are installed if they are missing.
+ * Nothing is renamed and no second branch is minted for a feature that already
+ * has a checkout.
  *
  * Any other collision — a leftover branch of either naming scheme without its
  * worktree, an occupied path — throws with a pointer at reconcile/teardown
