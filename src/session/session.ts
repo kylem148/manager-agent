@@ -963,10 +963,7 @@ async function fireDispatch(
     }
     const agentNote = job.agentName ? ` [${job.agentName}]` : "";
     const featureNote = job.feature ? ` in feature '${job.feature}'` : "";
-    const where =
-      job.status === "queued"
-        ? "queued for a free crew pane"
-        : `running in a Ghostty pane (${job.paneId ?? "?"})`;
+    const where = `running in a Ghostty pane (${job.paneId ?? "?"})`;
     const followup = resolve
       ? "I'll re-process the head when it finishes."
       : "I'll review it when it finishes.";

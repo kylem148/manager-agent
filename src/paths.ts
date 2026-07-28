@@ -82,6 +82,12 @@ export interface InstancePaths {
    *  Lives beside the dispatch config for the same reason the inbox does — feature
    *  worktrees are dispatch state — and is never written into the user's repo. */
   featureStore: string;
+  /** The crew panes co owns: each pane's Ghostty id plus the tty and shell pid a
+   *  job taught it, and co's dispatch lease on it. Ghostty can only be asked
+   *  whether a terminal id still exists, so everything reuse needs to prove a
+   *  pane is idle is remembered here — beside the dispatch config, because a
+   *  crew pane is dispatch state. Never written into the user's repo. */
+  paneStore: string;
   /** The running token/cost meter for this instance (see cost.ts). Sits at the
    *  instance root rather than in .memory/ or .dispatch/ because it is neither:
    *  not the co-manager's substrate (the co never reads or writes it, and it is
@@ -123,6 +129,7 @@ export function instancePaths(home: string, name: string): InstancePaths {
     dispatchConfig: path.join(dispatch, "config.json"),
     reviewInbox: path.join(dispatch, "inbox.json"),
     featureStore: path.join(dispatch, "features.json"),
+    paneStore: path.join(dispatch, "panes.json"),
     costLedger: path.join(root, ".cost.json"),
     captures,
     captureFile: (jobId) => path.join(captures, `${jobId}.log`),

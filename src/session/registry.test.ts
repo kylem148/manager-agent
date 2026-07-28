@@ -15,6 +15,8 @@ import {
 } from "./dispatchconfig.js";
 import { crewPaneTitle } from "./crewpanes.js";
 import { setGhosttyAvailableForTest, setOsaRunnerForTest } from "./transport.js";
+import { PaneStore, type PaneRecord } from "./panestore.js";
+import type { TtyProcess, TtyProbe } from "./paneoccupancy.js";
 import { DispatchRegistry, type Job, type RegistryOptions } from "./registry.js";
 
 /**
@@ -131,6 +133,96 @@ function stubGhostty(): () => void {
   return () => {
     setGhosttyAvailableForTest(null);
     setOsaRunnerForTest(null);
+  };
+}
+
+/**
+ * A fake pane world, for the reuse path: Ghostty AND the process tables of the
+ * panes' ttys, so a test can say "the agent in that pane exited" or "the captain
+ * started something in it" and watch where the next dispatch lands.
+ *
+ * It plays the launch script's two first acts in order — writing the pane
+ * identity sidecar (`<capture>.tty`, the tty and the pid that outlives the job)
+ * and then creating the capture file, which is the transport's launch probe.
+ * That is the only way co ever learns a pane's tty, so a stub that skipped it
+ * would make every pane unprovable and every dispatch a split.
+ *
+ * A pane is BUSY from the moment a job launches into it (an agent is running
+ * there) until the test calls agentExits(), exactly like the real thing.
+ */
+function stubPaneWorld(): {
+  ttyProbe: TtyProbe;
+  /** Pre-register a pane that already exists and is idle — a pane an earlier co
+   *  session created, which this one only knows through the pane store. */
+  seed: (paneId: string) => { tty: string; pid: number };
+  agentExits: (paneId: string) => void;
+  captainRuns: (paneId: string) => void;
+  close: (paneId: string) => void;
+  launches: () => string[];
+  teardown: () => void;
+} {
+  const panes = new Map<string, { tty: string; pid: number }>();
+  const busy = new Set<string>();
+  const dead = new Set<string>();
+  const launches: string[] = [];
+  let splits = 0;
+  let nextPid = 90000;
+  const ensure = (id: string): { tty: string; pid: number } => {
+    let rec = panes.get(id);
+    if (!rec) {
+      rec = { tty: `ttyfake.${id}`, pid: (nextPid += 2) };
+      panes.set(id, rec);
+    }
+    return rec;
+  };
+
+  setGhosttyAvailableForTest(true);
+  setOsaRunnerForTest(async (s) => {
+    const em = s.match(/exists \(first terminal whose id = "([^"]+)"/);
+    if (em) return dead.has(em[1]!) ? "false" : "true";
+    const tm = s.match(/first terminal whose id = "([^"]+)"/);
+    if (tm && dead.has(tm[1]!)) {
+      throw new Error(
+        `Ghostty got an error: Can't get terminal 1 whose id = "${tm[1]}". Invalid index. (-1719)`,
+      );
+    }
+    if (s.includes("close ")) return "";
+    launches.push(s);
+    const paneId = s.includes("split ") ? `pane-${++splits}` : tm![1]!;
+    const rec = ensure(paneId);
+    busy.add(paneId); // an agent is now running in it
+    const m = s.match(/\/bin\/sh '([^']+)\.sh'/);
+    if (m) {
+      await fsp.writeFile(`${m[1]}.tty`, `tty=${rec.tty}\npid=${rec.pid}\n`, "utf8");
+      await fsp.writeFile(m[1]!, "", "utf8");
+    }
+    return paneId;
+  });
+
+  const ttyProbe: TtyProbe = async (tty) => {
+    const found = [...panes.entries()].find(([, v]) => v.tty === tty);
+    if (!found) return null;
+    const [id, rec] = found;
+    if (dead.has(id)) return null; // the device went with the pane
+    const rows: TtyProcess[] = [
+      { pid: rec.pid - 1, ppid: 1, stat: "Ss", name: "login" },
+      { pid: rec.pid, ppid: rec.pid - 1, stat: "S", name: "zsh" },
+    ];
+    if (busy.has(id)) rows.push({ pid: rec.pid + 1, ppid: rec.pid, stat: "S+", name: "node" });
+    return rows;
+  };
+
+  return {
+    ttyProbe,
+    seed: (paneId) => ensure(paneId),
+    agentExits: (paneId) => busy.delete(paneId),
+    captainRuns: (paneId) => busy.add(paneId),
+    close: (paneId) => dead.add(paneId),
+    launches: () => launches,
+    teardown: () => {
+      setGhosttyAvailableForTest(null);
+      setOsaRunnerForTest(null);
+    },
   };
 }
 
@@ -461,104 +553,359 @@ test("Ghostty path takes over the anchor then splits the newest pane", async () 
   }
 });
 
-test("at the pane cap the next job queues, then reuses a freed pane on completion", async () => {
-  const { paths, cleanup } = await tmpInstance();
-  const teardown = stubGhostty();
-  try {
-    const config: DispatchConfig = defaultDispatchConfig();
-    config.repoPath = paths.root;
-    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
-    config.pane = { directionSequence: ["right", "down"], cap: 2 };
+// --- pane reuse: dispatch into an idle pane before splitting a new one -------
+//
+// The whole point of the reuse slice. Occupancy is the union of co's own lease
+// and what is actually running in the pane, and a pane is reused only when BOTH
+// say free. These drive the registry end to end against a fake pane world
+// (stubPaneWorld) that owns both signals.
 
+/** The reuse tests' shared setup: a linked config with a designated anchor. */
+function reuseConfig(root: string): DispatchConfig {
+  const config = defaultDispatchConfig();
+  config.repoPath = root;
+  config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+  return config;
+}
+
+/** The crew PROCESS exiting: the sentinel lands, the launch script self-deletes,
+ *  and the agent leaves the pane. One poll finalizes and releases. */
+async function crewExits(reg: DispatchRegistry, job: Job, world: { agentExits: (id: string) => void }): Promise<void> {
+  await fsp.writeFile(job.captureFile, `done\n__CO_DISPATCH_DONE__ 0\n`, "utf8");
+  await fsp.rm(`${job.captureFile}.sh`, { force: true });
+  if (job.paneId) world.agentExits(job.paneId);
+  await (reg as unknown as { tick: () => Promise<void> }).tick();
+}
+
+test("an idle pane is reused rather than split: dispatch, /exit the agent, dispatch again", async () => {
+  // Acceptance criterion 1, and the bug the slice exists for: panes used to
+  // accumulate one per dispatch even when the last one was back at a prompt.
+  const { paths, cleanup } = await tmpInstance();
+  const world = stubPaneWorld();
+  try {
     await withRegistry(
       {
         paths,
-        config,
+        config: reuseConfig(paths.root),
         onComplete: () => {},
         skipAnchorCheck: true,
         pollIntervalMs: 10_000,
+        ttyProbe: world.ttyProbe,
       },
       async (reg) => {
-        const j1 = await reg.dispatch("one"); // takeover anchor
-        const j2 = await reg.dispatch("two"); // split → pane-1 (now at cap 2)
-        const j3 = await reg.dispatch("three"); // cap reached, nothing free → queued
-        assert.equal(j3.status, "queued");
-        assert.equal(reg.activeCount(), 3);
+        const j1 = await reg.dispatch("one");
+        assert.equal(j1.paneId, "anchor-1", "the first dispatch takes over the designated anchor");
 
-        // Simulate j1's crew PROCESS exiting: buildJobScript's finish() writes
-        // the exit sentinel AND removes its own launch script in one breath, so a
-        // real process-exit is "sentinel present, <capture>.sh gone". Reproduce
-        // both — the registry now gates pane reuse on the script's absence (a
-        // hook-completed pane whose agent is still live keeps its script), so a
-        // completion that left the script behind would (correctly) NOT free the
-        // pane. Then run one manual poll: finalize() awaits the queue drain, so by
-        // the time tick() returns the freed anchor has relaunched the queued j3.
-        await fsp.writeFile(j1.captureFile, "done\n__CO_DISPATCH_DONE__ 0\n", "utf8");
-        await fsp.rm(`${j1.captureFile}.sh`, { force: true });
-        await (reg as unknown as { tick: () => Promise<void> }).tick();
-
+        await crewExits(reg, j1, world);
         assert.equal(j1.status, "done");
-        assert.equal(j3.status, "running", "queued job launches into the freed pane");
-        assert.equal(j3.paneId, "anchor-1", "reuses the oldest finished pane (the anchor)");
-        void j2;
+
+        const j2 = await reg.dispatch("two");
+        assert.equal(j2.paneId, "anchor-1", "the second dispatch runs in the SAME pane");
+        assert.equal(
+          world.launches().filter((s) => s.includes("split ")).length,
+          0,
+          "nothing was split",
+        );
       },
     );
   } finally {
-    teardown();
+    world.teardown();
     await cleanup();
   }
 });
 
-test("a hook-completed pane is NOT reused while its agent is still live, but is once the launch script clears", async () => {
-  // The Stop hook fires the review on the crew's FIRST finish, while the agent is
-  // still interactive in its pane. Releasing that pane for reuse then would paste
-  // a launch line into a running agent. The registry must fire the review but hold
-  // the pane until the crew PROCESS exits — signalled by buildJobScript removing
-  // its own launch script (<capture>.sh). This proves both halves — and that a
-  // LIVE pane is never reused.
+test("a pane whose agent is still live is never reused — co's lease holds it even if the tty looks idle", async () => {
+  // Acceptance criterion 2. The Stop hook fires the review on the crew's FIRST
+  // finish while the captain keeps talking to that same agent, so co's own
+  // "finished" is not evidence the pane is free. Both halves are proven here:
+  // the lease alone holds the pane, and releasing it is not enough either — the
+  // pane itself must also read idle.
   const { paths, cleanup } = await tmpInstance();
-  const teardown = stubGhostty();
+  const world = stubPaneWorld();
   try {
-    const config: DispatchConfig = defaultDispatchConfig();
-    config.repoPath = paths.root;
-    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
-    config.pane = { directionSequence: ["right", "down"], cap: 2 };
-
     const completed: string[] = [];
     await withRegistry(
       {
         paths,
-        config,
+        config: reuseConfig(paths.root),
         onComplete: (j) => completed.push(j.id),
         skipAnchorCheck: true,
         pollIntervalMs: 10_000,
+        ttyProbe: world.ttyProbe,
       },
       async (reg) => {
-        const j1 = await reg.dispatch("one"); // takeover anchor
-        const j2 = await reg.dispatch("two"); // split → pane-1 (now at cap 2)
-        const j3 = await reg.dispatch("three"); // cap reached, nothing free → queued
-        assert.equal(j3.status, "queued");
-
-        // j1's Stop hook fires on first finish: the sentinel lands but the launch
-        // script stays (the agent is still live in the pane). launchGhostty wrote
-        // that .sh to disk, so it genuinely exists.
+        const j1 = await reg.dispatch("one"); // anchor-1
+        // The Stop hook: sentinel written, launch script still there (the agent
+        // is live in the pane), and the captain is still typing at it.
         assert.ok(fs.existsSync(`${j1.captureFile}.sh`), "the launch script exists while the agent is live");
         await fsp.writeFile(j1.captureFile, "done\n__CO_DISPATCH_DONE__ 0\n", "utf8");
         await (reg as unknown as { tick: () => Promise<void> }).tick();
-
         assert.equal(j1.status, "done", "the review fires on first finish");
-        assert.ok(completed.includes("job-001"), "completion was reported immediately");
-        assert.equal(j3.status, "queued", "but the still-live pane is NOT reused yet");
-        assert.equal(reg.get("job-003")!.paneId, undefined, "the queued job has no pane");
+        assert.ok(completed.includes("job-001"));
 
-        // The human closes j1's agent: buildJobScript's finish() removes the
-        // script. The next poll reclaims the pane and drains the queued job into it.
+        const j2 = await reg.dispatch("two");
+        assert.equal(j2.paneId, "pane-1", "a NEW pane is split; the live session is untouched");
+
+        // Now pretend the pane's tty went quiet but the launch script is still
+        // there (co has not released the pane). The lease alone must hold it.
+        world.agentExits("anchor-1");
+        const j3 = await reg.dispatch("three");
+        assert.notEqual(j3.paneId, "anchor-1", "co's own unreleased lease still blocks reuse");
+
+        // Release it properly: the crew process exits, the script self-deletes.
+        await crewExits(reg, j1, world);
+        const j4 = await reg.dispatch("four");
+        assert.equal(j4.paneId, "anchor-1", "once both signals say free, it is reused");
+      },
+    );
+  } finally {
+    world.teardown();
+    await cleanup();
+  }
+});
+
+test("a pane running something the captain started is not reused, and is left alone", async () => {
+  // Acceptance criterion 3. co released the pane, but the captain is running an
+  // unrelated command in it: the process signal alone must keep it out.
+  const { paths, cleanup } = await tmpInstance();
+  const world = stubPaneWorld();
+  try {
+    await withRegistry(
+      {
+        paths,
+        config: reuseConfig(paths.root),
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        ttyProbe: world.ttyProbe,
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one"); // anchor-1
+        await crewExits(reg, j1, world); // co is done with the pane...
+        world.captainRuns("anchor-1"); // ...and the captain starts a build in it
+
+        const j2 = await reg.dispatch("two");
+        assert.equal(j2.paneId, "pane-1", "a new pane is split instead");
+        const pastes = world.launches().filter((s) => s.includes("input text"));
+        assert.equal(pastes.length, 1, "only the original takeover ever typed into a pane");
+      },
+    );
+  } finally {
+    world.teardown();
+    await cleanup();
+  }
+});
+
+test("with two idle panes, two consecutive dispatches occupy both rather than splitting", async () => {
+  // Acceptance criterion 4.
+  const { paths, cleanup } = await tmpInstance();
+  const world = stubPaneWorld();
+  try {
+    await withRegistry(
+      {
+        paths,
+        config: reuseConfig(paths.root),
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        ttyProbe: world.ttyProbe,
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one"); // anchor-1
+        const j2 = await reg.dispatch("two"); // split → pane-1
+        await crewExits(reg, j1, world);
+        await crewExits(reg, j2, world);
+
+        const j3 = await reg.dispatch("three");
+        const j4 = await reg.dispatch("four");
+        assert.equal(j3.paneId, "anchor-1", "the oldest free pane goes first");
+        assert.equal(j4.paneId, "pane-1", "the second dispatch takes the other free pane");
+        assert.equal(
+          world.launches().filter((s) => s.includes("split ")).length,
+          1,
+          "only the original split ever happened",
+        );
+      },
+    );
+  } finally {
+    world.teardown();
+    await cleanup();
+  }
+});
+
+test("there is no pane cap: with every pane busy, dispatches keep splitting", async () => {
+  // Acceptance criterion 5. Every pane is occupied (an agent is live in each), so
+  // each dispatch creates another one — at 2 panes and at 8.
+  const { paths, cleanup } = await tmpInstance();
+  const world = stubPaneWorld();
+  try {
+    await withRegistry(
+      {
+        paths,
+        config: reuseConfig(paths.root),
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        ttyProbe: world.ttyProbe,
+      },
+      async (reg) => {
+        const panes: string[] = [];
+        for (let i = 0; i < 8; i++) {
+          const job = await reg.dispatch(`job ${i}`);
+          assert.equal(job.status, "running", `dispatch ${i} must not be refused or held`);
+          panes.push(job.paneId!);
+        }
+        assert.equal(new Set(panes).size, 8, "eight dispatches, eight distinct panes");
+      },
+    );
+  } finally {
+    world.teardown();
+    await cleanup();
+  }
+});
+
+test("a pane the captain closed is pruned from the pane store and never dispatched into", async () => {
+  // Acceptance criterion 6, on the store side (the layout side is covered by the
+  // pruning tests further down).
+  const { paths, cleanup } = await tmpInstance();
+  const world = stubPaneWorld();
+  const store = PaneStore.ephemeral();
+  try {
+    await withRegistry(
+      {
+        paths,
+        config: reuseConfig(paths.root),
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        ttyProbe: world.ttyProbe,
+        paneStore: store,
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one"); // anchor-1
+        const j2 = await reg.dispatch("two"); // split → pane-1
+        await crewExits(reg, j1, world);
+        await crewExits(reg, j2, world);
+        assert.deepEqual(
+          store.list().map((r: PaneRecord) => r.id).sort(),
+          ["anchor-1", "pane-1"],
+          "both panes are on record",
+        );
+
+        world.close("pane-1"); // the captain closes it
+        const j3 = await reg.dispatch("three");
+        assert.equal(j3.paneId, "anchor-1", "the closed pane is not dispatched into");
+        assert.deepEqual(
+          store.list().map((r: PaneRecord) => r.id),
+          ["anchor-1"],
+          "and its record is gone rather than lingering into the next session",
+        );
+      },
+    );
+  } finally {
+    world.teardown();
+    await cleanup();
+  }
+});
+
+test("a stale lease from a killed co session does not block reuse; a live one does", async () => {
+  // Acceptance criterion 7. A lease is only believed while the process holding it
+  // is alive — otherwise a co that was Ctrl-C'd would poison its panes forever.
+  const { paths, cleanup } = await tmpInstance();
+
+  /** A previous session's record for the anchor: identity learned, lease still
+   *  held by pid 4242. Whether that pid is alive is the whole question. */
+  const seeded = (id: { tty: string; pid: number }): PaneStore =>
+    PaneStore.ephemeral([
+      {
+        id: "anchor-1",
+        role: "anchor",
+        tty: id.tty,
+        shellPid: id.pid,
+        usedAt: 1,
+        lease: { session: "dead-session", pid: 4242, job: "job-009" },
+      },
+    ]);
+
+  const world = stubPaneWorld();
+  try {
+    // The anchor already exists and is idle; this session has never launched
+    // into it, so everything it knows comes from the store.
+    const anchor = world.seed("anchor-1");
+    await withRegistry(
+      {
+        paths,
+        config: reuseConfig(paths.root),
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        ttyProbe: world.ttyProbe,
+        paneStore: seeded(anchor),
+        pidAlive: () => false, // the owning session is gone
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one");
+        assert.equal(j1.paneId, "anchor-1", "the stale lease is swept and the idle pane reused");
+      },
+    );
+  } finally {
+    world.teardown();
+  }
+
+  // Same record, but the owner is still alive: another co session is using it.
+  const world2 = stubPaneWorld();
+  try {
+    const anchor = world2.seed("anchor-1");
+    await withRegistry(
+      {
+        paths,
+        config: reuseConfig(paths.root),
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        ttyProbe: world2.ttyProbe,
+        paneStore: seeded(anchor),
+        pidAlive: () => true,
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one");
+        assert.equal(j1.paneId, "pane-1", "a live foreign lease means split, not steal");
+      },
+    );
+  } finally {
+    world2.teardown();
+    await cleanup();
+  }
+});
+
+test("a pane co has no identity for is never taken over twice — only the first, virgin anchor", async () => {
+  // The one unproven placement in the design, bounded: co may take over a freshly
+  // designated anchor once (it has no tty for it and `co pane` promises the first
+  // dispatch lands there). After that the anchor is judged like anything else,
+  // and a launch that reports no tty leaves it unprovable — so the next dispatch
+  // splits rather than typing into it again.
+  const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty(); // this stub writes NO identity sidecar
+  try {
+    await withRegistry(
+      {
+        paths,
+        config: reuseConfig(paths.root),
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        // Nothing can be read about any pane: every judgement is "unproven".
+        ttyProbe: async () => null,
+      },
+      async (reg) => {
+        const j1 = await reg.dispatch("one");
+        assert.equal(j1.paneId, "anchor-1", "the virgin anchor is taken over once");
+        await fsp.writeFile(j1.captureFile, "done\n__CO_DISPATCH_DONE__ 0\n", "utf8");
         await fsp.rm(`${j1.captureFile}.sh`, { force: true });
         await (reg as unknown as { tick: () => Promise<void> }).tick();
 
-        assert.equal(j3.status, "running", "the freed pane relaunches the queued job");
-        assert.equal(j3.paneId, "anchor-1", "into the released anchor pane");
-        void j2;
+        const j2 = await reg.dispatch("two");
+        assert.equal(j2.paneId, "pane-1", "with nothing provable, the next dispatch splits");
       },
     );
   } finally {
@@ -1457,10 +1804,13 @@ test("an orphaned launch failure is bounded: one split attempt, then a clean fai
   }
 });
 
-test("the fix is narrow: a busy pane we were HANDED still escalates to anchor loss", async () => {
-  // The boundary. A takeover targets a pane we did not create; if the job never
-  // starts there the pane is real, still open, and owned by something else — that
-  // is NOT an orphan, and the pre-existing escalation must be untouched.
+test("a busy pane we were HANDED is not a dead pane: the dispatch splits from it instead", async () => {
+  // The boundary, and the one behaviour this slice deliberately changes. A
+  // takeover targets a pane co did not create; if the job never starts there the
+  // pane is real, still open, and owned by something else. It used to escalate to
+  // "the anchor is gone, re-run `co pane`" — which was the wrong diagnosis and
+  // dropped a perfectly good link. Now it means exactly what it says: the pane is
+  // busy, so split one off it and leave whatever is in there alone.
   const { paths, cleanup } = await tmpInstance();
   const closes: string[] = [];
   setGhosttyAvailableForTest(true);
@@ -1469,6 +1819,12 @@ test("the fix is narrow: a busy pane we were HANDED still escalates to anchor lo
     if (s.includes("close ")) {
       closes.push(s);
       return "";
+    }
+    if (s.includes("split ")) {
+      // A split off the busy anchor works normally: play the launch probe.
+      const m = s.match(/\/bin\/sh '([^']+)\.sh'/);
+      if (m) await fsp.writeFile(m[1]!, "", "utf8");
+      return "pane-1";
     }
     // The paste "succeeds" but whatever owns the anchor swallowed it: no capture.
     return "anchor-1";
@@ -1487,11 +1843,11 @@ test("the fix is narrow: a busy pane we were HANDED still escalates to anchor lo
       },
       async (reg) => {
         const j1 = await reg.dispatch("one"); // takeover anchor-1, which is busy
-        assert.equal(j1.status, "failed");
-        assert.match(j1.error ?? "", /co pane/, "a busy handed pane still names the fix");
-        assert.equal(anchorLost, 1, "and still reports anchor loss exactly once");
-        assert.equal(reg.paneReady, false, "the anchor is dropped, exactly as before");
-        assert.deepEqual(closes, [], "nothing was created, so nothing is reaped");
+        assert.equal(j1.status, "running", "the dispatch lands rather than failing");
+        assert.equal(j1.paneId, "pane-1", "in a pane split off the busy anchor");
+        assert.equal(anchorLost, 0, "the anchor was never lost — it is just occupied");
+        assert.equal(reg.paneReady, true, "so the link is intact");
+        assert.deepEqual(closes, [], "nothing was created and abandoned");
       },
     );
   } finally {

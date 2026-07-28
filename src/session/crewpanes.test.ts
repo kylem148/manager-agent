@@ -5,6 +5,7 @@ import {
   DEFAULT_PANE_LAYOUT,
   crewPaneTitle,
   type PlacementDecision,
+  type PlacementInput,
 } from "./crewpanes.js";
 
 /**
@@ -12,25 +13,27 @@ import {
  * layer of crew dispatch, and it is pure: no AppleScript, no processes, no disk.
  * So these tests exercise the state machine directly — the same decisions the
  * transport would execute — against the acceptance criteria in the dispatch
- * order: anchor takeover, alternating splits of the newest pane, cap + reuse,
- * queue-when-full, configurable direction/cap, and restart survival.
+ * order: reuse a provably idle pane before creating one, alternating splits of
+ * the newest pane when nothing is free, no cap at any count, and restart
+ * survival. Whether a pane IS idle is measured elsewhere (paneoccupancy.ts) and
+ * arrives here as the `free` list, so it is a plain input in every case below.
  */
 
 const ANCHOR = { id: "pane-anchor", title: crewPaneTitle("my-saas") };
 
 /** Drive one full dispatch: plan → transport learns a pane id → commit. The
  *  callback yields the pane id the transport "creates" for split/takeover. */
-function dispatch(layout: CrewPaneLayout, newId: (d: PlacementDecision) => string): PlacementDecision {
-  const decision = layout.plan();
-  if (decision.kind === "queue") {
-    layout.abort(); // nothing placed; a queued dispatch commits nothing
-    return decision;
-  }
+function dispatch(
+  layout: CrewPaneLayout,
+  newId: (d: PlacementDecision) => string,
+  input: PlacementInput = {},
+): PlacementDecision {
+  const decision = layout.plan(input);
   layout.commit(newId(decision));
   return decision;
 }
 
-/** A transport stub: the anchor keeps its id; each split returns a fresh id. */
+/** A transport stub: an existing pane keeps its id; each split returns a fresh one. */
 function splitTransport(): (d: PlacementDecision) => string {
   let n = 0;
   return (d) => {
@@ -39,20 +42,36 @@ function splitTransport(): (d: PlacementDecision) => string {
   };
 }
 
-test("first dispatch takes over the anchor, no split", () => {
+/** The very first dispatch into an anchor co has never run a job in: the one
+ *  placement made without proof (see the module doc). */
+const VIRGIN_ANCHOR: PlacementInput = { anchorUnproven: true };
+
+test("the first dispatch into an anchor co has never used takes it over, no split", () => {
   const layout = new CrewPaneLayout(ANCHOR);
-  const decision = layout.plan();
+  const decision = layout.plan(VIRGIN_ANCHOR);
   assert.deepEqual(decision, { kind: "takeover", paneId: "pane-anchor" });
   layout.commit("pane-anchor");
   assert.equal(layout.paneCount, 1);
   assert.equal(layout.runningCount, 1);
 });
 
-test("jobs 2-4 split the newest pane, alternating beside/below by default", () => {
-  const layout = new CrewPaneLayout(ANCHOR); // default seq ["right","down"], cap 4
+test("an anchor co CAN judge but hasn't proven idle is split from, never taken over", () => {
+  // co has an identity on record for the anchor (anchorUnproven false) and the
+  // occupancy read did not put it in `free` — something is running in it. The
+  // pane must not be typed into; splitting it is harmless.
+  const layout = new CrewPaneLayout(ANCHOR);
+  assert.deepEqual(layout.plan({ free: [] }), {
+    kind: "split",
+    target: "pane-anchor",
+    direction: "right",
+  });
+});
+
+test("with nothing free, dispatches split the newest pane, alternating beside/below", () => {
+  const layout = new CrewPaneLayout(ANCHOR); // default seq ["right","down"]
   const tx = splitTransport();
 
-  dispatch(layout, tx); // job 1: takeover anchor
+  dispatch(layout, tx, VIRGIN_ANCHOR); // job 1: takeover anchor
 
   const j2 = dispatch(layout, tx);
   assert.deepEqual(j2, { kind: "split", target: "pane-anchor", direction: "right" });
@@ -67,90 +86,108 @@ test("jobs 2-4 split the newest pane, alternating beside/below by default", () =
   assert.equal(layout.paneCount, 4);
 });
 
-test("job 5 reuses the oldest finished pane when one is free", () => {
+test("a pane proven free is reused instead of splitting a new one", () => {
+  // The bug this whole slice exists for: the captain /exits the agent, the pane
+  // returns to a shell prompt, and the next dispatch used to split anyway.
   const layout = new CrewPaneLayout(ANCHOR);
   const tx = splitTransport();
-  for (let i = 0; i < 4; i++) dispatch(layout, tx); // fill to cap: anchor, pane-1, pane-2, pane-3
+  dispatch(layout, tx, VIRGIN_ANCHOR); // anchor
+  dispatch(layout, tx); // split → pane-1
+  layout.finish("pane-1");
 
-  // Finish two, oldest-first order should pick the anchor (seq 0).
+  const next = dispatch(layout, tx, { free: ["pane-1"] });
+  assert.deepEqual(next, { kind: "reuse", paneId: "pane-1" });
+  assert.equal(layout.paneCount, 2, "reuse creates no pane");
+  assert.equal(layout.runningCount, 2, "the reused pane flips back to running");
+});
+
+test("the oldest free pane wins, so reuse rotates rather than hammering one pane", () => {
+  const layout = new CrewPaneLayout(ANCHOR);
+  const tx = splitTransport();
+  for (let i = 0; i < 4; i++) dispatch(layout, tx, i === 0 ? VIRGIN_ANCHOR : {});
   layout.finish("pane-2");
   layout.finish("pane-anchor");
 
-  const j5 = dispatch(layout, tx);
-  assert.deepEqual(j5, { kind: "reuse", paneId: "pane-anchor" });
-  assert.equal(layout.paneCount, 4, "reuse must not create a 5th pane");
-  assert.equal(layout.runningCount, 3, "anchor flips back to running");
+  // Both are offered; the anchor was created first (seq 0), so it goes first.
+  const next = dispatch(layout, tx, { free: ["pane-2", "pane-anchor"] });
+  assert.deepEqual(next, { kind: "reuse", paneId: "pane-anchor" });
 });
 
-test("job 5 queues when at the cap with nothing finished", () => {
+test("a pane the layout knows is RUNNING is never reused, however free it looks", () => {
+  // Belt and braces over the registry's lease check: the layout has the last
+  // word on a pane it just launched into.
   const layout = new CrewPaneLayout(ANCHOR);
   const tx = splitTransport();
-  for (let i = 0; i < 4; i++) dispatch(layout, tx);
-
-  const j5 = dispatch(layout, tx);
-  assert.deepEqual(j5, { kind: "queue" });
-  assert.equal(layout.paneCount, 4, "a queued dispatch places nothing");
-
-  // Once a pane frees, the next dispatch reuses it rather than queueing.
-  layout.finish("pane-1");
-  const retry = dispatch(layout, tx);
-  assert.deepEqual(retry, { kind: "reuse", paneId: "pane-1" });
+  dispatch(layout, tx, VIRGIN_ANCHOR);
+  const next = layout.plan({ free: ["pane-anchor"] });
+  assert.deepEqual(next, { kind: "split", target: "pane-anchor", direction: "right" });
 });
 
-test("a queued dispatch leaves no pending state, so the next plan() works", () => {
+test("a pane co owns but does not track — the anchor, or one from an earlier run — is taken over", () => {
   const layout = new CrewPaneLayout(ANCHOR);
   const tx = splitTransport();
-  for (let i = 0; i < 4; i++) dispatch(layout, tx);
+  dispatch(layout, tx, VIRGIN_ANCHOR); // anchor is tracked now
+  dispatch(layout, tx); // split → pane-1
 
-  assert.deepEqual(layout.plan(), { kind: "queue" });
-  // No abort() needed after a queue; planning again must not throw.
-  assert.deepEqual(layout.plan(), { kind: "queue" });
+  // pane-77 is a pane a previous session created and the store still remembers;
+  // the registry proved it idle. It joins the layout rather than being split.
+  const next = layout.plan({ free: ["pane-77"] });
+  assert.deepEqual(next, { kind: "takeover", paneId: "pane-77" });
+  layout.commit("pane-77");
+  assert.deepEqual(layout.trackedPaneIds, ["pane-anchor", "pane-1", "pane-77"]);
 });
 
-test("direction sequence and cap are configurable", () => {
-  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["down", "right", "left"], cap: 3 });
+test("there is no cap: with nothing free, panes keep being created at any count", () => {
+  // The order is explicit that splitting must never refuse. A false "occupied"
+  // costs one extra pane, and that has to stay cheap at 5 panes and at 50.
+  const layout = new CrewPaneLayout(ANCHOR);
+  const tx = splitTransport();
+  const kinds = new Set<string>();
+  for (let i = 0; i < 25; i++) {
+    kinds.add(dispatch(layout, tx, i === 0 ? VIRGIN_ANCHOR : {}).kind);
+  }
+  assert.equal(layout.paneCount, 25, "every dispatch placed somewhere");
+  assert.deepEqual([...kinds].sort(), ["split", "takeover"], "no queue, no refusal");
+});
+
+test("direction sequence is configurable", () => {
+  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["down", "right", "left"] });
   const tx = splitTransport();
 
-  dispatch(layout, tx); // takeover
+  dispatch(layout, tx, VIRGIN_ANCHOR); // takeover
   assert.deepEqual(dispatch(layout, tx), { kind: "split", target: "pane-anchor", direction: "down" });
   assert.deepEqual(dispatch(layout, tx), { kind: "split", target: "pane-1", direction: "right" });
-
-  // cap is 3, so the 4th dispatch is past the cap already.
-  assert.equal(layout.paneCount, 3);
-  assert.deepEqual(layout.plan(), { kind: "queue" });
+  assert.deepEqual(dispatch(layout, tx), { kind: "split", target: "pane-2", direction: "left" });
+  assert.deepEqual(dispatch(layout, tx), { kind: "split", target: "pane-3", direction: "down" });
 });
 
 test("bad config falls back to defaults instead of crashing", () => {
-  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: [], cap: 0 });
+  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: [] });
   assert.deepEqual(layout.resolvedConfig, DEFAULT_PANE_LAYOUT);
 });
 
 test("splitCount indexes splits, not dispatches, so reuse doesn't skip directions", () => {
   // Regression guard: a reuse must not advance the direction sequence, or the
   // next real split would land in the wrong direction.
-  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"], cap: 2 });
+  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"] });
   const tx = splitTransport();
 
-  dispatch(layout, tx); // takeover anchor
+  dispatch(layout, tx, VIRGIN_ANCHOR); // takeover anchor
   assert.deepEqual(dispatch(layout, tx), { kind: "split", target: "pane-anchor", direction: "right" });
 
-  // At cap (2). Finish and reuse — this is not a split.
+  // Finish and reuse — this is not a split.
   layout.finish("pane-1");
-  assert.deepEqual(dispatch(layout, tx), { kind: "reuse", paneId: "pane-1" });
+  assert.deepEqual(dispatch(layout, tx, { free: ["pane-1"] }), { kind: "reuse", paneId: "pane-1" });
 
-  // Free a slot so a real split can happen again; it should be the SECOND
-  // direction ("down"), proving reuse didn't consume a sequence step.
-  const wide = CrewPaneLayout.fromState(layout.toState(), { directionSequence: ["right", "down"], cap: 3 });
-  wide.finish("pane-anchor");
-  // paneCount is 2 < cap 3 now, so this splits the newest pane.
-  const d = wide.plan();
-  assert.deepEqual(d, { kind: "split", target: "pane-1", direction: "down" });
+  // The next real split uses the SECOND direction ("down"), proving reuse didn't
+  // consume a sequence step.
+  assert.deepEqual(layout.plan(), { kind: "split", target: "pane-1", direction: "down" });
 });
 
 test("finish is tolerant of unknown and duplicate ids", () => {
   const layout = new CrewPaneLayout(ANCHOR);
   const tx = splitTransport();
-  dispatch(layout, tx);
+  dispatch(layout, tx, VIRGIN_ANCHOR);
   assert.equal(layout.finish("nope"), false, "unknown id is a no-op");
   assert.equal(layout.finish("pane-anchor"), true);
   assert.equal(layout.finish("pane-anchor"), false, "already-finished is a no-op");
@@ -164,22 +201,22 @@ test("plan() twice without resolving throws (dispatch is sequential)", () => {
 
 test("abort discards the pending decision so the next plan() succeeds", () => {
   const layout = new CrewPaneLayout(ANCHOR);
-  const first = layout.plan();
+  const first = layout.plan(VIRGIN_ANCHOR);
   assert.equal(first.kind, "takeover");
   layout.abort();
   // Aborting the takeover means no pane was created; planning again re-offers it.
-  assert.deepEqual(layout.plan(), { kind: "takeover", paneId: "pane-anchor" });
+  assert.deepEqual(layout.plan(VIRGIN_ANCHOR), { kind: "takeover", paneId: "pane-anchor" });
   assert.equal(layout.paneCount, 0);
 });
 
 test("state round-trips across a restart", () => {
-  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"], cap: 4 });
+  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"] });
   const tx = splitTransport();
-  dispatch(layout, tx); // takeover
+  dispatch(layout, tx, VIRGIN_ANCHOR); // takeover
   dispatch(layout, tx); // split → pane-1
   layout.finish("pane-anchor");
 
-  const restored = CrewPaneLayout.fromState(layout.toState(), { directionSequence: ["right", "down"], cap: 4 });
+  const restored = CrewPaneLayout.fromState(layout.toState(), { directionSequence: ["right", "down"] });
   assert.equal(restored.paneCount, 2);
   assert.equal(restored.runningCount, 1);
   // The next split should continue the sequence (2nd split → "down") and target
@@ -204,7 +241,7 @@ test("crewPaneTitle namespaces by instance for discovery", () => {
 test("prune drops a tracked pane and is tolerant of unknown ids", () => {
   const layout = new CrewPaneLayout(ANCHOR);
   const tx = splitTransport();
-  dispatch(layout, tx); // takeover anchor
+  dispatch(layout, tx, VIRGIN_ANCHOR); // takeover anchor
   dispatch(layout, tx); // split → pane-1
   assert.deepEqual(layout.trackedPaneIds, ["pane-anchor", "pane-1"]);
 
@@ -216,9 +253,9 @@ test("prune drops a tracked pane and is tolerant of unknown ids", () => {
 });
 
 test("after the newest pane is closed, the next split targets the newest LIVING pane (fibonacci preserved)", () => {
-  const layout = new CrewPaneLayout(ANCHOR); // seq ["right","down"], cap 4
+  const layout = new CrewPaneLayout(ANCHOR); // seq ["right","down"]
   const tx = splitTransport();
-  dispatch(layout, tx); // takeover anchor
+  dispatch(layout, tx, VIRGIN_ANCHOR); // takeover anchor
   dispatch(layout, tx); // split anchor → pane-1 (dir right)
   dispatch(layout, tx); // split pane-1 → pane-2 (dir down)
   assert.deepEqual(layout.trackedPaneIds, ["pane-anchor", "pane-1", "pane-2"]);
@@ -232,9 +269,9 @@ test("after the newest pane is closed, the next split targets the newest LIVING 
 });
 
 test("when every worker child is closed, the next split falls back to the anchor", () => {
-  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"], cap: 4 });
+  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"] });
   const tx = splitTransport();
-  dispatch(layout, tx); // takeover anchor (seq 0)
+  dispatch(layout, tx, VIRGIN_ANCHOR); // takeover anchor (seq 0)
   dispatch(layout, tx); // split → pane-1 (seq 1, splitCount 1)
   dispatch(layout, tx); // split → pane-2 (seq 2, splitCount 2)
 
@@ -246,15 +283,16 @@ test("when every worker child is closed, the next split falls back to the anchor
 
   // The link is not dead: the next worker grows by SPLITTING the persisted
   // anchor (the spiral's root), continuing the direction sequence (2 splits so
-  // far → index 2 % 2 → "right").
+  // far → index 2 % 2 → "right"). Note it SPLITS rather than taking the anchor
+  // over: nothing proved the anchor idle.
   const d = layout.plan();
   assert.deepEqual(d, { kind: "split", target: "pane-anchor", direction: "right" });
 });
 
 test("splitting from the anchor fallback registers a fresh child the next split grows from", () => {
-  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"], cap: 4 });
+  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"] });
   const tx = splitTransport();
-  dispatch(layout, tx); // takeover anchor
+  dispatch(layout, tx, VIRGIN_ANCHOR); // takeover anchor
   dispatch(layout, tx); // split → pane-1
   layout.prune("pane-1");
   layout.prune("pane-anchor"); // worker box empty
@@ -274,9 +312,9 @@ test("splitting from the anchor fallback registers a fresh child the next split 
 
 test("pruning does not disturb the direction sequence", () => {
   // A closed pane must not skip or repeat a split direction, or the spiral bends.
-  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"], cap: 4 });
+  const layout = new CrewPaneLayout(ANCHOR, { directionSequence: ["right", "down"] });
   const tx = splitTransport();
-  dispatch(layout, tx); // takeover
+  dispatch(layout, tx, VIRGIN_ANCHOR); // takeover
   dispatch(layout, tx); // split → pane-1 (dir right, splitCount 1)
   layout.prune("pane-1"); // captain closes it before the next dispatch
 

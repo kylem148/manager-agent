@@ -114,8 +114,8 @@ export interface FeatureView {
   intent?: string;
   /** Jobs the registry has dispatched under this feature (id + status + label). */
   jobs: { id: string; status: string; label: string }[];
-  /** Whether a crew agent is currently running or queued in the worktree. A
-   *  feature runs one agent at a time. */
+  /** Whether a crew agent is currently running in the worktree. A feature runs
+   *  one agent at a time. */
   busy: boolean;
   /** The feature's place in the serial merge queue, when it is enqueued: its
    *  position, whether it is the head, and its queue status (queued /
@@ -139,8 +139,8 @@ export interface CreateResult {
  * about a feature that is in both.
  */
 export type FeatureActivity =
-  /** A crew agent is running (or queued) in the worktree, and the feature is not
-   *  in the merge queue. */
+  /** A crew agent is running in the worktree, and the feature is not in the
+   *  merge queue. */
   | "working"
   /** Tracked, nothing running, not enqueued: work in the worktree, or waiting to
    *  be enqueued. The resting state. */
@@ -180,7 +180,7 @@ export interface FeatureOverview {
   /** The stored one-line description, when the co gave one at create time. */
   intent?: string;
   status: FeatureActivity;
-  /** Whether a crew agent is running or queued in the worktree. Reported
+  /** Whether a crew agent is running in the worktree. Reported
    *  separately from `status` because an enqueued feature's queue state is the
    *  more useful chip, and a resolver agent working a blocked head must still be
    *  visible. */
@@ -297,13 +297,11 @@ export class FeatureManager {
     });
   }
 
-  /** Whether a crew agent is currently running or queued in the feature's
-   *  worktree — a feature is worked one agent at a time, so this gates landing
-   *  and queue processing. */
+  /** Whether a crew agent is currently running in the feature's worktree — a
+   *  feature is worked one agent at a time, so this gates landing and queue
+   *  processing. */
   private isBusy(feature: string): boolean {
-    return this.registry
-      .jobsForFeature(feature)
-      .some((j) => j.status === "running" || j.status === "queued");
+    return this.registry.jobsForFeature(feature).some((j) => j.status === "running");
   }
 
   /**

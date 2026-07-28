@@ -155,7 +155,7 @@ export async function runLink(cfg: Config, name: string | undefined): Promise<nu
   line(c.dim(`  agents:  ${config.agents.map((a) => a.name).join(", ")}  (default: ${config.defaultAgent})`));
   line(c.dim(`  command: ${displayCommand(resolveAgentCommand(config), config.repoPath)}`));
   if (config.caps.timeoutSec) line(c.dim(`  timeout: ${config.caps.timeoutSec}s`));
-  line(c.dim(`  panes:   ${config.pane.directionSequence.join("/")} split, cap ${config.pane.cap}`));
+  line(c.dim(`  panes:   ${config.pane.directionSequence.join("/")} split, idle panes reused first`));
   line();
   if (!config.anchor) {
     line(c.dim("Next, on macOS + Ghostty, designate the crew pane so dispatches land in the"));
