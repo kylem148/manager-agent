@@ -6,6 +6,7 @@ import {
   normalizeSelection,
   osc52,
   pad,
+  renderInboxItem,
   renderMarkdownDoc,
   type DocSource,
   type FeaturePanelEntry,
@@ -2024,6 +2025,49 @@ test("the inbox tab lists filed reviews newest-first with level, verdict and hea
   // A list row is a summary: the body stays out of it until you open one.
   assert.ok(!frame.includes("middleware is registered"), "bodies aren't in the list");
   h.stop();
+});
+
+/** The panel's rows as PAINTED, split out of the frame by the cursor moves that
+ *  place them. lastFramePlain() abuts the rows, which hides a row's indent. */
+function paintedRows(h: Harness): string[] {
+  return h.lastFrame().split(/\x1b\[\d+;1H/).slice(1).map(stripAnsi);
+}
+
+test("every inbox row keeps its two-space indent when the headline runs past the edge", async () => {
+  // Each painted row goes through clip(), which truncates by word-wrapping, and
+  // a wrap point drops a leading space run (wrap.ts). An entry built wider than
+  // the screen therefore came back flush against the left edge while its shorter
+  // neighbours stayed indented, so the list's left margin went ragged entry by
+  // entry. The rows are laid out to the width now, so none of them reach clip().
+  const long: InboxPanelEntry[] = REVIEWS.map((r, i) => ({
+    ...r,
+    headline: `entry ${i + 1} with a headline far past the right-hand edge of this panel`,
+  }));
+  const h = harness(undefined, 60, 14, undefined, fakeInbox([...long, ...REVIEWS]));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const rows = paintedRows(h).filter((r) => /\w\) \[L\d\]/.test(r));
+  assert.equal(rows.length, 6, "a row per entry, long and short alike");
+  for (const r of rows) {
+    assert.match(r, /^ {2}\S/, `indented by exactly two: ${JSON.stringify(r)}`);
+    assert.ok(r.length <= 60, `laid out inside the width: ${r.length} in ${JSON.stringify(r)}`);
+  }
+  h.stop();
+});
+
+test("a drilled-in review keeps its header indent when the headline wraps", () => {
+  const entry: InboxPanelEntry = {
+    ...REVIEWS[0]!,
+    headline: "a headline long enough that it has to wrap onto a second visual row here",
+  };
+  const rows = renderInboxItem(entry, 40).map(stripAnsi);
+  assert.equal(rows[0], "", "the entry opens with one blank line and no more");
+  const header = rows.slice(1, rows.indexOf("", 1));
+  assert.ok(header.length > 2, "the headline and metadata both wrapped");
+  for (const r of header) {
+    assert.match(r, /^ {2}\S/, `header row indented by exactly two: ${JSON.stringify(r)}`);
+  }
 });
 
 test("selecting a review drills into its full body and pages; Backspace returns to the list", async () => {
