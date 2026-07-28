@@ -344,6 +344,10 @@ The session is a scrollable terminal UI, not a plain read-out:
   lines]` instead of flooding the input, and the full text is sent when you
   submit (backspace deletes the whole chip). One-liners paste inline. This uses
   bracketed paste; set `CO_PASTE=off` to disable it if your terminal misbehaves.
+  Inside the Ctrl-O panel a paste goes to the PR message editor when that is
+  open, verbatim and whole; on a plain tab it is swallowed, because no view out
+  there is a text buffer and a pasted paragraph containing an `m` must not merge
+  the head PR.
 - **Two small nautical moments** mark the two points where the session is doing
   something and would otherwise sit still. Firing a confirmed dispatch runs the
   order out to sea above the input bar, over the branch it's headed for
@@ -711,15 +715,71 @@ never a to-do list for the reader, and it covers the crew's local verification
 only: the PR's CI result is already in the fenced block below it.
 
 **And you can rewrite it without leaving the terminal: `e`.** On the queue tab,
-beside the `[m]`, `e` opens the head PR's message in a small editor over the
-panel — line 1 the title, a blank line, then the description, the way you write a
-commit message. It is the input bar's editor, so there is nothing new to learn:
-the arrows move, Home/End and Ctrl-A/E/U/K work on the line you're on, Backspace
-and Delete do what they always do, long lines wrap for display only, and the view
-follows the cursor down a long description. The one difference is Enter, which
-inserts a newline here rather than sending: a description is prose, so **Ctrl-S**
-is what saves it. Esc cancels, and on a buffer you've changed the first Esc warns
-before the second discards.
+beside the `[m]`, `e` opens the head PR's message in an editor over the panel:
+line 1 the title, a blank line, then the description, the way you write a commit
+message. It takes the majority of the screen (90% of the width and of the panel
+body, floored at 32 columns and 7 rows so it still works on a small terminal, and
+capped at 120 columns and 44 rows so a wide one doesn't produce a line length
+nobody can read a sentence across), because the job it exists for is replacing a
+whole description and a keyhole is no good for that.
+
+It is the input bar's editor, so there is nothing new to learn: the arrows move,
+Home/End and Ctrl-A/E/U/K work on the line you're on, Backspace and Delete do
+what they always do, long lines wrap for display only, and the view follows the
+cursor down a long description. The one difference is Enter, which inserts a
+newline here rather than sending: a description is prose, so **Ctrl-S** is what
+saves it. Esc cancels, and on a buffer you've changed the first Esc warns before
+the second discards.
+
+On top of that it has the things a whole-body rewrite needs and the prompt line
+does not: **paste**, **drag-select**, and three keys that act on the buffer
+rather than the line. A multi-line paste lands as literal text, because the
+terminal's bracketed paste is read as one payload however many chunks it arrives
+in, so a forty-line body can never be read as forty Enter presses. A left-drag
+selects text (caret to caret, the way any editor does it) and the moment you let
+go it is on your system clipboard through OSC 52, the same escape the panel's own
+drag-select and `y` use. Typing or pasting over a selection replaces it, so
+"select all, paste" swaps a description out in one gesture.
+
+**The popup's full key table.** Everything the editor binds, and what each key
+acts on. Nothing else does anything; keys with no meaning here (Tab, Ctrl-C,
+Ctrl-D) are deliberately swallowed rather than falling through to the panel's
+meanings for them, and while a save is in flight every key and every mouse event
+is ignored until it settles.
+
+| key | what it does | scope |
+| --- | ------------ | ----- |
+| any printable character | insert at the caret, replacing the selection | character |
+| **Enter** (and Shift/Ctrl/Alt+Enter, Ctrl-J) | insert a newline; it never sends | character |
+| **Backspace** | delete the selection, else the character before the caret | character |
+| **Delete** | delete the selection, else the character after the caret | character |
+| **←** / **→** | move one character; drops the selection | character |
+| **↑** / **↓** | move one *visual* row (a wrapped line moves row by row) | row |
+| **PgUp** / **PgDn** | move a windowful of rows | row |
+| mouse **wheel** | scroll three rows, caret and all | row |
+| **Home** / **Ctrl-A** | start of the line the caret is on | line |
+| **End** / **Ctrl-E** | end of that line | line |
+| **Ctrl-U** | kill back to the start of that line | line |
+| **Ctrl-K** | kill to the end of that line | line |
+| **Ctrl-G** | select the whole buffer | buffer |
+| **Ctrl-X** | clear the whole buffer. A *cut*: what it removes goes to the clipboard first | buffer |
+| **Ctrl-Y** | copy the selection to the clipboard, or the whole buffer when nothing is selected | selection / buffer |
+| **left-drag** | select text; on release it is copied to the clipboard | selection |
+| **click** | move the caret there; a click outside the box drops the selection | character |
+| **Ctrl-S** | save the title and description to GitHub | buffer |
+| **Esc** (and **Ctrl-O**) | cancel; on a changed buffer the first press warns, the second discards | buffer |
+
+Ctrl-A is Home and not select-all, in both editors. It is the oldest binding the
+prompt line has, and moving it would strand every use of it. That is why the
+wholesale verbs got keys of their own instead of re-pointing the line keys, and
+why Ctrl-U still kills one line even with everything selected.
+
+The mouse belongs to whichever surface is in front: while the popup is open a
+drag selects *text inside it*, and the panel's own drag-select of painted cells
+resumes the moment it closes. The two selections are different things and are
+stored differently: the panel's is screen cells, so a resize has to drop it; the
+editor's is buffer offsets, so it survives a resize and still names the same
+words at the new width.
 
 Saving writes the title and the description to GitHub with `gh pr edit`, and
 stores them with the feature at the same time — so a later re-processing can't
@@ -1430,7 +1490,17 @@ where it visually appears on a wrapped line, the viewport-follows-cursor rule,
 the editing verbs, and the `git commit`-shaped title/body split. Two editors on
 one screen must not disagree about where a line breaks or what Ctrl-U does, so
 the rules live in one pure, unit-tested module and both surfaces are thin
-key-routing layers over it. `tui.ts` is
+key-routing layers over it.
+
+The split inside that module is deliberate too. The *pure functions* (the wrap,
+the caret mapping, the scroll rule, the title/body split) are what both editors
+share. The `TextEditor` class on top of them is the popup's alone: the prompt bar
+keeps its own buffer and cursor in `tui.ts`, which is what let the popup grow a
+selection model, a select-all and a clear-all with no path by which any of it can
+reach the prompt line. That selection is stored as buffer OFFSETS rather than
+screen cells, unlike the panel's drag-select, so it survives a re-wrap and
+therefore a terminal resize: the same characters stay selected at the new width
+instead of the selection having to be dropped. `tui.ts` is
 deliberately one large file: the render loop, input handling, and scroll state
 share mutable state, and splitting them across modules would mean exporting
 that state rather than encapsulating it.

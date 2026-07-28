@@ -1297,6 +1297,22 @@ interface PrEditState {
   error: string | null;
   /** True once Esc has been pressed on a dirty buffer: the next Esc discards. */
   escPending: boolean;
+  /**
+   * Bracketed-paste state, kept HERE rather than on the Tui: while the popup is
+   * open the panel branch of consume() runs first, so the prompt's paste
+   * machinery is never reached and the popup needs its own. `pasting` spans data
+   * events (a long description arrives in several) and the buffered content is
+   * inserted as ONE literal insert when the end marker lands, so a forty-line
+   * body can never be read as forty Enter presses.
+   */
+  pasting: boolean;
+  pasteBuf: string;
+  /** True only during an active left-drag inside the popup. The SELECTION lives
+   *  in the editor (as buffer offsets); this is just the gesture. */
+  dragging: boolean;
+  /** A copy receipt or a clear confirmation, shown on the popup's message line
+   *  until the next key. Same idea as the panel's copyNotice, scoped to the box. */
+  notice: string | null;
 }
 
 /**
@@ -1485,6 +1501,9 @@ export class Tui implements SessionIO {
   // head, present until pressed or until the head's state changes.
   private queueMerging: string | null = null;
   private queueMergeError: string | null = null;
+  // True while a bracketed paste is being swallowed on a panel tab (see
+  // consumeOverlay). The popup keeps its own paste state, on its own buffer.
+  private overlayPasting = false;
   // What the PR message editor has to say on the queue tab after it closes: the
   // save that landed, or the reason `e` had nothing to open. It banners at the
   // top of the tab (like queueMergeError, and for the same reason: a flash on
@@ -2577,6 +2596,15 @@ export class Tui implements SessionIO {
         // nothing to save — Enter sends — so it stays the no-op it always was.
         return;
 
+      case "select-all":
+      case "clear-all":
+      case "copy":
+        // The three buffer-scoped verbs belong to the PR message editor too.
+        // The prompt line has no selection and no clipboard of its own, and
+        // these bytes did nothing here before the popup learned them, so they
+        // go on doing nothing, and the prompt's behaviour is unchanged.
+        return;
+
       case "none":
         return;
     }
@@ -3286,8 +3314,28 @@ export class Tui implements SessionIO {
     // The PR message editor takes the keyboard whole while it is open: it needs
     // the EDITOR's decode table (where Ctrl-U kills to line start), not the
     // panel's (where it pages up), so it is routed before any panel translation
-    // rather than through dispatchOverlay.
+    // rather than through dispatchOverlay. It handles its own bracketed paste,
+    // into its buffer.
     if (this.panel?.view.kind === "prEdit") return this.consumePrEdit(data, i);
+
+    // A bracketed paste on a panel TAB has nowhere to land, since no view out
+    // here is a text buffer, so it is swallowed whole rather than let its
+    // characters read as panel keys. That matters more than it sounds: `m` is
+    // the merge on the queue tab, and a pasted paragraph containing one would
+    // otherwise merge the head. (Reachable the moment pasting into the panel is
+    // a normal gesture, which the message editor makes it.)
+    if (this.overlayPasting) {
+      const end = data.indexOf(PASTE_END, i);
+      if (end === -1) return data.length - i; // still mid-paste; await the rest
+      this.overlayPasting = false;
+      return end - i + PASTE_END.length;
+    }
+    if (data.startsWith(PASTE_START, i)) {
+      this.overlayPasting = true;
+      return PASTE_START.length;
+    }
+    if (data.startsWith(PASTE_END, i)) return PASTE_END.length;
+
     const ch = data[i]!;
     if (ch === ESC && data[i + 1] === "[") return this.consumeOverlayCsi(data, i);
     // A lone ESC leaves. (Under the Kitty protocol Escape arrives as CSI 27 u,
@@ -3981,14 +4029,29 @@ export class Tui implements SessionIO {
    * than stored: a resize then re-lays it out instead of tearing (the same rule
    * the animation region follows). `textRows` is the buffer viewport's height;
    * the box also carries two borders and one message line.
+   *
+   * IT TAKES THE MAJORITY OF THE TERMINAL, because the job it exists for is
+   * replacing a whole description, and fourteen rows of a forty-line body is a
+   * keyhole. Both axes are a percentage of the screen with a floor and a ceiling:
+   *
+   *   width  90% of the columns, min 32, max 120 (never wider than cols - 2)
+   *   height 90% of the panel body (rows - 2), min 7, max 44 rows
+   *
+   * The floors keep it usable on a small terminal (the clamp to cols-2 / the body
+   * height wins over them, so the box never overflows a screen too small to hold
+   * its own minimum); the ceilings stop a full-screen terminal from producing a
+   * 200-column line length nobody can read a sentence across.
    */
   private prEditBox(): { left: number; top: number; width: number; textRows: number } {
-    const width = Math.max(24, Math.min(this.cols - 4, 76));
+    const width = Math.max(
+      1,
+      Math.min(this.cols - 2, Math.max(32, Math.min(120, Math.floor(this.cols * 0.9)))),
+    );
     // The panel body is rows 2..rows-1; the box lives inside that, never over
     // the tab bar or the footer.
     const body = Math.max(1, this.rows - 2);
-    const textRows = Math.max(1, Math.min(14, body - 3));
-    const height = textRows + 3;
+    const height = Math.max(4, Math.min(body, Math.max(7, Math.min(44, Math.floor(body * 0.9)))));
+    const textRows = Math.max(1, height - 3);
     const left = 1 + Math.max(0, Math.floor((this.cols - width) / 2));
     const top = Math.max(2, Math.min(1 + Math.floor((this.rows - height) / 2), this.rows - height));
     return { left, top, width, textRows };
@@ -4036,6 +4099,10 @@ export class Tui implements SessionIO {
       status: "editing",
       error: null,
       escPending: false,
+      pasting: false,
+      pasteBuf: "",
+      dragging: false,
+      notice: null,
     };
     panel.view = { kind: "prEdit" };
     this.queueEditNotice = null;
@@ -4048,6 +4115,10 @@ export class Tui implements SessionIO {
   private closePrEditor(notice?: { text: string; ok: boolean }): void {
     const panel = this.panel;
     if (!panel) return;
+    // A save can land mid-paste (the popup closes on success while the terminal
+    // is still feeding us the payload). Hand the paste over to the tab's own
+    // swallower rather than let its remaining bytes arrive as panel keys.
+    if (panel.prEdit?.pasting) this.overlayPasting = true;
     panel.prEdit = null;
     if (panel.view.kind === "prEdit") panel.view = { kind: "queue" };
     if (notice) this.queueEditNotice = notice;
@@ -4083,16 +4154,22 @@ export class Tui implements SessionIO {
     const saving = state.status === "saving";
     const ch = data[i]!;
 
-    // A bracketed paste: the content is ordinary text, inserted in one go so a
-    // long paste costs one repaint rather than one per character. A paste split
-    // across data events falls back to the per-character path below, where CR
-    // lands as a newline — which is what Enter does here anyway.
+    // Inside a bracketed paste every byte is opaque content, accumulated across
+    // as many data events as the paste spans, and never parsed as keys. This is
+    // the whole reason a multi-line description can be pasted at all: without it
+    // the embedded newlines arrive as Enter presses and the CSI sequences in a
+    // pasted diff arrive as arrow keys.
+    if (state.pasting) return this.consumePrEditPaste(state, data, i);
+
+    // The start of one. Checked before the generic CSI dispatch because the
+    // marker itself begins with ESC [.
     if (data.startsWith(PASTE_START, i)) {
-      const end = data.indexOf(PASTE_END, i + PASTE_START.length);
-      const body = data.slice(i + PASTE_START.length, end === -1 ? data.length : end);
-      if (!saving && body !== "") this.prEditAction({ kind: "insert", text: body });
-      return (end === -1 ? data.length : end + PASTE_END.length) - i;
+      state.pasting = true;
+      state.pasteBuf = "";
+      return PASTE_START.length;
     }
+    // A stray end marker with no start (a paste that began before the popup
+    // opened): swallow it rather than type its bytes.
     if (data.startsWith(PASTE_END, i)) return PASTE_END.length;
 
     // Alt+Enter as an ESC prefix, checked before the generic ESC dispatch for
@@ -4110,14 +4187,50 @@ export class Tui implements SessionIO {
     return 1;
   }
 
+  /**
+   * Consume bytes while inside the popup's bracketed paste. Everything up to
+   * PASTE_END is content; a chunk that ends without the marker is buffered and
+   * we stay `pasting` for the next data event. Returns bytes consumed.
+   *
+   * The whole payload lands as ONE insert, so a 40-line body costs one repaint
+   * and one undo-able edit rather than 2,000 keystrokes' worth of both.
+   */
+  private consumePrEditPaste(state: PrEditState, data: string, i: number): number {
+    const end = data.indexOf(PASTE_END, i);
+    if (end === -1) {
+      state.pasteBuf += data.slice(i);
+      return data.length - i;
+    }
+    state.pasteBuf += data.slice(i, end);
+    const text = state.pasteBuf;
+    state.pasting = false;
+    state.pasteBuf = "";
+    // A save in flight swallows the paste rather than queueing it: the same
+    // fire-once interlock every other key obeys while gh is running.
+    if (state.status !== "saving" && text !== "") {
+      state.notice = null;
+      state.escPending = false;
+      // TextEditor.insert normalises CR/CRLF and strips the control bytes a
+      // paste can carry, and replaces the selection when there is one, so
+      // "select all, paste" swaps a description out in one gesture.
+      state.editor.insert(text);
+      this.paint();
+    }
+    return end - i + PASTE_END.length;
+  }
+
   /** The CSI half of the editor's input: arrows, Home/End, Delete, the enhanced
-   *  protocols' spellings — and mouse reports, which are consumed WHOLE and
-   *  dropped so a drag can neither type its own coordinates into the buffer nor
-   *  start a panel selection behind the popup. */
+   *  protocols' spellings, and mouse reports, which belong to the EDITOR while
+   *  the popup is open (text selection), never to the panel underneath it. The
+   *  handoff is this one branch: the panel's own drag handler is unreachable
+   *  from here, and it resumes the moment the popup closes and the panel's input
+   *  path takes CSI again. */
   private consumePrEditCsi(data: string, i: number): number {
     if (data[i + 2] === "<") {
       const end = this.findMouseEnd(data, i + 3);
-      return end === -1 ? data.length - i : end - i + 1;
+      if (end === -1) return data.length - i;
+      this.handlePrEditMouse(data.slice(i + 3, end), data[end] === "M");
+      return end - i + 1;
     }
     let j = i + 2;
     while (j < data.length && !/[A-Za-z~]/.test(data[j]!)) j++;
@@ -4174,6 +4287,9 @@ export class Tui implements SessionIO {
     // Only another Escape consumes the discard arming; every other key disarms.
     const wasEscPending = state.escPending;
     if (action.kind !== "escape" && action.kind !== "open-docs") state.escPending = false;
+    // A receipt describes a selection that the next key is about to change, so
+    // it is retired here, and re-set below by the keys that earn a new one.
+    state.notice = null;
 
     switch (action.kind) {
       case "insert":
@@ -4199,6 +4315,31 @@ export class Tui implements SessionIO {
       case "kill-to-end":
         editor.killToEnd();
         break;
+      // The three buffer-scoped verbs. Ctrl-A/E/U/K stay line-scoped, because a
+      // description is many lines and they mean what they mean everywhere else,
+      // so wholesale work gets keys of its own.
+      case "select-all":
+        editor.selectAll();
+        break;
+      case "clear-all": {
+        // A cut, not a wipe: what it removes goes to the clipboard first, so the
+        // one key that can empty a forty-line body never empties it into nothing.
+        const gone = editor.clearAll();
+        if (gone !== "") {
+          this.copyToClipboard(gone);
+          state.notice = `cleared · ${countLines(gone)} line${countLines(gone) === 1 ? "" : "s"} on the clipboard`;
+        }
+        break;
+      }
+      case "copy": {
+        // The selection, or the whole buffer when nothing is selected: the same
+        // "give me this bit" / "give me the lot" pair the doc view has.
+        const text = editor.selectedText() || editor.text;
+        if (text === "") break;
+        this.copyToClipboard(text);
+        state.notice = copyReceipt(countLines(text));
+        break;
+      }
       case "save":
         this.savePrMessage();
         return;
@@ -4217,35 +4358,151 @@ export class Tui implements SessionIO {
     this.paint();
   }
 
+  // --- selecting text inside the popup -----------------------------------------
+  //
+  // The popup owns the mouse for as long as it is open (consumePrEditCsi routes
+  // every report here, and the panel's own drag handler is not reachable from
+  // that path). A left-drag selects TEXT, not painted cells: the endpoints are
+  // buffer offsets, so the selection survives a re-wrap, and therefore a resize,
+  // where the panel's row/col selection has to be dropped. On release the
+  // selected text goes to the system clipboard through the same OSC 52 write the
+  // panel and the transcript use.
+
+  /**
+   * An SGR mouse report while the popup is open. Same wire format and bit layout
+   * as handleMouse: low two bits the button, 32 motion, 64 the wheel.
+   */
+  private handlePrEditMouse(body: string, press: boolean): void {
+    const state = this.panel?.prEdit;
+    if (!state || state.status === "saving") return;
+    const parts = body.split(";");
+    const b = Number.parseInt(parts[0] ?? "", 10);
+    const x = Number.parseInt(parts[1] ?? "", 10);
+    const y = Number.parseInt(parts[2] ?? "", 10);
+    if (Number.isNaN(b)) return;
+
+    // The wheel scrolls by MOVING THE CARET, the way PgUp/PgDn already do here.
+    // The popup's scroll is derived from the caret on every paint (see
+    // prEditFrame), so this keeps one invariant (the caret is always on screen
+    // and the hardware cursor is always where the text cursor is) instead of
+    // introducing a second, free-floating scroll that a keystroke would snap back.
+    if (b === 64) { this.prEditScroll(-1, 3); return; }
+    if (b === 65) { this.prEditScroll(1, 3); return; }
+
+    const button = b & 0b11;
+    const motion = (b & 32) !== 0;
+    if (button !== 0) return;
+
+    if (!motion && press) this.beginPrEditSelection(x, y);
+    else if (motion && press) this.extendPrEditSelection(x, y);
+    else if (!press) this.endPrEditSelection();
+  }
+
+  /** Scroll by moving the caret `steps` visual rows, and repaint. */
+  private prEditScroll(delta: 1 | -1, steps: number): void {
+    const state = this.panel?.prEdit;
+    if (!state || state.status === "saving") return;
+    state.escPending = false;
+    state.notice = null;
+    const width = this.prEditWidth();
+    for (let n = 0; n < steps; n++) {
+      if (!state.editor.moveRow(delta, width)) break;
+    }
+    this.paint();
+  }
+
+  /**
+   * Map a 1-based screen (x, y) onto a visual (row, col) of the buffer.
+   *
+   * `inside` is false when the point is off the box's text area entirely, and a
+   * press there starts nothing. A DRAG that strays off the top or the bottom
+   * targets the row just outside the viewport instead, which pulls the scroll by
+   * one (the caret follows the drag, and the viewport follows the caret), so a
+   * selection can run past a screenful in either direction.
+   */
+  private prEditCellAt(
+    state: PrEditState,
+    x: number,
+    y: number,
+  ): { row: number; col: number; inside: boolean } {
+    const box = this.prEditBox();
+    const firstRow = box.top + 1; // row 0 of the box is the top border
+    const firstCol = box.left + 2; // "│" + one space
+    const inner = Math.max(1, box.width - 4);
+    const col = Math.max(0, x - firstCol);
+    const inside =
+      y >= firstRow && y < firstRow + box.textRows && x >= firstCol && x < firstCol + inner;
+    let row: number;
+    if (y < firstRow) row = state.scroll - 1;
+    else if (y >= firstRow + box.textRows) row = state.scroll + box.textRows;
+    else row = state.scroll + (y - firstRow);
+    return { row: Math.max(0, row), col, inside };
+  }
+
+  /** Left press: anchor a selection at that character, and put the caret there.
+   *  A press outside the box's text area only dismisses a standing selection,
+   *  because a stray click on the queue underneath must not start one. */
+  private beginPrEditSelection(x: number, y: number): void {
+    const state = this.panel?.prEdit;
+    if (!state || state.status === "saving") return;
+    const cell = this.prEditCellAt(state, x, y);
+    state.notice = null;
+    state.escPending = false;
+    if (!cell.inside) {
+      state.editor.clearSelection();
+      state.dragging = false;
+      this.paint();
+      return;
+    }
+    state.dragging = true;
+    state.editor.anchorAt(state.editor.offsetAt(cell.row, cell.col, this.prEditWidth()));
+    this.paint();
+  }
+
+  private extendPrEditSelection(x: number, y: number): void {
+    const state = this.panel?.prEdit;
+    if (!state || !state.dragging || state.status === "saving") return;
+    const cell = this.prEditCellAt(state, x, y);
+    state.editor.extendTo(state.editor.offsetAt(cell.row, cell.col, this.prEditWidth()));
+    this.paint();
+  }
+
+  /** Left release: a drag that selected something copies it, the same way a drag
+   *  over the panel body does. A bare click selected nothing and copies nothing:
+   *  it just moved the caret, which is what a click in a text box is for. */
+  private endPrEditSelection(): void {
+    const state = this.panel?.prEdit;
+    if (!state || !state.dragging) return;
+    state.dragging = false;
+    const text = state.editor.selectedText();
+    if (text === "") {
+      this.paint();
+      return;
+    }
+    this.copyToClipboard(text);
+    state.notice = copyReceipt(countLines(text));
+    this.paint();
+  }
+
   /** Run a buffer mutation and repaint. The scroll follows on the next paint. */
   private prEditEdit(fn: () => void): void {
     const state = this.panel?.prEdit;
     if (!state || state.status === "saving") return;
     state.escPending = false;
+    state.notice = null;
     fn();
     this.paint();
   }
 
   /** Up/Down: one visual row, clamped at both ends. There is no history here to
-   *  fall through to — this buffer is the only thing the keys address. */
+   *  fall through to, since this buffer is the only thing the keys address. */
   private prEditMoveRow(delta: 1 | -1): void {
-    const state = this.panel?.prEdit;
-    if (!state || state.status === "saving") return;
-    state.escPending = false;
-    state.editor.moveRow(delta, this.prEditWidth());
-    this.paint();
+    this.prEditScroll(delta, 1);
   }
 
   /** PgUp/PgDn: a viewport of rows at a time, by the same clamped row move. */
   private prEditPage(delta: 1 | -1): void {
-    const state = this.panel?.prEdit;
-    if (!state || state.status === "saving") return;
-    state.escPending = false;
-    const width = this.prEditWidth();
-    for (let n = 0; n < this.prEditBox().textRows; n++) {
-      if (!state.editor.moveRow(delta, width)) break;
-    }
-    this.paint();
+    this.prEditScroll(delta, this.prEditBox().textRows);
   }
 
   /**
@@ -4324,6 +4581,7 @@ export class Tui implements SessionIO {
     };
     // The title line is the first BUFFER line, however many visual rows it takes.
     const titleEnd = state.editor.text.indexOf("\n");
+    const sel = state.editor.selection;
     const rows: string[] = [
       border(`edit PR #${state.prNumber} · ${state.feature}`, "┌", "┐"),
     ];
@@ -4332,18 +4590,60 @@ export class Tui implements SessionIO {
       const seg = layout.segs[idx];
       const start = layout.starts[idx];
       const isTitle = seg !== undefined && start !== undefined && (titleEnd === -1 || start < titleEnd);
-      const text = seg === undefined ? "" : isTitle ? c.bold(seg) : seg;
+      let text = seg === undefined ? "" : isTitle ? c.bold(seg) : seg;
+      if (sel && seg !== undefined && start !== undefined) {
+        text = this.highlightSelectedRow(text, seg, start, layout.starts[idx + 1], sel);
+      }
       rows.push(c.dim("│") + " " + pad(text, inner) + " " + c.dim("│"));
     }
     rows.push(c.dim("│") + " " + pad(this.prEditMessage(state, inner), inner) + " " + c.dim("│"));
-    rows.push(
-      border(
-        state.status === "saving" ? "saving…" : "Ctrl-S save · Esc cancel",
-        "└",
-        "┘",
-      ),
-    );
+    rows.push(border(this.prEditKeys(state, width), "└", "┘"));
     return { rows, cursorRow: layout.cursorRow - state.scroll, cursorCol: layout.cursorCol };
+  }
+
+  /**
+   * Paint the part of one visual row that falls inside the selection.
+   *
+   * The row's span is [start, next) in BUFFER offsets, which is what makes this
+   * width-agnostic: the same characters highlight at any wrapping. A row whose
+   * newline is inside the selection highlights to its end (and an empty row
+   * inside the selection gets one reversed space) so a multi-line selection
+   * reads as one block instead of tearing into stripes at every line break,
+   * the same rule applyPanelSelection follows, for the same reason.
+   */
+  private highlightSelectedRow(
+    painted: string,
+    seg: string,
+    start: number,
+    next: number | undefined,
+    sel: { start: number; end: number },
+  ): string {
+    const stop = next ?? start + seg.length;
+    if (sel.end <= start || sel.start > stop) return painted;
+    const from = Math.max(0, Math.min(seg.length, sel.start - start));
+    // A selection running past this row's end covers its line break too.
+    const to = sel.end >= stop && stop > start ? seg.length : Math.max(0, Math.min(seg.length, sel.end - start));
+    if (seg === "" && sel.start <= start && sel.end > start) return `${ESC}[7m ${ESC}[27m`;
+    if (to <= from) return painted;
+    return highlightRange(painted, from, to);
+  }
+
+  /**
+   * The keys on the popup's bottom border, in tiers: the widest run that fits.
+   * Save and cancel are never dropped (they are the two ways out); the wholesale
+   * verbs go before them, and the drag hint goes first, because the gesture is
+   * self-revealing where a key is not.
+   */
+  private prEditKeys(state: PrEditState, width: number): string {
+    if (state.status === "saving") return "saving…";
+    const room = Math.max(0, width - 6);
+    const tiers = [
+      "Ctrl-S save · Esc cancel · drag select · Ctrl-G all · Ctrl-X clear · Ctrl-Y copy",
+      "Ctrl-S save · Esc cancel · Ctrl-G all · Ctrl-X clear · Ctrl-Y copy",
+      "Ctrl-S save · Esc cancel · Ctrl-G all · Ctrl-X clear",
+      "Ctrl-S save · Esc cancel",
+    ];
+    return tiers.find((t) => t.length <= room) ?? tiers[tiers.length - 1]!;
   }
 
   /** The popup's one message line: what it needs to say, most urgent first. */
@@ -4353,6 +4653,16 @@ export class Tui implements SessionIO {
       return c.yellow(this.clip("unsaved changes — Esc again to discard them", width));
     }
     if (state.error) return c.red(this.clip(state.error, width));
+    // A copy/clear receipt outranks the dirty hint: it names something that just
+    // happened, and it is gone on the next key either way.
+    if (state.notice) {
+      const terse = state.notice.replace("if nothing pastes, allow", "allow");
+      return c.cyan(this.clip(visibleWidth(state.notice) <= width ? state.notice : terse, width));
+    }
+    if (state.editor.selection) {
+      const n = countLines(state.editor.selectedText());
+      return c.dim(this.clip(`${n} line${n === 1 ? "" : "s"} selected · Ctrl-Y copies · typing replaces`, width));
+    }
     if (state.editor.dirty) return c.dim(this.clip("edited · Ctrl-S writes it to GitHub", width));
     return c.dim(this.clip("line 1 is the title · Enter inserts a newline", width));
   }

@@ -127,6 +127,27 @@ test("`i` stays a literal character at the editor layer; the tab-cycle bind is p
   assert.deepEqual(classifyByte("\x0f"), { kind: "open-docs" });
 });
 
+test("the buffer-scoped verbs decode in both encodings, and take nothing from the line keys", () => {
+  // Ctrl-G/X/Y are the PR editor's wholesale verbs. They were unbound before, so
+  // binding them costs the prompt line nothing, and it ignores all three.
+  assert.deepEqual(classifyByte("\x07"), { kind: "select-all" }); // Ctrl-G
+  assert.deepEqual(classifyByte("\x18"), { kind: "clear-all" }); // Ctrl-X
+  assert.deepEqual(classifyByte("\x19"), { kind: "copy" }); // Ctrl-Y
+  assert.deepEqual(classify(parseCsiU("103;5")!), { kind: "select-all" });
+  assert.deepEqual(classify(parseCsiU("120;5")!), { kind: "clear-all" });
+  assert.deepEqual(classify(parseCsiU("121;5")!), { kind: "copy" });
+
+  // Ctrl-A is NOT select-all: it is Home, in both editors, and moving it would
+  // break the one binding the prompt line has had the longest.
+  assert.deepEqual(classifyByte("\x01"), { kind: "home" });
+  assert.deepEqual(classifyByte("\x15"), { kind: "kill-to-start" }, "Ctrl-U is still line-scoped");
+  assert.deepEqual(classifyByte("\x0b"), { kind: "kill-to-end" }, "and so is Ctrl-K");
+  // The bare letters stay ordinary text.
+  for (const ch of ["g", "x", "y"]) {
+    assert.deepEqual(classifyByte(ch), { kind: "insert", text: ch });
+  }
+});
+
 test("printable input is inserted, unknown combos are swallowed", () => {
   assert.deepEqual(classifyByte("a"), { kind: "insert", text: "a" });
   assert.deepEqual(classifyByte(" "), { kind: "insert", text: " " });
