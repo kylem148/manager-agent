@@ -670,7 +670,12 @@ function shortStamp(iso: string): string {
  * identically wherever it appears.
  */
 export function renderInboxItem(entry: InboxPanelEntry, width: number): string[] {
-  const wrap = (s: string): string[] => (s === "" ? [""] : wrapLine(s, width));
+  // The two header lines carry a two-space indent, so they are wrapped INSIDE it
+  // and the indent re-applied to each row: wrapping drops a leading space run
+  // (wrap.ts), which would otherwise leave a long headline flush against the
+  // edge while the metadata line under it stayed indented.
+  const indented = (s: string): string[] =>
+    wrapLine(s, Math.max(1, width - 2)).map((r) => "  " + r);
   const meta = [
     entry.verdict,
     entry.jobId,
@@ -679,8 +684,8 @@ export function renderInboxItem(entry: InboxPanelEntry, width: number): string[]
   ].join(" · ");
   return [
     "",
-    ...wrap("  " + c.bold(entry.headline)),
-    ...wrap("  " + levelChip(entry.level) + " " + c.dim(meta)),
+    ...indented(c.bold(entry.headline)),
+    ...indented(levelChip(entry.level) + " " + c.dim(meta)),
     "",
     ...renderMarkdownDoc(entry.body, width),
   ];
@@ -4983,10 +4988,15 @@ export class Tui implements SessionIO {
     entries.forEach((e, idx) => {
       const label = OVERLAY_LABELS[idx];
       if (label === undefined) return; // beyond the label alphabet (cap keeps us inside it)
-      rows.push(
+      // Laid out to the width HERE, like every other tab's rows. A row handed to
+      // the painter wider than the screen falls into clip(), which truncates by
+      // word-wrapping, and a wrap point drops a leading space run (wrap.ts). The
+      // long entries would lose the two-space indent the short ones keep, and the
+      // list's left edge would go ragged.
+      const lead =
         "  " + c.cyan(`${label})`) + " " + levelChip(e.level) + " " +
-          c.dim(e.verdict.padEnd(10)) + " " + e.headline,
-      );
+          c.dim(e.verdict.padEnd(10)) + " ";
+      rows.push(lead + clipCell(e.headline, this.cols - visibleWidth(lead)));
     });
     return rows;
   }
