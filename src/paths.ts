@@ -88,6 +88,12 @@ export interface InstancePaths {
    *  pane is idle is remembered here — beside the dispatch config, because a
    *  crew pane is dispatch state. Never written into the user's repo. */
   paneStore: string;
+  /** The co's own at-a-glance task table: the handful of live items it keeps in
+   *  live state, persisted so the Ctrl-O Home tab can render them rather than
+   *  waiting for the model to re-print the table into the chat. Sits beside the
+   *  feature store for the same reason it does — small, per-instance runtime
+   *  state the app reads at paint time — and is never written into the repo. */
+  taskTable: string;
   /** The running token/cost meter for this instance (see cost.ts). Sits at the
    *  instance root rather than in .memory/ or .dispatch/ because it is neither:
    *  not the co-manager's substrate (the co never reads or writes it, and it is
@@ -130,6 +136,7 @@ export function instancePaths(home: string, name: string): InstancePaths {
     reviewInbox: path.join(dispatch, "inbox.json"),
     featureStore: path.join(dispatch, "features.json"),
     paneStore: path.join(dispatch, "panes.json"),
+    taskTable: path.join(dispatch, "tasks.json"),
     costLedger: path.join(root, ".cost.json"),
     captures,
     captureFile: (jobId) => path.join(captures, `${jobId}.log`),

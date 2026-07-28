@@ -99,6 +99,45 @@ function enhancedKeysEnabled(): boolean {
   return process.env.CO_KEYS !== "off";
 }
 
+/**
+ * Fit `s` into `width` visible columns for a fixed-column layout: unchanged when
+ * it already fits, otherwise cut with an ellipsis so the eye can tell a
+ * truncated cell from a short one.
+ *
+ * `width` is an upper bound, not a target — the cut lands on a word boundary
+ * where there is one (a truncated intent reads as words, not as a syllable) and
+ * hard-splits a word too long to break, which is what a branch name or a handle
+ * always is. Callers that need the column filled pad afterwards.
+ *
+ * ANSI-aware in both directions — it measures visible width, never bytes, and it
+ * appends a reset when it cuts a styled string, because a colour opened before
+ * the cut and closed after it would otherwise bleed across the rest of the row.
+ */
+export function clipCell(s: string, width: number): string {
+  if (width <= 0) return "";
+  if (visibleWidth(s) <= width) return s;
+  const cut = sliceVisibleAnsi(s, width - 1);
+  return `${cut}…${s.includes(ESC) ? `${ESC}[0m` : ""}`;
+}
+
+/** The first `width` visible columns of `s`, ANSI escapes kept where they sit
+ *  (unlike sliceVisibleText, which strips them for the clipboard). */
+function sliceVisibleAnsi(s: string, width: number): string {
+  return wrapLine(s.replace(/\s+/g, " "), Math.max(1, width))[0] ?? "";
+}
+
+/** Pad `s` out to `width` VISIBLE columns. The counterpart of clipCell for a
+ *  fixed-column layout, and the reason String.padEnd is wrong for any cell that
+ *  might carry colour: padEnd counts escape bytes as characters.
+ *
+ *  Exported with clipCell because they are the whole of the Home tab's column
+ *  arithmetic and the only part of it a test can pin: `colorEnabled` is false
+ *  under a test runner, so a rendered frame there carries no escapes to get
+ *  wrong. These are tested with the escapes written in by hand. */
+export function pad(s: string, width: number): string {
+  return s + " ".repeat(Math.max(0, width - visibleWidth(s)));
+}
+
 /** Count the lines in text, ignoring a single trailing newline. */
 function countLines(text: string): number {
   const parts = text.split("\n");
@@ -455,9 +494,9 @@ export type FeaturePanelStatus =
   | "removed";
 
 /**
- * One tracked feature worktree, as the panel's Features tab shows it: what it
- * is, what is happening to it, and which branch it lives on. Structurally a
- * subset of the session's FeatureOverview.
+ * One tracked feature worktree, as the panel's Home tab shows it: what it is,
+ * what is happening to it, and which branch it lives on. Structurally a subset
+ * of the session's FeatureOverview.
  */
 export interface FeaturePanelEntry {
   /** The feature handle (its created name, or its slug after a restart rebuilt
@@ -476,11 +515,16 @@ export interface FeaturePanelEntry {
   position?: number;
   /** Present when blocked: conflict vs red build+test. */
   blockedKind?: "conflict" | "failed";
+  /** Whether the worktree holds uncommitted changes, when that has been read.
+   *  UNDEFINED means nobody has looked — rendered as the plain state word, never
+   *  as clean, because "nothing to commit" is a claim and this would not be
+   *  evidence for it. Refreshed through the source's `refresh()`. */
+  dirty?: boolean;
 }
 
 /**
- * Backs the Ctrl-O panel's Features tab: EVERY tracked feature worktree, not
- * just the ones queued to land. Read fresh at paint time like the queue and the
+ * Backs the Home tab's worktree list: EVERY tracked feature worktree, not just
+ * the ones queued to land. Read fresh at paint time like the queue and the
  * inbox — the session derives it from in-memory state (registry records, jobs,
  * the queue snapshot, the stored intents), so re-reading costs nothing and
  * involves no git call, no filesystem read and no model call. Injected, so the
@@ -490,6 +534,34 @@ export interface FeaturePanelSource {
   /** Every tracked feature, in the order the tab lists them (the session sorts:
    *  closest-to-landing first, then the rest alphabetically). */
   list(): FeaturePanelEntry[];
+  /**
+   * Re-read whatever `list()` cannot derive for free — today the dirty flag,
+   * which costs one `git status` per worktree. Called when the captain opens or
+   * switches to the Home tab, NEVER on a paint, and the panel repaints when it
+   * resolves. Optional: a source without it simply reports no dirty state.
+   */
+  refresh?(): Promise<void>;
+}
+
+/** One row of the co's at-a-glance task table, as the Home tab paints it.
+ *  Structurally the session's TaskRow — declared here, like QueuePanelEntry, so
+ *  the low-level Tui never depends on the session layer. */
+export interface TaskPanelRow {
+  task: string;
+  type: string;
+  /** One word, by the co's own protocol. Nothing here enforces a vocabulary. */
+  status: string;
+}
+
+/**
+ * Backs the Home tab's task table. Read fresh at paint time like every other
+ * panel source — it is an in-memory list behind a small JSON file, so re-reading
+ * is free and a table the co rewrote mid-session shows on the next paint without
+ * a restart or a subscription.
+ */
+export interface TaskPanelSource {
+  /** The table, in the co's own order. */
+  list(): TaskPanelRow[];
 }
 
 /**
@@ -928,11 +1000,17 @@ export interface TuiOptions {
    */
   inbox?: InboxPanelSource;
   /**
-   * Backs the Ctrl-O panel's Features tab (every tracked feature worktree). Omit
-   * off the feature flow (unlinked, or PlainIO) and the tab simply isn't there;
-   * session.ts supplies one bound to the FeatureManager when linked.
+   * Backs the Home tab's worktree list (every tracked feature worktree). Omit
+   * off the feature flow (unlinked, or PlainIO) and Home says so where the list
+   * would be; session.ts supplies one bound to the FeatureManager when linked.
    */
   features?: FeaturePanelSource;
+  /**
+   * Backs the Home tab's task table. Omit and Home says the table is unavailable;
+   * session.ts always supplies one bound to the instance's task store, linked or
+   * not — the table is the co's own and needs no repo.
+   */
+  tasks?: TaskPanelSource;
 }
 
 /**
@@ -1075,17 +1153,19 @@ const VISUAL_MIN_COLS = 40;
 const VISUAL_MIN_FREE_ROWS = 8;
 
 /**
- * Single-key selectors for the doc list, in press order: digits first (the
- * obvious "press 3"), then letters for a longer list. No arrow key is ever
- * required — pressing the label beside a doc opens it. Doc-mode paging commands
+ * Single-key selectors for the doc and inbox lists. No arrow key is ever
+ * required — pressing the label beside a row opens it. Paging commands
  * (f/b/d/u/j/k/g/G) don't appear as list labels, so nothing collides.
  *
- * `i` is deliberately absent: it is the second spelling of Tab (D-20260724-9)
- * and cycles the panel's tabs from every view, so a doc labelled `i` could never
- * be opened. Dropping it from the alphabet keeps every doc reachable — the docs
- * after the 17th just shift one letter along — instead of leaving a dead label.
+ * TWO keys are deliberately absent, on the same rule: a key the panel reserves
+ * GLOBALLY can never be a label, because a row wearing it could never be opened.
+ * `i` is the second spelling of Tab (D-20260724-9). The DIGITS are the tab bar's
+ * direct jumps — `1`..`4` land on a tab from any view — which is why this
+ * alphabet starts at `a` rather than at `1` as it once did. Dropping them keeps
+ * every row reachable (the list is 25 labels deep, and both lists say so when
+ * they outgrow it) instead of leaving dead labels a captain would press first.
  */
-const OVERLAY_LABELS = "123456789abcdefghjklmnopqrstuvwxyz";
+const OVERLAY_LABELS = "abcdefghjklmnopqrstuvwxyz";
 
 /**
  * The persistent Ctrl-O panel (D-20260723-25): the non-modal home for BOTH the
@@ -1093,14 +1173,20 @@ const OVERLAY_LABELS = "123456789abcdefghjklmnopqrstuvwxyz";
  * does NOT auto-pop — the captain opens and closes it with Ctrl-O — and it hosts
  * the merge review in-place rather than through a separate modal surface.
  *
- * It has four home tabs, switched with Tab (or `i`), so their key spaces never
- * collide: the `queue` tab ([m] merges the ready head, and the rest pages its
- * inline diff), the `features` tab (every tracked worktree with its description,
- * state and branch — read-only, it only pages), the `docs` tab (1-9/a-z open a
- * doc), and the `inbox` tab (1-9/a-z open a filed crew review). Opening a doc
- * drops into a `doc` view; selecting a review drops into an `inboxItem` view. A
- * pending feature_land review adds a fifth `review` tab for as long as it is
- * pending. All the body views page identically. Backspace/Esc walk back out.
+ * It has four home tabs, listed in a persistent bar across the top so the tabs
+ * that exist are visible without knowing they do, and switched three ways that
+ * never collide: Tab (or `i`) cycles, and `1`..`4` jump straight to one from any
+ * view. In order: `home` (the co's task table over every tracked worktree —
+ * read-only, it only pages), the `queue` tab ([m] merges the ready head, `e`
+ * edits its PR message, and the rest pages its inline body), the `docs` tab
+ * (a-z open a doc), and the `inbox` tab (a-z open a filed crew review). Opening
+ * a doc drops into a `doc` view; selecting a review drops into an `inboxItem`
+ * view. A pending feature_land review adds a fifth `review` tab for as long as it
+ * is pending. All the body views page identically. Backspace/Esc walk back out.
+ *
+ * HOME IS THE LANDING TAB and it acts on nothing (no [m], no selector), which is
+ * what lets it be the thing the panel opens on: the first screen of a panel that
+ * merges branches must not be one where a stray keypress can merge one.
  *
  * THE QUEUE TAB IS THE MERGE (D-20260724-12). A green head renders its own diff,
  * commits and checks result right there and carries a live [m] that merges
@@ -1116,10 +1202,11 @@ const OVERLAY_LABELS = "123456789abcdefghjklmnopqrstuvwxyz";
  * inline diff is expensive to wrap and a paint can happen every frame.
  */
 type PanelView =
+  /** The landing page: the co's task table, then every tracked feature worktree
+   *  with its state, branch and description. A read-only overview — it scrolls,
+   *  and nothing on it acts. */
+  | { kind: "home" }
   | { kind: "queue" }
-  /** Every tracked feature worktree with its description, state and branch. A
-   *  read-only overview: it scrolls, and nothing on it acts. */
-  | { kind: "features" }
   | { kind: "docs" }
   | { kind: "doc"; name: string; content: string; rows: string[]; scroll: number; error: string | null }
   | { kind: "inbox" }
@@ -1154,10 +1241,10 @@ interface PanelState {
    *  depend on actually changed (see queueSignature). */
   queueRows: string[];
   queueSig: string;
-  /** Scroll offset of the features tab. It is a list, but an unbounded one — a
-   *  repo can have more features in flight than a small terminal has rows — so
-   *  unlike the docs/inbox lists it pages rather than clipping. */
-  featuresScroll: number;
+  /** Scroll offset of the Home tab. It is sized to fit typical content — a
+   *  handful of tasks over five or six worktrees — but the content is unbounded,
+   *  so unlike the docs/inbox lists it pages rather than clipping. */
+  homeScroll: number;
   /**
    * The copy confirmation, shown in the footer in place of the key hints, or
    * null. Sticky until the next panel key rather than timed out: it mirrors the
@@ -1385,6 +1472,7 @@ export class Tui implements SessionIO {
   private readonly queue?: QueuePanelSource;
   private readonly inbox?: InboxPanelSource;
   private readonly features?: FeaturePanelSource;
+  private readonly tasks?: TaskPanelSource;
   private panel: PanelState | null = null;
   private unsubscribeDocs: (() => void) | null = null;
   // The panel-native merge (D-20260724-12). `queueMerging` names the feature
@@ -1424,6 +1512,7 @@ export class Tui implements SessionIO {
     this.queue = opts.queue;
     this.inbox = opts.inbox;
     this.features = opts.features;
+    this.tasks = opts.tasks;
   }
 
   // --- lifecycle -------------------------------------------------------------
@@ -2789,21 +2878,22 @@ export class Tui implements SessionIO {
   // The persistent, non-modal home for the instance's user-facing docs AND the
   // live merge queue (D-20260723-25). The captain opens/closes it with Ctrl-O
   // (the same key both ways — see togglePanel and the "close" panel input); it
-  // never auto-pops. Four tabs (Tab or `i` switches): the QUEUE tab shows the
-  // ordered features and their state, with the ready head's review actioned
-  // in-place ([m] merge / [r] reject / [d] drill the full diff); the FEATURES tab
-  // shows EVERY tracked worktree — including the ones still being worked, which
-  // the queue never sees — with its stored description, its state and its branch;
-  // the DOCS tab lists docs/ (selectable by letter) and opens one rendered
-  // through the SAME markdown renderer the transcript uses, refreshing live when
-  // an agent writes it; the INBOX tab lists the filed crew reviews and opens
-  // one's full body on that same surface, and an open doc adds `y` to copy its
-  // raw markdown to the system clipboard. The docs read only through the injected
-  // DocSource (the sandboxed doc tool — the `.memory/` substrate is never listed
-  // or reachable here); the queue, the features and the inbox read a fresh
-  // in-memory snapshot from their sources at paint time. No step
-  // needs an arrow key: tab-switch is Tab, selection is a letter/number, paging
-  // is less-style (space/b, j/k, d/u, g/G).
+  // never auto-pops. Four tabs, named in a bar across the top of every view and
+  // reachable three ways (Tab, `i`, or the digit the bar shows beside each): the
+  // HOME tab is the landing page — the co's task table over EVERY tracked
+  // worktree, including the ones still being worked, which the queue never sees;
+  // the QUEUE tab shows the ordered features and their state, with the ready
+  // head's review actioned in-place ([m] merge / [e] edit its message / [d] drill
+  // the full diff); the DOCS tab lists docs/ (selectable by letter) and opens one
+  // rendered through the SAME markdown renderer the transcript uses, refreshing
+  // live when an agent writes it; the INBOX tab lists the filed crew reviews and
+  // opens one's full body on that same surface, and an open doc adds `y` to copy
+  // its raw markdown to the system clipboard. The docs read only through the
+  // injected DocSource (the sandboxed doc tool — the `.memory/` substrate is
+  // never listed or reachable here); the queue, the tasks, the worktrees and the
+  // inbox read a fresh in-memory snapshot from their sources at paint time. No
+  // step needs an arrow key: tabs are Tab/1-4, selection is a letter, paging is
+  // less-style (space/b, j/k, d/u, g/G).
 
   /** Visible content rows in the panel: full screen minus header + footer. */
   private overlayViewport(): number {
@@ -2823,16 +2913,21 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * Open the panel. With no DocSource, no queue AND no pending review there is
+   * Open the panel. With nothing wired at all and no pending review there is
    * nothing to show, so flash a hint instead (PlainIO/degraded never crashes on
    * the keybind). Otherwise the opening view is: the pending feature_land review
    * when one is waiting (that one IS a gate — it holds a caller open, so it wins
-   * the landing spot), else the QUEUE tab when a queue is wired (the merge flow
-   * is the reason the panel exists), else the DOCS tab. Subscribes to the doc
+   * the landing spot), else the FIRST tab in the bar, which is HOME whenever
+   * there is a Home to show. Home leads because it is the orientation view and
+   * because it acts on nothing: the screen a keystroke lands on by default must
+   * not be one where a stray press can merge a branch. Subscribes to the doc
    * write queue for live refresh and loads the doc list asynchronously.
    */
   private openPanel(): void {
-    if (!this.docs && !this.queue && !this.inbox && !this.features && !this.pendingReview) {
+    if (
+      !this.docs && !this.queue && !this.inbox && !this.features && !this.tasks &&
+      !this.pendingReview
+    ) {
       this.setStatus("panel unavailable");
       return;
     }
@@ -2866,7 +2961,7 @@ export class Tui implements SessionIO {
       queueScroll: 0,
       queueRows: [],
       queueSig: "",
-      featuresScroll: 0,
+      homeScroll: 0,
       copyNotice: null,
       selection: null,
       selecting: false,
@@ -2877,7 +2972,29 @@ export class Tui implements SessionIO {
       this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
       void this.loadList();
     }
+    if (view.kind === "home") this.refreshHome();
     this.paint();
+  }
+
+  /**
+   * Ask the feature source to re-read what it cannot derive for free (the dirty
+   * flag: one `git status` per worktree), and repaint when it lands. Called when
+   * Home is shown and nowhere else — a paint must never trigger I/O, and the one
+   * moment the answer matters is the moment the captain is looking at it.
+   *
+   * Fire-and-forget by design: the tab paints immediately from what the source
+   * already knows, and the dirty/clean refinement arrives a frame later. A source
+   * with no `refresh` (or one that rejects) simply leaves the rows as they are.
+   */
+  private refreshHome(): void {
+    const refresh = this.features?.refresh;
+    if (!refresh || !this.features) return;
+    void refresh.call(this.features).then(
+      () => {
+        if (this.panel) this.paint();
+      },
+      () => {},
+    );
   }
 
   /** Close the panel and repaint the transcript+editor beneath it, intact. A
@@ -2948,34 +3065,51 @@ export class Tui implements SessionIO {
     void this.loadList();
   }
 
-  /** The panel's home tabs, in order, given what's wired and pending: the queue
-   *  (when a queue source exists), the features overview (when a feature source
+  /** The panel's home tabs, IN BAR ORDER, given what's wired and pending: home
+   *  (when a task or feature source exists), the queue (when a queue source
    *  exists), docs (when a doc source exists), the review inbox (when an inbox
-   *  source exists), and a feature_land review whenever one is pending. Features
-   *  sits beside the queue because they are two views of the same flow — the
-   *  queue is what is lined up to LAND, features is everything in flight — and
-   *  the review gets its own tab even alongside the queue: the queue tab's [m] is
-   *  the panel-native queue merge, and two different merges must never share one
-   *  key (D-20260724-12). Tab cycles these. */
+   *  source exists), and a feature_land review whenever one is pending.
+   *
+   *  Home leads because it is the landing page and the one tab that acts on
+   *  nothing. The review gets its own tab even alongside the queue: the queue
+   *  tab's [m] is the panel-native queue merge, and two different merges must
+   *  never share one key (D-20260724-12). Tab cycles these; `1`..`4` (and `5`
+   *  when a review is pending) index straight into this list. */
   private panelTabs(): PanelView["kind"][] {
     const tabs: PanelView["kind"][] = [];
+    if (this.tasks || this.features) tabs.push("home");
     if (this.queue) tabs.push("queue");
-    if (this.features) tabs.push("features");
     if (this.docs) tabs.push("docs");
     if (this.inbox) tabs.push("inbox");
     if (this.pendingReview) tabs.push("review");
     return tabs;
   }
 
+  /** The one-word label each tab wears in the bar. */
+  private static readonly TAB_LABELS: Record<PanelView["kind"], string> = {
+    home: "home",
+    queue: "queue",
+    docs: "docs",
+    inbox: "inbox",
+    review: "review",
+    doc: "docs",
+    inboxItem: "inbox",
+    prEdit: "queue",
+  };
+
   /** A home tab's view state. Sub-views (doc, inboxItem) are never home tabs, so
-   *  anything unrecognised falls back to the queue. */
+   *  anything unrecognised falls back to the first tab that exists. */
   private homeView(kind: PanelView["kind"]): PanelView {
     switch (kind) {
-      case "features": return { kind: "features" };
+      case "home": return { kind: "home" };
+      case "queue": return { kind: "queue" };
       case "docs": return { kind: "docs" };
       case "inbox": return { kind: "inbox" };
       case "review": return { kind: "review" };
-      default: return { kind: "queue" };
+      // Sub-views (doc, inboxItem, prEdit) are never home tabs. Fall back to
+      // whatever tab is FIRST rather than to a fixed one — a panel may have no
+      // queue at all. panelTabs only ever yields home tabs, so this recurses once.
+      default: return this.homeView(this.panelTabs()[0] ?? "queue");
     }
   }
 
@@ -2990,9 +3124,32 @@ export class Tui implements SessionIO {
     const tabs = this.panelTabs();
     if (tabs.length < 2) return;
     const cur = tabs.indexOf(v.kind);
-    const next = tabs[(cur + 1) % tabs.length]!;
-    this.panel.view = this.homeView(next);
-    if (next === "review" && this.pendingReview) {
+    this.gotoTab(tabs[(cur + 1) % tabs.length]!);
+  }
+
+  /**
+   * `1`..`9`: jump straight to the nth tab in the bar, from ANY view — including
+   * out of an open doc or a filed review, which is the whole point of a direct
+   * jump. A digit past the end of the bar is a no-op.
+   *
+   * The digits are reserved panel-wide, which is why the doc and inbox lists are
+   * labelled from `a` (see OVERLAY_LABELS): a key that means "tab 2" everywhere
+   * cannot also mean "open the second doc" on one tab.
+   */
+  private jumpTab(index: number): void {
+    if (!this.panel) return;
+    const tab = this.panelTabs()[index];
+    if (!tab) return;
+    this.gotoTab(tab);
+  }
+
+  /** Land on a home tab: switch the view, run whatever that tab needs on arrival,
+   *  and repaint. The single path Tab, `i` and the number keys all take, so no
+   *  route onto a tab can skip its arrival work. */
+  private gotoTab(kind: PanelView["kind"]): void {
+    if (!this.panel) return;
+    this.panel.view = this.homeView(kind);
+    if (kind === "review" && this.pendingReview) {
       this.pendingReview.rows = renderLandingBody(
         this.pendingReview.review,
         this.pendingReview.status,
@@ -3000,10 +3157,13 @@ export class Tui implements SessionIO {
         this.cols,
       );
     }
+    // Home re-reads the worktrees' dirty state (a git call per worktree, so only
+    // ever on arrival).
+    if (kind === "home") this.refreshHome();
     this.paint();
     // Landing on docs re-lists so any writes that arrived while it was off screen
     // are picked up (onDocWrite skips the reload when docs aren't showing).
-    if (next === "docs") void this.loadList();
+    if (kind === "docs") void this.loadList();
   }
 
   /**
@@ -3083,12 +3243,12 @@ export class Tui implements SessionIO {
         rows: this.queueBody().length,
       };
     }
-    if (v.kind === "features") {
+    if (v.kind === "home") {
       const panel = this.panel;
       return {
-        get: () => panel.featuresScroll,
-        set: (n) => { panel.featuresScroll = n; },
-        rows: this.featuresTabRows().length,
+        get: () => panel.homeScroll,
+        set: (n) => { panel.homeScroll = n; },
+        rows: this.homeTabRows().length,
       };
     }
     if (v.kind === "doc" || v.kind === "inboxItem") {
@@ -3259,9 +3419,16 @@ export class Tui implements SessionIO {
     // was (see consume(): the panel branch is taken before any editor parsing).
     if ("nav" in ev && ev.nav === "tab") { this.switchTab(); return; }
     if ("ch" in ev && ev.ch === "i") { this.switchTab(); return; }
+    // The digits jump straight to a tab, from every view, for the same reason
+    // Tab lives here: they are the panel's own keys, reserved panel-wide, and no
+    // view may shadow them (which is why no list row is labelled with one).
+    if ("ch" in ev && ev.ch >= "1" && ev.ch <= "9") {
+      this.jumpTab(ev.ch.charCodeAt(0) - "1".charCodeAt(0));
+      return;
+    }
     switch (this.panel.view.kind) {
+      case "home": this.homeTabInput(ev); return;
       case "queue": this.queueTabInput(ev); return;
-      case "features": this.featuresTabInput(ev); return;
       case "docs": this.docsTabInput(ev, this.panel); return;
       case "doc": this.overlayDocInput(ev); return;
       case "inbox": this.inboxTabInput(ev); return;
@@ -3304,13 +3471,14 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * The features tab: an overview, and nothing else. It pages like the queue tab
-   * (the list can outgrow the screen) and Esc/Backspace/q close the panel, but no
-   * key here acts on a feature — landing is the queue's [m], and creating,
-   * enqueuing and abandoning are the co's levers. Deliberately no [m] and no
-   * selector, so this tab can never be the thing that merged something.
+   * The Home tab: an overview, and nothing else. It pages like the queue tab
+   * (the task table plus a long worktree list can outgrow the screen) and
+   * Esc/Backspace/q close the panel, but no key here acts on a feature — landing
+   * is the queue's [m], and creating, enqueuing and abandoning are the co's
+   * levers. Deliberately no [m] and no selector, so the tab the panel OPENS on
+   * can never be the thing that merged something.
    */
-  private featuresTabInput(input: OverlayInput): void {
+  private homeTabInput(input: OverlayInput): void {
     if ("nav" in input) {
       if (this.overlayScrollInput(input)) return;
       if (input.nav === "escape" || input.nav === "back") this.closePanel();
@@ -4189,45 +4357,59 @@ export class Tui implements SessionIO {
     return c.dim(this.clip("line 1 is the title · Enter inserts a newline", width));
   }
 
-  /** Paint the full-screen panel: header/tab bar, content viewport, footer. */
+  /** Paint the full-screen panel: tab bar, content viewport, footer. */
   /**
-   * What the panel is showing right now: the header title, the body rows, and
-   * the body row the viewport starts at.
+   * What the panel is showing right now: which TAB the current view belongs to,
+   * the detail that names it when the view is a sub-view of that tab (an open
+   * doc's filename, a filed review's level), the body rows, and the body row the
+   * viewport starts at.
    *
-   * ONE source of truth, read by both the paint and the mouse-selection copy, so
-   * a drag can only ever copy the rows that were actually painted under it. The
-   * queue body is fetched before its scroll is read because queueBody() clamps
-   * that scroll to the freshly-built row count.
+   * ONE source of truth for the view switch, read by the paint, the tab bar and
+   * the mouse-selection copy alike — so a drag can only ever copy the rows that
+   * were actually painted under it, and the bar can only ever highlight the tab
+   * the body came from. The queue body is fetched before its scroll is read
+   * because queueBody() clamps that scroll to the freshly-built row count.
    */
-  private panelFrame(): { title: string; body: string[]; start: number } {
+  private panelFrame(): {
+    tab: PanelView["kind"];
+    suffix: string;
+    body: string[];
+    start: number;
+  } {
     const panel = this.panel;
-    if (!panel) return { title: "", body: [], start: 0 };
+    if (!panel) return { tab: "home", suffix: "", body: [], start: 0 };
     const v = panel.view;
+    if (v.kind === "home") {
+      const body = this.homeTabRows();
+      // A feature landing (or being abandoned) shortens the list; never strand
+      // the view past its end.
+      const max = Math.max(0, body.length - this.overlayViewport());
+      if (panel.homeScroll > max) panel.homeScroll = max;
+      return { tab: "home", suffix: "", body, start: panel.homeScroll };
+    }
     if (v.kind === "queue" || v.kind === "prEdit") {
       // The message editor is a POPUP over this tab, not a view of its own: the
       // queue stays painted underneath it (paintPanel overlays the box), so the
       // captain never loses sight of the head they are writing about.
       const body = this.queueBody();
-      const title = panel.prEdit ? `queue · edit PR #${panel.prEdit.prNumber}` : "queue";
-      return { title, body, start: panel.queueScroll };
+      const suffix = panel.prEdit ? `edit PR #${panel.prEdit.prNumber}` : "";
+      return { tab: "queue", suffix, body, start: panel.queueScroll };
     }
-    if (v.kind === "features") {
-      const body = this.featuresTabRows();
-      // A feature landing (or being abandoned) shortens the list; never strand
-      // the view past its end.
-      const max = Math.max(0, body.length - this.overlayViewport());
-      if (panel.featuresScroll > max) panel.featuresScroll = max;
-      return { title: "features", body, start: panel.featuresScroll };
-    }
-    if (v.kind === "docs") return { title: "docs", body: this.docsTabRows(panel), start: 0 };
-    if (v.kind === "doc") return { title: `docs · ${v.name}`, body: v.rows, start: v.scroll };
-    if (v.kind === "inbox") return { title: "inbox", body: this.inboxTabRows(), start: 0 };
+    if (v.kind === "docs") return { tab: "docs", suffix: "", body: this.docsTabRows(panel), start: 0 };
+    if (v.kind === "doc") return { tab: "docs", suffix: v.name, body: v.rows, start: v.scroll };
+    if (v.kind === "inbox") return { tab: "inbox", suffix: "", body: this.inboxTabRows(), start: 0 };
     if (v.kind === "inboxItem") {
-      return { title: `inbox · ${v.entry.level} ${v.entry.verdict}`, body: v.rows, start: v.scroll };
+      return {
+        tab: "inbox",
+        suffix: `${v.entry.level} ${v.entry.verdict}`,
+        body: v.rows,
+        start: v.scroll,
+      };
     }
     const pr = this.pendingReview;
     return {
-      title: pr ? `review · ${pr.review.feature} → ${pr.review.target}` : "review",
+      tab: "review",
+      suffix: pr ? `${pr.review.feature} → ${pr.review.target}` : "",
       body: pr ? pr.rows : ["", "  " + c.dim("no review is pending.")],
       start: pr ? pr.scroll : 0,
     };
@@ -4238,10 +4420,10 @@ export class Tui implements SessionIO {
     if (!panel) return;
     const w = this.cols;
     const vp = this.overlayViewport();
-    const { title, body, start } = this.panelFrame();
+    const { tab, suffix, body, start } = this.panelFrame();
     panel.lastStart = start; // anchor for mapping mouse (x, y) → absolute body row
 
-    const frame: string[] = [term.moveTo(1, 1) + term.clearLine + this.overlayHeader(title)];
+    const frame: string[] = [term.moveTo(1, 1) + term.clearLine + this.overlayHeader(tab, suffix)];
     for (let r = 0; r < vp; r++) {
       const absRow = start + r;
       const lineText = this.applyPanelSelection(body[absRow] ?? "", absRow);
@@ -4268,12 +4450,47 @@ export class Tui implements SessionIO {
     this.out.write(frame.join(""));
   }
 
-  /** The tab bar as a header: the home tabs with the active one reversed, so the
-   *  captain sees every space and which is live. Sub-views (doc/inboxItem/review)
-   *  get a plain title instead. */
-  private overlayHeader(title: string): string {
+  /**
+   * The tab bar: every tab the panel has, numbered, across the top of every view.
+   *
+   * This is the panel's only discovery surface. Before it, the tabs existed but
+   * nothing on screen said so — the panel was usable by someone who already knew
+   * Tab cycled it, and by nobody else. So each tab is drawn with the digit that
+   * jumps to it (`2 queue`), and the ACTIVE one is drawn distinctly: cut out of
+   * the reversed bar (reversed-off, so it reads as the raised tab) with colour,
+   * and bracketed as `[2 queue]` when colour is off, because "which one am I on"
+   * must not be a thing only a colour terminal can answer.
+   *
+   * `suffix` names what a SUB-VIEW of the active tab is showing (an open doc's
+   * filename, a filed review's level, the PR the popup is editing) and rides
+   * inside the active tab's own segment — `[3 docs · plan.md]` — so the bar says
+   * where you are and what you are looking at in one line.
+   *
+   * It degrades in that order of value: the detail goes first, then the labels
+   * (leaving `1 2 3 4`, which still says how many tabs there are and which one
+   * you are on), and only a terminal too narrow even for that gets a clipped bar.
+   * A tab is never dropped from the list, because a tab you cannot see is a tab
+   * you do not know exists — which is the whole reason the bar is here.
+   */
+  private overlayHeader(active: PanelView["kind"], suffix = ""): string {
     const w = this.cols;
-    const bar = this.clip(` ${title} `, w).padEnd(w, " ");
+    const tabs = this.panelTabs();
+    const activeTab = Tui.TAB_LABELS[active];
+    const segments = (detail: boolean, labels: boolean): string[] =>
+      tabs.map((t, i) => {
+        const label = labels ? `${i + 1} ${Tui.TAB_LABELS[t]}` : `${i + 1}`;
+        const on = Tui.TAB_LABELS[t] === activeTab;
+        const text = on && detail && suffix !== "" ? `${label} · ${suffix}` : label;
+        if (!colorEnabled) return on ? `[${text}]` : ` ${text} `;
+        // Inside a reversed bar, turning the reverse OFF is what makes a segment
+        // stand out — the active tab reads as a cut-out rather than as more of
+        // the same block.
+        return on ? `${ESC}[27m ${text} ${ESC}[7m` : ` ${text} `;
+      });
+    const width = (segs: string[]): number => segs.reduce((n, s) => n + visibleWidth(s), 0);
+    const tiers = [segments(true, true), segments(false, true), segments(false, false)];
+    const segs = tiers.find((t) => width(t) <= w) ?? tiers[tiers.length - 1]!;
+    const bar = this.clip(segs.join(""), w) + " ".repeat(Math.max(0, w - width(segs)));
     return colorEnabled ? `${ESC}[7m${bar}${ESC}[27m` : bar;
   }
 
@@ -4465,77 +4682,159 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * The features tab: every tracked feature worktree, two rows each — the handle
-   * with its state chip and branch, then its description underneath.
+   * The Home tab: the panel's landing page, in two blocks — the co's at-a-glance
+   * task table, then every tracked feature worktree, one line each.
    *
-   * This is the view the queue tab cannot give. The queue holds only what the
-   * captain has marked done, so a feature still being worked is invisible there;
-   * here everything in flight shows at once, with the one thing git can't say
-   * about a branch — what it is FOR — read straight from the stored intent. No
-   * model call is made to describe anything, at paint time or ever: the intent is
-   * an authored one-liner, and a feature that never got one says so.
+   * The two answer the two questions the captain opens the panel with. The table
+   * is what we are doing (it used to exist only as prose the co re-printed into
+   * the chat; it is a stored, painted thing now). The worktree list is what is in
+   * flight — the view the queue tab cannot give, because the queue holds only
+   * what has been marked done and everything still being worked is invisible
+   * there.
    *
-   * Read fresh from the FeaturePanelSource, so a feature created, enqueued or
-   * landed while the panel is open shows on the next paint.
+   * Both are read fresh from their sources, so a table rewritten or a feature
+   * created while the panel is open shows on the next paint. One line per
+   * worktree rather than two is what keeps typical content — a handful of tasks
+   * over five or six worktrees — on one screen; paging is the overflow fallback,
+   * not the normal way to read this.
    */
-  private featuresTabRows(): string[] {
-    if (!this.features) return ["", "  " + c.dim("Feature worktrees aren't available in this session.")];
+  private homeTabRows(): string[] {
+    return [...this.taskTableRows(), "", ...this.worktreeRows()];
+  }
+
+  /** The task table: three columns, sized to their content and capped so one long
+   *  row can never push Status off a narrow screen. */
+  private taskTableRows(): string[] {
+    const rows: string[] = ["", "  " + c.dim("tasks")];
+    if (!this.tasks) {
+      rows.push("  " + c.dim("The task table isn't available in this session."));
+      return rows;
+    }
+    const table = this.tasks.list();
+    if (table.length === 0) {
+      rows.push("  " + c.dim("Nothing on the table."));
+      rows.push("  " + c.dim("The co keeps a handful of live items here — ask it where things stand."));
+      return rows;
+    }
+    // Columns hug their content — a Task column stretched to the width would put
+    // Type and Status somewhere off by the right edge, with a river of blank
+    // between. The task column is the one that gives when the terminal is narrow,
+    // and it takes what the other two leave.
+    const typeW = Math.min(12, Math.max(4, ...table.map((t) => t.type.length)));
+    const statusW = Math.min(12, Math.max(6, ...table.map((t) => t.status.length)));
+    const taskW = Math.max(
+      8,
+      Math.min(
+        Math.max(4, ...table.map((t) => t.task.length)),
+        this.cols - 4 - typeW - statusW - 4,
+      ),
+    );
+    // Padded by VISIBLE width, never by String.padEnd: a status chip carries
+    // colour, and padding the raw string would count the escape bytes as
+    // characters and collapse the column.
+    const line = (task: string, type: string, status: string): string =>
+      `${pad(clipCell(task, taskW), taskW)}  ${pad(clipCell(type, typeW), typeW)}  ${clipCell(status, statusW)}`;
+    rows.push("  " + c.dim(line("Task", "Type", "Status")));
+    for (const t of table) {
+      rows.push("  " + line(t.task, c.dim(t.type), this.taskStatusLabel(t.status)));
+    }
+    return rows;
+  }
+
+  /** A task's status, coloured by what it says. The vocabulary is the co's own,
+   *  so this recognises the words that carry a warning and leaves the rest plain
+   *  rather than pretending to know every word it might pick. */
+  private taskStatusLabel(status: string): string {
+    const s = status.toLowerCase();
+    if (/block|stuck|fail|red/.test(s)) return c.red(status);
+    if (/done|ready|green|shipped|landed/.test(s)) return c.green(status);
+    if (/wait|pending|review|queue/.test(s)) return c.yellow(status);
+    return status;
+  }
+
+  /**
+   * Every tracked feature worktree, one compact line each: the handle, its state,
+   * its branch and as much of its intent as fits. The intent is the one thing git
+   * can't say about a branch — what it is FOR — read straight from the stored
+   * text. No model call is made to describe anything, at paint time or ever, and
+   * a feature that never got an intent says so rather than showing a blank.
+   */
+  private worktreeRows(): string[] {
+    const rows: string[] = ["  " + c.dim("worktrees")];
+    if (!this.features) {
+      rows.push("  " + c.dim("Feature worktrees aren't available in this session (not linked)."));
+      return rows;
+    }
     const entries = this.features.list();
     if (entries.length === 0) {
-      return [
-        "",
-        "  " + c.dim("No feature worktrees yet."),
-        "  " + c.dim("Each feature the co creates gets its own branch and checkout, and shows up here."),
-      ];
+      rows.push("  " + c.dim("No feature worktrees yet."));
+      rows.push("  " + c.dim("Each feature the co creates gets its own branch and checkout, and shows up here."));
+      return rows;
     }
-    // Two columns, each as wide as its widest cell so the tab reads DOWN — the
-    // states in one column, the branches in another — rather than as ragged
-    // prose. Both capped, so one long name or one long chip can't push the
-    // branches off a narrow screen. The chip is measured by visible width: it
-    // carries colour, and padding on the raw string would count the escapes.
+    // Columns as wide as their widest cell so the list reads DOWN — the states in
+    // one column, the branches in another — rather than as ragged prose. Each is
+    // capped so one long name or one long chip can't push the rest off a narrow
+    // screen. Chips are measured by VISIBLE width: they carry colour, and padding
+    // the raw string would count the escapes.
     const chips = entries.map((e) => {
       const crew = e.busy && e.status !== "working" ? " " + c.cyan("[crew]") : "";
       return this.featureStateLabel(e) + crew;
     });
-    const nameWidth = Math.min(28, Math.max(...entries.map((e) => e.feature.length)));
-    const chipWidth = Math.min(24, Math.max(...chips.map((s) => visibleWidth(s))));
-    const rows: string[] = [""];
+    const nameW = Math.min(20, Math.max(...entries.map((e) => e.feature.length)));
+    const chipW = Math.min(22, Math.max(...chips.map((s) => visibleWidth(s))));
+    const branchW = Math.min(24, Math.max(...entries.map((e) => e.branch.length)));
     entries.forEach((e, idx) => {
-      rows.push(...this.featureEntryRows(e, chips[idx]!, nameWidth, chipWidth));
+      rows.push(this.worktreeLine(e, chips[idx]!, nameW, chipW, branchW));
     });
     return rows;
   }
 
-  /** One feature as its two rows: handle + state + branch, then the description
-   *  (wrapped, so a long one is never clipped out of the overview). */
-  private featureEntryRows(
+  /** One worktree as one line: marker, handle, state, branch, intent — the intent
+   *  truncated into whatever the fixed columns leave, so the line never wraps and
+   *  six worktrees stay six rows. */
+  private worktreeLine(
     e: FeaturePanelEntry,
     chip: string,
-    nameWidth: number,
-    chipWidth: number,
-  ): string[] {
-    const wrap = (s: string): string[] => (s === "" ? [""] : wrapLine(s, this.cols));
+    nameW: number,
+    chipW: number,
+    branchW: number,
+  ): string {
     // A marker on the two states that want the eye: one that can be merged right
     // now, and one that is holding the queue up.
     const marker = e.status === "ready" ? c.green("▸") : e.status === "blocked" ? c.red("▸") : " ";
-    const name = e.feature.length > nameWidth ? e.feature : e.feature.padEnd(nameWidth);
-    const pad = " ".repeat(Math.max(0, chipWidth - visibleWidth(chip)));
-    const head = `${marker} ${c.bold(name)}  ${chip}${pad}  ` + c.dim(e.branch);
+    const name = pad(clipCell(e.feature, nameW), nameW);
+    const branch = pad(clipCell(e.branch, branchW), branchW);
+    const head = `  ${marker} ${c.bold(name)}  ${pad(chip, chipW)}  ${c.dim(branch)}`;
+    const room = this.cols - visibleWidth(head) - 2;
     const intent = e.intent?.trim();
-    return [
-      ...wrap("  " + head),
-      ...wrap("      " + (intent ? intent : c.dim("no description — created without an intent"))),
-    ];
+    if (room < 8) return head;
+    const tail = intent
+      ? clipCell(intent, room)
+      : c.dim(clipCell("no description — created without an intent", room));
+    return `${head}  ${tail}`;
   }
 
   /** The coloured one-word state chip for a feature, mirroring the queue tab's
-   *  vocabulary for the states the two share. The `[crew]` marker beside it (see
-   *  featuresTabRows) is separate: an enqueued feature's queue state and a live
-   *  agent are both worth seeing, so neither hides the other. */
+   *  vocabulary for the states the two share.
+   *
+   *  `idle` is the one that resolves further, because "tracked, nothing running,
+   *  not enqueued" is not a state — it is the ABSENCE of the other states, and it
+   *  told the captain nothing. With the worktree's dirty flag read (see
+   *  FeaturePanelEntry.dirty) it becomes `clean` or `dirty`: whether there is
+   *  uncommitted work sitting in that checkout is the only question left about a
+   *  feature nothing else is happening to. Unread, it stays `idle` — never
+   *  `clean`, which would be a claim nobody checked.
+   *
+   *  The `[crew]` marker beside the chip (see worktreeRows) is separate: an
+   *  enqueued feature's queue state and a live agent are both worth seeing, so
+   *  neither hides the other. */
   private featureStateLabel(e: FeaturePanelEntry): string {
     switch (e.status) {
       case "working": return c.cyan("[crew running]");
-      case "idle": return c.dim("[idle]");
+      case "idle":
+        if (e.dirty === true) return c.yellow("[dirty]");
+        if (e.dirty === false) return c.dim("[clean]");
+        return c.dim("[idle]");
       case "queued": return c.dim(`[queued${e.position === undefined ? "" : ` #${e.position}`}]`);
       case "processing": return c.cyan("[processing]");
       case "ready": return c.green("[ready to merge]");
@@ -4584,9 +4883,11 @@ export class Tui implements SessionIO {
     const w = this.cols;
     const v = this.panel?.view;
     // Home tabs offer the switch hint whenever there's somewhere to switch to.
+    // The bar across the top already shows the numbers, so the hint names the
+    // cycle key and points at them rather than spelling every digit out.
     const onHomeTab =
-      v?.kind === "queue" || v?.kind === "features" || v?.kind === "docs" || v?.kind === "inbox";
-    const tabHint = onHomeTab && this.panelTabs().length > 1 ? "Tab/i switch · " : "";
+      v?.kind === "home" || v?.kind === "queue" || v?.kind === "docs" || v?.kind === "inbox";
+    const tabHint = onHomeTab && this.panelTabs().length > 1 ? "Tab/1-9 tabs · " : "";
 
     // Built before the hints: the doc view sizes its hint run against whatever
     // the indicator leaves, so the copy key isn't the thing that gets clipped.
@@ -4641,11 +4942,11 @@ export class Tui implements SessionIO {
       } else {
         left = " " + editHint + c.dim("space/b page · " + tabHint + "Esc close") + " ";
       }
-    } else if (v?.kind === "features") {
+    } else if (v?.kind === "home") {
       // Nothing here acts, so the bar advertises only paging and the exits.
       left = ` ${c.dim("space/b page · " + tabHint + "Esc close")} `;
     } else if (v?.kind === "docs" || v?.kind === "inbox") {
-      left = ` 1-9/a-z open · ${tabHint}Esc close `;
+      left = ` a-z open · ${tabHint}Esc close `;
     } else if (v?.kind === "doc") {
       // `y` is the only ACTION key on a doc, so it leads and is coloured the way
       // the queue tab leads with its [m]. The run shortens to fit beside the

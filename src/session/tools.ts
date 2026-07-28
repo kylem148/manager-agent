@@ -29,6 +29,7 @@ import {
   type FileReviewInput,
   type FileReviewResult,
 } from "./reviewinbox.js";
+import { TASK_TABLE_CAP, type TaskStore } from "./taskstore.js";
 
 /**
  * The co-manager's internal capability surface, exposed to the model as tools.
@@ -279,6 +280,41 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
         additionalProperties: false,
       },
     },
+    {
+      name: "task_table",
+      description:
+        "Replace the captain's at-a-glance task table with the current one, in a single call. The table is persisted and PAINTED by the panel (Ctrl-O, Home tab), so it is what the captain looks at between turns — keep it current rather than only printing it into the chat.\n\n" +
+        "One call replaces the WHOLE table: send every row you want showing, in the order you want them read. There is no add, update or remove, and rows have no ids — the table is a handful of items you re-derive anyway. Send an empty `tasks` list to clear it.\n\n" +
+        `Keep it at-a-glance, not a tracker: the live items that say where we are and what is next, ${TASK_TABLE_CAP} rows maximum and usually far fewer. Prune aggressively — an item that is no longer a live next step comes out of the table, and the logs carry the record. \`status\` is ONE word.`,
+      input_schema: {
+        type: "object",
+        properties: {
+          tasks: {
+            type: "array",
+            description:
+              "The complete table, in display order. An empty array clears it.",
+            items: {
+              type: "object",
+              properties: {
+                task: { type: "string", description: "What the item is, in a few words." },
+                type: {
+                  type: "string",
+                  description: "What kind of work it is (e.g. feature, fix, research, decision).",
+                },
+                status: {
+                  type: "string",
+                  description: "Where it stands, in ONE word (e.g. building, blocked, queued, next).",
+                },
+              },
+              required: ["task", "type", "status"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["tasks"],
+        additionalProperties: false,
+      },
+    },
   ];
 
   // The dispatch + feature tools are only exposed when the instance has been
@@ -330,7 +366,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
           intent: {
             type: "string",
             description:
-              "One line saying what the feature is for. Optional, but give it every time: it is stored with the feature (surviving a restart), echoed back by feature_status/feature_list, and shown as the feature's description beside its branch in the captain's Ctrl-O features tab — where the branch name says what KIND of work it is and this is the only thing that says what the work actually is.",
+              "One line saying what the feature is for. Optional, but give it every time: it is stored with the feature (surviving a restart), echoed back by feature_status/feature_list, and shown as the feature's description beside its branch in the captain's Ctrl-O Home tab — where the branch name says what KIND of work it is and this is the only thing that says what the work actually is.",
           },
         },
         required: ["name"],
@@ -478,6 +514,13 @@ export interface ExecutorContext {
    * the model is told next, which is mostly "and now say nothing more".
    */
   onFileReview?: (input: FileReviewInput) => Promise<FileReviewResult>;
+  /**
+   * The persisted at-a-glance task table (task_table tool), read by the panel's
+   * Home tab. Always wired in a real session — the table is the co's own and
+   * needs no repo — so its absence only means a degraded/test executor, where the
+   * tool reports the table is unavailable rather than throwing.
+   */
+  tasks?: TaskStore;
 }
 
 const FEATURE_UNAVAILABLE =
@@ -626,6 +669,26 @@ export function makeExecutor(ctx: ExecutorContext) {
             ...(feature ? { feature } : {}),
           });
           return ok(id, res);
+        }
+        case "task_table": {
+          if (!ctx.tasks) return err(id, "The task table is unavailable in this session.");
+          const raw = input.tasks;
+          if (!Array.isArray(raw)) {
+            return err(id, "task_table requires a `tasks` array (an empty one clears the table).");
+          }
+          const { stored, dropped } = await ctx.tasks.replace(raw);
+          return ok(id, {
+            stored: stored.length,
+            table: stored,
+            ...(dropped > 0
+              ? {
+                  dropped,
+                  note:
+                    `${dropped} row(s) were not stored: the table holds ${TASK_TABLE_CAP} rows at most and a row with no task text is dropped. ` +
+                    "Prune to the items that say where we are and what is next.",
+                }
+              : {}),
+          });
         }
         case "dispatch_order": {
           const order = String(input.order ?? "").trim();

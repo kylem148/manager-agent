@@ -399,11 +399,12 @@ flat over time — small rewritten orientation files plus large append-only logs
         │   ├── archive/           cold log history, off the read path
         │   │   └── decisions/ progress/ research/
         │   └── sessions/          verbatim per-session transcripts (the record)
-        └── .dispatch/          crew-dispatch state (only after `co link`)
+        └── .dispatch/          runtime state (the crew half only after `co link`)
             ├── config.json        repo path, named agent commands, caps, pane layout, anchor
             ├── panes.json         the crew panes co owns: tty + shell pid + its lease on each
             ├── inbox.json         the last 20 crew reviews, newest first (Ctrl-O → Inbox)
             ├── features.json      per-feature intent + PR message, keyed by slug
+            ├── tasks.json         the at-a-glance task table (Ctrl-O → Home)
             └── captures/          per-job captured output the co reviews from
 ```
 
@@ -576,38 +577,80 @@ inbox. So a clean chore costs you no attention, a mixed result costs you one
 line, and only a run that genuinely needs a decision interrupts you, with the
 decision and nothing else.
 
-### Everything in flight: the Features tab
+### The Ctrl-O panel: tabs and keys
 
-The queue tab only shows what you've marked done. The Ctrl-O panel's **Features**
-tab shows every feature worktree that exists — including the ones still being
-worked, which the queue never sees — one after another, two lines each:
+`Ctrl-O` opens a full-screen panel over the session and closes it again. Every
+tab it has is listed in a bar across the top, on every tab, with the one you're
+on marked:
 
 ```
-  ▸ checkout        [ready to merge]    co/feat-checkout
-      stripe checkout with saved cards
-    user-auth       [queued #2]         co/feat-user-auth
-      passkey login for the web app
-    search-reindex  [crew running]      co/feat-search-reindex
-      full-text search over the docs tier
-    migrations      [resolving] [crew]  co/feat-migrations
-      split the schema migration runner out of boot
+[1 home] 2 queue  3 docs  4 inbox
 ```
 
-The description is the **intent** the co-manager wrote when it created the
-feature — a plain authored line, not something regenerated per refresh, and no
-model is called to produce it. It is stored per feature under
+Move between them three ways: `Tab` (or `i`) cycles, and the **number beside a
+tab jumps straight to it** from anywhere in the panel, including out of an open
+doc. A fifth tab appears while a `feature_land` review is pending, and takes the
+next number. Because the digits belong to the bar, the doc and inbox lists label
+their rows `a)`, `b)`, `c)` rather than `1)`, `2)`, `3)`.
+
+| tab   | what it is                                                        | its keys                              |
+| ----- | ----------------------------------------------------------------- | ------------------------------------- |
+| home  | the task table, then every tracked worktree. Read-only            | paging only                           |
+| queue | the merge queue and the head's pull request                       | `m` merge, `e` edit the PR message    |
+| docs  | everything in `docs/`, opened through the transcript's renderer   | `a`-`z` open, `y` copies an open doc  |
+| inbox | the last 20 filed crew reviews                                    | `a`-`z` open                          |
+
+Everywhere: `space`/`b` page, `j`/`k` line, `d`/`u` half, `g`/`G` ends,
+`Backspace` steps back out of a doc or a review, `Esc` (or `Ctrl-O`, or `q`)
+closes. A left-drag selects and copies on release, on every tab.
+
+### Home: what we're doing, and what's in flight
+
+`Ctrl-O` opens on **Home**, which answers the two questions you open the panel
+with. On top, the co-manager's at-a-glance task table. Underneath, every feature
+worktree that exists — including the ones still being worked, which the queue
+never sees — one line each:
+
+```
+  tasks
+  Task                        Type       Status
+  ctrl-o overhaul             feature    building
+  bedrock retry backoff       fix        blocked
+  pricing table refresh       research   next
+
+  worktrees
+  ▸ checkout   [ready to merge]  feat/checkout   stripe checkout with saved cards
+    user-auth  [queued #2]       feat/user-auth  passkey login for the web app
+    search     [crew running]    feat/search     full-text search over the docs
+    scratch    [dirty]           feat/scratch    the schema migration runner
+```
+
+The table is the same handful of live items the co-manager has always kept —
+"you are here", pruned hard, one word of status each — except that it is now
+**stored** rather than only spoken. The co writes the whole table through one
+tool whenever it changes, so the panel paints the current one instead of you
+having to ask for it and pay for a turn. A missing or unreadable table file is an
+empty table, never a failed start.
+
+The description beside a worktree is the **intent** the co-manager wrote when it
+created the feature — a plain authored line, not something regenerated per
+refresh, and no model is called to produce it. It is stored per feature under
 `.dispatch/features.json`, so it is still there after a restart, including for
 worktrees the startup sweep rebuilt from disk. A feature created without one says
 so rather than showing a blank.
 
-The state chip is derived from what the session already knows: a crew agent live
+The state word is derived from what the session already knows: a crew agent live
 in the worktree, a merge-queue position, a green head, a block, a resolver run.
 An agent working an enqueued feature shows a `[crew]` marker beside its queue
 state, so a running agent is never hidden by it, and a `▸` marks the two rows
 that want your eye — the one that can merge right now, and the one holding the
-queue up. Nothing on this tab acts — no
-selector, no `[m]`. Landing is the queue tab's keystroke, and creating, enqueuing
-and abandoning are the co-manager's levers; this is the overview you
+queue up. A feature nothing else is happening to reads `[clean]` or `[dirty]`,
+from a real `git status` taken when you open the tab (and `[idle]` in the moment
+before that lands — never `[clean]`, which would be a claim nobody had checked).
+
+Nothing on this tab acts — no selector, no `[m]` — which is what lets it be the
+tab the panel opens on. Landing is the queue tab's keystroke, and creating,
+enqueuing and abandoning are the co-manager's levers; this is the overview you
 context-switch from.
 
 ### Landing work: one keystroke, `[m]`
@@ -1032,7 +1075,7 @@ src/
              crewpanes.ts paneoccupancy.ts panestore.ts
              dispatchconfig.ts transport.ts registry.ts
              worktrees.ts forge.ts checks.ts landing.ts landinggate.ts
-             mergequeue.ts features.ts featurestore.ts
+             mergequeue.ts features.ts featurestore.ts taskstore.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
 ```
 
@@ -1309,12 +1352,16 @@ not an anomaly at all, it is what every landed feature leaves behind now that
 refs are kept. The co's reach stops at the PR into `dev`: it never touches
 `main` and there is no promote path.
 
-`overview()` is the same module's read side for the panel's features tab: every
-tracked feature as one row — handle, branch, stored intent, and a single-word
-state derived in memory from the record's provision status, the merge queue and
-the registry's jobs (provisioning first, then the queue, then a live crew agent),
-ordered closest-to-landing first. No git call and no model call, so the panel can
-re-read it on every paint.
+`overview()` is the same module's read side for the Home tab's worktree list:
+every tracked feature as one row — handle, branch, stored intent, and a
+single-word state derived in memory from the record's provision status, the merge
+queue and the registry's jobs (provisioning first, then the queue, then a live
+crew agent), ordered closest-to-landing first. No git call and no model call, so
+the panel can re-read it on every paint. The one thing it cannot derive for free
+is whether a worktree is dirty, which costs a `git status` each: that lives in a
+cache `refreshDirty()` fills, and the panel asks for a refresh when you open Home
+and never on a paint. An unread worktree reports no dirty state at all rather
+than reporting clean.
 
 `featurestore.ts` is the durable half of a feature record. Git rebuilds
 everything else about a feature from its worktree, but not the prose the co
@@ -1336,12 +1383,28 @@ touched (that is what makes a bare re-enqueue a retry), but a description they
 deliberately deleted is deleted, so it cannot come back the next time a pull
 request is created for that feature.
 
+`taskstore.ts` is the same idea for the co's at-a-glance task table: a small
+ordered list of `{task, type, status}` under `.dispatch/tasks.json`, beside the
+feature store. The table always existed, but only as prose the co re-printed into
+the chat from its own memory, which left the panel nothing to render. It is
+written WHOLE through one model-facing tool (`task_table`) — no per-row add or
+update, no ids — because the co re-derives the handful of rows anyway and a
+partial write is only a way for the store and the co's belief about it to
+diverge. Junk rows are dropped, cells are folded to one line, the list is capped,
+and a write that had to truncate says so in the tool result rather than letting
+the co assume it stored everything. A missing or corrupt file is an empty table,
+never a failed start.
+
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,
-and the Ctrl-O panel. The panel has four home tabs, cycled with Tab — the merge
-queue, the features overview, the doc viewer, and the review inbox — each reading
-a small injected source, so the Tui never reaches into git, the filesystem, or
-the session layer itself. The queue tab renders the ready head's pull request —
+and the Ctrl-O panel. The panel has four home tabs — home (the task table over
+the worktree overview), the merge queue, the doc viewer, and the review inbox —
+listed in a persistent bar across the top and reached by Tab, `i`, or the digit
+the bar shows beside each. Each reads a small injected source, so the Tui never
+reaches into git, the filesystem, or the session layer itself; `panelFrame()` is
+the one switch behind the paint, the bar and the drag-copy alike, so no view can
+be painted from one tab and labelled as another. The queue tab renders the ready
+head's pull request —
 its checks evidence, then its message (title, description, commits) as its own
 block — and owns the `[m]` that merges it, through an injected `merge`
 callback that is the only thing the keystroke can reach. It composes none of
@@ -1350,9 +1413,10 @@ by the source (`splitEvidence`), so the panel and the pull request cannot drift
 apart. `e` on that tab opens the same message in a popup EDITOR over it, through
 a second injected callback (`editPrMessage`) that is likewise the only thing that
 keystroke can reach — one buffer in `git commit` shape, prose only, saved with
-Ctrl-S and never merging anything. The features tab is
-read-only by construction (no selector, no `[m]`, it only pages), so the overview
-can never be the thing that merged something; a pending `feature_land` review
+Ctrl-S and never merging anything. The home tab is
+read-only by construction (no selector, no `[m]`, it only pages), which is what
+lets the panel open on it: the tab a keystroke lands on by default can never be
+the thing that merged something. A pending `feature_land` review
 gets a fifth tab of its own for as long as it is pending, so the two merges never
 share a key. A doc and a filed review drill into the same paged body view. The
 panel body is one selection surface: a left-drag highlights and copies out of any

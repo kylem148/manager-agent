@@ -23,6 +23,10 @@ import type { ResearchConfig } from "../config.js";
  * body is the permanent record of a feature and co writes it without ever seeing
  * the diff, so the shape it writes to and the material the crew is told to hand
  * back are one mechanism, pinned together.
+ *
+ * And so is the task table's tool contract: the panel paints the STORE, so a
+ * prompt that stopped telling the co to write through `task_table` would leave
+ * the Home tab quietly showing yesterday's table with nothing broken to notice.
  */
 
 async function makeInstance(): Promise<{ paths: InstancePaths; cleanup: () => Promise<void> }> {
@@ -214,6 +218,33 @@ test("the panel's `e` editor is in the protocol, with the captain's version winn
       /never re-send yours over it with another\s+`feature_enqueue`/,
       "an edit of theirs is not something co undoes with its own draft",
     );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the task table is a tool call now, not just something the co prints", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    // Unlinked too: the table is the co's own and needs no repo, so every
+    // session has it.
+    const prompt = await buildSystemPrompt(paths, RESEARCH);
+    assert.match(prompt, /The table is persisted, and the panel paints it/);
+    assert.match(prompt, /`task_table`/, "the tool that stores it is named");
+    assert.match(
+      prompt,
+      /replaces every row in one call \(an empty\s+list clears it\)/,
+      "whole-table writes, so the store cannot drift from what the co believes",
+    );
+    assert.match(prompt, /Ctrl-O, Home\s+tab/, "and where the captain reads it");
+    assert.match(
+      prompt,
+      /rather than only printing the table into the chat/,
+      "the behaviour change: keeping the store current is the point",
+    );
+    // The at-a-glance rules the table has always had are still the rules.
+    assert.match(prompt, /at-a-glance, not a tracker/);
+    assert.match(prompt, /Task \| Type \| Status/);
   } finally {
     await cleanup();
   }

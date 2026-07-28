@@ -130,7 +130,7 @@ export interface CreateResult {
 }
 
 /**
- * Where a feature stands right now, in ONE word, for the panel's features tab.
+ * Where a feature stands right now, in ONE word, for the panel's Home tab.
  * Derived entirely from state the session already holds — the registry's jobs,
  * the merge queue, the record's provision status. No git call, no model call,
  * nothing that costs anything to compute at paint time.
@@ -166,7 +166,7 @@ export type FeatureActivity =
   | "removed";
 
 /**
- * One feature as the Ctrl-O features tab shows it: what it is, where it is, and
+ * One feature as the Ctrl-O Home tab shows it: what it is, where it is, and
  * what is happening to it. This is the overview the queue tab deliberately does
  * NOT give — the queue holds only the features the captain has marked done, and
  * everything still being worked is invisible there.
@@ -189,6 +189,18 @@ export interface FeatureOverview {
   position?: number;
   /** Present when blocked: conflict vs red build+test. */
   blockedKind?: "conflict" | "failed";
+  /**
+   * Whether the worktree holds uncommitted changes, as of the last
+   * `refreshDirty()`. Undefined means "not asked yet" and renders as the plain
+   * state word rather than as clean — the one thing this must never do is claim
+   * a tree is clean because nobody looked.
+   *
+   * It is the one field here that costs a git call, so unlike everything else in
+   * this shape it is READ FROM A CACHE rather than derived per call: the panel
+   * repaints many times a second and `git status` per worktree per frame would be
+   * absurd. The panel asks for a refresh when the captain opens the Home tab.
+   */
+  dirty?: boolean;
 }
 
 export interface AbandonResult {
@@ -255,12 +267,17 @@ export class FeatureManager {
    *  the deps below. FeatureManager is its host (busy check + record cleanup). */
   private readonly queue: MergeQueue;
   /** The co's authored prose keyed by slug: the intent, so status/list and the
-   *  panel's features tab can show what a feature is FOR, and the PR title/body
+   *  panel's Home tab can show what a feature is FOR, and the PR title/body
    *  written at enqueue, which the queue hands to landing.ts on every head
    *  processing. Durable: git can rebuild everything else about a feature from its
    *  worktree, but not what the co wrote, so those fields are persisted under
    *  `.dispatch/features.json` (featurestore.ts) and read back at session start. */
   private readonly store: FeatureStore;
+  /** Slug → "has uncommitted changes", as of the last refreshDirty(). The only
+   *  thing on the panel's overview that costs a git call, so it is cached rather
+   *  than derived: see refreshDirty. A slug that is absent is UNKNOWN, never
+   *  clean. */
+  private readonly dirty = new Map<string, boolean>();
 
   constructor(opts: FeatureManagerOptions) {
     this.registry = opts.registry;
@@ -392,7 +409,7 @@ export class FeatureManager {
   }
 
   /**
-   * Every tracked feature as the Ctrl-O features tab shows it — the at-a-glance
+   * Every tracked feature as the Ctrl-O Home tab shows it — the at-a-glance
    * overview of everything in flight, not just what is queued to land. Pure
    * in-memory derivation (registry records + jobs + the queue snapshot + the
    * stored intent), so the panel can call it fresh on every paint the way it
@@ -408,6 +425,7 @@ export class FeatureManager {
       const queue = this.queue.viewFor(record.feature);
       const busy = this.isBusy(record.feature);
       const intent = this.store.intent(record.slug);
+      const dirty = this.dirty.get(record.slug);
       return {
         feature: record.feature,
         slug: record.slug,
@@ -417,6 +435,7 @@ export class FeatureManager {
         busy,
         ...(queue ? { position: queue.position } : {}),
         ...(queue?.blockedKind ? { blockedKind: queue.blockedKind } : {}),
+        ...(dirty === undefined ? {} : { dirty }),
       } satisfies FeatureOverview;
     });
     return rows.sort((a, b) => {
@@ -425,6 +444,39 @@ export class FeatureManager {
       if (pa !== pb) return pa - pb;
       return a.slug.localeCompare(b.slug);
     });
+  }
+
+  /**
+   * Re-read every tracked worktree's dirty flag into the cache `overview()`
+   * reports from. One `git status --porcelain` per worktree, all of them at once,
+   * and a worktree that fails to answer (removed under us, a git that errored)
+   * drops out of the cache rather than being recorded as clean.
+   *
+   * Called by the panel when the captain opens the Home tab — the one moment the
+   * answer is about to be looked at — never on a paint and never on a timer. It
+   * NEVER REJECTS: an overview that shows a state word without the clean/dirty
+   * refinement is a small loss; a panel key that throws is not.
+   */
+  async refreshDirty(): Promise<void> {
+    const records = this.registry.listFeatures();
+    const live = new Set(records.map((r) => r.slug));
+    for (const slug of [...this.dirty.keys()]) {
+      if (!live.has(slug)) this.dirty.delete(slug); // landed or abandoned since
+    }
+    await Promise.all(
+      records.map(async (record) => {
+        try {
+          if (!fs.existsSync(record.worktreePath)) {
+            this.dirty.delete(record.slug);
+            return;
+          }
+          this.dirty.set(record.slug, await isWorktreeDirty(record.worktreePath));
+        } catch {
+          // Unknown beats wrong: the row shows its plain state word instead.
+          this.dirty.delete(record.slug);
+        }
+      }),
+    );
   }
 
   /** One feature's full picture, or null if nothing is tracked under that

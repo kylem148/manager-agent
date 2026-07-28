@@ -486,7 +486,7 @@ test("a feature's intent SURVIVES a restart: the record is rebuilt from git, the
     assert.equal((await next.status("User Auth"))?.intent, "passkey login for the web app");
     assert.equal((await next.status("checkout"))?.intent, "stripe checkout with saved cards");
 
-    // And it reaches the panel's features tab, which is the whole point.
+    // And it reaches the panel's Home tab, which is the whole point.
     const overview = next.overview();
     assert.deepEqual(
       overview.map((f) => [f.feature, f.intent, f.status, f.branch]),
@@ -567,6 +567,33 @@ test("the features overview lists queued and unqueued side by side, closest-to-l
     const started = fx.features.beginResolveHead();
     assert.equal(started.started, false, "a green head has nothing to resolve");
     assert.equal(fx.features.overview()[0]!.status, "ready", "and nothing changed under it");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("the overview's dirty flag is refreshed on demand, and unknown until it is", async () => {
+  const fx = await makeFixture();
+  try {
+    const created = await fx.features.create("wip", "half-finished work");
+
+    // Never guessed: before anyone asks, the row says nothing about the tree
+    // rather than claiming it is clean.
+    assert.equal(fx.features.overview()[0]!.dirty, undefined, "unknown until asked");
+
+    await fx.features.refreshDirty();
+    assert.equal(fx.features.overview()[0]!.dirty, false, "a fresh worktree is clean");
+
+    await fsp.writeFile(path.join(created.feature.worktreePath, "scratch.txt"), "wip\n", "utf8");
+    assert.equal(fx.features.overview()[0]!.dirty, false, "the cache is not a live read");
+    await fx.features.refreshDirty();
+    assert.equal(fx.features.overview()[0]!.dirty, true, "and the refresh sees the change");
+
+    // A feature that goes away takes its cached flag with it.
+    await fsp.rm(path.join(created.feature.worktreePath, "scratch.txt"));
+    await fx.features.abandon("wip");
+    await fx.features.refreshDirty();
+    assert.deepEqual(fx.features.overview(), []);
   } finally {
     await fx.cleanup();
   }

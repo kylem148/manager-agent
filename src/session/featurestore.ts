@@ -14,7 +14,7 @@ import { serializeWrite } from "../memory/writequeue.js";
  * authored at `feature_create` time) and, since the authored-PR-message slice,
  * the PR TITLE and BODY the co composes when it enqueues a finished feature.
  * Both used to live only in a Map that died with the session — which made the
- * Ctrl-O features tab lie after every restart, and would make a re-processed head
+ * Ctrl-O Home tab lie after every restart, and would make a re-processed head
  * silently fall back to the mechanical PR message.
  *
  * So that prose is persisted here, keyed by slug (the handle that survives — the
