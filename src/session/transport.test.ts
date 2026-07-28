@@ -22,6 +22,7 @@ import {
   setOsaRunnerForTest,
   PaneUnavailableError,
   dispatchCorrelation,
+  readPaneIdentity,
 } from "./transport.js";
 
 /**
@@ -186,6 +187,46 @@ test("job script end-to-end: order intact, sentinel code, self-cleanup", async (
   }
 });
 
+test("job script reports the pane's identity (tty + the pid that outlives the job)", async () => {
+  // Ghostty's API cannot tell co what tty a pane is on, so the launch script is
+  // the only thing that can — and pane reuse is impossible without it. Run the
+  // real script and read the sidecar back through the real parser.
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const { captureFile, scriptPath } = await writeJobScript(paths, "job-tty", `sh -c 'true'`, "x");
+    // No `hold`: the takeover/reuse shape, where the pane's own shell is our
+    // PARENT and is the process that will still be there when the job is done.
+    execFileSync("/bin/sh", [scriptPath], { stdio: "ignore" });
+    const identity = await readPaneIdentity(captureFile);
+    assert.equal(
+      identity.shellPid,
+      process.pid,
+      "without hold the recorded pid is the launching shell — here, this test process",
+    );
+    // stdio is ignored above, so there is no tty to report; the field is simply
+    // absent, which reads downstream as "this pane can't be proven idle".
+    const raw = await fsp.readFile(`${captureFile}.tty`, "utf8");
+    assert.match(raw, /^tty=/m, "the sidecar always carries a tty line, empty or not");
+    assert.match(raw, new RegExp(`^pid=${process.pid}$`, "m"));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("readPaneIdentity is tolerant: a missing or junk sidecar is an empty identity", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  try {
+    const capture = paths.captureFile("job-none");
+    assert.deepEqual(await readPaneIdentity(capture), {}, "no sidecar at all");
+    await fsp.writeFile(`${capture}.tty`, "tty=not a device\npid=0\n", "utf8");
+    assert.deepEqual(await readPaneIdentity(capture), {}, "junk fields are dropped, not trusted");
+    await fsp.writeFile(`${capture}.tty`, "tty=/dev/ttys004\npid=4242\n", "utf8");
+    assert.deepEqual(await readPaneIdentity(capture), { tty: "ttys004", shellPid: 4242 });
+  } finally {
+    await cleanup();
+  }
+});
+
 test("job script survives Ctrl-C (SIGINT to the process group) and still writes the sentinel", async () => {
   // Quitting an interactive agent with Ctrl-C sends SIGINT to the pane's whole
   // foreground group — the wrapper sh included. The trap must keep the wrapper
@@ -283,7 +324,16 @@ test("launchGhostty consults the planner, probes the launch, and commits the pan
     };
 
     setOsaRunnerForTest(stubLaunch("j1"));
-    const first = await launchGhostty({ paths, config, layout, jobId: "j1", order: "one" });
+    // anchorUnproven: co has never run a job in this anchor, which is the one
+    // case where it may still be taken over without proof (see crewpanes.ts).
+    const first = await launchGhostty({
+      paths,
+      config,
+      layout,
+      jobId: "j1",
+      order: "one",
+      placement: { anchorUnproven: true },
+    });
     assert.equal(first.paneId, "anchor-1");
     assert.equal(first.placement?.kind, "takeover");
     assert.equal(layout.paneCount, 1);
@@ -323,6 +373,7 @@ test("launchGhostty degrades when a busy pane never starts the job (paste went n
       layout,
       jobId: "busy",
       order: "x",
+      placement: { anchorUnproven: true },
       paneStartTimeoutMs: 300,
     }).then(
       () => null,
@@ -409,10 +460,19 @@ test("launchGhostty aborts the plan when osascript fails, leaving the layout cle
     setOsaRunnerForTest(async () => {
       throw new Error("osascript boom");
     });
-    await assert.rejects(() => launchGhostty({ paths, config, layout, jobId: "j1", order: "x" }));
+    await assert.rejects(() =>
+      launchGhostty({
+        paths,
+        config,
+        layout,
+        jobId: "j1",
+        order: "x",
+        placement: { anchorUnproven: true },
+      }),
+    );
     // The failed plan must be aborted so the next dispatch re-offers the anchor.
     assert.equal(layout.paneCount, 0);
-    assert.deepEqual(layout.plan(), { kind: "takeover", paneId: "anchor-1" });
+    assert.deepEqual(layout.plan({ anchorUnproven: true }), { kind: "takeover", paneId: "anchor-1" });
   } finally {
     setOsaRunnerForTest(null);
     await cleanup();

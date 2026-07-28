@@ -401,6 +401,7 @@ flat over time — small rewritten orientation files plus large append-only logs
         │   └── sessions/          verbatim per-session transcripts (the record)
         └── .dispatch/          crew-dispatch state (only after `co link`)
             ├── config.json        repo path, named agent commands, caps, pane layout, anchor
+            ├── panes.json         the crew panes co owns: tty + shell pid + its lease on each
             ├── inbox.json         the last 20 crew reviews, newest first (Ctrl-O → Inbox)
             ├── features.json      per-feature intent + PR message, keyed by slug
             └── captures/          per-job captured output the co reviews from
@@ -501,18 +502,40 @@ jobs to grow from, then records that terminal's stable id (Ghostty's API can't t
 a pane, so the id is the handle; a dispatch verifies it still exists and asks you
 to re-run `co pane` if you've since closed it). The first job takes over that
 anchor pane, and each later job splits the newest crew pane, alternating
-beside/below, up to a cap (default 4) after which the oldest finished pane is
-reused or the job queues. The split direction sequence and the cap are config
-values you can retune. Requires Ghostty 1.3+ and a one-time macOS Automation
-permission (granted the first time it scripts Ghostty).
+beside/below. The split direction sequence is a config value you can retune.
+Requires Ghostty 1.3+ and a one-time macOS Automation permission (granted the
+first time it scripts Ghostty).
+
+**An idle pane is reused before a new one is cut.** `/exit` the agent and the
+pane goes back to a shell prompt; the next dispatch runs there instead of
+splitting again, so panes stop piling up one per job. A pane is only reused when
+*both* signals say it is free: co holds no dispatch on it, **and** nothing is
+running in it right now — checked fresh, against the real pane, at the moment of
+dispatch. Anything else in that pane, whether an agent you're still talking to, a
+build you started, or an editor, means it is occupied and a new pane is split
+instead. There is **no cap**: splitting is what "everything is busy" falls back
+to, so an extra pane is always available, and getting it wrong in that direction
+costs you one pane while the other direction would cost you your work.
+
+How it knows: Ghostty's scripting API can tell co whether a terminal still exists
+and nothing else — no tty, no process, no "is it at a prompt". So each job's
+launch script reports the pane's tty and the pid of the shell that outlives the
+job, co remembers that per pane (under `.dispatch/panes.json`), and a dispatch
+reads that tty's process table (`ps`) to decide. A pane whose processes are all
+shells is idle; anything else is not. co only ever considers panes it created or
+the anchor you handed it, never a terminal of yours, and every uncertainty — an
+unreadable pane, one it has no record for, a probe that fails — reads as
+occupied.
 
 **Close crew panes freely.** A finished worker pane you close is dropped from
-the layout before the next placement is decided, so the following job grows from
-the newest pane that still exists, and from the anchor once you've closed every
-worker. Closing panes never breaks the link: you can spawn and delete crew panes
-all session without re-running anything. Only closing the *anchor* pane itself
-leaves nothing to grow from, and that fails the dispatch cleanly with a re-run
-`co pane` message rather than a broken link.
+the layout, and from co's pane records, before the next placement is decided, so
+the following job grows from the newest pane that still exists, and from the
+anchor once you've closed every worker. Closing panes never breaks the link: you
+can spawn and delete crew panes all session without re-running anything. Only
+closing the *anchor* pane itself leaves nothing to grow from, and that fails the
+dispatch cleanly with a re-run `co pane` message rather than a broken link. A
+busy anchor is a different thing entirely and no longer reads as a lost one: co
+splits off it and leaves what's in it alone.
 
 **Dispatch is visible-only.** A crew agent runs in a visible Ghostty pane or it
 does not run at all — there is deliberately no background/headless path. If a
@@ -765,7 +788,11 @@ keystroke stream, so newlines and quotes in an order can't be re-interpreted by
 whatever the pane is doing. If the pane doesn't start the job within about four
 seconds (something else — an editor, another agent — owns it), the dispatch
 fails cleanly and launches nothing rather than running the agent somewhere you
-can't see. The co-manager's own `PATH` is baked into the script, because a
+can't see. The script's very first act, before the capture file even exists, is
+writing down where it is: the pane's tty and the pid of the shell that will still
+be there when the job is done. That sidecar is the only way co ever learns what a
+pane is — Ghostty won't say — and it is what makes reusing that pane later a
+measurement rather than a guess. The co-manager's own `PATH` is baked into the script, because a
 command-launched Ghostty surface otherwise inherits only the bare GUI `PATH` and
 wouldn't find a user-installed agent binary.
 
@@ -811,10 +838,13 @@ Because the hook fires while the agent is still live in its pane, completion and
 pane reuse are kept separate: the review lands immediately, but that pane is not
 offered to a later dispatch until the crew process actually exits. The per-job
 launch script deletes itself as its last act, so its absence is the signal that
-the pane is back to an idle shell and safe to reuse — until then a new dispatch
-that hits the pane cap splits or queues rather than pasting a launch line into a
-running agent. Close the crew when you're done with it and the pane rejoins the
-reusable set on the next poll (or the next dispatch that needs it).
+co's own hold on the pane is over — until then a new dispatch splits rather than
+pasting a launch line into a running agent. That is only co's half of the
+question, though: even once co lets go, the pane still has to *look* idle when
+the next dispatch reads it, so an agent you keep talking to, or anything else you
+start in there, keeps it yours. Close the crew when you're done with it and the
+pane rejoins the reusable set on the next poll (or the next dispatch that needs
+it).
 
 Even without the hook the run still reports: the script wrapper writes the
 sentinel with the crew's real exit code when the agent process exits, and it
@@ -999,7 +1029,8 @@ src/
   tui/       tui.ts editor.ts markdown.ts wrap.ts keys.ts banner.ts
              commands.ts visuals.ts
   session/   session.ts prompt.ts tools.ts reviewinbox.ts
-             crewpanes.ts dispatchconfig.ts transport.ts registry.ts
+             crewpanes.ts paneoccupancy.ts panestore.ts
+             dispatchconfig.ts transport.ts registry.ts
              worktrees.ts forge.ts checks.ts landing.ts landinggate.ts
              mergequeue.ts features.ts featurestore.ts
   memory/    memory.ts docs.ts templates.ts writequeue.ts
@@ -1054,11 +1085,34 @@ chat gate as one pure function: L2 returns exactly one dim pointer line, L1 and
 L3 return none (L1's signal is the co's own next sentence — the decision the
 captain has to make), and the body reaches the chat at no level.
 
-The dispatch layer is four focused modules. `crewpanes.ts` is the pure pane-
-placement planner (anchor takeover, alternating splits of the newest *living*
-pane, cap + reuse-oldest, all configurable) with no I/O; it exposes its tracked
-pane ids and a `prune` so a closed pane is dropped, and an emptied worker box
-falls back to splitting the anchor. `dispatchconfig.ts` reads/writes the
+The dispatch layer is six focused modules. `crewpanes.ts` is the pure pane-
+placement planner (reuse a proven-idle pane first, else alternating splits of the
+newest *living* pane, direction sequence configurable) with no I/O; it exposes
+its tracked pane ids and a `prune` so a closed pane is dropped, and an emptied
+worker box falls back to splitting the anchor. Whether a pane IS idle never
+reaches it as an opinion — it arrives as a list of ids proven free at that
+instant, so placement can't drift out of date with the screen.
+
+`paneoccupancy.ts` is where that proof is made, and it exists because Ghostty's
+scripting dictionary exposes a terminal's `id`, `name` and `working directory`
+and nothing else: no tty, no pid, no "is it at a prompt". So the per-job launch
+script reports the pane's tty and the pid of the shell that outlives the job, and
+this module reads that tty's process table (`ps -t`) and calls the pane idle only
+when every process on it is a shell (or the `login` a Ghostty pane bootstraps
+through). The recorded shell pid must still be alive on that tty, which is what
+binds a recycled device name back to the pane co thinks it is. The verdict is a
+pure function over (does it exist, is it leased, what is its identity, what is
+running) so the whole decision is unit-tested with the process lookup stubbed;
+the asymmetry is wired in rather than left to callers — an unreadable table, a
+pane with no record, a dead shell and a failed probe all come back "not free",
+because a false occupied costs one split and a false free costs the captain's
+work. `panestore.ts` is the durable half: which panes co owns, each one's tty and
+shell pid, and co's own lease on it, under `.dispatch/panes.json`. A lease is
+believed only while the process holding it is alive, so a co that was killed
+leaves stale claims that are swept at load and before every dispatch rather than
+panes that are blocked forever.
+
+`dispatchconfig.ts` reads/writes the
 per-instance `.dispatch/config.json`, resolves which named crew agent a dispatch
 uses (default or `confirm <name>` override), and resolves that agent's command
 into a runnable shell command line (git-style: the template runs verbatim, only
@@ -1068,13 +1122,17 @@ planner and delivers each job as a per-job script file, with a capture-file +
 completion-sentinel contract. There is no background/headless launcher by
 design: a pane that can't be placed raises a `PaneUnavailableError` and the
 dispatch fails cleanly. `registry.ts` owns in-flight jobs: it launches into a
-pane, polls captures for the sentinel, enforces timeouts, drains the pane queue,
-mints a unique capture key per dispatch, and fires a completion callback, all
-non-blocking. It is also what keeps the link durable across closed panes, from
-both sides: proactively, it probes every tracked pane's existence before
-planning and prunes the dead ones; reactively, a pane that dies between that
-sweep and the split is pruned and the placement re-planned against the
-survivors. One dead worker costs one pruned id, never the whole layout.
+pane, polls captures for the sentinel, enforces timeouts, mints a unique capture
+key per dispatch, and fires a completion callback, all non-blocking. It is also
+what surveys the panes before each dispatch — asking Ghostty which of them still
+exist and `ps` what is running in the survivors — and so is where the two halves
+of pane hygiene meet: a pane the captain closed is pruned from the layout and the
+store, and a pane that answers "here, and idle" to both questions is handed to
+the planner as reusable. Reactively, a pane that dies between that survey and the
+launch is pruned and the placement re-planned against the survivors, and one that
+turns out to be busy after all (the transport's launch probe catches it) is
+dropped from the offer and the dispatch splits instead. One dead worker costs one
+pruned id, never the whole layout.
 
 `worktrees.ts` is the git-worktree lifecycle harness for the
 parallel-dispatch feature: verify the `origin/dev` integration branch is

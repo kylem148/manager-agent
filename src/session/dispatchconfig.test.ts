@@ -153,7 +153,6 @@ test("dispatch config round-trips through disk", async () => {
     assert.equal(read?.caps.timeoutSec, 900);
     assert.equal(read?.caps.turnLimit, 40);
     assert.deepEqual(read?.pane.directionSequence, ["right", "down"]);
-    assert.equal(read?.pane.cap, 4);
     assert.equal(read?.anchor, null);
   } finally {
     await cleanup();
@@ -201,7 +200,23 @@ test("coerce fills defaults for a partial/hand-edited config", async () => {
     assert.deepEqual(read?.agents, EXAMPLE_AGENTS);
     assert.equal(read?.defaultAgent, EXAMPLE_AGENTS[0]!.name);
     assert.deepEqual(read?.pane.directionSequence, ["right", "down"]);
-    assert.equal(read?.pane.cap, 4);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a `cap` from an older config is read and dropped — crew panes are uncapped", async () => {
+  const { home, name, cleanup } = await makeInstance();
+  try {
+    const paths = instancePaths(home, name);
+    await fsp.mkdir(paths.dispatch, { recursive: true });
+    await fsp.writeFile(
+      paths.dispatchConfig,
+      JSON.stringify({ repoPath: "/r", pane: { directionSequence: ["down"], cap: 4 } }),
+      "utf8",
+    );
+    const read = await readDispatchConfig(paths);
+    assert.deepEqual(read?.pane, { directionSequence: ["down"] }, "the stale cap is not part of the config");
   } finally {
     await cleanup();
   }

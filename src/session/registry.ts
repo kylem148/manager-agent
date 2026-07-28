@@ -14,8 +14,12 @@ import {
   launchGhostty,
   parseSentinel,
   PaneUnavailableError,
+  type LaunchResult,
   type TransportKind,
 } from "./transport.js";
+import type { PlacementInput } from "./crewpanes.js";
+import { PaneStore } from "./panestore.js";
+import { judgePane, pidAlive, psTtyProbe, type TtyProbe } from "./paneoccupancy.js";
 import { installCrewStopHook, type InstallResult } from "./crewhook.js";
 import { stopCaptureFile, type StopCapture } from "./crewstophook.js";
 import {
@@ -31,11 +35,11 @@ import {
  * The dispatch job registry and capture watcher.
  *
  * One registry per session. It owns every in-flight crew job: it launches each
- * in a VISIBLE Ghostty pane, polls its capture file for completion, enforces the
- * wall-clock timeout, and drains the queue when a pane frees. It is fully
- * non-blocking: nothing here is ever awaited on the conversation path — the
- * session arms and fires a dispatch and moves on, and the registry notifies via a
- * callback when a job finishes. Multiple jobs run concurrently.
+ * in a VISIBLE Ghostty pane, polls its capture file for completion, and enforces
+ * the wall-clock timeout. It is fully non-blocking: nothing here is ever awaited
+ * on the conversation path — the session arms and fires a dispatch and moves on,
+ * and the registry notifies via a callback when a job finishes. Multiple jobs
+ * run concurrently.
  *
  * VISIBLE-PANE-ONLY. A crew agent runs in a pane the operator can watch, or it
  * does not run. There is no background/headless path. If a visible pane cannot
@@ -97,9 +101,33 @@ import {
  * script is already gone at completion time (a non-Claude agent, or a run whose
  * only marker is the exit-time sentinel) the release happens inline; otherwise
  * the job waits in pendingRelease and tick() releases it when the script clears.
+ *
+ * PANE REUSE. A dispatch reuses a pane co owns before it splits a new one, and
+ * it must be RIGHT about that: reuse pastes a launch line into an existing pane,
+ * so a pane wrongly called idle eats the captain's work. Occupancy is therefore
+ * the union of two signals, either of which marks a pane taken:
+ *
+ *  - co's own LEASE: a job of this session running in it (including one that has
+ *    filed its report but whose agent is still live, see pendingRelease), or a
+ *    lease in the pane store held by another co session that is still alive.
+ *  - the PANE ITSELF: anything running on its tty that is not a shell
+ *    (paneoccupancy.ts). This is the signal that catches what co cannot know —
+ *    the captain kept talking to an agent that already reported, or started a
+ *    build in a pane co thinks it finished with.
+ *
+ * The reading is taken FRESH on every dispatch (surveyPanes), never cached:
+ * Ghostty is asked whether each pane still exists, `ps` is asked what is running
+ * on it, and only a pane that answers "here, and idle" to both is reusable.
+ * Everything else — a probe that fails, a pane with no identity on record, a
+ * shell that has since died — reads as occupied and costs a split, which is the
+ * cheap mistake. Panes co has never owned are not candidates at any point: the
+ * universe is the tracked layout plus the pane store plus the anchor.
+ *
+ * There is NO CAP and no queue. Splitting is what "everything is busy" falls
+ * back to, so it must always be available.
  */
 
-export type JobStatus = "running" | "queued" | "done" | "failed";
+export type JobStatus = "running" | "done" | "failed";
 
 export interface Job {
   id: string;
@@ -108,8 +136,8 @@ export interface Job {
   /** A short human label for notices (first line of the order, trimmed). */
   label: string;
   /** The crew agent this job launched with (the confirm-time override or the
-   *  config default). Undefined means the config default was used. Kept so a
-   *  queued job relaunches with the same agent and reviews can name it. */
+   *  config default). Undefined means the config default was used. Kept so
+   *  reviews can name it. */
   agentName?: string;
   transport: TransportKind;
   status: JobStatus;
@@ -120,11 +148,10 @@ export interface Job {
   feature?: string;
   /** The working directory the crew process was launched in, when it isn't the
    *  linked repo: a feature-scoped job runs inside the feature's worktree.
-   *  Kept on the job so a queued relaunch lands in the same checkout. Absent for
-   *  a plain dispatch. */
+   *  Absent for a plain dispatch. */
   cwd?: string;
   captureFile: string;
-  /** Epoch ms when the job started running (set on launch, not on queue). */
+  /** Epoch ms when the job started running (set on launch). */
   startedAt: number | null;
   /** Exit code from the sentinel, once complete (-1 when unobservable). */
   exitCode?: number;
@@ -181,6 +208,15 @@ export interface RegistryOptions {
    *  own budget (4s, generous on purpose); tests shorten it so exercising a
    *  probe-timeout costs milliseconds instead of seconds. */
   paneStartTimeoutMs?: number;
+  /** Test seam: the pane records co owns (identity + leases). Defaults to the
+   *  instance's `.dispatch/panes.json`, loaded lazily on the first dispatch. */
+  paneStore?: PaneStore;
+  /** Test seam: read a tty's process table. Defaults to the real `ps` probe;
+   *  stubbing it is what makes the occupancy predicate testable without panes. */
+  ttyProbe?: TtyProbe;
+  /** Test seam: is this pid still alive? Judges a persisted lease — a lease from
+   *  a killed co session must go stale, never poison a pane permanently. */
+  pidAlive?: (pid: number) => boolean;
 }
 
 /** Per-dispatch options beyond the order and agent. */
@@ -191,6 +227,16 @@ export interface DispatchOptions {
    *  feature's isolated checkout on its own `<type>/<slug>` branch, never the
    *  primary tree. Omit for the plain repo-cwd dispatch. */
   feature?: string;
+}
+
+/** The fresh reading one dispatch places against (see surveyPanes). */
+interface PaneSurvey {
+  /** Pane ids co owns that are provably unoccupied right now, best first. */
+  free: string[];
+  /** True when co has no identity on record for the anchor at all — it has never
+   *  run a job there, so nothing about it can be read. The one case where the
+   *  first dispatch still takes the anchor over unproven (see crewpanes.ts). */
+  anchorUnproven: boolean;
 }
 
 export class DispatchRegistry {
@@ -226,8 +272,6 @@ export class DispatchRegistry {
    *  capture/identity key is unique per dispatch, not merely per session: a
    *  back-to-back re-run of the same order must never share a capture key. */
   private readonly runTag: string;
-  /** FIFO of jobs waiting for a crew pane to free (at the pane cap). */
-  private readonly queue: string[] = [];
   private layout: CrewPaneLayout | null;
   private poller: ReturnType<typeof setInterval> | null = null;
   private jobSeq = 0;
@@ -256,6 +300,15 @@ export class DispatchRegistry {
   private readonly provisionFeature: (opts: WorktreeOptions, feature: string) => Promise<FeatureRecord>;
   /** Test-only override of the transport's launch-probe budget (see options). */
   private readonly paneStartTimeoutMs?: number;
+  /** The panes co owns, with their tty identity and co's leases on them. Loaded
+   *  lazily (and once) on the first dispatch, because construction is sync and
+   *  a session that never dispatches should never touch the file. */
+  private paneStorePromise: Promise<PaneStore> | null;
+  private readonly ttyProbe: TtyProbe;
+  private readonly aliveCheck: (pid: number) => boolean;
+  /** This session's identity in a pane lease. Random rather than the pid alone,
+   *  so a lease can be recognised as ours even after a pid is recycled. */
+  private readonly sessionId: string;
 
   constructor(opts: RegistryOptions) {
     this.paths = opts.paths;
@@ -281,6 +334,10 @@ export class DispatchRegistry {
     this.installHook = opts.installHook ?? ((agentCommand) => installCrewStopHook({ agentCommand }));
     this.provisionFeature = opts.provisionWorktree ?? provisionWorktree;
     this.paneStartTimeoutMs = opts.paneStartTimeoutMs;
+    this.paneStorePromise = opts.paneStore ? Promise.resolve(opts.paneStore) : null;
+    this.ttyProbe = opts.ttyProbe ?? psTtyProbe;
+    this.aliveCheck = opts.pidAlive ?? pidAlive;
+    this.sessionId = randomBytes(6).toString("hex");
     // Tests (and the no-anchor case) skip the live existence probe.
     this.anchorChecked = this.skipAnchorCheck || !this.layout;
   }
@@ -328,9 +385,18 @@ export class DispatchRegistry {
     return this.jobs.get(id);
   }
 
-  /** Jobs currently running or queued. */
+  /** Jobs currently running. */
   activeCount(): number {
-    return this.list().filter((j) => j.status === "running" || j.status === "queued").length;
+    return this.list().filter((j) => j.status === "running").length;
+  }
+
+  /** The pane records, loaded once per session. A store that can't be read is an
+   *  empty one (see panestore.ts) — co simply knows no panes and splits. */
+  private paneStore(): Promise<PaneStore> {
+    if (!this.paneStorePromise) {
+      this.paneStorePromise = PaneStore.load(this.paths, this.aliveCheck);
+    }
+    return this.paneStorePromise;
   }
 
   // --- feature records (worktree layer) --------------------------------------
@@ -417,9 +483,9 @@ export class DispatchRegistry {
   }
 
   /**
-   * Launch (or queue) a dispatch for `order`. Returns the created Job. Never
-   * throws into the caller: a launch failure marks the job failed and notifies,
-   * so a bad dispatch can't crash the session. Starts the poller if idle.
+   * Launch a dispatch for `order`. Returns the created Job. Never throws into
+   * the caller: a launch failure marks the job failed and notifies, so a bad
+   * dispatch can't crash the session. Starts the poller if idle.
    *
    * With `opts.feature`, the dispatch is scoped to that feature: its worktree is
    * provisioned if this is the feature's first dispatch (ensureFeatureWorktree),
@@ -427,8 +493,8 @@ export class DispatchRegistry {
    * the agent binds to the isolated checkout by being launched inside it. A
    * worktree is worked serially (agents in one checkout would trample each
    * other's index and files), so a second dispatch to a feature whose job is
-   * still running or queued fails cleanly instead of launching. Provisioning
-   * failures take the same marked-failed-and-notified path as launch failures.
+   * still running fails cleanly instead of launching. Provisioning failures take
+   * the same marked-failed-and-notified path as launch failures.
    */
   async dispatch(order: string, agentName?: string, opts: DispatchOptions = {}): Promise<Job> {
     // Pick up a `co pane` / `co link` change made since the session started (or
@@ -476,8 +542,8 @@ export class DispatchRegistry {
     }
 
     // Reclaim any hook-completed pane whose agent has since been closed before
-    // this job plans its placement, so a genuinely-free pane is reused now
-    // instead of this dispatch queueing until the next poll tick.
+    // this job plans its placement, so a genuinely-free pane is offered to this
+    // dispatch now rather than one poll tick later.
     await this.releaseFinishedPanes();
 
     try {
@@ -495,10 +561,7 @@ export class DispatchRegistry {
       // (a half-state worktree, a missing repo) can't crash the session.
       if (job.feature) {
         const clash = this.list().find(
-          (j) =>
-            j.id !== job.id &&
-            j.feature === job.feature &&
-            (j.status === "running" || j.status === "queued"),
+          (j) => j.id !== job.id && j.feature === job.feature && j.status === "running",
         );
         if (clash) {
           throw new Error(
@@ -510,21 +573,15 @@ export class DispatchRegistry {
         job.cwd = record.worktreePath;
       }
 
-      // Proactively drop any worker pane the captain has closed since it was
-      // created, so the common "delete a finished worker, dispatch again" path
-      // plans against living panes only and never even hits a dead-pane error.
-      await this.reconcilePaneLiveness();
+      // Read the real panes: which ones co owns still exist, and which of those
+      // are provably idle RIGHT NOW. This both prunes the panes the captain has
+      // closed (so placement never targets a dead id) and produces the reuse
+      // candidates, so the common "the agent exited, dispatch again" path lands
+      // in the pane that just freed instead of splitting another one.
+      const survey = await this.surveyPanes();
 
       try {
-        const launched = await this.launchResilient(job);
-        if (!launched) {
-          // At the pane cap with nothing free: hold this job until one frees.
-          // This is the ONLY non-launch outcome that isn't a failure — the queue
-          // never runs anything in the background, it just waits for a pane.
-          job.status = "queued";
-          job.startedAt = null;
-          this.queue.push(job.id);
-        }
+        await this.launchResilient(job, survey);
       } catch (e) {
         if (!(e instanceof PaneUnavailableError)) throw e;
         // Only a dead ANCHOR reaches here: launchResilient prunes-and-retries a
@@ -647,78 +704,166 @@ export class DispatchRegistry {
   }
 
   /**
-   * Prune every tracked crew pane the captain has closed since it was created, so
-   * the very next placement targets living panes only. Probes Ghostty's `exists`
-   * for each tracked pane id (in parallel) and drops the dead ones from the
-   * layout. This is the PROACTIVE half of link durability: the common
-   * delete-a-worker-then-dispatch path never even reaches a dead-pane error,
-   * because the dead id is gone before plan() runs. launchResilient is the
-   * reactive backstop for a pane that dies between this sweep and the split.
+   * Read the real panes, fresh, at dispatch time: which panes co owns still
+   * exist, and which of those are provably unoccupied. This is both halves of
+   * pane hygiene in one sweep.
    *
-   * Never nulls the layout: a dead anchor is pruned from the tracked list here
-   * too (so a surviving child can still be split from), and the anchor-loss
-   * decision is deferred to the moment a dispatch actually needs the anchor and
-   * finds it gone (launchResilient → dispatch's catch). Best-effort — a probe
-   * failure degrades to "gone", which at worst orphans a live pane from tracking,
-   * never a link break.
+   * PRUNING (the proactive half of link durability): every candidate is probed
+   * for existence through Ghostty, and a pane the captain has closed is dropped
+   * from the layout AND from the pane store, so placement never targets a dead
+   * id and the record doesn't come back next session. launchResilient remains
+   * the reactive backstop for a pane that dies between this sweep and the split.
+   * Never nulls the layout: a dead anchor is pruned here too (a surviving child
+   * can still be split from), and the anchor-loss decision is deferred to the
+   * moment a dispatch actually needs the anchor and finds it gone.
+   *
+   * REUSE: a candidate with no lease and nothing but shells on its tty is
+   * offered to the planner. Everything else — leased by us or another live co
+   * session, running something, or simply not provable — is left out, because
+   * the cost of being wrong in that direction is the captain's work.
+   *
+   * The universe of candidates is exactly what co owns: the panes the layout
+   * tracks, the panes the store remembers (which is how a pane survives a
+   * restart), and the designated anchor. Nothing else is ever considered.
    */
-  private async reconcilePaneLiveness(): Promise<void> {
-    if (!this.layout) return;
-    const ids = this.layout.trackedPaneIds;
-    if (ids.length === 0) return;
+  private async surveyPanes(): Promise<PaneSurvey> {
+    const store = await this.paneStore();
+    // A lease whose session died is not a lease. Swept before every dispatch so
+    // a killed co never permanently blocks the pane it was using.
+    store.sweepLeases(this.aliveCheck);
+
+    const anchorId = this.config.anchor?.id;
+    const anchorIdentity = anchorId ? store.identity(anchorId) : {};
+    const anchorUnproven = Boolean(anchorId) && (!anchorIdentity.tty || !anchorIdentity.shellPid);
+
+    // Ordered by preference: the store's own oldest-used-first ordering, then
+    // anything tracked or designated that has no record yet (unprovable, but it
+    // still has to be probed so a closed pane gets pruned).
+    const ids: string[] = [];
+    for (const id of [
+      ...store.list().map((r) => r.id),
+      ...(this.layout?.trackedPaneIds ?? []),
+      ...(anchorId ? [anchorId] : []),
+    ]) {
+      if (!ids.includes(id)) ids.push(id);
+    }
+    if (ids.length === 0) return { free: [], anchorUnproven };
+
     const alive = await Promise.all(ids.map((id) => paneExists(id)));
+    const live: string[] = [];
     ids.forEach((id, i) => {
-      if (!alive[i]) this.layout?.prune(id);
+      if (alive[i]) {
+        live.push(id);
+        return;
+      }
+      // Gone: forget it in both places. A pane the captain closed must never be
+      // dispatched into, and must not linger as a record that outlives it.
+      this.layout?.prune(id);
+      store.forget(id);
     });
+
+    // One `ps` per pane still in the running, and only for panes not already
+    // ruled out by a lease — a leased pane is occupied whatever its tty says.
+    const judged = await Promise.all(
+      live.map(async (id) => {
+        const leasedBy = this.leaseHolder(id, store);
+        const identity = store.identity(id);
+        const procs = !leasedBy && identity.tty ? await this.ttyProbe(identity.tty) : null;
+        return { id, verdict: judgePane({ exists: true, identity, procs, ...(leasedBy ? { leasedBy } : {}) }) };
+      }),
+    );
+    return { free: judged.filter((j) => j.verdict.free).map((j) => j.id), anchorUnproven };
+  }
+
+  /** Who holds a live dispatch lease on a pane, or undefined when it is free of
+   *  co's claims. This session's own claim comes first and is authoritative: a
+   *  job still running there, or one that has reported but whose agent is still
+   *  live in the pane (pendingRelease) — the exact case where co's "finished"
+   *  and the captain's diverge. Otherwise the store answers, which is how a
+   *  second co session's panes stay out of this one's reach. */
+  private leaseHolder(paneId: string, store: PaneStore): string | undefined {
+    const own = this.list().find(
+      (j) => j.paneId === paneId && (j.status === "running" || this.pendingRelease.has(j.id)),
+    );
+    if (own) return `job ${own.id}`;
+    return store.leaseHolder(paneId, { session: this.sessionId });
   }
 
   /**
-   * Launch a job on a pane, surviving the captain closing a worker pane. On a
-   * PaneUnavailableError for a tracked WORKER pane, prune just that dead id and
-   * re-plan against the survivors (the next newest living child, else the
-   * anchor), leaving the rest of the link intact — one dead pane never destroys
-   * the layout.
+   * Launch a job on a pane, surviving everything that can be wrong about the
+   * reading the survey just took. Each retry strictly shrinks the options, so
+   * the loop is bounded (and carries an explicit budget as a backstop):
    *
-   * Only a dead ANCHOR (the growth root) — or an id we don't track and so can't
-   * prune — escapes as a PaneUnavailableError, which dispatch()/drainQueue turn
-   * into a clean "re-run `co pane`" failure. The loop is bounded: each retry
-   * prunes exactly one tracked pane, and an emptied list falls back to the
-   * anchor, which escapes rather than looping.
+   *  - a candidate that turns out to be GONE is pruned from the layout and the
+   *    store and dropped from the offer;
+   *  - a candidate that is still there but wouldn't run the job — the pane was
+   *    busy after all, a false "free" the transport's launch probe caught — is
+   *    dropped from the offer and the dispatch re-plans, which splits instead;
+   *  - the one unproven anchor takeover, refused the same way, stops being
+   *    offered as a takeover so the re-plan splits from the anchor rather than
+   *    typing into it again;
+   *  - a live split ORIGIN that won't split is pruned from the layout (it is no
+   *    longer a useful place to grow from) but kept in the store, so it can
+   *    still be reused later once it frees.
    *
-   * An ORPHANED failure is neither of those and must not be treated as one. There
+   * Only a dead ANCHOR — no living surface left to grow from — escapes as a
+   * PaneUnavailableError, which dispatch() turns into a clean "re-run `co pane`"
+   * failure.
+   *
+   * An ORPHANED failure is none of those and must not be treated as one. There
    * the split SUCCEEDED, the pane we created never ran its job, and the transport
    * already closed it again: that id was never committed to the layout, so there
    * is no dead tracked pane behind it and the anchor is fine. It is re-thrown as a
-   * plain Error so neither caller's PaneUnavailableError branch fires — this one
-   * dispatch fails, the shared layout is untouched, and nobody is told to re-run
-   * `co pane` for a healthy link. It is deliberately NOT retried: a split that
-   * keeps being created but never runs its job would otherwise loop forever.
+   * plain Error so the caller's PaneUnavailableError branch doesn't fire — this
+   * one dispatch fails, the shared layout is untouched, and nobody is told to
+   * re-run `co pane` for a healthy link. It is deliberately NOT retried: a split
+   * that keeps being created but never runs its job would otherwise loop forever.
    */
-  private async launchResilient(job: Job): Promise<boolean> {
+  private async launchResilient(job: Job, survey: PaneSurvey): Promise<void> {
+    let free = [...survey.free];
+    let anchorUnproven = survey.anchorUnproven;
+    let budget = free.length + 4;
     for (;;) {
       try {
-        return await this.launchOnPane(job);
+        await this.launchOnPane(job, { free, anchorUnproven });
+        return;
       } catch (e) {
         if (!(e instanceof PaneUnavailableError)) throw e;
         if (e.orphaned) throw new Error(this.orphanLaunchMessage());
-        const deadId = e.paneId;
-        // The anchor itself is gone, or the failed id isn't a tracked worker we
-        // can prune: there is no living surface to grow from. Surface it to the
-        // anchor-loss path rather than looping.
-        if (!this.layout || deadId === this.config.anchor?.id || !this.layout.prune(deadId)) {
-          throw e;
+        if (budget-- <= 0) throw e;
+        const failedId = e.paneId;
+        const stillThere = await paneExists(failedId);
+        if (!stillThere) {
+          await this.forgetPane(failedId);
+          if (!this.layout || failedId === this.config.anchor?.id) throw e;
+          free = free.filter((id) => id !== failedId);
+          continue;
         }
-        // Pruned a dead worker pane; loop to re-plan against the survivors.
+        if (free.includes(failedId)) {
+          free = free.filter((id) => id !== failedId);
+          continue;
+        }
+        if (failedId === this.config.anchor?.id && anchorUnproven) {
+          anchorUnproven = false;
+          continue;
+        }
+        if (this.layout?.prune(failedId)) continue;
+        throw e;
       }
     }
   }
 
   /**
-   * Ghostty launch path: launchGhostty consults the planner (its single plan()).
-   * Returns true if the job actually launched into a pane, false if the planner
-   * said to queue (at the cap with nothing free). The caller owns queue bookkeeping.
+   * Ghostty launch path: launchGhostty consults the planner (its single plan())
+   * with the fresh occupancy reading, and every decision places somewhere — reuse
+   * when a pane co owns is provably idle, a split otherwise.
+   *
+   * On success the pane's identity (the tty and the pid of the shell that
+   * outlives the job, reported by the launch script) and co's lease on it are
+   * recorded, which is what makes the NEXT dispatch able to judge this pane
+   * instead of splitting blindly.
    */
-  private async launchOnPane(job: Job): Promise<boolean> {
+  private async launchOnPane(job: Job, placement: PlacementInput): Promise<void> {
     const res = await launchGhostty({
       paths: this.paths,
       config: this.config,
@@ -726,15 +871,42 @@ export class DispatchRegistry {
       jobId: job.id,
       order: job.order,
       captureFile: job.captureFile,
+      placement,
       ...(job.agentName ? { agentName: job.agentName } : {}),
       ...(job.cwd ? { cwd: job.cwd } : {}),
       ...(this.paneStartTimeoutMs !== undefined
         ? { paneStartTimeoutMs: this.paneStartTimeoutMs }
         : {}),
     });
-    if (res.placement && res.placement.kind === "queue") return false;
     job.paneId = res.paneId;
-    return true;
+    await this.recordLaunch(job, res);
+  }
+
+  /** Remember the pane a job just launched into: what it is (tty + the pid that
+   *  outlives the job there) and that co is using it. Best-effort — a record
+   *  that doesn't land costs a future split, never this dispatch. */
+  private async recordLaunch(job: Job, res: LaunchResult): Promise<void> {
+    const paneId = res.paneId;
+    if (!paneId) return;
+    const store = await this.paneStore();
+    await store.remember(paneId, {
+      role: paneId === this.config.anchor?.id ? "anchor" : "worker",
+      usedAt: this.clock.now(),
+      ...(res.identity?.tty ? { tty: res.identity.tty } : {}),
+      ...(res.identity?.shellPid ? { shellPid: res.identity.shellPid } : {}),
+    });
+    await store.acquire(paneId, {
+      session: this.sessionId,
+      pid: process.pid,
+      job: job.id,
+      at: this.clock.now(),
+    });
+  }
+
+  /** Drop a pane that no longer exists from everything that tracks it. */
+  private async forgetPane(paneId: string): Promise<void> {
+    this.layout?.prune(paneId);
+    (await this.paneStore()).forget(paneId);
   }
 
   /** Begin polling capture files if not already. */
@@ -760,13 +932,12 @@ export class DispatchRegistry {
       await this.checkJob(job);
     }
     // A hook-completed pane whose agent the human has since closed (its launch
-    // script self-deleted) rejoins the reusable set here and drains any queued
-    // job into it. Runs before the stop check so a release that launches a
-    // queued job keeps the poller alive for it.
+    // script self-deleted) rejoins the reusable set here, so the pane is already
+    // free when the next dispatch surveys — rather than only being noticed then.
     await this.releaseFinishedPanes();
-    // Nothing left to watch and nothing queued: stop the timer. A pane still
-    // pending release with nothing queued does NOT hold the poller (and the
-    // process) open — a future dispatch that needs the pane re-drains it.
+    // Nothing left to watch: stop the timer. A pane still pending release does
+    // NOT hold the poller (and the process) open — the next dispatch releases it
+    // itself before it plans.
     if (this.activeCount() === 0 && this.poller) {
       clearInterval(this.poller);
       this.poller = null;
@@ -831,9 +1002,7 @@ export class DispatchRegistry {
   }
 
   /** Move a job to a terminal state, fire its review, and release its pane for
-   *  reuse — but only once that pane no longer hosts a live agent. The queue
-   *  drain is awaited so a released pane deterministically relaunches the next
-   *  queued job before the caller (a poll tick) returns.
+   *  reuse — but only once that pane no longer hosts a live agent.
    *
    *  COMPLETION and PANE RELEASE are separate on the pane path (see the class
    *  doc): the Stop hook fires on the crew's first finish while the agent is
@@ -849,7 +1018,10 @@ export class DispatchRegistry {
     // Notify first so the review is enqueued before we relaunch anything; the
     // ordering keeps a completion callback ahead of the next job's launch notices.
     this.onComplete(job);
-    if (!job.paneId || !this.layout) return; // failed before a pane was placed
+    // No pane was ever placed (a launch that failed): nothing to release. A job
+    // WITH a pane is released even if the layout has since been dropped (a lost
+    // anchor), so co's lease on that pane doesn't outlive the job in the store.
+    if (!job.paneId) return;
     if (this.paneAgentGone(job)) {
       await this.releasePane(job);
     } else {
@@ -868,12 +1040,17 @@ export class DispatchRegistry {
     return !fs.existsSync(jobScriptFile(job.captureFile));
   }
 
-  /** Free a completed job's pane in the planner and drain the queue into it.
-   *  Idempotent per job via pendingRelease removal by the caller. */
+  /** Free a completed job's pane: idle in the planner, and unleased in the store
+   *  so a later session (or a second co) can see it is no longer ours. Idempotent
+   *  per job via pendingRelease removal by the caller.
+   *
+   *  Releasing co's claim is NOT the same as declaring the pane reusable — the
+   *  next dispatch still has to find it idle for itself. This only drops the half
+   *  of occupancy that is co's own bookkeeping. */
   private async releasePane(job: Job): Promise<void> {
-    if (!job.paneId || !this.layout) return;
-    this.layout.finish(job.paneId);
-    await this.drainQueue();
+    if (!job.paneId) return;
+    this.layout?.finish(job.paneId);
+    await (await this.paneStore()).release(job.paneId, this.sessionId);
   }
 
   /** Release any completed-but-still-live pane whose crew process has now exited
@@ -892,64 +1069,6 @@ export class DispatchRegistry {
         this.pendingRelease.delete(id);
         await this.releasePane(job);
       }
-    }
-  }
-
-  /**
-   * A pane just freed: try to launch the oldest queued job. Re-plans through the
-   * layout, so a freed pane is reused (or the job re-queues if the planner still
-   * says to). Best-effort; a launch failure fails just that job.
-   */
-  private async drainQueue(): Promise<void> {
-    if (!this.layout) return;
-    // A pane the captain closed while jobs waited must not be planned against, so
-    // sweep liveness once before draining — the freed slot then re-plans over
-    // living panes only.
-    await this.reconcilePaneLiveness();
-    while (this.queue.length > 0) {
-      if (!this.layout) return; // the anchor died mid-drain; stop cleanly
-      const nextId = this.queue[0]!;
-      const job = this.jobs.get(nextId);
-      if (!job || job.status !== "queued") {
-        this.queue.shift(); // stale entry (job finished/removed); drop it
-        continue;
-      }
-      // Mark running provisionally so launchOnPane's plan()/commit() treat it as
-      // an active job; revert if the planner still says to queue.
-      job.status = "running";
-      job.startedAt = this.clock.now();
-      let launched = false;
-      try {
-        launched = await this.launchResilient(job);
-      } catch (e) {
-        if (e instanceof PaneUnavailableError) {
-          // launchResilient already pruned any dead worker pane and retried, and
-          // already converted an orphaned launch failure to a plain Error, so only
-          // a dead ANCHOR reaches here. There is no background path: drop pane
-          // geometry for the session and fail this job cleanly — same as a
-          // first-time dispatch that can't place a pane.
-          this.queue.shift();
-          this.layout = null;
-          this.onAnchorLost?.();
-          job.status = "failed";
-          job.error = this.paneUnavailableMessage();
-          this.onComplete(job);
-          continue;
-        }
-        this.queue.shift();
-        job.status = "failed";
-        job.error = (e as Error).message;
-        this.onComplete(job);
-        continue;
-      }
-      if (!launched) {
-        // Still no room. Revert and stop; the next completion re-drains.
-        job.status = "queued";
-        job.startedAt = null;
-        return;
-      }
-      this.queue.shift();
-      this.ensurePolling();
     }
   }
 

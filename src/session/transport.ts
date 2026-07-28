@@ -4,7 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { resolveCommandLine, resolveAgentCommand, shellQuote, type DispatchConfig } from "./dispatchconfig.js";
 import type { InstancePaths } from "../paths.js";
-import { CrewPaneLayout, type PlacementDecision } from "./crewpanes.js";
+import { CrewPaneLayout, type PlacementDecision, type PlacementInput } from "./crewpanes.js";
+import { normalizeTty, type PaneIdentity } from "./paneoccupancy.js";
 import { SENTINEL_PREFIX, sentinelLine, parseSentinel } from "./sentinel.js";
 
 // Re-exported so every existing importer of the sentinel (registry, tests) keeps
@@ -79,8 +80,12 @@ export interface LaunchResult {
   transport: TransportKind;
   /** The Ghostty pane id the run occupies, when applicable. */
   paneId?: string;
-  /** The placement decision taken, for reporting/queueing. */
+  /** The placement decision taken, for reporting. */
   placement?: PlacementDecision;
+  /** What the launched script reported about its pane: the tty it lives on and
+   *  the pid of the process that outlives the job there. The registry remembers
+   *  this so a later dispatch can prove the pane idle instead of splitting. */
+  identity?: PaneIdentity;
 }
 
 /**
@@ -206,6 +211,42 @@ export function jobScriptFile(captureFile: string): string {
 }
 
 /**
+ * The pane-identity sidecar a job script writes as its very first act: the tty
+ * the pane lives on, and the pid of the process that OUTLIVES the job there (the
+ * held login shell of a split-born pane, or the shell that ran the launch line
+ * on a takeover).
+ *
+ * This exists because Ghostty's scripting API has no way to ask a terminal what
+ * tty it is on — `id`, `name` and `working directory` are the whole surface. The
+ * only component that can answer is something running inside the pane, so the
+ * launch script answers once and co remembers it (panestore.ts). Without it a
+ * pane can never be proven idle, and every dispatch would split a new one.
+ */
+export function jobTtyFile(captureFile: string): string {
+  return `${captureFile}.tty`;
+}
+
+/**
+ * Read back what the job script reported about its pane. Best-effort in every
+ * direction: a missing or malformed sidecar is simply an empty identity, which
+ * reads downstream as "this pane can't be proven idle" and costs a split.
+ */
+export async function readPaneIdentity(captureFile: string): Promise<PaneIdentity> {
+  let raw: string;
+  try {
+    raw = await fsp.readFile(jobTtyFile(captureFile), "utf8");
+  } catch {
+    return {};
+  }
+  const tty = normalizeTty(raw.match(/^tty=(.*)$/m)?.[1]);
+  const pid = Number(raw.match(/^pid=(\d+)$/m)?.[1] ?? "");
+  return {
+    ...(tty ? { tty } : {}),
+    ...(Number.isInteger(pid) && pid > 0 ? { shellPid: pid } : {}),
+  };
+}
+
+/**
  * The per-job launch script for the PANE path. Written to disk next to the
  * capture file; the pane only ever receives `/bin/sh '<this file>'` (plus a
  * `hold` argument on the split path). Everything fragile lives in here, read by
@@ -254,6 +295,7 @@ export function buildJobScript(args: {
   const { crewCommand, captureFile, scriptPath, cwd, pathEnv } = args;
   const qCapture = shellQuote(captureFile);
   const qSelf = shellQuote(scriptPath);
+  const qTty = shellQuote(jobTtyFile(captureFile));
   // Hand the crew process (and thus its inherited-environment Stop hook) the
   // correlation the hook reads to find this exact capture — see crewstophook.ts.
   const { job, captureDir } = dispatchCorrelation(captureFile);
@@ -274,6 +316,17 @@ export function buildJobScript(args: {
     `trap : INT`,
     `trap 'finish 129; exit 129' HUP`,
     `trap 'finish 143; exit 143' TERM`,
+    // Report the pane's identity BEFORE the capture file exists, so it is always
+    // on disk by the time the transport's launch probe sees the capture and the
+    // registry reads it. The pid recorded is the one that OUTLIVES this job in
+    // this pane: with `hold` that is this script itself (it execs the login shell
+    // at the end, keeping the pid), otherwise it is the pane's own shell, which
+    // ran this launch line and will still be there when the job is done. That
+    // pair — tty plus a pid alive on it — is how a later dispatch proves this
+    // pane is idle instead of guessing (see paneoccupancy.ts).
+    `if [ "$1" = hold ]; then co_pane_pid=$$; else co_pane_pid=\${PPID:-0}; fi`,
+    `co_tty=$(tty 2>/dev/null) || co_tty=$(ps -o tty= -p $$ 2>/dev/null)`,
+    `printf 'tty=%s\\npid=%s\\n' "$co_tty" "$co_pane_pid" > ${qTty} 2>/dev/null`,
     // Creating the capture is the launch probe the transport polls for.
     `: > ${qCapture}`,
     ...(cwd && cwd.trim()
@@ -366,8 +419,7 @@ export function composeSplitScript(args: { decision: PlacementDecision; launchCo
   const cmd = osaEscape(launchCommand);
 
   // A takeover or reuse runs in an existing terminal by id; a split makes a new
-  // terminal from the target and runs there. `queue` never reaches the transport
-  // (the caller holds it), so it is not represented here.
+  // terminal from the target and runs there.
   if (decision.kind === "split") {
     return [
       'tell application "Ghostty"',
@@ -479,9 +531,10 @@ async function waitForFileCreation(file: string, timeoutMs: number): Promise<boo
 
 /**
  * Launch a job on the visible-Ghostty path. Consumes crewpanes.ts seams: plan()
- * to decide placement, then commit(newPaneId) with the id AppleScript returns —
- * or abort() if the launch fails, so a dead dispatch never corrupts the layout.
- * A `queue` decision places nothing and is returned to the caller to hold.
+ * to decide placement (against the caller's fresh occupancy reading), then
+ * commit(newPaneId) with the id AppleScript returns — or abort() if the launch
+ * fails, so a dead dispatch never corrupts the layout. Every dispatch places
+ * somewhere: reuse when a pane co owns is provably idle, a split otherwise.
  *
  * Delivery is by per-job script file (see buildJobScript): a split launches it
  * as the new pane's command; takeover/reuse paste the one-line launch. After
@@ -520,6 +573,11 @@ export async function launchGhostty(args: {
   /** Capture file override (the registry namespaces these per session); defaults
    *  to the instance's captureFile(jobId) for direct callers and tests. */
   captureFile?: string;
+  /** The FRESH occupancy reading placement is decided against: which panes are
+   *  provably idle right now, and whether the anchor has ever hosted a co job.
+   *  Omitted, nothing is reusable and this dispatch creates a pane — the safe
+   *  default for a caller that cannot measure. */
+  placement?: PlacementInput;
   /** Probe budget override for tests. */
   paneStartTimeoutMs?: number;
 }): Promise<LaunchResult> {
@@ -527,11 +585,7 @@ export async function launchGhostty(args: {
   await ensureCaptureDir(paths);
   const captureFile = args.captureFile ?? paths.captureFile(jobId);
 
-  const decision = layout.plan();
-  if (decision.kind === "queue") {
-    // Nothing to launch; the caller re-plans when a pane frees.
-    return { transport: "ghostty", placement: decision };
-  }
+  const decision = layout.plan(args.placement ?? {});
 
   const crewCommand = jobCommandLine(config, order, agentName, args.cwd);
   // The job script owns everything fragile: cd, the (possibly multi-line) order,
@@ -606,5 +660,10 @@ export async function launchGhostty(args: {
     );
   }
   layout.commit(paneId);
-  return { transport: "ghostty", paneId, placement: decision };
+  // The script writes its identity sidecar BEFORE the capture file, so by the
+  // time the probe above succeeded the reading is already on disk. An absent or
+  // unreadable one is not a launch failure — it only means this pane can't be
+  // proven idle later, which costs a split.
+  const identity = await readPaneIdentity(captureFile);
+  return { transport: "ghostty", paneId, placement: decision, identity };
 }
