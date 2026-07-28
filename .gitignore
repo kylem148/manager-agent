@@ -1,6 +1,6 @@
 # dependencies
-# no trailing slash: feature worktrees symlink these back to the primary
-# checkout, and a dir-only pattern doesn't match a symlink
+# no trailing slash: it matches a real directory and also any leftover symlink
+# an older build left behind in a worktree, which a dir-only pattern would miss
 node_modules
 
 # build output

@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import fs from "node:fs";
 import path from "node:path";
-import { requireRemoteDev, type CommandRunner } from "./forge.js";
+import { requireRemoteDev, spawnCommand, type CommandRunner } from "./forge.js";
 
 /**
  * Git-worktree lifecycle for parallel dispatch — the lowest layer of the
@@ -57,14 +57,23 @@ import { requireRemoteDev, type CommandRunner } from "./forge.js";
  * per-repo, survives reboots (unlike a tmpdir), and is obvious in a file
  * listing. Override with `baseDir`; a base inside the repo is rejected.
  *
- * BUILDABILITY: a fresh worktree checks out sources only — node_modules/ and
- * dist/ are gitignored, so it wouldn't build without an install. Instead of
- * reinstalling per feature, provision symlinks both from the primary tree
- * (when they exist there). The links are this module's own artifacts:
- * teardown and reconcile unlink them before `git worktree remove` (a
- * non-ignored symlink would read as an untracked file and block removal), and
- * the dirty check sees through them so they never make a worktree look like
- * it holds user work.
+ * ISOLATION: a worktree owns its build output outright and may reach nothing
+ * outside itself. A fresh checkout has sources only, so provision runs the
+ * repo's OWN frozen install to populate node_modules/, and teardown deletes the
+ * artifacts again before `git worktree remove` (untracked build output would
+ * otherwise block the removal in a repo that does not gitignore it).
+ *
+ * An earlier build symlinked node_modules/ and dist/ back to the primary tree
+ * to skip that install, and it cost a day of the captain's work. `npm ci`
+ * begins by reading node_modules and deleting every entry it finds; through a
+ * symlink those entries are the PRIMARY tree's, so one crew agent's routine
+ * reinstall emptied the captain's dependencies, and the only surviving copy
+ * went with the worktree at teardown. Two quieter faults rode along: every
+ * worktree build wrote through the dist/ link into the primary's dist, which is
+ * the dist the installed `co` actually runs, and a branch's own dependency
+ * changes were invisible because it built against the primary's. Sharing one
+ * writable directory between two trees is the defect; per-worktree installs are
+ * the fix, and the seconds they cost are the price of all three.
  *
  * Git is invoked the way the rest of the dispatch layer shells out
  * (node:child_process spawn) but with an argv array and no shell, so branch
@@ -105,9 +114,11 @@ const OWNERSHIP_CONFIG_VAR = "comanager-feature";
 const DEFAULT_DEV_BRANCH = "dev";
 const DEFAULT_REMOTE = "origin";
 
-/** The build artifacts provision links from the primary tree so a worktree is
- *  buildable without an install. Order matters only for readability. */
-const LINKED_ARTIFACTS = ["node_modules", "dist"] as const;
+/** Build output a worktree owns privately. NEVER shared with the primary tree:
+ *  provision creates node_modules/ here with an install, teardown deletes both
+ *  from the worktree, and the dirty check reads them as build output rather than
+ *  user work. Order matters only for readability. */
+const BUILD_ARTIFACTS = ["node_modules", "dist"] as const;
 
 /** Where a feature's provision stands. This module returns "ready" (provision
  *  completed) or throws; "provisioning" and "failed" exist for higher layers
@@ -130,6 +141,26 @@ export interface FeatureRecord {
   /** Absolute path of the feature's worktree under the managed base dir. */
   worktreePath: string;
   provisionStatus: ProvisionStatus;
+  /** What became of the worktree's dependency install. Present on every record
+   *  provision returns; absent on records rebuilt from an older store. A
+   *  "failed" here is NOT a failed provision (see installDependencies) but it is
+   *  the one thing a caller should surface rather than swallow. */
+  dependencies?: DependencyInstall;
+}
+
+/** The outcome of a worktree's dependency install.
+ *  - installed: the repo's own frozen install ran and succeeded.
+ *  - present:   node_modules was already there; nothing to do.
+ *  - skipped:   the repo has no lockfile to install from (or is not a Node
+ *               package at all), so there is nothing co can honestly run.
+ *  - failed:    the install ran and did not succeed. The worktree is still a
+ *               valid checkout; its dependencies are simply not there yet. */
+export interface DependencyInstall {
+  status: "installed" | "present" | "skipped" | "failed";
+  /** The command that ran, for the statuses where one did. */
+  command?: string;
+  /** Why, for the statuses that need a why. */
+  reason?: string;
 }
 
 export interface WorktreeOptions {
@@ -147,6 +178,11 @@ export interface WorktreeOptions {
   /** Injected command runner for everything that touches the remote (fetch,
    *  push, gh). Tests pass a fake; production omits it. */
   run?: CommandRunner;
+  /** Injected runner for the worktree's dependency install. A SECOND seam on
+   *  purpose: `run` is the remote's, and the fake forge behind it answers every
+   *  command with success, which would turn a test of the install into a test of
+   *  nothing. Production omits both and gets spawnCommand. */
+  installRun?: CommandRunner;
 }
 
 export interface ResolvedWorktreeOptions {
@@ -158,6 +194,7 @@ export interface ResolvedWorktreeOptions {
    *  cut, rebase and ancestor check in the feature flow. */
   devRef: string;
   run?: CommandRunner;
+  installRun?: CommandRunner;
 }
 
 /** The default managed worktree home: a sibling dir of the repo. */
@@ -183,6 +220,7 @@ export function resolveWorktreeOptions(opts: WorktreeOptions): ResolvedWorktreeO
     remote,
     devRef: `${remote}/${devBranch}`,
     ...(opts.run ? { run: opts.run } : {}),
+    ...(opts.installRun ? { installRun: opts.installRun } : {}),
   };
 }
 
@@ -472,48 +510,110 @@ export async function listOwnedFeatureBranches(
   return [...found].map(([branch, slug]) => ({ branch, slug }));
 }
 
-// --- build-artifact links ----------------------------------------------------
+// --- build artifacts ---------------------------------------------------------
 
-/** Symlink node_modules/ (and dist/ if present) from the primary tree into the
- *  worktree so it builds without an install. Skips anything already present in
- *  the worktree — never replaces real content with a link. Idempotent. */
-async function linkArtifacts(repoPath: string, worktreePath: string): Promise<void> {
-  for (const name of LINKED_ARTIFACTS) {
-    const source = path.join(repoPath, name);
-    const target = path.join(worktreePath, name);
-    if (!fs.existsSync(source)) continue;
-    const existing = await fsp.lstat(target).catch(() => null);
-    if (existing) continue;
-    await fsp.symlink(source, target, "dir");
-  }
+/** The first non-empty line of a command's output, trimmed and bounded: an
+ *  install failure's headline, not its transcript. Empty when there is none. */
+function firstLine(text: string): string {
+  const line = text.split("\n").find((l) => l.trim() !== "")?.trim() ?? "";
+  return line.length > 160 ? line.slice(0, 157) + "…" : line;
 }
 
-/** Remove the artifact links this module created (and only links — a real dir
- *  named node_modules is someone's work and stays). Run before
- *  `git worktree remove`: a non-ignored symlink counts as an untracked file
- *  and would block the removal. */
-async function unlinkArtifacts(worktreePath: string): Promise<void> {
-  for (const name of LINKED_ARTIFACTS) {
+/** The install a repo asks for, read off the lockfile it commits.
+ *
+ *  FROZEN in every case, deliberately: an install that rewrites the lockfile
+ *  would leave the worktree dirty, the safety rules read dirty as user work, and
+ *  the worktree would then block its own teardown forever. A repo with no
+ *  lockfile — or no package.json at all, since `co link` takes any repo — gets
+ *  nothing. Guessing an install that writes to the tree is worse than leaving
+ *  the crew agent to install as part of its own work. */
+function detectInstall(repoPath: string): { command: string; args: string[] } | null {
+  const has = (f: string) => fs.existsSync(path.join(repoPath, f));
+  if (!has("package.json")) return null;
+  if (has("pnpm-lock.yaml")) return { command: "pnpm", args: ["install", "--frozen-lockfile"] };
+  if (has("bun.lockb") || has("bun.lock")) return { command: "bun", args: ["install", "--frozen-lockfile"] };
+  // Berry renamed the flag. .yarnrc.yml is the marker that a repo is on it.
+  if (has("yarn.lock")) {
+    const flag = has(".yarnrc.yml") ? "--immutable" : "--frozen-lockfile";
+    return { command: "yarn", args: ["install", flag] };
+  }
+  if (has("package-lock.json")) return { command: "npm", args: ["ci"] };
+  return null;
+}
+
+/** Give a fresh worktree its OWN dependencies, with the repo's own install.
+ *
+ *  This is what replaced symlinking node_modules/ back to the primary tree; the
+ *  module header records what that cost. Nothing here reads, writes or resolves
+ *  any path outside `worktreePath`.
+ *
+ *  BEST EFFORT. A failed install is reported, never fatal: the worktree is a
+ *  perfectly valid checkout either way, the crew agent installs as part of its
+ *  work, and refusing to provision a feature over a cold npm cache or a flaky
+ *  registry would be a worse trade than handing back a checkout that needs one
+ *  command. Idempotent: dependencies already in place are left alone. */
+async function installDependencies(
+  r: ResolvedWorktreeOptions,
+  worktreePath: string,
+): Promise<DependencyInstall> {
+  const install = detectInstall(r.repoPath);
+  if (!install) return { status: "skipped", reason: "no lockfile to install from" };
+  if (fs.existsSync(path.join(worktreePath, "node_modules"))) {
+    return { status: "present", reason: "node_modules was already provisioned" };
+  }
+  const command = `${install.command} ${install.args.join(" ")}`;
+  const runner = r.installRun ?? spawnCommand;
+  // spawnCommand rejects only when the binary is missing; a nonzero exit comes
+  // back as a result. Both are the same thing here: no dependencies, say so.
+  const res = await runner(install.command, install.args, worktreePath).catch((e: unknown) => ({
+    code: -1,
+    stdout: "",
+    stderr: e instanceof Error ? e.message : String(e),
+  }));
+  if (res.code === 0) return { status: "installed", command };
+  const detail = firstLine(res.stderr) || firstLine(res.stdout) || `exited ${res.code}`;
+  return { status: "failed", command, reason: detail };
+}
+
+/** Delete a doomed worktree's build output, so `git worktree remove` (which
+ *  refuses a tree holding untracked files) can do its job in a repo that does
+ *  not gitignore node_modules/ or dist/.
+ *
+ *  BOTH SHAPES ARE HANDLED because both exist on disk: a real directory, which
+ *  is what provision creates now and which is removed outright, and a SYMLINK,
+ *  which is what an older build left pointing at the primary tree and which is
+ *  only unlinked. The link is never followed. fs.rm does not traverse one
+ *  anyway, but the two cases are split explicitly because getting this wrong is
+ *  precisely how the primary tree gets destroyed.
+ *
+ *  Scoped to BUILD_ARTIFACTS inside the worktree. Nothing else is touched and
+ *  `--force` is never handed to git. */
+async function removeBuildArtifacts(worktreePath: string): Promise<void> {
+  for (const name of BUILD_ARTIFACTS) {
     const target = path.join(worktreePath, name);
     const st = await fsp.lstat(target).catch(() => null);
-    if (st?.isSymbolicLink()) await fsp.unlink(target);
+    if (!st) continue;
+    if (st.isSymbolicLink()) await fsp.unlink(target);
+    else await fsp.rm(target, { recursive: true, force: true });
   }
 }
 
-/** Whether a worktree holds user work: any status entry that is not one of our
- *  own artifact symlinks. The links are provisioning plumbing, not work — in a
- *  repo that doesn't gitignore them they'd show as untracked and make every
- *  provisioned worktree read as dirty forever. */
+/** Whether a worktree holds user work: any status entry that is not build
+ *  output. A whole untracked node_modules/ or dist/ is provisioning, not work,
+ *  and in a repo that doesn't gitignore them every provisioned worktree would
+ *  otherwise read as dirty forever and never be tearable down.
+ *
+ *  Only the DIRECTORY ITSELF is excused. Git reports an untracked directory as
+ *  one entry ("dist/"), while a modified tracked file under it is reported by
+ *  its own path ("dist/app.js"), which does not match and still counts as work.
+ *  So a repo that commits its build output is judged normally. */
 export async function isWorktreeDirty(worktreePath: string): Promise<boolean> {
   const out = await git(worktreePath, ["status", "--porcelain"]);
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;
     // Porcelain v1: two status chars, a space, then the path.
     const entryPath = line.slice(3).replace(/\/$/, "");
-    if ((LINKED_ARTIFACTS as readonly string[]).includes(entryPath)) {
-      const st = await fsp.lstat(path.join(worktreePath, entryPath)).catch(() => null);
-      if (st?.isSymbolicLink()) continue;
-    }
+    if ((BUILD_ARTIFACTS as readonly string[]).includes(entryPath)) continue;
     return true;
   }
   return false;
@@ -577,8 +677,15 @@ export async function provisionWorktree(
           `run reconcile or teardown before re-provisioning`,
       );
     }
-    await linkArtifacts(r.repoPath, worktreePath);
-    return { feature, slug, branch: existing.branch, worktreePath, provisionStatus: "ready" };
+    const dependencies = await installDependencies(r, worktreePath);
+    return {
+      feature,
+      slug,
+      branch: existing.branch,
+      worktreePath,
+      provisionStatus: "ready",
+      dependencies,
+    };
   }
   // Both naming schemes are checked. The conventional name may be the captain's
   // own branch, which co must not cut over or adopt; a bare `co/feat-<slug>` is
@@ -602,8 +709,8 @@ export async function provisionWorktree(
   // from adopting `origin/dev` as its upstream (it pushes to its own name).
   await git(r.repoPath, ["worktree", "add", worktreePath, "-b", branch, "--no-track", r.devRef]);
   await markOwnedBranch(r.repoPath, branch, slug);
-  await linkArtifacts(r.repoPath, worktreePath);
-  return { feature, slug, branch, worktreePath, provisionStatus: "ready" };
+  const dependencies = await installDependencies(r, worktreePath);
+  return { feature, slug, branch, worktreePath, provisionStatus: "ready", dependencies };
 }
 
 export interface TeardownResult {
@@ -651,7 +758,7 @@ export async function teardownWorktree(
 
   let worktreeRemoved = false;
   if (owned && fs.existsSync(owned.path)) {
-    await unlinkArtifacts(owned.path);
+    await removeBuildArtifacts(owned.path);
     await git(r.repoPath, ["worktree", "remove", owned.path]);
     worktreeRemoved = true;
   }
@@ -745,7 +852,7 @@ export async function reconcileWorktrees(
       report.kept.push({ ref: entry.path, reason: "worktree has uncommitted work" });
       continue;
     }
-    await unlinkArtifacts(entry.path);
+    await removeBuildArtifacts(entry.path);
     await git(r.repoPath, ["worktree", "remove", entry.path]);
     report.removedWorktrees.push(entry.path);
   }

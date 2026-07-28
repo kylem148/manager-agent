@@ -1241,8 +1241,10 @@ pruned id, never the whole layout.
 parallel-dispatch feature: verify the `origin/dev` integration branch is
 reachable (verify only — co never creates `dev`, locally or on the remote),
 provision a per-feature worktree on a fresh `<type>/<slug>` branch cut from
-`origin/dev` (with `node_modules`/`dist` symlinked from the primary tree so it
-builds without an install), tear a finished feature down (after a PR merge the
+`origin/dev` (running the repo's own frozen install so the worktree owns its
+dependencies outright — an earlier build symlinked `node_modules`/`dist` back to
+the primary tree instead, and a crew agent's routine `npm ci` followed the link
+and emptied the captain's), tear a finished feature down (after a PR merge the
 worktree goes and the branch ref is kept; on an explicit abandon, branch
 deletion is guarded by a merge-base check against `origin/dev`, so unmerged
 work is never destroyed), and a reconcile sweep that cleans zombie checkouts
