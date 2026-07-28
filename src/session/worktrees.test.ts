@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   FEATURE_BRANCH_TYPES,
+  checkRepoPath,
   ensureRemoteDevBranch,
   featureBranch,
   featureSlug,
@@ -17,9 +18,11 @@ import {
   provisionWorktree,
   reconcileFeatures,
   reconcileWorktrees,
+  runGit,
   teardownWorktree,
   defaultWorktreeBase,
 } from "./worktrees.js";
+import { describeSpawnError } from "./forge.js";
 import { makeFakeForge, type FakeForge } from "./forgefake.test.js";
 
 /**
@@ -603,3 +606,103 @@ test("reconcileWorktrees leaves a feature named in keep fully alone", async () =
     await cleanup();
   }
 });
+
+// --- the linked repo ---------------------------------------------------------
+//
+// checkRepoPath and the ENOENT it exists to stop being mistaken for a broken
+// git install. The bug these came from: a repoPath stored with a stray command
+// glued onto it, which reached spawn() as a cwd, and every git call in the
+// feature layer then failed as `spawn git ENOENT` — the identical error a
+// machine with no git produces.
+
+test("runGit reports a missing cwd as a missing directory, not a missing git", async () => {
+  const { root, cleanup } = await makeRepo();
+  try {
+    const gone = path.join(root, "not-a-directory");
+    await assert.rejects(
+      () => runGit(gone, ["status"]),
+      (e: Error) => {
+        assert.match(e.message, /working directory does not exist/);
+        assert.match(e.message, new RegExp(gone.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+        // The point of the whole exercise: it must not read as a missing binary.
+        assert.doesNotMatch(e.message, /no 'git' found on PATH/);
+        return true;
+      },
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("describeSpawnError names PATH when the cwd is fine, and passes non-ENOENT through", async () => {
+  const { repo, cleanup } = await makeRepo();
+  try {
+    const missingBinary = Object.assign(new Error("spawn nope ENOENT"), { code: "ENOENT" });
+    assert.match(describeSpawnError(missingBinary, "nope", repo).message, /no 'nope' found on PATH/);
+
+    // Anything that is not an ENOENT is somebody else's fault to describe.
+    const other = Object.assign(new Error("spawn git EACCES"), { code: "EACCES" });
+    assert.equal(describeSpawnError(other, "git", repo), other);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("checkRepoPath accepts a repository root", async () => {
+  const { repo, cleanup } = await makeRepo();
+  try {
+    const check = await checkRepoPath(repo);
+    assert.equal(check.ok, true);
+    assert.ok(check.ok && samePathish(check.repoPath, repo));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("checkRepoPath rejects a path that does not exist", async () => {
+  const { root, cleanup } = await makeRepo();
+  try {
+    // Exactly the shape the real fault had: a real repo path with a stray
+    // command appended by a prompt that accepted the whole line.
+    const check = await checkRepoPath(path.join(root, "repo", "co pane gav-lib"));
+    assert.equal(check.ok, false);
+    assert.ok(!check.ok && /does not exist/.test(check.reason));
+    assert.ok(!check.ok && check.toplevel === undefined);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("checkRepoPath rejects a directory that is not a git repository", async () => {
+  const { root, cleanup } = await makeRepo();
+  try {
+    const plain = path.join(root, "plain");
+    await fsp.mkdir(plain);
+    const check = await checkRepoPath(plain);
+    assert.equal(check.ok, false);
+    assert.ok(!check.ok && /not a git repository/.test(check.reason));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("checkRepoPath rejects a subdirectory of a repo and offers its root", async () => {
+  const { repo, cleanup } = await makeRepo();
+  try {
+    const sub = path.join(repo, "frontend");
+    await fsp.mkdir(sub);
+    const check = await checkRepoPath(sub);
+    assert.equal(check.ok, false);
+    assert.ok(!check.ok && /is not its root/.test(check.reason));
+    assert.ok(!check.ok && check.toplevel && samePathish(check.toplevel, repo));
+    // Why it is refused at all: the managed base would land inside the repo.
+    assert.ok(defaultWorktreeBase(sub).startsWith(repo + path.sep));
+  } finally {
+    await cleanup();
+  }
+});
+
+/** Compare two paths through realpath — macOS spells tmp both ways. */
+function samePathish(a: string, b: string): boolean {
+  return fs.realpathSync(a) === fs.realpathSync(b);
+}

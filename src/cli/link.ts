@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import path from "node:path";
 import * as readline from "node:readline";
 import type { Config } from "../config.js";
@@ -15,6 +14,7 @@ import {
   type DispatchConfig,
 } from "../session/dispatchconfig.js";
 import { resolveCommandWord } from "./resolvecommand.js";
+import { checkRepoPath } from "../session/worktrees.js";
 import { crewPaneTitle } from "../session/crewpanes.js";
 import { c, line, write } from "../ui.js";
 
@@ -67,19 +67,11 @@ export async function runLink(cfg: Config, name: string | undefined): Promise<nu
   // 1. Repo path. Default to the prior value, or (on a first link) the current
   //    working directory: `co link` is almost always run from inside the repo
   //    you want to dispatch into, so pre-filling cwd makes the common case a
-  //    single Enter.
-  const repoDefault = existing.repoPath || process.cwd();
-  const repoPath = await promptWithDefault(
-    "Target repo path (the coding agent runs here): ",
-    repoDefault,
-  );
-  const resolvedRepo = repoPath ? path.resolve(untilde(repoPath)) : "";
+  //    single Enter. Validated before it is stored — see promptRepoPath.
+  const resolvedRepo = await promptRepoPath(existing.repoPath || process.cwd());
   if (!resolvedRepo) {
-    line(c.yellow("no repo path entered — nothing changed."));
+    line(c.yellow("no usable repo path entered — nothing changed."));
     return 1;
-  }
-  if (!fs.existsSync(resolvedRepo)) {
-    line(c.yellow(`note: ${resolvedRepo} does not exist yet. Saved anyway; create it before dispatching.`));
   }
 
   // 2. Crew agents. You type the WORD you'd run the agent with (e.g. `cc` for
@@ -248,6 +240,45 @@ function untilde(p: string): string {
     return path.join(process.env.HOME ?? "", p.slice(1));
   }
   return p;
+}
+
+/**
+ * Prompt for the repo path until it is one that will actually work, and return
+ * it resolved. Empty (or an unusable answer the operator declines to correct)
+ * comes back "" and aborts the link.
+ *
+ * This USED to accept whatever was typed, with a yellow note when the directory
+ * did not exist — and that permissiveness is how a path with a stray command
+ * glued onto its end ("…/frontend/co pane gav-lib") got stored and stayed stored.
+ * Everything downstream then failed as `spawn git ENOENT` from inside git
+ * plumbing, which reads as a missing git rather than a bad config value.
+ *
+ * A path co cannot dispatch into is not worth storing, so a bad one is now
+ * refused and re-asked. The one failure with an obvious right answer — a path
+ * inside the repo rather than its root — is offered the root instead, since that
+ * is what the operator meant and typing it again proves nothing.
+ */
+async function promptRepoPath(initial: string): Promise<string> {
+  let current = initial;
+  for (;;) {
+    const answer = (await promptWithDefault(
+      "Target repo path (the coding agent runs here): ",
+      current,
+    )).trim();
+    if (!answer) return "";
+    const check = await checkRepoPath(path.resolve(untilde(answer)));
+    if (check.ok) return check.repoPath;
+
+    line(c.yellow(`  ${check.reason}`));
+    if (check.toplevel) {
+      line(c.green(`  Using the repository root instead: ${check.toplevel}`));
+      return check.toplevel;
+    }
+    line(c.dim("  Enter the path to a git repository's root, or press Enter to abort."));
+    // Drop the default: re-offering the rejected value would let a bare Enter
+    // store the very thing that was just refused.
+    current = "";
+  }
 }
 
 /**

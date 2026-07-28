@@ -67,7 +67,12 @@ import { FeatureManager } from "./features.js";
 import { FeatureStore } from "./featurestore.js";
 import { TaskStore } from "./taskstore.js";
 import type { MergeHeadResult } from "./mergequeue.js";
-import { DEFAULT_FEATURE_BRANCH_TYPE, defaultWorktreeBase, featureSlug } from "./worktrees.js";
+import {
+  DEFAULT_FEATURE_BRANCH_TYPE,
+  checkRepoPath,
+  defaultWorktreeBase,
+  featureSlug,
+} from "./worktrees.js";
 import { scrubCapture } from "./transport.js";
 import { findCrewTranscript, renderTranscriptForReview } from "./crewtranscript.js";
 
@@ -434,13 +439,33 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
 
   io.start();
 
+  // The linked repo is the cwd of every git call in the feature layer AND of
+  // every crew dispatch, so a path that is missing or is not a repository root
+  // disables both — silently, until something deep in git plumbing throws. It is
+  // checked once here so the session opens by naming the config value at fault
+  // instead of letting a `spawn git ENOENT` pass itself off as a broken git
+  // install (the fault this whole check was written for; see checkRepoPath).
+  let repoUsable = true;
+  if (dispatch) {
+    const repo = await checkRepoPath(dispatch.repoPath);
+    if (!repo.ok) {
+      repoUsable = false;
+      io.appendBlock(c.yellow(`  · the linked repo is unusable: ${repo.reason}`));
+      io.appendBlock(c.dim(`    stored in ${paths.dispatchConfig}`));
+      io.appendBlock(
+        c.dim(`    Feature and dispatch levers fail until it is fixed — re-run \`co link ${paths.name}\`.`),
+      );
+    }
+  }
+
   // Boot reconcile: rebuild feature records from the on-disk worktrees so a
   // feature (1 feature → 1 worktree → 1 branch) survives a restart. Read-only
   // over feature state — it rebuilds records and SURFACES anomalies (a branch
   // with unmerged work but no worktree, a stray dir), destroying nothing.
   // Best-effort: a repo that has never seen the flow, or a git hiccup, must not
-  // block the session opening.
-  if (state.features) {
+  // block the session opening. Skipped outright when the repo path is already
+  // known bad, so the one honest message above is not followed by its symptom.
+  if (state.features && repoUsable) {
     try {
       const report = await state.features.reconcileAtBoot();
       if (report.records.length > 0) {

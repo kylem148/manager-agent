@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 
 /**
  * The forge layer: everything that talks to the REMOTE — `git fetch`, `git push`,
@@ -43,6 +44,35 @@ export interface CommandResult {
  *  argv array (never a shell string — branch names and PR bodies are data). */
 export type CommandRunner = (command: string, args: string[], cwd: string) => Promise<CommandResult>;
 
+/**
+ * Re-describe a spawn failure so it names the fault it actually is.
+ *
+ * Node reports a spawn whose `cwd` DOES NOT EXIST with exactly the error it uses
+ * for a missing binary: message `spawn git ENOENT`, `code: "ENOENT"`,
+ * `path: "git"`. Nothing in the error distinguishes them, and the two faults
+ * have nothing in common — one is a broken toolchain, the other a stale config
+ * pointing somewhere that was moved or was never right.
+ *
+ * That ambiguity has already cost a real diagnosis: a linked `repoPath` that had
+ * been corrupted at `co link` time surfaced as `spawn git ENOENT` from the boot
+ * reconcile, was read as "git is not installed", and sent the hunt off to PATH
+ * and Xcode command line tools while the actual bad value sat in config.json.
+ *
+ * So every ENOENT is checked against the one thing that separates the cases —
+ * whether the working directory is there — and rewritten to say which. Anything
+ * that is not an ENOENT is passed through untouched.
+ */
+export function describeSpawnError(err: NodeJS.ErrnoException, command: string, cwd: string): Error {
+  if (err.code !== "ENOENT") return err;
+  if (cwd && !fs.existsSync(cwd)) {
+    return new Error(
+      `cannot run \`${command}\`: its working directory does not exist (${cwd}). ` +
+        `Node reports this as "spawn ${command} ENOENT", which reads like a missing binary but is not one.`,
+    );
+  }
+  return new Error(`cannot run \`${command}\`: no '${command}' found on PATH.`);
+}
+
 /** The real runner: spawn with an argv array and no shell, collecting output.
  *  Never throws on a nonzero exit — callers read the code. */
 export const spawnCommand: CommandRunner = (command, args, cwd) =>
@@ -52,7 +82,7 @@ export const spawnCommand: CommandRunner = (command, args, cwd) =>
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += String(d)));
     child.stderr.on("data", (d) => (stderr += String(d)));
-    child.on("error", (e) => reject(e));
+    child.on("error", (e) => reject(describeSpawnError(e, command, cwd)));
     child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
   });
 

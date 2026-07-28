@@ -9,6 +9,8 @@ import { describeSearch } from "../research.js";
 import { ModelProvider } from "../model.js";
 import { instancesDir, instancePaths } from "../paths.js";
 import { listInstances } from "../memory/memory.js";
+import { readDispatchConfig } from "../session/dispatchconfig.js";
+import { checkRepoPath } from "../session/worktrees.js";
 import { c, line } from "../ui.js";
 
 type Status = "ok" | "warn" | "fail";
@@ -88,6 +90,31 @@ export async function runDoctor(cfg: Config, opts: { ping: boolean }): Promise<n
     detail: stale.length
       ? `${stale.length} instance(s) on the old live/+logs/ layout: ${stale.join(", ")} (migrates on next open)`
       : "two-tier (docs/ + .memory/)",
+  });
+
+  // Linked repos. Every crew dispatch and every git call in the feature layer
+  // runs with the linked repoPath as its cwd, so a stale or malformed one takes
+  // out both — and does it as an ENOENT from inside git plumbing, which reads
+  // like a missing git rather than a bad config value. Checked here so `co
+  // doctor` answers the question directly instead of leaving it to a lever to
+  // fail. An unlinked instance is not a fault: dispatch is opt-in.
+  const repoIssues: string[] = [];
+  let linkedCount = 0;
+  for (const n of listInstances(cfg.home)) {
+    const dc = await readDispatchConfig(instancePaths(cfg.home, n));
+    if (!dc) continue;
+    linkedCount++;
+    const repo = await checkRepoPath(dc.repoPath);
+    if (!repo.ok) repoIssues.push(`${n} → ${repo.reason}`);
+  }
+  checks.push({
+    name: "linked repos",
+    status: repoIssues.length ? "fail" : "ok",
+    detail: repoIssues.length
+      ? `${repoIssues.join("; ")} — re-run \`co link <name>\``
+      : linkedCount
+        ? `${linkedCount} linked, each a git repository root`
+        : "none linked (dispatch is opt-in)",
   });
 
   // Bedrock auth (bearer token preferred, SigV4 fallback)

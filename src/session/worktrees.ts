@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import fs from "node:fs";
 import path from "node:path";
-import { requireRemoteDev, spawnCommand, type CommandRunner } from "./forge.js";
+import { describeSpawnError, requireRemoteDev, spawnCommand, type CommandRunner } from "./forge.js";
 
 /**
  * Git-worktree lifecycle for parallel dispatch — the lowest layer of the
@@ -312,7 +312,9 @@ export function runGit(cwd: string, args: string[]): Promise<GitResult> {
     let err = "";
     child.stdout.on("data", (d) => (out += String(d)));
     child.stderr.on("data", (d) => (err += String(d)));
-    child.on("error", reject);
+    // A cwd that does not exist raises the same ENOENT as a missing git binary;
+    // describeSpawnError is what keeps the two apart. See its comment.
+    child.on("error", (e) => reject(describeSpawnError(e as NodeJS.ErrnoException, "git", cwd)));
     child.on("close", (code) => resolve({ code: code ?? -1, stdout: out, stderr: err }));
   });
 }
@@ -385,6 +387,62 @@ function realpathOr(p: string): string {
 
 function samePath(a: string, b: string): boolean {
   return realpathOr(a) === realpathOr(b);
+}
+
+// --- the linked repo ---------------------------------------------------------
+
+/** What a repoPath turned out to be. `toplevel` is set on the one failure that
+ *  has a mechanical fix — a path INSIDE a repo — so a caller can offer the root
+ *  instead of just refusing. */
+export type RepoPathCheck =
+  | { ok: true; repoPath: string }
+  | { ok: false; reason: string; toplevel?: string };
+
+/**
+ * Is this a usable `repoPath` — the value `co link` stores and every git call in
+ * the feature layer runs as its cwd?
+ *
+ * WHY THIS EXISTS. `repoPath` was trusted from config all the way down to
+ * `spawn(..., { cwd })`, so a bad one first surfaced as an ENOENT out of git
+ * plumbing at boot, and an ENOENT that (see describeSpawnError) is indis-
+ * tinguishable from a missing git. One corrupted value therefore presented as a
+ * broken toolchain. It is checked once, up front, where the value is entered and
+ * where a session opens, and the answer says what is wrong in the config's terms.
+ *
+ * THE ROOT IS REQUIRED, not merely somewhere inside the repo, and that is not
+ * fussiness. `defaultWorktreeBase` derives the managed worktree home as a
+ * SIBLING of repoPath, so a repoPath of `<repo>/frontend` puts the base at
+ * `<repo>/frontend-worktrees` — inside the real working tree, which is precisely
+ * what this module's WORKTREE HOME rule forbids. `resolveWorktreeOptions` cannot
+ * catch that: it compares the base against repoPath alone, and
+ * `frontend-worktrees` is not under `frontend/`. Only the git toplevel closes it,
+ * and only an async caller can ask git for it. So the invariant is enforced here,
+ * at the two entry points, rather than at every use.
+ */
+export async function checkRepoPath(repoPath: string): Promise<RepoPathCheck> {
+  const raw = repoPath.trim();
+  if (!raw) return { ok: false, reason: "no repo path is linked" };
+  const resolved = path.resolve(raw);
+  const st = await fsp.stat(resolved).catch(() => null);
+  if (!st) return { ok: false, reason: `${resolved} does not exist` };
+  if (!st.isDirectory()) return { ok: false, reason: `${resolved} is not a directory` };
+
+  const top = await runGit(resolved, ["rev-parse", "--show-toplevel"]);
+  if (top.code !== 0 || !top.stdout.trim()) {
+    return { ok: false, reason: `${resolved} is not a git repository` };
+  }
+  const toplevel = top.stdout.trim();
+  if (!samePath(toplevel, resolved)) {
+    return {
+      ok: false,
+      toplevel,
+      reason:
+        `${resolved} is inside a git repository but is not its root (${toplevel}). ` +
+        `Feature worktrees are created as a sibling of the linked path, so a subdirectory ` +
+        `would put them inside the repo's own working tree.`,
+    };
+  }
+  return { ok: true, repoPath: resolved };
 }
 
 // --- ownership ---------------------------------------------------------------
