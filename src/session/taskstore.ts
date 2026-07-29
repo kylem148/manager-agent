@@ -4,46 +4,102 @@ import type { InstancePaths } from "../paths.js";
 import { serializeWrite } from "../memory/writequeue.js";
 
 /**
- * The co's at-a-glance task table, made machine-readable.
+ * The captain's at-a-glance task table: a small shared surface with TWO writers.
  *
  * The table itself is not new: the co has always kept a handful of live items —
- * "you are here", aggressively pruned, one word of status each — and rendered
- * them into the chat from its own memory. Nothing on disk held them, so the
- * Ctrl-O panel had nothing to read and the captain could only see the table by
- * asking for it and paying for a turn.
+ * "you are here", aggressively pruned, one word of status each. What changed is
+ * who it belongs to. It is the CAPTAIN'S table now (D-20260729-2): he types rows
+ * into it from the Ctrl-O Home tab, and the co reads them at cold start as
+ * context it would otherwise never see. The co still writes here too, through
+ * the `task_table` tool, but sparingly — a row goes in when the captain asks for
+ * one or when the item is plainly a major workstream, and never otherwise.
  *
- * So the table is persisted here, as a small ordered list under the instance's
- * `.dispatch/` dir — beside the feature store and the review inbox, the same tier
- * every other piece of per-instance runtime state lives in, and never inside the
- * user's repo. The co rewrites it WHOLE through one tool (`task_table`); there is
- * deliberately no per-row add/update/remove and no ids, because the table is a
- * handful of rows the co re-derives anyway, and a whole-table write is the only
- * shape that cannot drift out of step with what the co believes.
+ * Two writers is exactly why the whole-table write is GONE (D-20260729-3). The
+ * store used to be rewritten in full on every call, which was safe while the co
+ * was the only author and is a data-loss bug the moment it is not: any call the
+ * co made would silently delete the row the captain typed a second earlier. The
+ * settled rule from the PR message editor holds here too — the captain's edit
+ * wins and the co never writes over it — so every operation below names ONE row
+ * and can touch nothing else.
  *
- * Like the feature store it is a CACHE of the co's own prose, not a source of
- * truth about anything: a missing, corrupt or unwritable file is an empty table
- * and must never fail a session start. Writes swallow their own errors and ride
- * the shared memory write queue, so a whole-file rewrite can't interleave with
- * the other tool calls of one model round.
+ * Rows are addressed by their exact task TEXT, never by index: with two writers
+ * an index goes stale between turns, and a stale index does not fail, it hits
+ * the wrong row. Text that matches no row, or more than one, is an error rather
+ * than a guess — the same posture the doc tool's `str_replace` takes.
+ *
+ * Retirement is an ACTION and not a third status: `retire` lifts a row out of
+ * the table and appends it to the `done` list, timestamped, so finishing
+ * something shrinks the table instead of growing a column of `done` rows nobody
+ * scans past.
+ *
+ * Like the feature store it is a CACHE of a conversation, not a source of truth
+ * about anything: a missing, corrupt or unwritable file is an empty table and
+ * must never fail a session start. Writes swallow their own errors and ride the
+ * shared memory write queue, so a whole-file rewrite can't interleave with the
+ * other tool calls of one model round.
  */
 
-/** One row of the table: what it is, what kind of work it is, where it stands.
- *  `status` is one word by convention (the prompt says so); nothing here enforces
- *  a vocabulary, because the co picks words that fit the project. */
+/**
+ * The whole status vocabulary: something is being built, or it is waiting its
+ * turn. Two words and no more.
+ *
+ * A free-form status looked harmless and was not. It let the table drift into a
+ * tracker — `ready-to-arm`, `scoping`, `recommended`, `backlog` all appeared in
+ * real stores — and a column of eight different words is a column you read
+ * instead of scan, which is the opposite of what an at-a-glance block is for.
+ * The tool's schema now offers only these two, and anything else that reaches
+ * the store (an older file, a model that ignored the enum) coerces to `queued`.
+ */
+export const TASK_STATUSES = ["building", "queued"] as const;
+export type TaskStatus = (typeof TASK_STATUSES)[number];
+
+/** One row of the table: what it is, and whether it is being built or waiting.
+ *  There is deliberately no `type` — what kind of work an item is never changed
+ *  what the captain did next, and it cost a column. And no body: a task is one
+ *  line of text, which is the whole of what the captain asked for. */
 export interface TaskRow {
   task: string;
-  type: string;
-  status: string;
+  status: TaskStatus;
+}
+
+/** A retired row. Retiring is how a row LEAVES the table, so the text is kept
+ *  with the moment it left — nothing the captain or the co put here is ever
+ *  silently destroyed, even though no viewer for this list exists yet. */
+export interface RetiredTask {
+  task: string;
+  /** ISO 8601. */
+  retiredAt: string;
 }
 
 /**
  * How many rows the table keeps. The table is an at-a-glance summary, not a
- * tracker — the prompt asks for a handful of items and aggressive pruning — so
- * this is a backstop against a model that forgets that, not a budget to fill.
- * A write over the cap is truncated and SAYS SO in the tool result, so the co
- * finds out rather than silently believing it stored 40 rows.
+ * tracker — the prompt asks only for major items, and says the co's default is
+ * not to add a row at all — so this is a backstop against a table nobody can
+ * scan, not a budget to fill. An `add` over the cap FAILS and says so; it never
+ * silently drops the row or evicts someone else's.
  */
-export const TASK_TABLE_CAP = 12;
+export const TASK_TABLE_CAP = 5;
+
+export type TaskErrorCode =
+  | "EMPTY_TASK"
+  | "TABLE_FULL"
+  | "DUPLICATE_TASK"
+  | "BAD_STATUS"
+  | "NO_MATCH"
+  | "MULTIPLE_MATCHES";
+
+/** A refused operation, with a machine-readable code and a sentence saying what
+ *  to do next — because one of the two callers is a model choosing its next tool
+ *  call, and the other is a panel with one line to print. */
+export class TaskError extends Error {
+  constructor(
+    readonly code: TaskErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "TaskError";
+  }
+}
 
 /** A trimmed, single-line, non-empty string, or undefined. Newlines are folded
  *  out: a row is one line in a table, and a pasted paragraph would tear the
@@ -54,15 +110,32 @@ function cell(raw: unknown): string | undefined {
   return flat === "" ? undefined : flat;
 }
 
+/**
+ * The status of a row, narrowed to the two the table has. `building` is the only
+ * word that means anything specific; EVERYTHING else — a missing status, a
+ * word from the old free-form vocabulary, junk — is `queued`.
+ *
+ * That is a coercion and not a validation on purpose: a store written under the
+ * old shape is read, not rejected, and the panel is never handed a third word it
+ * has no column for. The WRITE path is strict (see setStatus); this is the read.
+ */
+function status(raw: unknown): TaskStatus {
+  return cell(raw)?.toLowerCase() === "building" ? "building" : "queued";
+}
+
+export function isTaskStatus(v: unknown): v is TaskStatus {
+  return typeof v === "string" && (TASK_STATUSES as readonly string[]).includes(v);
+}
+
 /** Coerce one row. A row with no task text is dropped entirely — it would render
- *  as a blank line and mean nothing. Type and status fall back to "—" so a
- *  half-filled row still lines up in its columns. */
+ *  as a blank line and mean nothing. A `type` field (the old shape) is ignored
+ *  rather than carried, so the next write drops it from the file too. */
 function coerceRow(raw: unknown): TaskRow | undefined {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
   const o = raw as Record<string, unknown>;
   const task = cell(o.task);
   if (!task) return undefined;
-  return { task, type: cell(o.type) ?? "—", status: cell(o.status) ?? "—" };
+  return { task, status: status(o.status) };
 }
 
 /** Drop anything that isn't a usable row, and cap the list. A hand-edited or
@@ -77,14 +150,50 @@ export function coerceTasks(raw: unknown): TaskRow[] {
   return out.slice(0, TASK_TABLE_CAP);
 }
 
+/** Coerce the retired list. Uncapped: it is the only record that a row ever
+ *  existed, it is never read into the model's context, and a line of it is a few
+ *  dozen bytes — so it grows with the project rather than rolling. */
+export function coerceRetired(raw: unknown): RetiredTask[] {
+  if (!Array.isArray(raw)) return [];
+  const out: RetiredTask[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+    const o = item as Record<string, unknown>;
+    const task = cell(o.task);
+    if (!task) continue;
+    out.push({ task, retiredAt: cell(o.retiredAt) ?? "" });
+  }
+  return out;
+}
+
+/**
+ * The file's shape. It was a bare array of rows before the `done` list existed,
+ * and a real instance still has one on disk, so a bare array is read as the
+ * table with nothing retired — the same tolerance the row coercion gives the old
+ * `type` field.
+ */
+interface TaskFile {
+  tasks: TaskRow[];
+  done: RetiredTask[];
+}
+
+function coerceFile(raw: unknown): TaskFile {
+  if (Array.isArray(raw)) return { tasks: coerceTasks(raw), done: [] };
+  if (typeof raw !== "object" || raw === null) return { tasks: [], done: [] };
+  const o = raw as Record<string, unknown>;
+  return { tasks: coerceTasks(o.tasks), done: coerceRetired(o.done) };
+}
+
 export class TaskStore {
   private rows: TaskRow[];
+  private retired: RetiredTask[];
 
   private constructor(
     private readonly filePath: string,
-    rows: TaskRow[],
+    file: TaskFile,
   ) {
-    this.rows = rows;
+    this.rows = file.tasks;
+    this.retired = file.done;
   }
 
   /**
@@ -96,20 +205,25 @@ export class TaskStore {
     const file = paths.taskTable;
     try {
       const raw = await fsp.readFile(file, "utf8");
-      return new TaskStore(file, coerceTasks(JSON.parse(raw)));
+      return new TaskStore(file, coerceFile(JSON.parse(raw)));
     } catch {
-      return new TaskStore(file, []);
+      return new TaskStore(file, { tasks: [], done: [] });
     }
   }
 
   /** In-memory table with no file behind it, for tests and degraded paths. */
-  static ephemeral(rows: unknown = []): TaskStore {
-    return new TaskStore("", coerceTasks(rows));
+  static ephemeral(rows: unknown = [], done: unknown = []): TaskStore {
+    return new TaskStore("", { tasks: coerceTasks(rows), done: coerceRetired(done) });
   }
 
-  /** The table, in the co's own order. A copy: the panel must not mutate it. */
+  /** The table, in order. A copy: no caller may mutate it in place. */
   list(): TaskRow[] {
     return this.rows.map((r) => ({ ...r }));
+  }
+
+  /** Everything retired out of the table, oldest first. */
+  done(): RetiredTask[] {
+    return this.retired.map((r) => ({ ...r }));
   }
 
   get size(): number {
@@ -117,22 +231,109 @@ export class TaskStore {
   }
 
   /**
-   * Replace the WHOLE table. The only write path there is: the co re-renders the
-   * table from scratch each time it changes, so a partial update would only ever
-   * be a way for the stored table and the co's belief about it to diverge. An
-   * empty list clears it.
+   * Append one row, always as `queued`. A new task has not been started — that
+   * is the captain's own spec — so `add` takes no status and `status` is the
+   * separate step that says work has begun.
    *
-   * Returns what was actually stored and how many rows were dropped (junk rows,
-   * or rows past the cap), so the caller can tell the co rather than let it
-   * assume. The in-memory list updates synchronously so the very next paint sees
-   * it; the returned promise resolves once the file has been rewritten.
+   * Refuses rather than absorbs: no text, text already on the table (which would
+   * make BOTH rows unaddressable), or a full table. A full table is not silently
+   * truncated and nothing is evicted to make room — evicting would be this
+   * store deleting a row nobody named, which is the whole thing it exists to
+   * prevent.
    */
-  async replace(rows: unknown): Promise<{ stored: TaskRow[]; dropped: number }> {
-    const all = Array.isArray(rows) ? rows : [];
-    const stored = coerceTasks(all);
-    this.rows = stored;
+  async add(task: unknown): Promise<TaskRow> {
+    const text = cell(task);
+    if (!text) {
+      throw new TaskError("EMPTY_TASK", "A task needs some text: one short line saying what it is.");
+    }
+    if (this.rows.some((r) => r.task === text)) {
+      throw new TaskError(
+        "DUPLICATE_TASK",
+        `The table already holds "${text}". Rows are addressed by their exact text, so it cannot hold two.`,
+      );
+    }
+    if (this.rows.length >= TASK_TABLE_CAP) {
+      throw new TaskError(
+        "TABLE_FULL",
+        `The table already holds its maximum of ${TASK_TABLE_CAP} rows. Retire something first: ${this.quoted()}.`,
+      );
+    }
+    const row: TaskRow = { task: text, status: "queued" };
+    this.rows.push(row);
     await this.persist();
-    return { stored: this.list(), dropped: Math.max(0, all.length - stored.length) };
+    return { ...row };
+  }
+
+  /**
+   * Move one row between the two statuses. Strict, unlike the read path: a third
+   * word is refused rather than coerced, because a write that quietly became
+   * `queued` is a write the caller believes landed.
+   */
+  async setStatus(task: unknown, next: unknown): Promise<TaskRow> {
+    if (!isTaskStatus(next)) {
+      throw new TaskError(
+        "BAD_STATUS",
+        `Status must be one of: ${TASK_STATUSES.join(", ")}. There is no third value.`,
+      );
+    }
+    const row = this.rows[this.indexOf(task)]!;
+    row.status = next;
+    await this.persist();
+    return { ...row };
+  }
+
+  /**
+   * Retire one row: it leaves the table and is appended to the `done` list with
+   * the moment it left. Done is an action, not a status — the table is what we
+   * are doing, and a finished item is not that.
+   *
+   * `at` is injectable so a test can pin the timestamp; the default is now.
+   */
+  async retire(task: unknown, at: string = new Date().toISOString()): Promise<RetiredTask> {
+    const index = this.indexOf(task);
+    const [row] = this.rows.splice(index, 1);
+    const record: RetiredTask = { task: row!.task, retiredAt: at };
+    this.retired.push(record);
+    await this.persist();
+    return { ...record };
+  }
+
+  /**
+   * The index of the row whose text is exactly `query`, or a TaskError.
+   *
+   * Whitespace is folded first, so text copied back out of the table matches
+   * however it was re-typed, but nothing else is guessed: no prefix match, no
+   * case folding, no "closest row". Two writers means the caller's idea of the
+   * table can be a turn out of date, and acting on the nearest-looking row is
+   * how the wrong row gets retired.
+   */
+  private indexOf(query: unknown): number {
+    const want = cell(query);
+    if (!want) {
+      throw new TaskError("EMPTY_TASK", "Name the row by its exact task text.");
+    }
+    const hits: number[] = [];
+    this.rows.forEach((r, i) => {
+      if (r.task === want) hits.push(i);
+    });
+    if (hits.length === 0) {
+      throw new TaskError(
+        "NO_MATCH",
+        `No row reads "${want}". The table holds: ${this.quoted()}. Address a row by its exact text.`,
+      );
+    }
+    if (hits.length > 1) {
+      throw new TaskError(
+        "MULTIPLE_MATCHES",
+        `"${want}" matches ${hits.length} rows, so there is no way to tell which you meant.`,
+      );
+    }
+    return hits[0]!;
+  }
+
+  /** The table's texts, for an error that has to say what IS there. */
+  private quoted(): string {
+    return this.rows.length === 0 ? "(nothing)" : this.rows.map((r) => `"${r.task}"`).join(", ");
   }
 
   /**
@@ -142,7 +343,7 @@ export class TaskStore {
    */
   private async persist(): Promise<void> {
     if (this.filePath === "") return;
-    const snapshot = this.list();
+    const snapshot: TaskFile = { tasks: this.list(), done: this.done() };
     const file = this.filePath;
     try {
       await serializeWrite(async () => {

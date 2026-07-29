@@ -65,7 +65,7 @@ import {
 import { DispatchRegistry, type Job } from "./registry.js";
 import { FeatureManager } from "./features.js";
 import { FeatureStore } from "./featurestore.js";
-import { TaskStore } from "./taskstore.js";
+import { TaskError, TaskStore } from "./taskstore.js";
 import type { MergeHeadResult } from "./mergequeue.js";
 import {
   DEFAULT_FEATURE_BRANCH_TYPE,
@@ -217,6 +217,26 @@ function docSource(paths: InstancePaths): DocSource {
   };
 }
 
+/**
+ * Run one of the captain's task-table writes for the panel.
+ *
+ * The store has already mutated in memory by the time this is called (its
+ * operations do that synchronously and only the file write is awaited), so the
+ * panel repaints immediately and this settles a moment later with the verdict.
+ * A refusal — a full table, a row the co retired between the paint and the
+ * keystroke — comes back as the one line the panel has room for, never as a
+ * thrown error over a session.
+ */
+async function taskWrite(op: Promise<unknown>): Promise<{ ok: boolean; message?: string }> {
+  try {
+    await op;
+    return { ok: true };
+  } catch (e) {
+    if (e instanceof TaskError) return { ok: false, message: e.message };
+    return { ok: false, message: `the task table could not be written: ${(e as Error).message}` };
+  }
+}
+
 /** The chore showing right now, so we never pick the same one twice running —
  *  a repeat reads as a stuck spinner, which is the bug this whole thing fixes. */
 let lastChore = "";
@@ -292,9 +312,9 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // after a restart still open its pull request with the message the co wrote.
   const featureStore = await FeatureStore.load(paths);
 
-  // The co's at-a-glance task table, painted by the panel's Home tab. Loaded
-  // whether or not the instance is linked — the table is the co's own and needs
-  // no repo — and a missing or corrupt file is simply an empty table.
+  // The captain's at-a-glance task table, painted AND edited on the panel's Home
+  // tab. Loaded whether or not the instance is linked — the table needs no repo
+  // — and a missing or corrupt file is simply an empty table.
   const taskStore = await TaskStore.load(paths);
 
   // The spend meter. Loads before the first turn (including the cold-start
@@ -303,6 +323,11 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
 
   const system = await buildSystemPrompt(paths, cfg.research, {
     excludeTranscript: transcript.file,
+    // Read ONCE, here, into the live-state block. The captain edits the table
+    // all session from the panel, but this prompt is the cache prefix: a block
+    // that re-read the store per turn would change bytes underneath it and cost
+    // the whole cache. The co reads the current table with `task_table list`.
+    tasks: taskStore.list(),
     dispatch: dispatch
       ? {
           repoPath: dispatch.repoPath,
@@ -327,10 +352,22 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
         // The Inbox tab reads the in-memory store fresh at paint time, so a
         // review filed mid-session shows without any subscription.
         inbox: { list: () => inbox.list() },
-        // The Home tab's task table, on the same rule: the co rewrites the whole
-        // table through the task_table tool and the next paint shows it. Wired
-        // whether or not the instance is linked, so Ctrl-O always has a Home.
-        tasks: { list: () => taskStore.list() },
+        // The Home tab's task table, on the same rule: read fresh at paint time,
+        // so a row either writer added shows on the next paint. Wired whether or
+        // not the instance is linked, so Ctrl-O always has a Home.
+        //
+        // The three writes are the captain's own keys (a/x/s), calling straight
+        // into the SAME store the co's task_table tool holds — one table with
+        // two writers, not two copies of one. Each names a single row, so
+        // neither writer can clobber the other's, and a refusal (a full table, a
+        // row that has since moved) comes back as a line the panel prints rather
+        // than an exception.
+        tasks: {
+          list: () => taskStore.list(),
+          add: (task) => taskWrite(taskStore.add(task)),
+          setStatus: (task, status) => taskWrite(taskStore.setStatus(task, status)),
+          retire: (task) => taskWrite(taskStore.retire(task)),
+        },
         // The merge-queue panel tab only exists when the instance is linked (a
         // queue needs a repo). Read fresh at paint time via the FeatureManager,
         // which is created below; the closure is never called before then.

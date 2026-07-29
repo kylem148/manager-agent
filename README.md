@@ -413,9 +413,9 @@ flat over time — small rewritten orientation files plus large append-only logs
 ```
 
 - **Cold start reads only the orientation files** (`projectbrief`,
-  `activeContext`) plus `docs/architecture.md` and `docs/plan.md` when they
-  exist. Full logs are never loaded into context; the model searches them or
-  reads a line range on demand via tools.
+  `activeContext`), `docs/architecture.md` and `docs/plan.md` when they exist,
+  and the task table as it stood at that moment. Full logs are never loaded into
+  context; the model searches them or reads a line range on demand via tools.
 - **`activeContext.md` is the most important file** — current focus, what's
   being decided, recent decisions (compressed), pointers into logs, what's in
   flight, known risks, open questions, next likely actions.
@@ -599,7 +599,7 @@ their rows `a)`, `b)`, `c)` rather than `1)`, `2)`, `3)`.
 
 | tab   | what it is                                                        | its keys                              |
 | ----- | ----------------------------------------------------------------- | ------------------------------------- |
-| home  | the task table, then every tracked worktree. Read-only            | paging only                           |
+| home  | the task table (yours to edit), then every tracked worktree       | `a` add, `x` retire, `s` status       |
 | queue | the merge queue and the head's pull request                       | `m` merge, `e` edit the PR message    |
 | docs  | everything in `docs/`, opened through the transcript's renderer   | `a`-`z` open, `y` copies an open doc  |
 | inbox | the last 20 filed crew reviews                                    | `a`-`z` open                          |
@@ -611,18 +611,17 @@ closes. A left-drag selects and copies on release, on every tab.
 ### Home: what we're doing, and what's in flight
 
 `Ctrl-O` opens on **Home**, which answers the two questions you open the panel
-with. On top, the co-manager's at-a-glance task table. Underneath, every feature
-worktree that exists — including the ones still being worked, which the queue
-never sees — one line each:
+with. On top, your at-a-glance task table. Underneath, every feature worktree
+that exists — including the ones still being worked, which the queue never sees:
 
 ```
-  tasks
-  Task                        Type       Status
-  ctrl-o overhaul             feature    building
-  bedrock retry backoff       fix        blocked
-  pricing table refresh       research   next
+  Tasks
 
-  worktrees
+  building   Fix crew handoff truncation
+  queued     Ctrl-O home page cleanup
+
+  Worktrees
+
   ▸ checkout   [ready to merge]  feat/checkout   stripe checkout with saved cards
     user-auth  [queued #2]       feat/user-auth  passkey login for the web app
     search     [crew running]    feat/search     full-text search over the docs
@@ -630,18 +629,30 @@ never sees — one line each:
 ```
 
 The table is the same handful of live items the co-manager has always kept —
-"you are here", pruned hard, one word of status each — except that it is now
-**stored** rather than only spoken. The co writes the whole table through one
-tool whenever it changes, so the panel paints the current one instead of you
-having to ask for it and pay for a turn. A missing or unreadable table file is an
-empty table, never a failed start.
+"you are here", pruned hard — except that it is **stored**, and it is **yours**.
+It holds at most five rows and a row's status is one of exactly two words,
+`building` or `queued`: a table that grows a row per step is a tracker, and the
+point of this block is that it can be read at a glance. A missing or unreadable
+table file is an empty table, never a failed start.
+
+**You write to it here, and the co-manager reads it.** `a` opens a one-line
+field (Enter adds the task as `queued`, Esc adds nothing); the arrows or `j`/`k`
+pick a row, `x` retires it, `s` flips it between `queued` and `building`, and
+`Esc` drops the selection. `x` and `s` do nothing at all until you have picked a
+row, so no single stray key can change the table. Changes are on disk
+immediately, and a retired row is kept with the time it left. The co-manager
+edits the same table through a tool, one row at a time — it can't overwrite what
+you typed — and the table is in what it reads at session start, so a note you
+jot here is context it actually has.
 
 The description beside a worktree is the **intent** the co-manager wrote when it
 created the feature — a plain authored line, not something regenerated per
 refresh, and no model is called to produce it. It is stored per feature under
 `.dispatch/features.json`, so it is still there after a restart, including for
 worktrees the startup sweep rebuilt from disk. A feature created without one says
-so rather than showing a blank.
+so rather than showing a blank. Nothing on this tab is ever cut off at the right
+edge: a description too long to sit beside the columns wraps underneath them,
+indented, and a resize re-wraps it.
 
 The state word is derived from what the session already knows: a crew agent live
 in the worktree, a merge-queue position, a green head, a block, a resolver run.
@@ -652,10 +663,10 @@ queue up. A feature nothing else is happening to reads `[clean]` or `[dirty]`,
 from a real `git status` taken when you open the tab (and `[idle]` in the moment
 before that lands — never `[clean]`, which would be a claim nobody had checked).
 
-Nothing on this tab acts — no selector, no `[m]` — which is what lets it be the
-tab the panel opens on. Landing is the queue tab's keystroke, and creating,
-enqueuing and abandoning are the co-manager's levers; this is the overview you
-context-switch from.
+The worktree list itself acts on nothing — no selector, no `[m]` — which,
+with the task keys gated behind a submitted line or a picked row, is what lets
+this be the tab the panel opens on. Landing is the queue tab's keystroke, and
+creating, enqueuing and abandoning are the co-manager's levers.
 
 ### Landing work: one keystroke, `[m]`
 
@@ -1462,17 +1473,20 @@ touched (that is what makes a bare re-enqueue a retry), but a description they
 deliberately deleted is deleted, so it cannot come back the next time a pull
 request is created for that feature.
 
-`taskstore.ts` is the same idea for the co's at-a-glance task table: a small
-ordered list of `{task, type, status}` under `.dispatch/tasks.json`, beside the
-feature store. The table always existed, but only as prose the co re-printed into
-the chat from its own memory, which left the panel nothing to render. It is
-written WHOLE through one model-facing tool (`task_table`) — no per-row add or
-update, no ids — because the co re-derives the handful of rows anyway and a
-partial write is only a way for the store and the co's belief about it to
-diverge. Junk rows are dropped, cells are folded to one line, the list is capped,
-and a write that had to truncate says so in the tool result rather than letting
-the co assume it stored everything. A missing or corrupt file is an empty table,
-never a failed start.
+`taskstore.ts` is the same idea for the at-a-glance task table: a small ordered
+list of `{task, status}` plus a `done` list, under `.dispatch/tasks.json`, beside
+the feature store. It has TWO writers — the captain's keys on the Home tab and
+the co's `task_table` tool — so every operation names ONE row, by its exact task
+text, and can touch nothing else. There is deliberately no whole-table write: it
+was the only shape while the co was the sole author, and the moment the captain
+also types here it is a silent way to delete what he just wrote. Text matching no
+row, or matching two, is an error rather than a guess (an index would go stale
+between turns), an add past the cap fails rather than evicting anyone, and
+retiring moves a row into `done` with a timestamp instead of leaving it in the
+table under a third status. Junk rows are dropped, cells are folded to one line,
+a status the store does not know becomes `queued` rather than an error, and a
+bare-array file from before the `done` list reads back fine. A missing or corrupt
+file is an empty table, never a failed start.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,
@@ -1492,10 +1506,10 @@ by the source (`splitEvidence`), so the panel and the pull request cannot drift
 apart. `e` on that tab opens the same message in a popup EDITOR over it, through
 a second injected callback (`editPrMessage`) that is likewise the only thing that
 keystroke can reach — one buffer in `git commit` shape, prose only, saved with
-Ctrl-S and never merging anything. The home tab is
-read-only by construction (no selector, no `[m]`, it only pages), which is what
-lets the panel open on it: the tab a keystroke lands on by default can never be
-the thing that merged something. A pending `feature_land` review
+Ctrl-S and never merging anything. The home tab merges nothing
+and edits nothing on ONE key — its task keys need a submitted line or a picked
+row first — which is what lets the panel open on it: the tab a keystroke lands on
+by default can never be the thing that merged something. A pending `feature_land` review
 gets a fifth tab of its own for as long as it is pending, so the two merges never
 share a key. A doc and a filed review drill into the same paged body view. The
 panel body is one selection surface: a left-drag highlights and copies out of any

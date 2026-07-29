@@ -4,6 +4,7 @@ import { readLiveMemory, readTranscriptTail, type TranscriptTurn } from "../memo
 import { readSurfacedDocs } from "../memory/docs.js";
 import { describeSearch } from "../research.js";
 import type { ResearchConfig } from "../config.js";
+import type { TaskRow } from "./taskstore.js";
 
 /**
  * Assemble the system prompt in altitude order: absolute identity + constraints,
@@ -332,25 +333,46 @@ decision.`;
 
 const TASK_TABLE_PROTOCOL = `## Task table
 
-Task table = at-a-glance, not a tracker. Keep the task table in live state
-minimal: only the handful of items that define where we are and what's next,
-each with a one-word status. It is a quick "you are here," not an exhaustive
-log. The full detail (rationale, history, design notes, done items) lives in
-\`.memory\` (the logs and the activeContext narrative), not in the table. Prune
-aggressively: when an item is no longer a live next step, drop it from the table
-and let the logs carry the record. Default columns Task | Type | Status; render
-it at session start, after a crew review, and when next steps change, not every
-turn.
+Task table = at-a-glance, not a tracker. **The default is NOT to add a row.** A
+row belongs in the table only when the captain asks for one, or when the item is
+plainly a major future workstream. Intermediate and mechanical steps never belong
+in it, however real the work is — they live in \`.memory\` (the logs and the
+activeContext narrative) with the rest of the detail. Maximum 5 rows, and usually
+far fewer.
 
-**The table is persisted, and the panel paints it.** Call \`task_table\` with the
-whole table whenever it changes — it replaces every row in one call (an empty
-list clears it), and the captain reads the result in the panel (Ctrl-O, Home
-tab), where it sits above the worktree list. That is where the table LIVES now,
-so keep the store current rather than only printing the table into the chat: a
-table you only spoke is one the captain cannot look at between turns. Update it
-in the same turn as the change it reflects — a crew review that moves an item on,
-a new next step, an item you have pruned — and keep printing it into the chat
-only when the captain actually wants to read it there.`;
+Two columns, Status | Task, and \`status\` is one of exactly two words:
+\`building\` for the thing being worked right now, \`queued\` for anything waiting
+its turn. There is no third value, and a task is one plain line of text with no
+body. A new task always arrives \`queued\`; it becomes \`building\` when work on it
+actually starts.
+
+**The table is the CAPTAIN'S, and you are the second writer on it.** He types
+rows into it himself, from the panel (Ctrl-O, Home tab): \`a\` adds one, \`x\`
+retires the highlighted row, \`s\` toggles its status. The current table is in
+your live-state block at session start, so what he jotted there is context you
+have — treat it as his, and read a row you did not write as something he put
+there deliberately. Two rules follow and they are absolute: **never write over a
+row you did not name**, and **never assume a row you did not add is stale.** If a
+row looks wrong or finished to you, say so and let him call it.
+
+**Edit it one row at a time, with \`task_table\`:**
+- \`list\` — the current table. Do this first if you are unsure what is there.
+- \`add\` — append one row, always \`queued\`.
+- \`status\` — move one row between \`building\` and \`queued\`.
+- \`retire\` — take one row OUT of the table. **This is what "done" means here:**
+  finishing something retires it (it is kept, timestamped, in a \`done\` list),
+  rather than sitting in the table under a third status word.
+
+Every command names ONE row, by its EXACT task text — never by position, because
+the captain edits the same table between your turns and a position you read
+earlier may be a different row now. Text that matches no row, or more than one,
+fails rather than guessing: \`list\` and copy the text. There is no whole-table
+write and no clear.
+
+So the store, not the chat, is where the table lives: update it in the same turn
+as the change it reflects — a crew review that moves an item on, a new next step,
+an item that is finished — and print the table into the chat only when the
+captain actually wants to read it there.`;
 
 /**
  * The dispatch section, included only when the instance is linked to a repo.
@@ -606,6 +628,14 @@ export async function buildSystemPrompt(
      *  transport dispatch will use, and the crew agents + default. Null/absent
      *  when unlinked. */
     dispatch?: { repoPath: string; transport: string; agents: string[]; defaultAgent: string } | null;
+    /**
+     * The task table as it stands at session start, for the live-state block.
+     * Passed IN, as a plain snapshot, rather than read from the store here — the
+     * whole prompt sits inside the cache prefix and must stay byte-identical for
+     * the session, so this is a value read once at assembly and never a live
+     * view of a store the captain is editing underneath it.
+     */
+    tasks?: TaskRow[];
   } = {},
 ): Promise<string> {
   const live = await readLiveMemory(paths);
@@ -624,6 +654,7 @@ export async function buildSystemPrompt(
       const rel = path.relative(paths.root, paths.docFile(d.name));
       return `### ${rel}\n\n${d.content.trim()}`;
     }),
+    taskTableBlock(opts.tasks ?? []),
   ].join("\n\n");
 
   return [
@@ -654,6 +685,31 @@ export async function buildSystemPrompt(
     "---",
     recentConversationBlock(tail),
   ].join("\n\n");
+}
+
+/**
+ * The task table, as a block of live state.
+ *
+ * It belongs here and not only in the protocol section because the table is the
+ * captain's own surface now: rows he types into the panel are notes meant to
+ * reach the co, and a note the co never reads is a note that lives nowhere. So
+ * it is surfaced beside the brief and the active context, in the same shape.
+ *
+ * Rendered from a snapshot taken ONCE at assembly. Nothing here is re-read per
+ * turn and nothing carries a timestamp: this block sits inside the prompt-cache
+ * prefix, so a byte that moves mid-session costs the whole cache.
+ */
+function taskTableBlock(rows: TaskRow[]): string {
+  const body =
+    rows.length === 0
+      ? "(empty)"
+      : rows.map((r) => `${r.status.padEnd(8)}  ${r.task}`).join("\n");
+  return (
+    "### task table (the captain's, painted on Ctrl-O → Home)\n\n" +
+    "_As it stood when this session opened. He edits it there himself; call" +
+    " `task_table list` for the current one._\n\n" +
+    body
+  );
 }
 
 /**

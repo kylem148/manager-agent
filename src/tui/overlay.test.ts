@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import {
   Tui,
   clipCell,
+  flowRow,
   normalizeSelection,
   osc52,
+  packRow,
   pad,
   renderInboxItem,
   renderMarkdownDoc,
@@ -109,6 +111,10 @@ function fakeDocs(initial: Record<string, string>): DocSource & {
 interface Harness {
   tui: Tui;
   send(bytes: string): void;
+  /** Resize the terminal the way SIGWINCH does, with the panel still open. */
+  resize(cols: number, rows: number): void;
+  /** The width the terminal currently reports. */
+  cols(): number;
   lastFrame(): string;
   lastFramePlain(): string;
   /** Every byte written to the terminal, for assertions about sequences that
@@ -128,7 +134,16 @@ function harness(
 ): Harness {
   let listener: ((d: string) => void) | null = null;
   const writes: string[] = [];
-  const out: OutStream = { write: (s) => writes.push(String(s)), columns: cols, rows };
+  const size = { cols, rows };
+  const out: OutStream = {
+    write: (s) => writes.push(String(s)),
+    get columns(): number {
+      return size.cols;
+    },
+    get rows(): number {
+      return size.rows;
+    },
+  };
   const inp: InStream = {
     isTTY: true,
     setRawMode: () => {},
@@ -152,6 +167,12 @@ function harness(
   return {
     tui,
     send: (bytes) => listener?.(bytes),
+    resize: (c, r) => {
+      size.cols = c;
+      size.rows = r;
+      process.emit("SIGWINCH");
+    },
+    cols: () => size.cols,
     lastFrame: () => writes[writes.length - 1] ?? "",
     lastFramePlain: () => stripAnsi(writes[writes.length - 1] ?? ""),
     writes: () => writes,
@@ -203,6 +224,69 @@ test("clipCell cuts within a width, marks the cut, and closes any style it cut",
   assert.ok(visibleWidth(styled) <= 12, "measured in columns, not bytes");
   assert.ok(styled.endsWith("\x1b[0m"), "and the colour is closed, so it can't bleed down the row");
   assert.equal(clipCell("anything", 0), "", "no room is no cell, not a crash");
+});
+
+// --- flowRow / packRow: the wrap that replaced the clip ----------------------
+//
+// The Home tab's descriptions used to be cut with an ellipsis, which removed the
+// overflow and left the text unreadable — the actual complaint. These two are
+// the arithmetic that fixes it, and the properties below are the whole contract:
+// nothing wider than the width, and nothing lost.
+
+/** The words of a set of flowed rows, with the indent and the lead removed, so a
+ *  test can ask whether every character survived the wrap. */
+function words(rows: string[]): string[] {
+  return rows.join(" ").split(/\s+/).filter((w) => w !== "");
+}
+
+test("flowRow wraps a long description on word boundaries and loses nothing", () => {
+  const text =
+    "the resolver rebases the feature onto the current origin/dev tip and pushes it back with a lease";
+  const rows = flowRow("  building   ", text, 48);
+
+  assert.ok(rows.length > 1, "a description longer than the width is more than one row");
+  for (const row of rows) {
+    assert.ok(visibleWidth(row) <= 48, `no row is wider than the width: ${JSON.stringify(row)}`);
+  }
+  // Word boundaries, not columns: no row ends mid-word.
+  assert.deepEqual(words(rows).slice(1), text.split(" "), "every word survives, in order");
+  assert.equal(words(rows)[0], "building", "and the lead is still the lead");
+});
+
+test("flowRow indents continuations to the column the text started in", () => {
+  const rows = flowRow("  queued     ", "one two three four five six seven eight", 24);
+  assert.ok(rows.length > 1);
+  for (const row of rows.slice(1)) {
+    assert.match(row, /^ {13}\S/, "a continuation hangs under the text, not under the row");
+  }
+});
+
+test("flowRow styles each row separately, so a colour cannot bleed past the wrap", () => {
+  // colorEnabled is false under a test runner, so the style function stands in
+  // for c.dim: what matters is that it is applied per row and never spans one.
+  const rows = flowRow("  ", "a description with several words in it", 16, (s) => `<${s}>`);
+  assert.ok(rows.length > 1);
+  for (const row of rows) assert.match(row, /^ +<[^<>]*>$/, `styled whole: ${JSON.stringify(row)}`);
+});
+
+test("flowRow survives the degenerate widths without a crash or an empty row", () => {
+  assert.deepEqual(flowRow("", "", 40), [""], "no text is one empty row, not none");
+  const narrow = flowRow("          ", "supercalifragilistic", 8);
+  assert.ok(narrow.length >= 1);
+  assert.deepEqual(words(narrow).join(""), "supercalifragilistic", "hard-split, never dropped");
+});
+
+test("packRow lays a head across lines when its columns outgrow the terminal", () => {
+  const rows = packRow("  ▸ ", ["checkout", "[ready to merge]", "co/feat-checkout"], 28, 6);
+  assert.ok(rows.length > 1, "it did not fit on one");
+  for (const row of rows) assert.ok(visibleWidth(row) <= 28, JSON.stringify(row));
+  assert.deepEqual(words(rows), ["▸", "checkout", "[ready", "to", "merge]", "co/feat-checkout"]);
+  for (const row of rows.slice(1)) assert.match(row, /^ {6}\S/, "continuations hang");
+
+  // One token wider than the whole row is hard-split rather than dropped.
+  const long = packRow("  ▸ ", ["co/feat-a-very-long-branch-name-indeed"], 20, 6);
+  for (const row of long) assert.ok(visibleWidth(row) <= 20, JSON.stringify(row));
+  assert.equal(words(long).slice(1).join(""), "co/feat-a-very-long-branch-name-indeed");
 });
 
 // --- renderMarkdownDoc (the shared-renderer reuse) --------------------------
@@ -2293,9 +2377,62 @@ function fakeFeatures(
   return api;
 }
 
-function fakeTasks(initial: TaskPanelRow[]): TaskPanelSource & { set(v: TaskPanelRow[]): void } {
+/**
+ * A task source with the captain's three writes wired, standing in for the real
+ * store: one table, addressed by exact row text, refusing what the store refuses
+ * (a full table, a row that isn't there) rather than throwing.
+ *
+ * `writes` records what the panel actually asked for, which is the half a frame
+ * assertion cannot see — a key that repaints a row it never persisted would look
+ * identical on screen.
+ */
+type FakeTasks = TaskPanelSource & {
+  set(v: TaskPanelRow[]): void;
+  writes: string[];
+  /** Set to refuse the next write with this message, as a full table would. */
+  refuse: string | null;
+};
+
+const FAKE_TASK_CAP = 5;
+
+function fakeTasks(initial: TaskPanelRow[], opts: { readOnly?: boolean } = {}): FakeTasks {
   let cur = initial;
-  return { list: () => cur, set: (v) => (cur = v) };
+  const api: FakeTasks = {
+    list: () => cur,
+    set: (v) => (cur = v),
+    writes: [],
+    refuse: null,
+  };
+  if (opts.readOnly) return api;
+  const guard = (what: string): { ok: boolean; message?: string } | null => {
+    api.writes.push(what);
+    if (api.refuse === null) return null;
+    const message = api.refuse;
+    api.refuse = null;
+    return { ok: false, message };
+  };
+  api.add = (task) => {
+    const refused = guard(`add:${task}`);
+    if (refused) return Promise.resolve(refused);
+    if (cur.length >= FAKE_TASK_CAP) {
+      return Promise.resolve({ ok: false, message: `The table already holds its maximum of ${FAKE_TASK_CAP} rows.` });
+    }
+    cur = [...cur, { task, status: "queued" }];
+    return Promise.resolve({ ok: true });
+  };
+  api.setStatus = (task, status) => {
+    const refused = guard(`status:${task}:${status}`);
+    if (refused) return Promise.resolve(refused);
+    cur = cur.map((r) => (r.task === task ? { ...r, status } : r));
+    return Promise.resolve({ ok: true });
+  };
+  api.retire = (task) => {
+    const refused = guard(`retire:${task}`);
+    if (refused) return Promise.resolve(refused);
+    cur = cur.filter((r) => r.task !== task);
+    return Promise.resolve({ ok: true });
+  };
+  return api;
 }
 
 const FEATURES: FeaturePanelEntry[] = [
@@ -2325,9 +2462,9 @@ const FEATURES: FeaturePanelEntry[] = [
 ];
 
 const TASKS: TaskPanelRow[] = [
-  { task: "ctrl-o overhaul", type: "feature", status: "building" },
-  { task: "bedrock retry backoff", type: "fix", status: "blocked" },
-  { task: "pricing table refresh", type: "research", status: "next" },
+  { task: "ctrl-o overhaul", status: "building" },
+  { task: "bedrock retry backoff", status: "queued" },
+  { task: "pricing table refresh", status: "queued" },
 ];
 
 test("Home shows the task table above the worktree list", async () => {
@@ -2337,10 +2474,9 @@ test("Home shows the task table above the worktree list", async () => {
   await settle();
   const frame = h.lastFramePlain();
 
-  // The table first, with its columns.
-  assert.match(frame, /Task\s+Type\s+Status/, "the table's columns are named");
-  assert.match(frame, /ctrl-o overhaul\s+feature\s+building/);
-  assert.match(frame, /bedrock retry backoff\s+fix\s+blocked/);
+  // The table first: status in a fixed left column, then the name. No Type.
+  assert.match(frame, /building\s+ctrl-o overhaul/);
+  assert.match(frame, /queued\s+bedrock retry backoff/);
   // Then the worktrees, one line each, carrying all four facts.
   assert.match(frame, /checkout\s+\[ready to merge\]\s+co\/feat-checkout\s+stripe checkout with saved cards/);
   assert.match(frame, /user-auth\s+\[queued #2\]\s+co\/feat-user-auth\s+passkey login for the web app/);
@@ -2405,7 +2541,7 @@ test("with no feature source, Home is still the task table and says why the list
   h.send(CTRL_O);
   await settle();
   const frame = h.lastFramePlain();
-  assert.match(frame, /ctrl-o overhaul\s+feature\s+building/, "the table is there");
+  assert.match(frame, /building\s+ctrl-o overhaul/, "the table is there");
   assert.match(frame, /aren't available in this session \(not linked\)/, "and the gap is explained");
   h.stop();
 });
@@ -2419,12 +2555,37 @@ test("the task table reads its source fresh: a table rewritten mid-session shows
   assert.match(h.lastFramePlain(), /ctrl-o overhaul/);
   // What the task_table tool does, from the panel's point of view: the whole
   // table is replaced, and the next paint shows it. No restart, no subscription.
-  tasks.set([{ task: "landing the panel", type: "feature", status: "review" }]);
+  tasks.set([{ task: "landing the panel", status: "building" }]);
   h.tui.appendBlock("something happened");
   await frame();
   const painted = h.lastFramePlain();
-  assert.match(painted, /landing the panel\s+feature\s+review/, "the new table is painted");
+  assert.match(painted, /building\s+landing the panel/, "the new table is painted");
   assert.ok(!painted.includes("ctrl-o overhaul"), "and the old rows are gone");
+  h.stop();
+});
+
+test("the task table is a spaced status-first list, with no Type column", async () => {
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const rows = screenRows(h);
+  const heading = rows.findIndex((r) => r.trim() === "Tasks");
+  assert.ok(heading > 0, "the block is headed");
+  assert.equal(rows[heading + 1], "", "with a blank line under the heading");
+
+  // Status first, in a column the eye can run down: every task name starts at
+  // the same column, whichever status word is in front of it.
+  const listed = TASKS.map((t) => rows.find((r) => r.includes(t.task)) ?? "");
+  for (const [i, row] of listed.entries()) {
+    assert.ok(row !== "", `row ${i} is painted`);
+    assert.match(row, /^ {2}(building|queued) /, "indented, status leading");
+    assert.equal(row.indexOf(TASKS[i]!.task), 13, "and the names line up in one column");
+    // The dropped column is really gone, not just unlabelled: the name is the
+    // end of the row.
+    assert.ok(row.endsWith(TASKS[i]!.task), `nothing follows the name: ${JSON.stringify(row)}`);
+  }
+  assert.ok(!rows.some((r) => /\bType\b/.test(r)), "and no header names it either");
   h.stop();
 });
 
@@ -2438,6 +2599,82 @@ test("a feature with no intent renders a placeholder, never a blank tail", async
   const frame = h.lastFramePlain();
   assert.match(frame, /nameless\s+\[idle\]\s+co\/feat-nameless/);
   assert.match(frame, /no description/);
+  h.stop();
+});
+
+// --- nothing on Home runs off the right edge ---------------------------------
+//
+// The captain's complaint: the description beside a worktree is the only thing on
+// the row that says what the work is FOR, and it ran off the edge. It was cut
+// with an ellipsis, which is the same information loss with tidier punctuation.
+// So it wraps now, and these pin the property that matters — the WHOLE text is on
+// screen, at any width, across a resize.
+
+const LONG_INTENT =
+  "rebase the blocked head onto the current origin/dev tip, re-push it with a lease, " +
+  "and read the pull request's real checks back before the queue offers a merge again";
+
+/** The painted panel body as one whitespace-normalized string, so a test can ask
+ *  whether a description survived the wrap instead of where each piece landed. */
+function painted(h: Harness): string {
+  return screenRows(h).join(" ").replace(/\s+/g, " ").trim();
+}
+
+test("a description too long for its row wraps, and every word of it is on screen", async () => {
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([
+    { feature: "resolver", branch: "co/feat-resolver", intent: LONG_INTENT, status: "blocked", busy: false },
+  ]), fakeTasks([]));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+
+  const rows = screenRows(h);
+  assert.ok(painted(h).includes(LONG_INTENT), "the whole description is readable");
+  assert.ok(!painted(h).includes("…"), "nothing was cut to get it there");
+  // It is more than one row, and the continuations read as part of the row above
+  // rather than as new entries in the list.
+  const started = rows.findIndex((r) => r.includes("rebase the blocked head"));
+  assert.ok(started > 0);
+  assert.match(rows[started + 1]!, /^ {6}\S/, "the tail hangs under the row it belongs to");
+  h.stop();
+});
+
+test("a resize re-wraps the descriptions, with nothing stale and nothing clipped", async () => {
+  const h = harness(undefined, 120, 24, undefined, undefined, fakeFeatures([
+    { feature: "resolver", branch: "co/feat-resolver", intent: LONG_INTENT, status: "idle", busy: false },
+  ]), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const wide = screenRows(h).filter((r) => r !== "").length;
+  assert.ok(painted(h).includes(LONG_INTENT), "readable at 120 columns");
+
+  // Narrow the terminal under the open panel: the rows are rebuilt at the new
+  // width, so the same text takes more of them and still says all of it.
+  h.resize(60, 24);
+  await settle();
+  assert.ok(painted(h).includes(LONG_INTENT), "and still readable at 60");
+  assert.ok(!painted(h).includes("…"), "no row was cut to fit the narrower screen");
+  assert.ok(
+    screenRows(h).filter((r) => r !== "").length > wide,
+    "the same content really did re-wrap into more rows",
+  );
+  for (const row of screenRows(h)) {
+    assert.ok(visibleWidth(row) <= h.cols(), `inside the new width: ${JSON.stringify(row)}`);
+  }
+  h.stop();
+});
+
+test("a long branch name is wrapped with the row, never ellipsized out of it", async () => {
+  const branch = "co/feat-ctrl-o-home-tab-readability-pass";
+  const h = harness(undefined, 64, 20, undefined, undefined, fakeFeatures([
+    { feature: "home-cleanup", branch, intent: "make the panel readable", status: "idle", busy: false },
+  ]), fakeTasks([]));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.ok(painted(h).includes(branch), "the whole branch is there");
+  assert.ok(painted(h).includes("make the panel readable"), "and so is the description");
   h.stop();
 });
 
@@ -2599,6 +2836,261 @@ test("Ctrl-O closes the panel from Home", async () => {
   assert.match(h.lastFramePlain(), /you > /, "closed with the key that opened it");
   h.send("typed\r");
   assert.equal(await answer, "typed");
+  h.stop();
+});
+
+// --- editing the task table from Home ----------------------------------------
+//
+// The table has two writers now (D-20260729-3): the co, through its tool, and
+// the captain, right here. What these pin is the rule that lets that live on the
+// tab the panel OPENS on — no single stray keystroke may change anything. `a`
+// opens a field and writes only what is submitted; `x` and `s` do nothing at all
+// until a row has been deliberately selected. Nothing is selected on open.
+//
+// The colours and the on-screen look are the captain's to judge; what a test can
+// hold is which row is marked, which write was asked for, and which keys did
+// nothing.
+
+const ARROW_UP = "\x1b[A";
+const ARROW_DOWN = "\x1b[B";
+
+/** The painted task rows, in order: the marked one carries the ▸. */
+function taskRows(h: Harness): string[] {
+  const rows = screenRows(h);
+  const head = rows.findIndex((r) => r.trim() === "Tasks");
+  const out: string[] = [];
+  for (let i = head + 1; i < rows.length; i++) {
+    if (rows[i]!.trim() === "Worktrees") break;
+    if (/\b(building|queued|new)\b/.test(rows[i]!)) out.push(rows[i]!);
+  }
+  return out;
+}
+
+/** The row currently marked with ▸, or "" when nothing is selected. */
+function selectedRow(h: Harness): string {
+  return taskRows(h).find((r) => r.trimStart().startsWith("▸")) ?? "";
+}
+
+test("Home opens with nothing selected, and x/s do nothing until something is", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.equal(selectedRow(h), "", "the tab lands inert: no row is marked");
+
+  // The two mutating keys, pressed with nothing selected. This is the property
+  // that lets Home stay the landing tab: they must not act on "the first row",
+  // "the last row", or anything else.
+  h.send("x");
+  h.send("s");
+  await settle();
+  assert.deepEqual(tasks.writes, [], "no write was even attempted");
+  assert.deepEqual(tasks.list(), TASKS, "and the table is untouched");
+  assert.equal(selectedRow(h), "", "still nothing selected");
+  h.stop();
+});
+
+test("arrows and j/k move the selection; Esc clears it and leaves the tab inert", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+
+  h.send(ARROW_DOWN);
+  await settle();
+  assert.match(selectedRow(h), /ctrl-o overhaul/, "down from nothing takes the first row");
+  h.send("j");
+  await settle();
+  assert.match(selectedRow(h), /bedrock retry backoff/, "j moves down");
+  h.send(ARROW_UP);
+  await settle();
+  assert.match(selectedRow(h), /ctrl-o overhaul/, "and up moves back");
+  h.send("k");
+  await settle();
+  assert.match(selectedRow(h), /ctrl-o overhaul/, "clamped at the top rather than wrapping");
+
+  // Only one row is ever marked.
+  assert.equal(taskRows(h).filter((r) => r.trimStart().startsWith("▸")).length, 1);
+
+  h.send(ESC);
+  await settle();
+  assert.equal(selectedRow(h), "", "Esc drops the selection");
+  assert.match(h.lastFramePlain(), /ctrl-o overhaul/, "and the panel is still open");
+  h.send(ESC);
+  await settle();
+  assert.match(h.lastFramePlain(), /you > /, "a second Esc, with nothing selected, closes it");
+  h.stop();
+});
+
+test("`x` retires the highlighted row and drops the selection with it", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j");
+  h.send("j");
+  await settle();
+  assert.match(selectedRow(h), /bedrock retry backoff/);
+
+  h.send("x");
+  await settle();
+  assert.deepEqual(tasks.writes, ["retire:bedrock retry backoff"], "the named row, and only it");
+  assert.deepEqual(tasks.list().map((t) => t.task), ["ctrl-o overhaul", "pricing table refresh"]);
+  // The selection goes with it, so a second press cannot fall onto a neighbour.
+  assert.equal(selectedRow(h), "");
+  h.send("x");
+  await settle();
+  assert.equal(tasks.writes.length, 1, "and the second press wrote nothing");
+  h.stop();
+});
+
+test("`s` toggles the highlighted row between building and queued", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j"); // ctrl-o overhaul, which is building
+  await settle();
+
+  h.send("s");
+  await settle();
+  assert.deepEqual(tasks.writes, ["status:ctrl-o overhaul:queued"]);
+  assert.equal(tasks.list()[0]!.status, "queued");
+  assert.match(selectedRow(h), /queued\s+ctrl-o overhaul/, "the row is repainted, still selected");
+
+  h.send("s");
+  await settle();
+  assert.equal(tasks.list()[0]!.status, "building", "and it toggles back");
+  h.stop();
+});
+
+test("`a` adds only what is submitted: Enter stores it, Esc stores nothing", async () => {
+  const tasks = fakeTasks([]);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+
+  // Opened, typed into, then abandoned: nothing reaches the store.
+  h.send("a");
+  h.send("a task I thought better of");
+  await settle();
+  assert.match(h.lastFramePlain(), /a task I thought better of/, "the field shows what is typed");
+  h.send(ESC);
+  await settle();
+  assert.deepEqual(tasks.writes, [], "Esc wrote nothing");
+  assert.deepEqual(tasks.list(), []);
+  assert.match(h.lastFramePlain(), /Nothing on the table/, "the field is gone");
+
+  // And the same field, submitted.
+  h.send("a");
+  h.send("wire the panel");
+  h.send("\r");
+  await settle();
+  assert.deepEqual(tasks.writes, ["add:wire the panel"]);
+  assert.deepEqual(tasks.list(), [{ task: "wire the panel", status: "queued" }], "always queued");
+  assert.match(h.lastFramePlain(), /queued\s+wire the panel/, "and it is painted as a row");
+  assert.equal(selectedRow(h), "", "a fresh row is not selected: the tab stays inert");
+  h.stop();
+});
+
+test("the add field owns the keyboard: digits are text, not a jump to tab 2", async () => {
+  const tasks = fakeTasks([]);
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(undefined, 90, 20, q, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("a");
+  // Every one of these means something on the tab underneath: 2 jumps to the
+  // queue, x retires, q closes, m would merge one tab over.
+  h.send("2 fix the xmq parser");
+  h.send("\r");
+  await settle();
+  assert.deepEqual(tasks.writes, ["add:2 fix the xmq parser"]);
+  assert.equal(q.calls, 0, "and nothing merged on the way through");
+  assert.match(h.lastFramePlain(), /2 fix the xmq parser/, "still on Home, with the row");
+  h.stop();
+});
+
+test("a refused add keeps the field open with the text, and says why", async () => {
+  const tasks = fakeTasks([]);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  tasks.refuse = "The table already holds its maximum of 5 rows. Retire something first.";
+  h.send("a");
+  h.send("one too many");
+  h.send("\r");
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /maximum of 5 rows/, "the refusal is printed");
+  assert.match(frame, /one too many/, "with the typed text still there to edit");
+  assert.deepEqual(tasks.list(), [], "and nothing was stored");
+  h.stop();
+});
+
+test("a selection whose row the co retired mid-session simply stops being one", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j");
+  h.send("j");
+  await settle();
+  assert.match(selectedRow(h), /bedrock retry backoff/);
+
+  // The other writer moves the table under the captain's cursor.
+  tasks.set([TASKS[0]!, TASKS[2]!]);
+  h.tui.appendBlock("the co did something");
+  await frame();
+  assert.equal(selectedRow(h), "", "the selection is gone, not slid onto the next row");
+  h.send("x");
+  await settle();
+  assert.deepEqual(tasks.writes, [], "so x is a no-op rather than retiring a row nobody chose");
+  h.stop();
+});
+
+test("a source with no write hooks paints the table and says the keys aren't available", async () => {
+  const tasks = fakeTasks(TASKS, { readOnly: true });
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("a");
+  await settle();
+  assert.match(h.lastFramePlain(), /adding a task isn't available/);
+  h.send("j");
+  h.send("x");
+  await settle();
+  assert.match(h.lastFramePlain(), /retiring a task isn't available/);
+  assert.deepEqual(tasks.list(), TASKS);
+  h.stop();
+});
+
+test("Home's footer names the keys, because nothing else can", async () => {
+  const h = harness(undefined, 90, 20, undefined, undefined, fakeFeatures([]), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const footer = screenRows(h).at(-1) ?? "";
+  assert.match(footer, /a add/);
+  assert.match(footer, /x retire/);
+  assert.match(footer, /s status/);
+  assert.match(footer, /space\/b page/, "and paging is still what it always was");
+
+  // While the field is open the footer names its two keys instead.
+  h.send("a");
+  await settle();
+  const typing = screenRows(h).at(-1) ?? "";
+  assert.match(typing, /Enter add the task/);
+  assert.match(typing, /Esc cancel/);
   h.stop();
 });
 

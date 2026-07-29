@@ -29,7 +29,7 @@ import {
   type FileReviewInput,
   type FileReviewResult,
 } from "./reviewinbox.js";
-import { TASK_TABLE_CAP, type TaskStore } from "./taskstore.js";
+import { TaskError, TASK_STATUSES, TASK_TABLE_CAP, type TaskStore } from "./taskstore.js";
 
 /**
  * The co-manager's internal capability surface, exposed to the model as tools.
@@ -55,6 +55,9 @@ export const DOC_COMMANDS = [
   "list",
 ] as const;
 export type DocCommand = (typeof DOC_COMMANDS)[number];
+
+export const TASK_COMMANDS = ["add", "status", "retire", "list"] as const;
+export type TaskCommand = (typeof TASK_COMMANDS)[number];
 
 /**
  * Tool activity the REPL may surface to the user: external work only. Memory
@@ -283,35 +286,32 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     {
       name: "task_table",
       description:
-        "Replace the captain's at-a-glance task table with the current one, in a single call. The table is persisted and PAINTED by the panel (Ctrl-O, Home tab), so it is what the captain looks at between turns — keep it current rather than only printing it into the chat.\n\n" +
-        "One call replaces the WHOLE table: send every row you want showing, in the order you want them read. There is no add, update or remove, and rows have no ids — the table is a handful of items you re-derive anyway. Send an empty `tasks` list to clear it.\n\n" +
-        `Keep it at-a-glance, not a tracker: the live items that say where we are and what is next, ${TASK_TABLE_CAP} rows maximum and usually far fewer. Prune aggressively — an item that is no longer a live next step comes out of the table, and the logs carry the record. \`status\` is ONE word.`,
+        "Read and edit the captain's at-a-glance task table, one row at a time. One tool, dispatching on `command`. The table is persisted and PAINTED by the panel (Ctrl-O, Home tab), and the captain edits it there himself — it is his surface, and you are the second writer on it.\n\n" +
+        "Commands:\n" +
+        "- list — the current table. Takes no other parameter. Call it before editing if you are unsure what is there.\n" +
+        "- add — append `task` as a new row, always `queued`. A task is one short line of text and has no body.\n" +
+        "- status — move the row named by `task` to `building` or `queued`. Work that has actually started is `building`.\n" +
+        "- retire — take the row named by `task` OUT of the table. This is what `done` means here: retiring appends it to a kept `done` list and shrinks the table. There is no third status.\n\n" +
+        "A row is addressed BY ITS EXACT TASK TEXT, never by position — the captain edits the same table between your turns, so a position you read last turn may be a different row now. Text matching no row, or more than one, is an ERROR rather than a guess; `list` first and copy the text.\n\n" +
+        "You cannot replace, clear or reorder the table, and no call can touch a row it did not name. That is deliberate: a whole-table write would silently delete rows the captain had just typed.\n\n" +
+        `The DEFAULT IS NOT TO ADD A ROW. A row belongs here only when the captain asks for one, or when the item is plainly a major future workstream. Intermediate and mechanical steps never belong in the table, however real they are. ${TASK_TABLE_CAP} rows maximum (an add beyond that FAILS — nothing is evicted for you), and usually far fewer. Never assume a row you did not add is stale: if you did not put it there, the captain did.`,
       input_schema: {
         type: "object",
         properties: {
-          tasks: {
-            type: "array",
+          command: { type: "string", enum: [...TASK_COMMANDS] },
+          task: {
+            type: "string",
             description:
-              "The complete table, in display order. An empty array clears it.",
-            items: {
-              type: "object",
-              properties: {
-                task: { type: "string", description: "What the item is, in a few words." },
-                type: {
-                  type: "string",
-                  description: "What kind of work it is (e.g. feature, fix, research, decision).",
-                },
-                status: {
-                  type: "string",
-                  description: "Where it stands, in ONE word (e.g. building, blocked, queued, next).",
-                },
-              },
-              required: ["task", "type", "status"],
-              additionalProperties: false,
-            },
+              "For add: the new row's text, one short line. For status and retire: the EXACT text of the row to act on, as `list` returns it.",
+          },
+          status: {
+            type: "string",
+            enum: [...TASK_STATUSES],
+            description:
+              "For status: `building` if it is being worked right now, `queued` if it is waiting its turn. There is no third value — finishing something is `retire`.",
           },
         },
-        required: ["tasks"],
+        required: ["command"],
         additionalProperties: false,
       },
     },
@@ -515,10 +515,12 @@ export interface ExecutorContext {
    */
   onFileReview?: (input: FileReviewInput) => Promise<FileReviewResult>;
   /**
-   * The persisted at-a-glance task table (task_table tool), read by the panel's
-   * Home tab. Always wired in a real session — the table is the co's own and
-   * needs no repo — so its absence only means a degraded/test executor, where the
-   * tool reports the table is unavailable rather than throwing.
+   * The persisted at-a-glance task table (task_table tool), painted and EDITED
+   * by the panel's Home tab. Always wired in a real session — the table needs no
+   * repo — so its absence only means a degraded/test executor, where the tool
+   * reports the table is unavailable rather than throwing. The same store object
+   * backs the captain's keystrokes, which is what makes the two writers one
+   * table rather than two copies of one.
    */
   tasks?: TaskStore;
 }
@@ -672,23 +674,42 @@ export function makeExecutor(ctx: ExecutorContext) {
         }
         case "task_table": {
           if (!ctx.tasks) return err(id, "The task table is unavailable in this session.");
-          const raw = input.tasks;
-          if (!Array.isArray(raw)) {
-            return err(id, "task_table requires a `tasks` array (an empty one clears the table).");
+          const tasks = ctx.tasks;
+          const command = String(input.command ?? "") as TaskCommand;
+          try {
+            switch (command) {
+              case "list":
+                return ok(id, { table: tasks.list() });
+              case "add": {
+                const added = await tasks.add(input.task);
+                return ok(id, { added, table: tasks.list() });
+              }
+              case "status": {
+                const row = await tasks.setStatus(input.task, input.status);
+                return ok(id, { updated: row, table: tasks.list() });
+              }
+              case "retire": {
+                const retired = await tasks.retire(input.task);
+                return ok(id, { retired, table: tasks.list() });
+              }
+              default:
+                return err(
+                  id,
+                  JSON.stringify({
+                    error: "UNKNOWN_COMMAND",
+                    message: `Unknown task_table command "${command}". Use one of: ${TASK_COMMANDS.join(", ")}.`,
+                  }),
+                );
+            }
+          } catch (e) {
+            // A refusal is the point of this tool, not an exception: the co is
+            // told exactly which row it named and what the table actually holds,
+            // so its next call can be right rather than a guess.
+            if (e instanceof TaskError) {
+              return err(id, JSON.stringify({ error: e.code, message: e.message, table: tasks.list() }));
+            }
+            throw e;
           }
-          const { stored, dropped } = await ctx.tasks.replace(raw);
-          return ok(id, {
-            stored: stored.length,
-            table: stored,
-            ...(dropped > 0
-              ? {
-                  dropped,
-                  note:
-                    `${dropped} row(s) were not stored: the table holds ${TASK_TABLE_CAP} rows at most and a row with no task text is dropped. ` +
-                    "Prune to the items that say where we are and what is next.",
-                }
-              : {}),
-          });
         }
         case "dispatch_order": {
           const order = String(input.order ?? "").trim();
