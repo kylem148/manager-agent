@@ -6,6 +6,7 @@ import path from "node:path";
 import { instancePaths, type InstancePaths } from "../paths.js";
 import { createInstance } from "../memory/memory.js";
 import { buildSystemPrompt } from "./prompt.js";
+import { TASK_TABLE_CAP } from "./taskstore.js";
 import type { ResearchConfig } from "../config.js";
 
 /**
@@ -244,7 +245,38 @@ test("the task table is a tool call now, not just something the co prints", asyn
     );
     // The at-a-glance rules the table has always had are still the rules.
     assert.match(prompt, /at-a-glance, not a tracker/);
-    assert.match(prompt, /Task \| Type \| Status/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the table's contract is two columns, two status words, and a bias against rows", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH);
+    // The behaviour change: adding a row is the exception, not the reflex. A
+    // table that grows a row per step is the tracker this is not meant to be.
+    assert.match(prompt, /\*\*The default is NOT to add a row\.\*\*/);
+    assert.match(
+      prompt,
+      /only when the captain asks for one, or when the item is\s+plainly a major future workstream/,
+      "the two things that earn a row",
+    );
+    assert.match(
+      prompt,
+      /Intermediate and mechanical steps never belong/,
+      "and the thing that never does",
+    );
+    // Pinned against the cap itself, so lowering it again cannot leave the
+    // prompt promising the old number.
+    assert.match(prompt, new RegExp(`Maximum ${TASK_TABLE_CAP} rows`), "the cap it is held to");
+    assert.match(prompt, /Two columns, Status \| Task/, "Type is gone and status leads");
+    assert.match(
+      prompt,
+      /\\?`building\\?` for the thing being worked right now, \\?`queued\\?` for anything waiting/,
+      "the whole vocabulary, spelled out",
+    );
+    assert.match(prompt, /There is no third value/);
   } finally {
     await cleanup();
   }

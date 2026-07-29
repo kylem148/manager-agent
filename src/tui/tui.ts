@@ -209,6 +209,13 @@ export function packRow(lead: string, tokens: string[], width: number, indent: n
   return rows;
 }
 
+/** The Home tab's task list: the status word in a fixed left column (sized to
+ *  the longer of the two the contract allows), then a gap, then the name. Fixed
+ *  rather than content-sized because a column that moves is a column you have to
+ *  read instead of scan. */
+const TASK_STATUS_W = "building".length;
+const TASK_STATUS_GAP = "   ";
+
 /** Where a worktree's description hangs when it will not fit beside the columns:
  *  in past the row's own two-space indent and its marker, so it reads as part of
  *  the row above rather than as a row of its own. */
@@ -624,9 +631,10 @@ export interface FeaturePanelSource {
  *  the low-level Tui never depends on the session layer. */
 export interface TaskPanelRow {
   task: string;
-  type: string;
-  /** One word, by the co's own protocol. Nothing here enforces a vocabulary. */
-  status: string;
+  /** Exactly two values, because the table is a "you are here" and not a
+   *  tracker: something is being built, or it is waiting its turn. The store
+   *  coerces anything else to `queued`, so the painter only ever sees these. */
+  status: "building" | "queued";
 }
 
 /**
@@ -5121,20 +5129,26 @@ export class Tui implements SessionIO {
    * created while the panel is open shows on the next paint — and rebuilt at the
    * CURRENT width every paint, so a resize re-wraps everything here for free.
    *
-   * A worktree's description is the one thing on its row that says what the work
-   * is FOR, and cutting it with an ellipsis removed the overflow while leaving
-   * the information unreadable — which was the complaint. So text that outgrows
-   * its room wraps instead, and a long row costs a line or two rather than its
-   * meaning.
+   * Nothing on this tab is ever clipped. A worktree's description is the one
+   * thing on its row that says what the work is FOR, and cutting it with an
+   * ellipsis removed the overflow while leaving the information unreadable —
+   * which was the complaint. So text that outgrows its room wraps instead, and a
+   * long row costs a line or two rather than its meaning.
    */
   private homeTabRows(): string[] {
     return [...this.taskTableRows(), "", ...this.worktreeRows()];
   }
 
-  /** The task table: three columns, sized to their content and capped so one long
-   *  row can never push Status off a narrow screen. */
+  /**
+   * The task table: a spaced two-column list, status first.
+   *
+   * Status leads and sits in a fixed column so the eye runs straight down it —
+   * "what is being built right now" is the question this block exists to answer,
+   * and it was buried on the right behind two content-sized columns before. The
+   * old `Type` column is gone: it never changed what the captain did next.
+   */
   private taskTableRows(): string[] {
-    const rows: string[] = ["", "  " + c.dim("tasks")];
+    const rows: string[] = ["", "  " + c.dim("Tasks"), ""];
     if (!this.tasks) return [...rows, ...this.homeNote("The task table isn't available in this session.")];
     const table = this.tasks.list();
     if (table.length === 0) {
@@ -5144,40 +5158,21 @@ export class Tui implements SessionIO {
         ...this.homeNote("The co keeps a handful of live items here — ask it where things stand."),
       ];
     }
-    // Columns hug their content — a Task column stretched to the width would put
-    // Type and Status somewhere off by the right edge, with a river of blank
-    // between. The task column is the one that gives when the terminal is narrow,
-    // and it takes what the other two leave.
-    const typeW = Math.min(12, Math.max(4, ...table.map((t) => t.type.length)));
-    const statusW = Math.min(12, Math.max(6, ...table.map((t) => t.status.length)));
-    const taskW = Math.max(
-      8,
-      Math.min(
-        Math.max(4, ...table.map((t) => t.task.length)),
-        this.cols - 4 - typeW - statusW - 4,
-      ),
-    );
-    // Padded by VISIBLE width, never by String.padEnd: a status chip carries
-    // colour, and padding the raw string would count the escape bytes as
-    // characters and collapse the column.
-    const line = (task: string, type: string, status: string): string =>
-      `${pad(clipCell(task, taskW), taskW)}  ${pad(clipCell(type, typeW), typeW)}  ${clipCell(status, statusW)}`;
-    rows.push("  " + c.dim(line("Task", "Type", "Status")));
     for (const t of table) {
-      rows.push("  " + line(t.task, c.dim(t.type), this.taskStatusLabel(t.status)));
+      // Padded by VISIBLE width, never by String.padEnd: the status carries
+      // colour, and padding the raw string would count the escape bytes as
+      // characters and collapse the column.
+      const lead = "  " + pad(this.taskStatusLabel(t.status), TASK_STATUS_W) + TASK_STATUS_GAP;
+      rows.push(...flowRow(lead, t.task, this.cols));
     }
     return rows;
   }
 
-  /** A task's status, coloured by what it says. The vocabulary is the co's own,
-   *  so this recognises the words that carry a warning and leaves the rest plain
-   *  rather than pretending to know every word it might pick. */
-  private taskStatusLabel(status: string): string {
-    const s = status.toLowerCase();
-    if (/block|stuck|fail|red/.test(s)) return c.red(status);
-    if (/done|ready|green|shipped|landed/.test(s)) return c.green(status);
-    if (/wait|pending|review|queue/.test(s)) return c.yellow(status);
-    return status;
+  /** A task's status, coloured by the panel's existing convention rather than a
+   *  new one: the worktree chips already paint a live crew cyan and a thing
+   *  waiting its turn dim, and these two words mean the same two things. */
+  private taskStatusLabel(status: TaskPanelRow["status"]): string {
+    return status === "building" ? c.cyan("building") : c.dim("queued");
   }
 
   /** A line of explanation under a Home heading, wrapped rather than clipped. */

@@ -2409,9 +2409,9 @@ const FEATURES: FeaturePanelEntry[] = [
 ];
 
 const TASKS: TaskPanelRow[] = [
-  { task: "ctrl-o overhaul", type: "feature", status: "building" },
-  { task: "bedrock retry backoff", type: "fix", status: "blocked" },
-  { task: "pricing table refresh", type: "research", status: "next" },
+  { task: "ctrl-o overhaul", status: "building" },
+  { task: "bedrock retry backoff", status: "queued" },
+  { task: "pricing table refresh", status: "queued" },
 ];
 
 test("Home shows the task table above the worktree list", async () => {
@@ -2421,10 +2421,9 @@ test("Home shows the task table above the worktree list", async () => {
   await settle();
   const frame = h.lastFramePlain();
 
-  // The table first, with its columns.
-  assert.match(frame, /Task\s+Type\s+Status/, "the table's columns are named");
-  assert.match(frame, /ctrl-o overhaul\s+feature\s+building/);
-  assert.match(frame, /bedrock retry backoff\s+fix\s+blocked/);
+  // The table first: status in a fixed left column, then the name. No Type.
+  assert.match(frame, /building\s+ctrl-o overhaul/);
+  assert.match(frame, /queued\s+bedrock retry backoff/);
   // Then the worktrees, one line each, carrying all four facts.
   assert.match(frame, /checkout\s+\[ready to merge\]\s+co\/feat-checkout\s+stripe checkout with saved cards/);
   assert.match(frame, /user-auth\s+\[queued #2\]\s+co\/feat-user-auth\s+passkey login for the web app/);
@@ -2489,7 +2488,7 @@ test("with no feature source, Home is still the task table and says why the list
   h.send(CTRL_O);
   await settle();
   const frame = h.lastFramePlain();
-  assert.match(frame, /ctrl-o overhaul\s+feature\s+building/, "the table is there");
+  assert.match(frame, /building\s+ctrl-o overhaul/, "the table is there");
   assert.match(frame, /aren't available in this session \(not linked\)/, "and the gap is explained");
   h.stop();
 });
@@ -2503,12 +2502,37 @@ test("the task table reads its source fresh: a table rewritten mid-session shows
   assert.match(h.lastFramePlain(), /ctrl-o overhaul/);
   // What the task_table tool does, from the panel's point of view: the whole
   // table is replaced, and the next paint shows it. No restart, no subscription.
-  tasks.set([{ task: "landing the panel", type: "feature", status: "review" }]);
+  tasks.set([{ task: "landing the panel", status: "building" }]);
   h.tui.appendBlock("something happened");
   await frame();
   const painted = h.lastFramePlain();
-  assert.match(painted, /landing the panel\s+feature\s+review/, "the new table is painted");
+  assert.match(painted, /building\s+landing the panel/, "the new table is painted");
   assert.ok(!painted.includes("ctrl-o overhaul"), "and the old rows are gone");
+  h.stop();
+});
+
+test("the task table is a spaced status-first list, with no Type column", async () => {
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const rows = screenRows(h);
+  const heading = rows.findIndex((r) => r.trim() === "Tasks");
+  assert.ok(heading > 0, "the block is headed");
+  assert.equal(rows[heading + 1], "", "with a blank line under the heading");
+
+  // Status first, in a column the eye can run down: every task name starts at
+  // the same column, whichever status word is in front of it.
+  const listed = TASKS.map((t) => rows.find((r) => r.includes(t.task)) ?? "");
+  for (const [i, row] of listed.entries()) {
+    assert.ok(row !== "", `row ${i} is painted`);
+    assert.match(row, /^ {2}(building|queued) /, "indented, status leading");
+    assert.equal(row.indexOf(TASKS[i]!.task), 13, "and the names line up in one column");
+    // The dropped column is really gone, not just unlabelled: the name is the
+    // end of the row.
+    assert.ok(row.endsWith(TASKS[i]!.task), `nothing follows the name: ${JSON.stringify(row)}`);
+  }
+  assert.ok(!rows.some((r) => /\bType\b/.test(r)), "and no header names it either");
   h.stop();
 });
 

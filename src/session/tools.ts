@@ -29,7 +29,7 @@ import {
   type FileReviewInput,
   type FileReviewResult,
 } from "./reviewinbox.js";
-import { TASK_TABLE_CAP, type TaskStore } from "./taskstore.js";
+import { TASK_STATUSES, TASK_TABLE_CAP, type TaskStore } from "./taskstore.js";
 
 /**
  * The co-manager's internal capability surface, exposed to the model as tools.
@@ -285,7 +285,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
       description:
         "Replace the captain's at-a-glance task table with the current one, in a single call. The table is persisted and PAINTED by the panel (Ctrl-O, Home tab), so it is what the captain looks at between turns — keep it current rather than only printing it into the chat.\n\n" +
         "One call replaces the WHOLE table: send every row you want showing, in the order you want them read. There is no add, update or remove, and rows have no ids — the table is a handful of items you re-derive anyway. Send an empty `tasks` list to clear it.\n\n" +
-        `Keep it at-a-glance, not a tracker: the live items that say where we are and what is next, ${TASK_TABLE_CAP} rows maximum and usually far fewer. Prune aggressively — an item that is no longer a live next step comes out of the table, and the logs carry the record. \`status\` is ONE word.`,
+        `The DEFAULT IS NOT TO ADD A ROW. A row belongs here only when the captain asks for one, or when the item is plainly a major future workstream. Intermediate and mechanical steps never belong in the table, however real they are. ${TASK_TABLE_CAP} rows maximum, and usually far fewer. Prune aggressively — an item that is no longer a major live item comes out, and the logs carry the record.`,
       input_schema: {
         type: "object",
         properties: {
@@ -293,20 +293,19 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
             type: "array",
             description:
               "The complete table, in display order. An empty array clears it.",
+            maxItems: TASK_TABLE_CAP,
             items: {
               type: "object",
               properties: {
                 task: { type: "string", description: "What the item is, in a few words." },
-                type: {
-                  type: "string",
-                  description: "What kind of work it is (e.g. feature, fix, research, decision).",
-                },
                 status: {
                   type: "string",
-                  description: "Where it stands, in ONE word (e.g. building, blocked, queued, next).",
+                  enum: [...TASK_STATUSES],
+                  description:
+                    "`building` if it is being worked right now, `queued` if it is waiting its turn. There is no third value.",
                 },
               },
-              required: ["task", "type", "status"],
+              required: ["task", "status"],
               additionalProperties: false,
             },
           },
@@ -685,7 +684,7 @@ export function makeExecutor(ctx: ExecutorContext) {
                   dropped,
                   note:
                     `${dropped} row(s) were not stored: the table holds ${TASK_TABLE_CAP} rows at most and a row with no task text is dropped. ` +
-                    "Prune to the items that say where we are and what is next.",
+                    "Prune to the major items only.",
                 }
               : {}),
           });

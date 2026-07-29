@@ -332,15 +332,18 @@ decision.`;
 
 const TASK_TABLE_PROTOCOL = `## Task table
 
-Task table = at-a-glance, not a tracker. Keep the task table in live state
-minimal: only the handful of items that define where we are and what's next,
-each with a one-word status. It is a quick "you are here," not an exhaustive
-log. The full detail (rationale, history, design notes, done items) lives in
-\`.memory\` (the logs and the activeContext narrative), not in the table. Prune
-aggressively: when an item is no longer a live next step, drop it from the table
-and let the logs carry the record. Default columns Task | Type | Status; render
-it at session start, after a crew review, and when next steps change, not every
-turn.
+Task table = at-a-glance, not a tracker. **The default is NOT to add a row.** A
+row belongs in the table only when the captain asks for one, or when the item is
+plainly a major future workstream. Intermediate and mechanical steps never belong
+in it, however real the work is — they live in \`.memory\` (the logs and the
+activeContext narrative) with the rest of the detail. Maximum 5 rows, and usually
+far fewer. Prune aggressively: when an item is no longer a major live item, drop
+it from the table and let the logs carry the record.
+
+Two columns, Status | Task, and \`status\` is one of exactly two words:
+\`building\` for the thing being worked right now, \`queued\` for anything waiting
+its turn. There is no third value. Render the table at session start, after a
+crew review, and when next steps change, not every turn.
 
 **The table is persisted, and the panel paints it.** Call \`task_table\` with the
 whole table whenever it changes — it replaces every row in one call (an empty

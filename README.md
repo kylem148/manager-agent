@@ -613,16 +613,16 @@ closes. A left-drag selects and copies on release, on every tab.
 `Ctrl-O` opens on **Home**, which answers the two questions you open the panel
 with. On top, the co-manager's at-a-glance task table. Underneath, every feature
 worktree that exists — including the ones still being worked, which the queue
-never sees — one line each:
+never sees:
 
 ```
-  tasks
-  Task                        Type       Status
-  ctrl-o overhaul             feature    building
-  bedrock retry backoff       fix        blocked
-  pricing table refresh       research   next
+  Tasks
 
-  worktrees
+  building   Fix crew handoff truncation
+  queued     Ctrl-O home page cleanup
+
+  Worktrees
+
   ▸ checkout   [ready to merge]  feat/checkout   stripe checkout with saved cards
     user-auth  [queued #2]       feat/user-auth  passkey login for the web app
     search     [crew running]    feat/search     full-text search over the docs
@@ -630,11 +630,13 @@ never sees — one line each:
 ```
 
 The table is the same handful of live items the co-manager has always kept —
-"you are here", pruned hard, one word of status each — except that it is now
-**stored** rather than only spoken. The co writes the whole table through one
-tool whenever it changes, so the panel paints the current one instead of you
-having to ask for it and pay for a turn. A missing or unreadable table file is an
-empty table, never a failed start.
+"you are here", pruned hard — except that it is now **stored** rather than only
+spoken. The co writes the whole table through one tool whenever it changes, so
+the panel paints the current one instead of you having to ask for it and pay for
+a turn. It holds at most five rows and a row's status is one of exactly two
+words, `building` or `queued`: a table that grows a row per step is a tracker,
+and the point of this block is that it can be read at a glance. A missing or
+unreadable table file is an empty table, never a failed start.
 
 The description beside a worktree is the **intent** the co-manager wrote when it
 created the feature — a plain authored line, not something regenerated per
@@ -1465,7 +1467,7 @@ deliberately deleted is deleted, so it cannot come back the next time a pull
 request is created for that feature.
 
 `taskstore.ts` is the same idea for the co's at-a-glance task table: a small
-ordered list of `{task, type, status}` under `.dispatch/tasks.json`, beside the
+ordered list of `{task, status}` under `.dispatch/tasks.json`, beside the
 feature store. The table always existed, but only as prose the co re-printed into
 the chat from its own memory, which left the panel nothing to render. It is
 written WHOLE through one model-facing tool (`task_table`) — no per-row add or
@@ -1473,8 +1475,10 @@ update, no ids — because the co re-derives the handful of rows anyway and a
 partial write is only a way for the store and the co's belief about it to
 diverge. Junk rows are dropped, cells are folded to one line, the list is capped,
 and a write that had to truncate says so in the tool result rather than letting
-the co assume it stored everything. A missing or corrupt file is an empty table,
-never a failed start.
+the co assume it stored everything. A status the store does not know becomes
+`queued` rather than an error, so a file written under an older, free-form
+vocabulary reads back fine. A missing or corrupt file is an empty table, never a
+failed start.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,

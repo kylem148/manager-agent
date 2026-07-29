@@ -27,23 +27,37 @@ import { serializeWrite } from "../memory/writequeue.js";
  * the other tool calls of one model round.
  */
 
-/** One row of the table: what it is, what kind of work it is, where it stands.
- *  `status` is one word by convention (the prompt says so); nothing here enforces
- *  a vocabulary, because the co picks words that fit the project. */
+/**
+ * The whole status vocabulary: something is being built, or it is waiting its
+ * turn. Two words and no more.
+ *
+ * A free-form status looked harmless and was not. It let the table drift into a
+ * tracker — `ready-to-arm`, `scoping`, `recommended`, `backlog` all appeared in
+ * real stores — and a column of eight different words is a column you read
+ * instead of scan, which is the opposite of what an at-a-glance block is for.
+ * The tool's schema now offers only these two, and anything else that reaches
+ * the store (an older file, a model that ignored the enum) coerces to `queued`.
+ */
+export const TASK_STATUSES = ["building", "queued"] as const;
+export type TaskStatus = (typeof TASK_STATUSES)[number];
+
+/** One row of the table: what it is, and whether it is being built or waiting.
+ *  There is deliberately no `type` — what kind of work an item is never changed
+ *  what the captain did next, and it cost a column. */
 export interface TaskRow {
   task: string;
-  type: string;
-  status: string;
+  status: TaskStatus;
 }
 
 /**
  * How many rows the table keeps. The table is an at-a-glance summary, not a
- * tracker — the prompt asks for a handful of items and aggressive pruning — so
- * this is a backstop against a model that forgets that, not a budget to fill.
- * A write over the cap is truncated and SAYS SO in the tool result, so the co
- * finds out rather than silently believing it stored 40 rows.
+ * tracker — the prompt asks only for major items, and says the default is not to
+ * add a row at all — so this is a backstop against a model that forgets that,
+ * not a budget to fill. A write over the cap is truncated and SAYS SO in the
+ * tool result, so the co finds out rather than silently believing it stored 40
+ * rows.
  */
-export const TASK_TABLE_CAP = 12;
+export const TASK_TABLE_CAP = 5;
 
 /** A trimmed, single-line, non-empty string, or undefined. Newlines are folded
  *  out: a row is one line in a table, and a pasted paragraph would tear the
@@ -54,15 +68,28 @@ function cell(raw: unknown): string | undefined {
   return flat === "" ? undefined : flat;
 }
 
+/**
+ * The status of a row, narrowed to the two the table has. `building` is the only
+ * word that means anything specific; EVERYTHING else — a missing status, a
+ * word from the old free-form vocabulary, junk — is `queued`.
+ *
+ * That is a coercion and not a validation on purpose: a store written under the
+ * old shape is read, not rejected, and the panel is never handed a third word it
+ * has no column for.
+ */
+function status(raw: unknown): TaskStatus {
+  return cell(raw)?.toLowerCase() === "building" ? "building" : "queued";
+}
+
 /** Coerce one row. A row with no task text is dropped entirely — it would render
- *  as a blank line and mean nothing. Type and status fall back to "—" so a
- *  half-filled row still lines up in its columns. */
+ *  as a blank line and mean nothing. A `type` field (the old shape) is ignored
+ *  rather than carried, so the next write drops it from the file too. */
 function coerceRow(raw: unknown): TaskRow | undefined {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
   const o = raw as Record<string, unknown>;
   const task = cell(o.task);
   if (!task) return undefined;
-  return { task, type: cell(o.type) ?? "—", status: cell(o.status) ?? "—" };
+  return { task, status: status(o.status) };
 }
 
 /** Drop anything that isn't a usable row, and cap the list. A hand-edited or
