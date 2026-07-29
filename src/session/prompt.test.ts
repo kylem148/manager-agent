@@ -224,27 +224,90 @@ test("the panel's `e` editor is in the protocol, with the captain's version winn
   }
 });
 
-test("the task table is a tool call now, not just something the co prints", async () => {
+test("the task table is a shared surface the captain owns, not the co's own block", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
-    // Unlinked too: the table is the co's own and needs no repo, so every
-    // session has it.
+    // Unlinked too: the table needs no repo, so every session has it.
     const prompt = await buildSystemPrompt(paths, RESEARCH);
-    assert.match(prompt, /The table is persisted, and the panel paints it/);
+    assert.match(prompt, /\*\*The table is the CAPTAIN'S, and you are the second writer on it\.\*\*/);
     assert.match(prompt, /`task_table`/, "the tool that stores it is named");
+    assert.match(prompt, /Ctrl-O, Home\s+tab/, "and where the captain reads and edits it");
+    // The two rules that make two writers safe. Both are prose the model acts
+    // on, so both are pinned: losing either turns a shared table into a table
+    // the co quietly overwrites (D-20260729-3).
+    assert.match(prompt, /\*\*never write over a\s+row you did not name\*\*/);
+    assert.match(prompt, /\*\*never assume a row you did not add is stale\.\*\*/);
     assert.match(
       prompt,
-      /replaces every row in one call \(an empty\s+list clears it\)/,
-      "whole-table writes, so the store cannot drift from what the co believes",
+      /There is no whole-table\s+write and no clear/,
+      "the capability that made the co a hazard here is gone, and it says so",
     );
-    assert.match(prompt, /Ctrl-O, Home\s+tab/, "and where the captain reads it");
     assert.match(
       prompt,
-      /rather than only printing the table into the chat/,
+      /update the store in the same turn|update it in the same turn/,
       "the behaviour change: keeping the store current is the point",
     );
     // The at-a-glance rules the table has always had are still the rules.
     assert.match(prompt, /at-a-glance, not a tracker/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the four row commands are named, and addressed by exact text", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH);
+    for (const command of ["list", "add", "status", "retire"]) {
+      assert.match(prompt, new RegExp(`- \\\`${command}\\\` —`), `${command} is described`);
+    }
+    assert.match(
+      prompt,
+      /by its EXACT task text — never by position/,
+      "an index goes stale between turns when the captain is also writing",
+    );
+    assert.match(
+      prompt,
+      /matches no row, or more than one,\s+fails rather than guessing/,
+      "the same failure posture the doc tool's str_replace takes",
+    );
+    assert.match(
+      prompt,
+      /\*\*This is what "done" means here:\*\*/,
+      "done retires a row out of the table; it is not a third status",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the table is in the live-state block, read once and stable for the session", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const rows = [
+      { task: "Fix crew handoff truncation", status: "building" as const },
+      { task: "Ctrl-O home page cleanup", status: "queued" as const },
+    ];
+    const prompt = await buildSystemPrompt(paths, RESEARCH, { tasks: rows });
+    // It sits inside Live state, beside the brief and the active context — the
+    // point of the whole change is that a row the captain jotted reaches the co.
+    const liveAt = prompt.indexOf("## Live state (current reality)");
+    const tableAt = prompt.indexOf("### task table");
+    assert.ok(liveAt > 0 && tableAt > liveAt, "the table block is inside live state");
+    assert.match(prompt, /building\s+Fix crew handoff truncation/);
+    assert.match(prompt, /queued\s+Ctrl-O home page cleanup/);
+
+    // The block is a pure function of the rows passed in. That is what keeps the
+    // cache prefix byte-stable: nothing here re-reads the store, and nothing
+    // here is a clock.
+    assert.equal(await buildSystemPrompt(paths, RESEARCH, { tasks: rows }), prompt);
+    const moved = await buildSystemPrompt(paths, RESEARCH, {
+      tasks: [{ task: "Fix crew handoff truncation", status: "queued" }],
+    });
+    assert.notEqual(moved, prompt, "and a different table really does render differently");
+
+    const empty = await buildSystemPrompt(paths, RESEARCH);
+    assert.match(empty, /### task table[\s\S]*\(empty\)/, "an empty table says so rather than vanishing");
   } finally {
     await cleanup();
   }
@@ -277,6 +340,13 @@ test("the table's contract is two columns, two status words, and a bias against 
       "the whole vocabulary, spelled out",
     );
     assert.match(prompt, /There is no third value/);
+    // The captain's own two specifications, in his words: a task is one line
+    // with no body, and it starts queued.
+    assert.match(prompt, /one plain line of text with no\s+body/);
+    assert.match(
+      prompt,
+      /A new task always arrives \\?`queued\\?`; it becomes \\?`building\\?` when work on it\s+actually starts/,
+    );
   } finally {
     await cleanup();
   }

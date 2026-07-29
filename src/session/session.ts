@@ -303,6 +303,12 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
 
   const system = await buildSystemPrompt(paths, cfg.research, {
     excludeTranscript: transcript.file,
+    // Read ONCE, here, into the live-state block. The table changes all session
+    // — the co edits it, and soon the captain will too — but this prompt is the
+    // cache prefix: a block that re-read the store per turn would change bytes
+    // underneath it and cost the whole cache. The co reads the current table
+    // with `task_table list`.
+    tasks: taskStore.list(),
     dispatch: dispatch
       ? {
           repoPath: dispatch.repoPath,
@@ -327,8 +333,8 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
         // The Inbox tab reads the in-memory store fresh at paint time, so a
         // review filed mid-session shows without any subscription.
         inbox: { list: () => inbox.list() },
-        // The Home tab's task table, on the same rule: the co rewrites the whole
-        // table through the task_table tool and the next paint shows it. Wired
+        // The Home tab's task table, on the same rule: read fresh at paint time,
+        // so a row the co added or retired shows on the next paint. Wired
         // whether or not the instance is linked, so Ctrl-O always has a Home.
         tasks: { list: () => taskStore.list() },
         // The merge-queue panel tab only exists when the instance is linked (a

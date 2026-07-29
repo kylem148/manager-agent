@@ -413,9 +413,9 @@ flat over time — small rewritten orientation files plus large append-only logs
 ```
 
 - **Cold start reads only the orientation files** (`projectbrief`,
-  `activeContext`) plus `docs/architecture.md` and `docs/plan.md` when they
-  exist. Full logs are never loaded into context; the model searches them or
-  reads a line range on demand via tools.
+  `activeContext`), `docs/architecture.md` and `docs/plan.md` when they exist,
+  and the task table as it stood at that moment. Full logs are never loaded into
+  context; the model searches them or reads a line range on demand via tools.
 - **`activeContext.md` is the most important file** — current focus, what's
   being decided, recent decisions (compressed), pointers into logs, what's in
   flight, known risks, open questions, next likely actions.
@@ -1466,19 +1466,20 @@ touched (that is what makes a bare re-enqueue a retry), but a description they
 deliberately deleted is deleted, so it cannot come back the next time a pull
 request is created for that feature.
 
-`taskstore.ts` is the same idea for the co's at-a-glance task table: a small
-ordered list of `{task, status}` under `.dispatch/tasks.json`, beside the
-feature store. The table always existed, but only as prose the co re-printed into
-the chat from its own memory, which left the panel nothing to render. It is
-written WHOLE through one model-facing tool (`task_table`) — no per-row add or
-update, no ids — because the co re-derives the handful of rows anyway and a
-partial write is only a way for the store and the co's belief about it to
-diverge. Junk rows are dropped, cells are folded to one line, the list is capped,
-and a write that had to truncate says so in the tool result rather than letting
-the co assume it stored everything. A status the store does not know becomes
-`queued` rather than an error, so a file written under an older, free-form
-vocabulary reads back fine. A missing or corrupt file is an empty table, never a
-failed start.
+`taskstore.ts` is the same idea for the at-a-glance task table: a small ordered
+list of `{task, status}` plus a `done` list, under `.dispatch/tasks.json`, beside
+the feature store. It has TWO writers — the captain's keys on the Home tab and
+the co's `task_table` tool — so every operation names ONE row, by its exact task
+text, and can touch nothing else. There is deliberately no whole-table write: it
+was the only shape while the co was the sole author, and the moment the captain
+also types here it is a silent way to delete what he just wrote. Text matching no
+row, or matching two, is an error rather than a guess (an index would go stale
+between turns), an add past the cap fails rather than evicting anyone, and
+retiring moves a row into `done` with a timestamp instead of leaving it in the
+table under a third status. Junk rows are dropped, cells are folded to one line,
+a status the store does not know becomes `queued` rather than an error, and a
+bare-array file from before the `done` list reads back fine. A missing or corrupt
+file is an empty table, never a failed start.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,

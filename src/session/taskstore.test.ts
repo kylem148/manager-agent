@@ -5,15 +5,26 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { instancePaths } from "../paths.js";
-import { TaskStore, TASK_TABLE_CAP, TASK_STATUSES, coerceTasks, type TaskRow } from "./taskstore.js";
-import { makeExecutor, newSideEffects, toolDefinitions } from "./tools.js";
+import {
+  TaskError,
+  TaskStore,
+  TASK_TABLE_CAP,
+  TASK_STATUSES,
+  coerceTasks,
+  type TaskRow,
+} from "./taskstore.js";
+import { makeExecutor, newSideEffects, toolDefinitions, TASK_COMMANDS } from "./tools.js";
 import type { ResearchConfig } from "../config.js";
 
 /**
- * The persisted task table (taskstore.ts). The table used to exist only as prose
- * the co re-printed into the chat, so these tests are about the thing that made
- * it renderable: a small file that survives a restart, is rewritten whole, and
- * degrades to an empty table rather than failing a session start.
+ * The persisted task table (taskstore.ts), now a TWO-WRITER surface: the captain
+ * types rows into it from the panel and the co edits it through `task_table`.
+ *
+ * That is what these tests are really about. The store used to be rewritten
+ * whole on every call, which is safe with one author and is silent data loss
+ * with two — so every operation here names ONE row, by its exact text, and the
+ * tests that matter most are the ones pinning that it can touch nothing else and
+ * that an unclear address FAILS rather than picking a row.
  */
 
 async function tmpPaths(): Promise<{ paths: ReturnType<typeof instancePaths>; cleanup: () => Promise<void> }> {
@@ -29,15 +40,27 @@ const ROWS: TaskRow[] = [
   { task: "bedrock retry backoff", status: "queued" },
 ];
 
+/** The code of the TaskError a call throws, or "" when it did not throw. */
+async function refusal(op: () => Promise<unknown>): Promise<{ code: string; message: string }> {
+  try {
+    await op();
+    return { code: "", message: "" };
+  } catch (e) {
+    assert.ok(e instanceof TaskError, `expected a TaskError, got ${String(e)}`);
+    return { code: e.code, message: e.message };
+  }
+}
+
 test("a table written in one session is read back in the next", async () => {
   const { paths, cleanup } = await tmpPaths();
   try {
     const first = await TaskStore.load(paths);
     assert.deepEqual(first.list(), [], "a missing file is an empty table, not a failure");
 
-    const res = await first.replace(ROWS);
-    assert.deepEqual(res.stored, ROWS);
-    assert.equal(res.dropped, 0);
+    await first.add("ctrl-o overhaul");
+    await first.setStatus("ctrl-o overhaul", "building");
+    await first.add("bedrock retry backoff");
+    assert.deepEqual(first.list(), ROWS);
 
     // Beside the feature store, under .dispatch/ — never in the user's repo.
     assert.ok(fs.existsSync(paths.taskTable), "the table is on disk");
@@ -51,22 +74,154 @@ test("a table written in one session is read back in the next", async () => {
   }
 });
 
-test("a write replaces the WHOLE table, and an empty list clears it", async () => {
+test("add appends as queued, at the end, and never as anything else", async () => {
+  const store = TaskStore.ephemeral();
+  const row = await store.add("  wire   the   panel  ");
+  // Whitespace is folded, because a row is one line in a table.
+  assert.deepEqual(row, { task: "wire the panel", status: "queued" });
+  await store.add("second");
+  assert.deepEqual(store.list(), [
+    { task: "wire the panel", status: "queued" },
+    { task: "second", status: "queued" },
+  ]);
+  // A new task has not been started: `building` is the separate step that says
+  // work has begun, and add cannot skip it.
+  assert.ok(store.list().every((r) => r.status === "queued"));
+
+  assert.equal((await refusal(() => store.add("   "))).code, "EMPTY_TASK");
+  assert.equal(store.size, 2, "and a refused add stored nothing");
+});
+
+test("a row is addressed by its EXACT text; no match and two matches both fail", async () => {
+  const store = TaskStore.ephemeral(ROWS);
+
+  // The exact text works, whitespace-folded as the store stores it.
+  assert.deepEqual(await store.setStatus("bedrock retry backoff", "building"), {
+    task: "bedrock retry backoff",
+    status: "building",
+  });
+
+  // Nothing close counts. A prefix, a case fold and a near miss are all refused
+  // rather than resolved to "the obvious one" — with two writers, the obvious
+  // one is how the wrong row gets retired.
+  for (const near of ["bedrock", "BEDROCK RETRY BACKOFF", "bedrock retry backof"]) {
+    const { code, message } = await refusal(() => store.retire(near));
+    assert.equal(code, "NO_MATCH", `"${near}" is not a match`);
+    assert.match(message, /ctrl-o overhaul/, "and the error says what the table DOES hold");
+  }
+
+  // A file hand-edited (or written by an older build) can hold two rows reading
+  // the same. Neither is guessed at.
+  const dupes = TaskStore.ephemeral([
+    { task: "same", status: "queued" },
+    { task: "same", status: "building" },
+  ]);
+  assert.equal((await refusal(() => dupes.retire("same"))).code, "MULTIPLE_MATCHES");
+  assert.equal((await refusal(() => dupes.setStatus("same", "queued"))).code, "MULTIPLE_MATCHES");
+  assert.equal(dupes.size, 2, "and nothing was touched on the way to refusing");
+});
+
+test("no operation touches a row it did not name", async () => {
+  const store = TaskStore.ephemeral([
+    { task: "one", status: "building" },
+    { task: "two", status: "queued" },
+    { task: "three", status: "queued" },
+  ]);
+  const before = store.list();
+
+  await store.setStatus("two", "building");
+  assert.deepEqual(store.list()[0], before[0], "the row above is untouched");
+  assert.deepEqual(store.list()[2], before[2], "and the row below");
+
+  await store.retire("one");
+  assert.deepEqual(store.list(), [
+    { task: "two", status: "building" },
+    { task: "three", status: "queued" },
+  ]);
+
+  await store.add("four");
+  assert.deepEqual(store.list().slice(0, 2), [
+    { task: "two", status: "building" },
+    { task: "three", status: "queued" },
+  ], "an add is an append and rewrites nothing");
+});
+
+test("adding the text of a row already on the table is refused, not duplicated", async () => {
+  const store = TaskStore.ephemeral(ROWS);
+  const { code, message } = await refusal(() => store.add("ctrl-o overhaul"));
+  assert.equal(code, "DUPLICATE_TASK");
+  assert.match(message, /already holds/);
+  // Two rows reading the same would make BOTH unaddressable, which is the one
+  // state the exact-text contract cannot recover from.
+  assert.deepEqual(store.list(), ROWS);
+});
+
+test("status takes the two words and nothing else", async () => {
+  const store = TaskStore.ephemeral(ROWS);
+  await store.setStatus("ctrl-o overhaul", "queued");
+  assert.equal(store.list()[0]!.status, "queued");
+  await store.setStatus("ctrl-o overhaul", "building");
+  assert.equal(store.list()[0]!.status, "building");
+
+  // Strict on the way in, unlike the read path: a write that silently became
+  // `queued` is a write the caller believes landed.
+  for (const bad of ["done", "ready-to-arm", "", 3, undefined]) {
+    assert.equal((await refusal(() => store.setStatus("ctrl-o overhaul", bad))).code, "BAD_STATUS");
+  }
+  assert.equal(store.list()[0]!.status, "building", "and the row is as it was");
+});
+
+test("retire lifts a row out of the table and keeps it, timestamped, in done", async () => {
   const { paths, cleanup } = await tmpPaths();
   try {
     const store = await TaskStore.load(paths);
-    await store.replace(ROWS);
-    // Not a merge, not an append: what the co sends is the table now.
-    await store.replace([{ task: "ship it", status: "building" }]);
-    assert.deepEqual(store.list(), [{ task: "ship it", status: "building" }]);
-    assert.deepEqual((await TaskStore.load(paths)).list(), store.list());
+    await store.add("ctrl-o overhaul");
+    await store.add("bedrock retry backoff");
 
-    await store.replace([]);
-    assert.deepEqual(store.list(), [], "an empty list is how the co clears the table");
-    assert.deepEqual((await TaskStore.load(paths)).list(), []);
+    const at = "2026-07-29T10:11:12.000Z";
+    const record = await store.retire("ctrl-o overhaul", at);
+    assert.deepEqual(record, { task: "ctrl-o overhaul", retiredAt: at });
+    assert.deepEqual(store.list(), [{ task: "bedrock retry backoff", status: "queued" }]);
+    assert.deepEqual(store.done(), [{ task: "ctrl-o overhaul", retiredAt: at }]);
+
+    // Done is an ACTION, not a third status: nothing retired is still in the
+    // table, and nothing retired is lost either.
+    const reloaded = await TaskStore.load(paths);
+    assert.deepEqual(reloaded.list(), [{ task: "bedrock retry backoff", status: "queued" }]);
+    assert.deepEqual(reloaded.done(), [{ task: "ctrl-o overhaul", retiredAt: at }]);
+
+    // A default timestamp is a real one.
+    await reloaded.retire("bedrock retry backoff");
+    const stamped = reloaded.done()[1]!;
+    assert.ok(!Number.isNaN(Date.parse(stamped.retiredAt)), "the default stamp parses as a date");
   } finally {
     await cleanup();
   }
+});
+
+test("the table is capped at five, and the sixth add FAILS rather than dropping anything", async () => {
+  const store = TaskStore.ephemeral();
+  assert.equal(TASK_TABLE_CAP, 5, "an at-a-glance block, not a backlog");
+  for (let n = 0; n < TASK_TABLE_CAP; n++) await store.add(`task ${n + 1}`);
+
+  const { code, message } = await refusal(() => store.add("one too many"));
+  assert.equal(code, "TABLE_FULL");
+  assert.match(message, /Retire something first/);
+  assert.match(message, /"task 1"/, "and it names what is in the way");
+  // Nothing is evicted to make room: evicting is this store deleting a row
+  // nobody named, which is the thing it exists to prevent.
+  assert.equal(store.size, TASK_TABLE_CAP);
+  assert.equal(store.list()[0]!.task, "task 1");
+
+  await store.retire("task 3");
+  await store.add("one too many");
+  assert.deepEqual(store.list().map((r) => r.task), [
+    "task 1",
+    "task 2",
+    "task 4",
+    "task 5",
+    "one too many",
+  ]);
 });
 
 test("a corrupt file reads back as an empty table, and the next write heals it", async () => {
@@ -77,9 +232,12 @@ test("a corrupt file reads back as an empty table, and the next write heals it",
 
     const store = await TaskStore.load(paths);
     assert.deepEqual(store.list(), [], "a broken cache never stops the co opening");
+    assert.deepEqual(store.done(), []);
 
-    await store.replace(ROWS);
-    assert.deepEqual((await TaskStore.load(paths)).list(), ROWS, "and the file is valid again");
+    await store.add("ctrl-o overhaul");
+    assert.deepEqual((await TaskStore.load(paths)).list(), [
+      { task: "ctrl-o overhaul", status: "queued" },
+    ], "and the file is valid again");
   } finally {
     await cleanup();
   }
@@ -118,12 +276,12 @@ test("rows are coerced: junk is dropped, cells are one line, status is one of tw
 });
 
 /**
- * The store on disk predates the two-word contract: real files hold a `type`
- * field and free-form statuses (`ready-to-arm`, `scoping`, `armed`, `backlog`).
- * Reading one is not an error case — it is the normal case on the first run
- * after this change, and it must land as a table the panel can paint.
+ * The store on disk predates both the two-word contract and the `done` list:
+ * real files hold a `type` field, free-form statuses, and a BARE ARRAY where the
+ * file now holds an object. Reading one is not an error case — it is the normal
+ * case on the first run after this change.
  */
-test("a store written under the old shape loads: type ignored, unknown status queued", async () => {
+test("a store written under the old shape loads: bare array, type ignored, status coerced", async () => {
   const { paths, cleanup } = await tmpPaths();
   try {
     await fsp.mkdir(path.dirname(paths.taskTable), { recursive: true });
@@ -144,6 +302,7 @@ test("a store written under the old shape loads: type ignored, unknown status qu
       // The one word that survived the old vocabulary keeps its meaning.
       { task: "Widget render audit", status: "building" },
     ]);
+    assert.deepEqual(store.done(), [], "a file with no done list has retired nothing");
     for (const row of store.list()) {
       assert.ok(TASK_STATUSES.includes(row.status), `${row.status} is one of the two`);
       assert.ok(!("type" in row), "and nothing carries the old field forward");
@@ -151,27 +310,10 @@ test("a store written under the old shape loads: type ignored, unknown status qu
 
     // And the next write heals the file itself, rather than leaving `type` on
     // disk for the next reader to strip again.
-    await store.replace(store.list());
-    const onDisk = JSON.parse(await fsp.readFile(paths.taskTable, "utf8")) as unknown[];
+    await store.setStatus("Widget render audit", "queued");
+    const onDisk = JSON.parse(await fsp.readFile(paths.taskTable, "utf8")) as Record<string, unknown>;
     assert.ok(!JSON.stringify(onDisk).includes("\"type\""), "the stored rows are the new shape");
-  } finally {
-    await cleanup();
-  }
-});
-
-test("the table is capped at five, and a write over the cap reports what it dropped", async () => {
-  const { paths, cleanup } = await tmpPaths();
-  try {
-    assert.equal(TASK_TABLE_CAP, 5, "an at-a-glance block, not a backlog");
-    const many = Array.from({ length: TASK_TABLE_CAP + 5 }, (_, n) => ({
-      task: `task ${n + 1}`,
-      status: "queued",
-    }));
-    const store = await TaskStore.load(paths);
-    const res = await store.replace(many);
-    assert.equal(res.stored.length, TASK_TABLE_CAP);
-    assert.equal(res.dropped, 5, "truncation is reported, never silent");
-    assert.equal(store.list()[0]!.task, "task 1", "the head of the table is what survives");
+    assert.ok(Array.isArray(onDisk.tasks) && Array.isArray(onDisk.done), "and the file has both lists");
   } finally {
     await cleanup();
   }
@@ -180,16 +322,20 @@ test("the table is capped at five, and a write over the cap reports what it drop
 test("an ephemeral store holds a table with no file behind it", async () => {
   const store = TaskStore.ephemeral(ROWS);
   assert.equal(store.size, 2);
-  await store.replace([{ task: "only", status: "building" }]);
-  assert.deepEqual(store.list(), [{ task: "only", status: "building" }]);
+  await store.retire("ctrl-o overhaul");
+  assert.deepEqual(store.list(), [{ task: "bedrock retry backoff", status: "queued" }]);
 });
 
-test("list() hands back a copy, so a caller cannot mutate the stored table", () => {
+test("list() and done() hand back copies, so a caller cannot mutate the store", async () => {
   const store = TaskStore.ephemeral(ROWS);
+  await store.retire("ctrl-o overhaul", "2026-07-29T00:00:00.000Z");
   const rows = store.list();
-  rows[0]!.status = "queued";
+  rows[0]!.status = "building";
   rows.push({ task: "injected", status: "queued" });
-  assert.deepEqual(store.list(), ROWS);
+  const done = store.done();
+  done[0]!.task = "rewritten";
+  assert.deepEqual(store.list(), [{ task: "bedrock retry backoff", status: "queued" }]);
+  assert.deepEqual(store.done(), [{ task: "ctrl-o overhaul", retiredAt: "2026-07-29T00:00:00.000Z" }]);
 });
 
 // --- the tool the co writes through ------------------------------------------
@@ -210,80 +356,90 @@ async function callTool(
   return { content: res.content, ...(res.is_error ? { is_error: true } : {}) };
 }
 
-test("the task_table tool is declared, linked or not, and replaces the table in one call", async () => {
-  // The table is the co's own: unlike the feature levers it does not ride the
-  // dispatch link, so it is declared in both shapes of the tool surface.
+test("the task_table tool is declared, linked or not, and dispatches on a command", async () => {
+  // The table does not ride the dispatch link (it needs no repo), so it is
+  // declared in both shapes of the tool surface.
   for (const dispatch of [false, true]) {
     const tool = toolDefinitions({ dispatch }).find((t) => t.name === "task_table");
     assert.ok(tool, `declared with dispatch=${dispatch}`);
-    assert.match(tool.description, /replaces? the (whole|captain's)/i);
-    assert.deepEqual(tool.input_schema.required, ["tasks"]);
+    assert.deepEqual(tool.input_schema.required, ["command"]);
+    const props = tool.input_schema.properties as Record<string, { enum?: string[] }>;
+    assert.deepEqual(props.command?.enum, ["add", "status", "retire", "list"]);
+    assert.deepEqual(props.status?.enum, ["building", "queued"], "and the status enum is the gate");
+    assert.ok(!("tasks" in props), "the whole-table array is gone from the contract");
   }
-
-  const store = TaskStore.ephemeral(ROWS);
-  const res = await callTool(store, {
-    tasks: [{ task: "one thing", status: "building" }],
-  });
-  assert.ok(!res.is_error, res.content);
-  assert.deepEqual(store.list(), [{ task: "one thing", status: "building" }]);
-  assert.match(res.content, /"stored": ?1/, "and the co is told what was stored");
-
-  // An empty list is the documented way to clear it.
-  await callTool(store, { tasks: [] });
-  assert.deepEqual(store.list(), []);
+  assert.deepEqual([...TASK_COMMANDS], ["add", "status", "retire", "list"]);
 });
 
-/**
- * The schema is the real gate on the vocabulary. Coercion in the store is the
- * backstop for a file written before this change; the enum is what stops a third
- * status ever being SUBMITTED, and the cap rides beside it as maxItems so the
- * model is told the ceiling rather than only told off for exceeding it.
- */
-test("the tool's schema offers two statuses and no more, and caps the table at five", () => {
-  const tool = toolDefinitions().find((t) => t.name === "task_table");
-  assert.ok(tool);
-  const props = tool.input_schema.properties as {
-    tasks: {
-      maxItems?: number;
-      items: { properties: Record<string, { enum?: string[] }>; required?: string[] };
-    };
-  };
-  assert.equal(props.tasks.maxItems, TASK_TABLE_CAP);
-  assert.deepEqual(props.tasks.items.properties.status?.enum, ["building", "queued"]);
-  assert.deepEqual(props.tasks.items.required, ["task", "status"]);
-  assert.ok(!("type" in props.tasks.items.properties), "the Type column is gone from the contract too");
-});
-
-test("a status outside the enum still cannot be stored: it lands as queued", async () => {
+test("the tool adds, moves and retires one named row, and lists the table", async () => {
   const store = TaskStore.ephemeral();
-  // The schema rejects this shape; the store is what happens if one gets past it
-  // anyway (an older file, a model that ignored the enum). Never a third word.
-  await callTool(store, { tasks: [{ task: "an old row", type: "fix", status: "ready-to-arm" }] });
-  assert.deepEqual(store.list(), [{ task: "an old row", status: "queued" }]);
+
+  const added = await callTool(store, { command: "add", task: "one thing" });
+  assert.ok(!added.is_error, added.content);
+  assert.deepEqual(store.list(), [{ task: "one thing", status: "queued" }]);
+  assert.match(added.content, /"status": ?"queued"/, "a new row is queued, always");
+
+  await callTool(store, { command: "add", task: "another" });
+  await callTool(store, { command: "status", task: "one thing", status: "building" });
+  assert.deepEqual(store.list(), [
+    { task: "one thing", status: "building" },
+    { task: "another", status: "queued" },
+  ]);
+
+  const listed = await callTool(store, { command: "list" });
+  assert.match(listed.content, /one thing/);
+  assert.match(listed.content, /another/);
+
+  const retired = await callTool(store, { command: "retire", task: "one thing" });
+  assert.ok(!retired.is_error, retired.content);
+  assert.deepEqual(store.list(), [{ task: "another", status: "queued" }]);
+  assert.equal(store.done()[0]!.task, "one thing");
+  assert.match(retired.content, /retiredAt/, "with the moment it left");
 });
 
-test("the tool tells the co when rows were dropped, rather than letting it assume", async () => {
-  const store = TaskStore.ephemeral();
-  const res = await callTool(store, {
-    tasks: [
-      ...Array.from({ length: TASK_TABLE_CAP }, (_, n) => ({ task: `t${n}`, status: "queued" })),
-      { task: "one too many", status: "queued" },
-      { status: "queued" }, // no task text
-    ],
-  });
-  assert.equal(store.size, TASK_TABLE_CAP);
-  assert.match(res.content, /"dropped": ?2/);
-  assert.match(res.content, /Prune to the major items/);
-});
-
-test("a malformed or unavailable call is an error the co can read, never a throw", async () => {
+test("there is no way to clear or replace the table in one call", async () => {
   const store = TaskStore.ephemeral(ROWS);
-  const bad = await callTool(store, { tasks: "three things" });
-  assert.equal(bad.is_error, true);
-  assert.match(bad.content, /requires a `tasks` array/);
-  assert.deepEqual(store.list(), ROWS, "and the stored table is untouched");
+  // The shapes the old contract accepted, and every plausible attempt at the
+  // old behaviour, all bounce off the command dispatch.
+  for (const input of [
+    { tasks: [] },
+    { command: "replace", tasks: [{ task: "x", status: "queued" }] },
+    { command: "clear" },
+    { command: "" },
+  ]) {
+    const res = await callTool(store, input);
+    assert.equal(res.is_error, true, JSON.stringify(input));
+    assert.match(res.content, /UNKNOWN_COMMAND/);
+  }
+  assert.deepEqual(store.list(), ROWS, "and the table is exactly as it was");
+});
 
-  const missing = await callTool(undefined, { tasks: [] });
+test("a refusal comes back as an error the co can read, carrying the real table", async () => {
+  const store = TaskStore.ephemeral(ROWS);
+
+  const missing = await callTool(store, { command: "retire", task: "something else" });
   assert.equal(missing.is_error, true);
-  assert.match(missing.content, /task table is unavailable/);
+  assert.match(missing.content, /NO_MATCH/);
+  assert.match(missing.content, /ctrl-o overhaul/, "so its next call can be right");
+  assert.deepEqual(store.list(), ROWS);
+
+  const full = TaskStore.ephemeral(
+    Array.from({ length: TASK_TABLE_CAP }, (_, n) => ({ task: `t${n}`, status: "queued" })),
+  );
+  const over = await callTool(full, { command: "add", task: "one too many" });
+  assert.equal(over.is_error, true);
+  assert.match(over.content, /TABLE_FULL/);
+  assert.equal(full.size, TASK_TABLE_CAP, "nothing was dropped to make room");
+
+  const unavailable = await callTool(undefined, { command: "list" });
+  assert.equal(unavailable.is_error, true);
+  assert.match(unavailable.content, /task table is unavailable/);
+});
+
+test("a status outside the enum is refused by the tool, never coerced into the table", async () => {
+  const store = TaskStore.ephemeral(ROWS);
+  const res = await callTool(store, { command: "status", task: "ctrl-o overhaul", status: "done" });
+  assert.equal(res.is_error, true);
+  assert.match(res.content, /BAD_STATUS/);
+  assert.equal(store.list()[0]!.status, "building", "the row did not move");
 });
