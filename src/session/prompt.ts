@@ -337,9 +337,9 @@ const TASK_TABLE_PROTOCOL = `## Task table
 Task table = at-a-glance, not a tracker. **The default is NOT to add a row.** A
 row belongs in the table only when the captain asks for one, or when the item is
 plainly a major future workstream. Intermediate and mechanical steps never belong
-in it, however real the work is — they live in \`.memory\` (the logs and the
-activeContext narrative) with the rest of the detail. Maximum 5 rows, and usually
-far fewer.
+in it, however real the work is; they live in \`.memory\` with the rest of the
+detail. Nothing caps the table, so that restraint is yours to keep, not a limit
+you write up against.
 
 Two columns, Status | Task, and \`status\` is one of exactly two words:
 \`building\` for the thing being worked right now, \`queued\` for anything waiting
@@ -348,10 +348,8 @@ body. A new task always arrives \`queued\`; it becomes \`building\` when work on
 actually starts.
 
 **The table is the CAPTAIN'S, and you are the second writer on it.** He types
-rows into it himself, from the panel (Ctrl-O, Home tab): \`a\` adds one, \`e\`
-rewrites the highlighted row's text, \`x\` retires it, \`s\` toggles its status.
-The current table is in
-your live-state block at session start, so what he jotted there is context you
+rows into it himself, from the panel (Ctrl-O, Home tab), and the table as it
+stood then is in your live-state block, so what he jotted there is context you
 have — treat it as his, and read a row you did not write as something he put
 there deliberately. Two rules follow and they are absolute: **never write over a
 row you did not name**, and **never assume a row you did not add is stale.** If a
@@ -362,11 +360,10 @@ row looks wrong or finished to you, say so and let him call it.
 - \`add\` — append one row, always \`queued\`.
 - \`status\` — move one row between \`building\` and \`queued\`.
 - \`rename\` — rewrite one row's TEXT (\`task\` is the row, \`new_task\` is its new
-  wording), keeping its status and its place. This is the fix for a typo or a
-  reworded task; retiring and re-adding would lose both.
+  wording), keeping its status and its place. Retiring and re-adding loses both.
 - \`retire\` — take one row OUT of the table. **This is what "done" means here:**
-  finishing something retires it (it is kept, timestamped, in a \`done\` list),
-  rather than sitting in the table under a third status word.
+  finishing something retires it (kept, timestamped, in a \`done\` list) rather
+  than sitting in the table under a third status word.
 
 Every command names ONE row, by its EXACT task text — never by position, because
 the captain edits the same table between your turns and a position you read
@@ -381,15 +378,13 @@ rows would make both unaddressable — the same rule \`add\` is held to). Renami
 row to the text it already has is a successful no-op.
 
 **The table is displayed \`building\` first**, then \`queued\`, each group keeping
-the order it was stored in — in your live-state block, in what \`task_table\`
-hands back, and on the captain's panel, all from one rule so the three cannot
-disagree. It is a DISPLAY order: the stored table keeps insertion order, so the
-position of a row in what you read says nothing about when it was added, and
+the order it was stored in — your live-state block, what \`task_table\` hands back
+and the captain's panel, all from one rule so the three cannot disagree. It is a
+DISPLAY order: the stored table keeps insertion order, and
 toggling a row's status moves it in the display without rewriting anything.
 
 So the store, not the chat, is where the table lives: update it in the same turn
-as the change it reflects — a crew review that moves an item on, a new next step,
-an item that is finished — and print the table into the chat only when the
+as the change it reflects, and print the table into the chat only when the
 captain actually wants to read it there.`;
 
 /**

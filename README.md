@@ -690,10 +690,15 @@ that exists — including the ones still being worked, which the queue never see
 
 The table is the same handful of live items the co-manager has always kept —
 "you are here", pruned hard — except that it is **stored**, and it is **yours**.
-It holds at most five rows and a row's status is one of exactly two words,
-`building` or `queued`: a table that grows a row per step is a tracker, and the
-point of this block is that it can be read at a glance. A missing or unreadable
-table file is an empty table, never a failed start.
+A row's status is one of exactly two words, `building` or `queued`: a table that
+grows a row per step is a tracker, and the point of this block is that it can be
+read at a glance. There is **no row limit** — the restraint against tracker-creep
+is aimed at the co-manager, whose prompt tells it that adding a row is the
+exception, and it was never meant to stop you jotting a sixth. Put as many on it
+as you want: the tab is one scrolling body, so a table longer than the screen
+pages with `space`/`b` (and `g`/`G` for the ends) like everything else here, and
+the heading counts the rows (`Tasks (12)`) once there are more than fit. A
+missing or unreadable table file is an empty table, never a failed start.
 
 **`building` rows are painted first**, then the `queued` ones, each group in the
 order you put them in — so the thing actually being worked is the first line of

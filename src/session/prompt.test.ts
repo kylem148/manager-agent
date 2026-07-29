@@ -6,7 +6,6 @@ import path from "node:path";
 import { instancePaths, type InstancePaths } from "../paths.js";
 import { createInstance } from "../memory/memory.js";
 import { buildSystemPrompt } from "./prompt.js";
-import { TASK_TABLE_CAP } from "./taskstore.js";
 import type { ResearchConfig } from "../config.js";
 
 /**
@@ -37,6 +36,17 @@ async function makeInstance(): Promise<{ paths: InstancePaths; cleanup: () => Pr
     paths: instancePaths(home, "inst"),
     cleanup: () => rm(home, { recursive: true, force: true }),
   };
+}
+
+/** Just the `## Task table` section of an assembled prompt, up to the next
+ *  heading — so a size or wording assertion about that section cannot be
+ *  satisfied (or broken) by prose somewhere else in the system prompt. */
+function taskTableSection(prompt: string): string {
+  const at = prompt.indexOf("## Task table");
+  assert.ok(at > 0, "the prompt has a task-table section");
+  const rest = prompt.slice(at);
+  const end = rest.indexOf("\n## ", 1);
+  return end < 0 ? rest : rest.slice(0, end);
 }
 
 const RESEARCH = {} as ResearchConfig;
@@ -400,6 +410,24 @@ test("the live-state table is painted building-first, through the shared helper"
   }
 });
 
+/**
+ * The system prompt is under a size review and this section overlaps heavily with
+ * the `task_table` tool description, which the model reads anyway. So the section
+ * has a budget: it may shrink, and it may not grow back. 3,300 bytes is the size
+ * it came down to when the row cap left it (3,533 before), rounded up a hair so a
+ * one-word clarification is not a test failure.
+ */
+test("the task-table section stays inside its size budget", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const section = taskTableSection(await buildSystemPrompt(paths, RESEARCH));
+    const bytes = Buffer.byteLength(section, "utf8");
+    assert.ok(bytes <= 3300, `the task-table section is ${bytes} bytes, over its 3300-byte budget`);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("the table's contract is two columns, two status words, and a bias against rows", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
@@ -417,9 +445,12 @@ test("the table's contract is two columns, two status words, and a bias against 
       /Intermediate and mechanical steps never belong/,
       "and the thing that never does",
     );
-    // Pinned against the cap itself, so lowering it again cannot leave the
-    // prompt promising the old number.
-    assert.match(prompt, new RegExp(`Maximum ${TASK_TABLE_CAP} rows`), "the cap it is held to");
+    // The restraint is now guidance and ONLY guidance: nothing refuses an add on
+    // a row count, so a protocol that still promised a ceiling would have the co
+    // decline work the store allows and hand the captain a wall that isn't there.
+    const section = taskTableSection(prompt);
+    assert.doesNotMatch(section, /Maximum \d+ rows|\d+ rows maximum|at most \d+ rows/, "no ceiling is promised");
+    assert.match(section, /Nothing caps the table, so that restraint is yours to keep/);
     assert.match(prompt, /Two columns, Status \| Task/, "Type is gone and status leads");
     assert.match(
       prompt,

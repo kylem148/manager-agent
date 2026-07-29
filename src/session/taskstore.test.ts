@@ -8,7 +8,6 @@ import { instancePaths } from "../paths.js";
 import {
   TaskError,
   TaskStore,
-  TASK_TABLE_CAP,
   TASK_STATUSES,
   coerceTasks,
   type TaskRow,
@@ -286,29 +285,63 @@ test("retire lifts a row out of the table and keeps it, timestamped, in done", a
   }
 });
 
-test("the table is capped at five, and the sixth add FAILS rather than dropping anything", async () => {
+/**
+ * The five-row cap is GONE from the store, and this is the case it was costing:
+ * the captain's `a` on the Home tab calls straight into `add`, so a cap here was
+ * a cap on his own notepad. The restraint it was aimed at — the co's reflex to
+ * add a row per step — is prose in the prompt and the tool description now,
+ * where it can be judgement rather than a failed call.
+ */
+test("the table has no row limit: a sixth add lands like the first", async () => {
   const store = TaskStore.ephemeral();
-  assert.equal(TASK_TABLE_CAP, 5, "an at-a-glance block, not a backlog");
-  for (let n = 0; n < TASK_TABLE_CAP; n++) await store.add(`task ${n + 1}`);
+  for (let n = 0; n < 12; n++) await store.add(`task ${n + 1}`);
+  assert.equal(store.size, 12, "no count refused the sixth, or the twelfth");
+  assert.deepEqual(
+    store.list().slice(4, 7).map((r) => r.task),
+    ["task 5", "task 6", "task 7"],
+    "and they are all really there, in the order they were typed",
+  );
+  // The refusals that remain are about the ROW, never about how many there are.
+  assert.equal((await refusal(() => store.add("task 6"))).code, "DUPLICATE_TASK");
+  assert.equal((await refusal(() => store.add("  "))).code, "EMPTY_TASK");
+  assert.equal(store.size, 12, "and neither refusal disturbed the table");
+});
 
-  const { code, message } = await refusal(() => store.add("one too many"));
-  assert.equal(code, "TABLE_FULL");
-  assert.match(message, /Retire something first/);
-  assert.match(message, /"task 1"/, "and it names what is in the way");
-  // Nothing is evicted to make room: evicting is this store deleting a row
-  // nobody named, which is the thing it exists to prevent.
-  assert.equal(store.size, TASK_TABLE_CAP);
-  assert.equal(store.list()[0]!.task, "task 1");
+test("a long table is written and read back whole, never truncated on the way in", async () => {
+  const { paths, cleanup } = await tmpPaths();
+  try {
+    const store = await TaskStore.load(paths);
+    for (let n = 0; n < 9; n++) await store.add(`task ${n + 1}`);
 
+    // A read that dropped the tail would be the worst kind of cap: the row is
+    // accepted, persisted, and gone one restart later with nothing saying so.
+    const reloaded = await TaskStore.load(paths);
+    assert.deepEqual(reloaded.list(), store.list());
+    assert.equal(reloaded.size, 9);
+    // The same, one layer down, for a file that arrives already long.
+    assert.equal(
+      coerceTasks(Array.from({ length: 40 }, (_, n) => ({ task: `t${n}`, status: "queued" }))).length,
+      40,
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("nothing is ever evicted: a row leaves only when someone names it", async () => {
+  const store = TaskStore.ephemeral();
+  for (let n = 0; n < 6; n++) await store.add(`task ${n + 1}`);
   await store.retire("task 3");
-  await store.add("one too many");
+  await store.add("one more");
   assert.deepEqual(store.list().map((r) => r.task), [
     "task 1",
     "task 2",
     "task 4",
     "task 5",
-    "one too many",
+    "task 6",
+    "one more",
   ]);
+  assert.deepEqual(store.done().map((r) => r.task), ["task 3"], "and the one that left is kept");
 });
 
 test("a corrupt file reads back as an empty table, and the next write heals it", async () => {
@@ -511,17 +544,37 @@ test("a refusal comes back as an error the co can read, carrying the real table"
   assert.match(missing.content, /ctrl-o overhaul/, "so its next call can be right");
   assert.deepEqual(store.list(), ROWS);
 
-  const full = TaskStore.ephemeral(
-    Array.from({ length: TASK_TABLE_CAP }, (_, n) => ({ task: `t${n}`, status: "queued" })),
-  );
-  const over = await callTool(full, { command: "add", task: "one too many" });
-  assert.equal(over.is_error, true);
-  assert.match(over.content, /TABLE_FULL/);
-  assert.equal(full.size, TASK_TABLE_CAP, "nothing was dropped to make room");
-
   const unavailable = await callTool(undefined, { command: "list" });
   assert.equal(unavailable.is_error, true);
   assert.match(unavailable.content, /task table is unavailable/);
+});
+
+/**
+ * The co's restraint is guidance, not a refusal. A row count that FAILED its add
+ * told the co the wrong thing twice: that the table was full when it was the
+ * captain's to fill, and that a judgement call about tracker-creep was something
+ * the harness would make for it. The tool now says so in words and enforces
+ * nothing, which is the only shape guidance can honestly take.
+ */
+test("the tool's add is never refused on a row count, and promises no ceiling", async () => {
+  const store = TaskStore.ephemeral(
+    Array.from({ length: 5 }, (_, n) => ({ task: `t${n}`, status: "queued" })),
+  );
+  const sixth = await callTool(store, { command: "add", task: "one more" });
+  assert.ok(!sixth.is_error, sixth.content);
+  assert.equal(store.size, 6, "the sixth row is on the table");
+  const seventh = await callTool(store, { command: "add", task: "and another" });
+  assert.ok(!seventh.is_error, seventh.content);
+  assert.equal(store.size, 7);
+  assert.ok(!JSON.stringify(store.list()).includes("TABLE_FULL"));
+
+  // And the description the model actually reads carries the discipline without
+  // a number, so it cannot plan around a limit that no longer exists.
+  const tool = toolDefinitions({ dispatch: false }).find((t) => t.name === "task_table");
+  assert.ok(tool);
+  assert.match(tool.description, /DEFAULT IS NOT TO ADD A ROW/, "the restraint is still stated");
+  assert.match(tool.description, /There is no row limit/, "and stated as restraint, not as a wall");
+  assert.doesNotMatch(tool.description, /\d+ rows maximum|maximum of \d+ rows/, "no count is promised");
 });
 
 test("the tool renames one named row, and refuses in the shape the co can read", async () => {
