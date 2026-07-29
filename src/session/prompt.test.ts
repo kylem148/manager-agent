@@ -7,7 +7,12 @@ import { instancePaths, type InstancePaths } from "../paths.js";
 import { createInstance } from "../memory/memory.js";
 import { buildSystemPrompt } from "./prompt.js";
 import type { ResearchConfig } from "../config.js";
-import { PROTOCOL_SECTIONS, protocolBody, protocolIndex } from "./protocols.js";
+import {
+  PROTOCOL_SECTIONS,
+  protocolBody,
+  protocolIndex,
+  protocolSectionsFor,
+} from "./protocols.js";
 import { toolDefinitions } from "./tools.js";
 import { SURFACED_DOC_MAX_CHARS } from "../memory/docs.js";
 
@@ -86,7 +91,7 @@ async function reachable(paths: InstancePaths): Promise<string> {
 test("the orders protocol tells the crew to commit with no attribution trailer", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
-    const prompt = await buildSystemPrompt(paths, RESEARCH);
+    const prompt = await reachable(paths);
     assert.match(prompt, /Conventional Commits form/);
     assert.match(prompt, /use EXACTLY the message you give/);
     assert.match(prompt, /no\s+`Co-Authored-By` line/);
@@ -227,15 +232,21 @@ test("every order makes the crew close its report with the material the PR needs
   const { paths, cleanup } = await makeInstance();
   try {
     // Unlinked too: the checklist is the orders protocol, which every session has.
-    const prompt = await buildSystemPrompt(paths, RESEARCH);
+    const prompt = await reachable(paths);
     assert.match(prompt, /\*\*Close the report\*\*/);
-    assert.match(prompt, /diffstat \(files changed, insertions, deletions\)/);
-    assert.match(prompt, /verification it\s+actually ran, with the real output/);
+    assert.match(prompt, /diffstat: files changed, insertions, deletions/);
+    assert.match(prompt, /verification it actually ran, with the real output/);
     assert.match(
       prompt,
-      /approaches it tried and abandoned,\s+with the reason each was dropped/,
+      /approaches it tried and abandoned, with the reason each was dropped/,
       "the How section's material has to come from somewhere",
     );
+    // And the crew is told how LONG to make it. Nothing truncates that report by
+    // design, so its length is decided entirely by what the order asked for — a
+    // crew told to "report what you did" writes an essay the co then carries in
+    // context for the rest of the session.
+    assert.match(prompt, /keep that report tight/);
+    assert.match(prompt, /no narration of\s+the work/);
   } finally {
     await cleanup();
   }
@@ -630,8 +641,10 @@ test("the cache prefix stays inside its budget", async () => {
     // on-demand tier — it must never go up. Still to move, in rough order of
     // size: the orders protocol, the task-table command reference, and the
     // review protocol's detail (the level gate itself stays permanent). Those
-    // three are worth roughly another 7,000 characters.
-    const BUDGET = 53_000;
+    // three are worth roughly another 5,000 characters. (The orders protocol has
+    // already moved; what remains is the task-table command reference and the
+    // review protocol's detail, plus a pass over the tool descriptions.)
+    const BUDGET = 51_500;
     const actual = await prefixChars(paths);
     assert.ok(
       actual <= BUDGET,
@@ -698,12 +711,24 @@ test("every protocol section is reachable and self-titled", () => {
 });
 
 test("the index tells the co when to read, not just what exists", () => {
-  const index = protocolIndex();
+  const index = protocolIndex({ dispatch: true });
   // A passive table of contents does not reliably trigger a read, and a section
   // that is never read is prose the co improvises around.
   assert.match(index, /BEFORE you act/);
   assert.match(index, /read it before/i);
+  // Every section, linked or not, states its trigger.
+  for (const line of index.split("\n").filter((l) => l.startsWith("- ")))
+    assert.match(line, /read it before/i, line);
   assert.equal(PROTOCOL_SECTIONS.every((s) => index.includes(s)), true);
+
+  // An unlinked instance lists only what it can actually reach — offering a
+  // section whose tool argument would be rejected is worse than not offering it.
+  // `orders` is there either way: an unlinked co still writes orders.
+  const unlinked = protocolIndex({});
+  assert.match(unlinked, /`orders`/);
+  assert.ok(!unlinked.includes("`pr-message`"));
+  assert.deepEqual(protocolSectionsFor({}), ["orders"]);
+  assert.deepEqual(protocolSectionsFor({ dispatch: true }), [...PROTOCOL_SECTIONS]);
 });
 
 test("a surfaced doc is truncated into the prefix, with a pointer to the rest", async () => {

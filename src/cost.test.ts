@@ -18,6 +18,7 @@ import {
   formatFleetReport,
   localDay,
   normalizeModelId,
+  isGeoScoped,
   ratesFor,
   sparkline,
   type TokenUsage,
@@ -56,33 +57,51 @@ test("model ids resolve regardless of geo and provider prefix", () => {
   assert.ok(ratesFor("us.anthropic.claude-opus-4-8"));
 });
 
-test("opus 4.8 carries the bedrock rate, not the first-party one", () => {
-  const r = ratesFor("us.anthropic.claude-opus-4-8")!;
-  // Anthropic's own API is $5/$25; Bedrock is $6/$30. Pricing this app off the
-  // first-party table would understate every invoice by 20%.
-  assert.equal(r.input, 6);
-  assert.equal(r.output, 30);
-  assert.equal(r.cacheWrite5m, 7.5);
-  assert.equal(r.cacheWrite1h, 12);
-  assert.equal(r.cacheRead, 0.6);
+test("the endpoint prefix, not the model, decides the 10% premium", () => {
+  // Anthropic documents it for Bedrock: regional endpoints carry a 10% premium
+  // over global. `us.` and `global.` are the SAME MODEL — the prefix is a
+  // data-residency choice that costs a tenth of the entire bill, and this app
+  // shipped on the expensive side of it without the meter ever saying so.
+  const global = ratesFor("global.anthropic.claude-opus-5")!;
+  assert.equal(global.input, 5);
+  assert.equal(global.output, 25);
+  assert.equal(global.cacheWrite5m, 6.25);
+  assert.equal(global.cacheWrite1h, 10);
+  assert.equal(global.cacheRead, 0.5);
+
+  const geo = ratesFor("us.anthropic.claude-opus-5")!;
+  assert.equal(geo.input, 5.5);
+  assert.equal(geo.output, 27.5);
+  assert.equal(geo.cacheWrite1h, 11);
+  assert.equal(geo.cacheRead, 0.55);
+
+  // The premium lands on every class, not just input.
+  for (const k of ["input", "output", "cacheWrite5m", "cacheWrite1h", "cacheRead"] as const) {
+    assert.equal(geo[k], Math.round(global[k] * 1.1 * 1e6) / 1e6, k);
+  }
+
+  // A bare id is global-priced: no prefix, no premium.
+  assert.equal(ratesFor("anthropic.claude-opus-5")!.input, 5);
+  assert.equal(isGeoScoped("us.anthropic.claude-opus-5"), true);
+  assert.equal(isGeoScoped("global.anthropic.claude-opus-5"), false);
+  assert.equal(isGeoScoped("anthropic.claude-opus-5"), false);
 });
 
 test("an unknown model has no rates rather than a guessed one", () => {
   assert.equal(ratesFor("us.anthropic.claude-something-9"), null);
 });
 
-test("opus 5 is priced, but flagged as derived rather than published", () => {
-  // The model this app is actually pointed at. AWS publishes no Opus 5 row, but
-  // Anthropic documents it as a drop-in at Opus 4.8's pricing and Bedrock
-  // resells that tier at a flat 1.2x — so it is priced, and the report says the
-  // rate is derived rather than passing an inference off as a quote.
+test("every opus rate is flagged as derived, because AWS publishes no row", () => {
+  // AWS's pricing page renders no Opus row this app could transcribe. The rates
+  // are inferred from Anthropic's first-party table plus the documented regional
+  // premium, and corroborated by independent trackers — well founded, but not a
+  // quote, and /cost has to say so rather than pass an inference off as one.
+  // The only authoritative figure is the invoice.
   const r = ratesFor("us.anthropic.claude-opus-5")!;
   assert.ok(r, "the configured model must price, or the meter is useless");
-  assert.equal(r.input, 6);
-  assert.equal(r.output, 30);
   assert.equal(r.confirmed, false);
-
-  assert.equal(ratesFor("us.anthropic.claude-opus-4-8")!.confirmed, true);
+  assert.equal(ratesFor("us.anthropic.claude-opus-4-8")!.confirmed, false);
+  assert.equal(ratesFor("global.anthropic.claude-opus-5")!.confirmed, false);
 });
 
 test("a derived rate is announced on the report's rate line", async () => {
@@ -93,20 +112,24 @@ test("a derived rate is announced on the report's rate line", async () => {
   );
   assert.match(text, /rate derived, not published by AWS/);
   assert.doesNotMatch(text, /no bedrock rate on file/, "it IS priced, just not quoted");
-  assert.match(text, /\$0\.0300/, "1,000 output tokens at $30/Mtok");
+  assert.match(text, /\$0\.0275/, "1,000 output tokens at the us. rate of $27.50/Mtok");
 });
 
 test("launch pricing applies inside its window and lapses after", () => {
-  const promo = ratesFor("us.anthropic.claude-sonnet-5", "2026-07-27")!;
+  // Checked on the global endpoint so the promo figures read as published.
+  const promo = ratesFor("global.anthropic.claude-sonnet-5", "2026-07-27")!;
   assert.equal(promo.input, 2);
   assert.equal(promo.output, 10);
 
-  const onLastDay = ratesFor("us.anthropic.claude-sonnet-5", "2026-08-31")!;
+  const onLastDay = ratesFor("global.anthropic.claude-sonnet-5", "2026-08-31")!;
   assert.equal(onLastDay.input, 2, "the through date is inclusive");
 
-  const standard = ratesFor("us.anthropic.claude-sonnet-5", "2026-09-01")!;
+  const standard = ratesFor("global.anthropic.claude-sonnet-5", "2026-09-01")!;
   assert.equal(standard.input, 3);
   assert.equal(standard.output, 15);
+
+  // The premium composes with the promo rather than replacing it.
+  assert.equal(ratesFor("us.anthropic.claude-sonnet-5", "2026-07-27")!.input, 2.2);
 });
 
 // --- pricing ------------------------------------------------------------------
@@ -114,10 +137,10 @@ test("launch pricing applies inside its window and lapses after", () => {
 test("cost sums all four token classes, not just output", () => {
   const r = ratesFor("us.anthropic.claude-opus-4-8")!;
   const u = usage({ input: 1_000_000, cacheWrite: 1_000_000, cacheRead: 1_000_000, output: 1_000_000 });
-  // 6 + 12 (1h write) + 0.6 + 30
-  assert.equal(costOf(u, r, "1h"), 48.6);
-  // 6 + 7.5 (5m write) + 0.6 + 30
-  assert.equal(costOf(u, r, "5m"), 44.1);
+  // 5.5 + 11 (1h write) + 0.55 + 27.5, at the us. geo rate
+  assert.equal(costOf(u, r, "1h"), 44.55);
+  // 5.5 + 6.875 (5m write) + 0.55 + 27.5
+  assert.equal(costOf(u, r, "5m"), 40.425);
 });
 
 test("pricing output alone would understate a realistic turn badly", () => {
@@ -142,7 +165,7 @@ test("a cold turn costs far more than the same turn warm", () => {
   // The write/read spread on the prefix is the 1h TTL's whole justification.
   assert.equal(
     Number(((cold - warm) * 1_000_000).toFixed(0)),
-    22_000 * (r.cacheWrite1h - r.cacheRead),
+    Math.round(22_000 * (r.cacheWrite1h - r.cacheRead)),
   );
 });
 
@@ -202,15 +225,16 @@ test("switching models keeps separate buckets so old tokens keep their price", a
   const models = ledger.lifetime().models;
   assert.equal(Object.keys(models).length, 2);
 
-  // Priced per bucket: $30 of Opus output plus $10 of promo-priced Sonnet.
+  // Priced per bucket: $27.50 of Opus output plus $11 of promo-priced Sonnet
+  // (both at the us. geo rate — the same 1.1x lands on each).
   const opus = costOf(models["us.anthropic.claude-opus-4-8"]!, ratesFor("us.anthropic.claude-opus-4-8")!, "1h");
   const sonnet = costOf(
     models["us.anthropic.claude-sonnet-5"]!,
     ratesFor("us.anthropic.claude-sonnet-5", "2026-07-27")!,
     "1h",
   );
-  assert.equal(opus, 30);
-  assert.equal(sonnet, 10);
+  assert.equal(opus, 27.5);
+  assert.equal(sonnet, 11);
 });
 
 test("the meter is written after every turn, not at exit", async () => {
@@ -294,7 +318,7 @@ test("the report leads with output tokens and a real cost", async () => {
 
   assert.match(text, /20,000 out/, "output tokens are the headline");
   // 0.006 + 0.12 + 0.30 + 0.60 = $1.026
-  assert.match(text, /\$1\.03/);
+  assert.match(text, /\$0\.9405/);
   assert.match(text, /session/);
   assert.match(text, /all time/);
   assert.match(text, /cache read 500,000/, "the prompt side is shown, since it is where the money goes");
@@ -430,7 +454,7 @@ test("a sparkline distinguishes an idle day from a cheap one", () => {
 
 test("both daily averages are reported, because one of them always misleads", async () => {
   const ledger = CostLedger.ephemeral({ since: "2026-07-20T09:00:00.000Z" });
-  // $30 of output on two active days, inside an 8-day calendar span.
+  // $27.50 of output on two active days, inside an 8-day calendar span.
   await ledger.record("us.anthropic.claude-opus-4-8", usage({ output: 500_000 }), {
     now: at("2026-07-21"),
   });
@@ -447,8 +471,12 @@ test("both daily averages are reported, because one of them always misleads", as
     }),
   );
 
-  assert.match(text, /\$15\.00 per active day \(2\)/, "$30 over 2 working days");
-  assert.match(text, /\$3\.75 per calendar day \(8\)/, "$30 over the 8 days since first use");
+  assert.match(text, /\$13\.75 per active day \(2\)/, "$27.50 over 2 working days");
+  assert.match(
+    text,
+    /\$3\.44 per calendar day \(8\)/,
+    "$27.50 over the 8 days since first use",
+  );
 });
 
 test("today's row counts only today, and the 7-day window shows the shape", async () => {
@@ -470,10 +498,10 @@ test("today's row counts only today, and the 7-day window shows the shape", asyn
   );
 
   // 33,333 output tokens at $30/Mtok = $0.99999
-  assert.match(text, /today {6}33,333 out\s+\$1\.00/, "today is today only, not all time");
+  assert.match(text, /today {6}33,333 out\s+\$0\.9167/, "today is today only, not all time");
   assert.match(text, /all time\s+133,333 out/);
   // The window is 07-21..07-27: idle, idle, idle, spend, idle, idle, spend.
-  assert.match(text, /last 7d\s+···[^·]··[^·]\s+\$4\.00\s+\(07-21 → 07-27\)/);
+  assert.match(text, /last 7d\s+···[^·]··[^·]\s+\$3\.67\s+\(07-21 → 07-27\)/);
 });
 
 test("a turn recorded today shows up under today even late in the evening", async () => {
@@ -518,9 +546,9 @@ test("the fleet view sums every instance, because the bedrock key is shared", as
 
   assert.match(text, /cost across 3 co-managers/);
   // $3 + $6 of output at $30/Mtok.
-  assert.match(text, /alpha\s+100,000\s+\$3\.00/);
-  assert.match(text, /bravo\s+200,000\s+\$6\.00/);
-  assert.match(text, /total\s+300,000\s+\$9\.00\s+2/, "totals tokens, dollars and turns");
+  assert.match(text, /alpha\s+100,000\s+\$2\.75/);
+  assert.match(text, /bravo\s+200,000\s+\$5\.50/);
+  assert.match(text, /total\s+300,000\s+\$8\.25\s+2/, "totals tokens, dollars and turns");
 });
 
 test("the fleet view lists idle instances rather than hiding them", async () => {
@@ -559,8 +587,8 @@ test("fleet day averages merge the series across instances", async () => {
   const text = plain(
     formatFleetReport({ entries, cacheTtl: "1h", home: "/home/co", now: at("2026-07-27") }),
   );
-  assert.match(text, /\$3\.00 per active day \(2\)/);
-  assert.match(text, /\$2\.00 per calendar day \(3\)/, "07-25 → 07-27 inclusive");
+  assert.match(text, /\$2\.75 per active day \(2\)/);
+  assert.match(text, /\$1\.83 per calendar day \(3\)/, "07-25 → 07-27 inclusive");
 });
 
 test("fleet wall-clock is summed across instances", async () => {
@@ -776,4 +804,52 @@ test("the report names the keep-alive beside the rebuilds it is meant to prevent
   );
   assert.match(text, /keep-alive 1 probe\(s\) to hold the cache open/);
   assert.match(text, /not counted as turns/);
+});
+
+test("the report prices the geo premium, and names the endpoint without it", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("us.anthropic.claude-opus-5", usage({ output: 1_000_000 }), {
+    rounds: 1,
+    now: at("2026-07-27"),
+  });
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-5",
+      cacheTtl: "1h",
+      now: at("2026-07-27"),
+    }),
+  );
+  // 1M output at $27.50 is $27.50; the same tokens on global would be $25.00, so
+  // the premium is $2.50. In dollars rather than as a percentage, because "10% of
+  // everything" is easy to nod at and a dollar figure is not.
+  assert.match(text, /geo premium \+10% for US\/Canada residency/);
+  assert.match(text, /\$2\.50 of the above/);
+  assert.match(text, /global\.claude-opus-5 is the same model without it/);
+});
+
+test("the global endpoint gets no premium line, because there is no premium", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("global.anthropic.claude-opus-5", usage({ output: 1_000 }), { rounds: 1 });
+  const text = plain(
+    formatCostReport({ ledger, modelId: "global.anthropic.claude-opus-5", cacheTtl: "1h" }),
+  );
+  assert.doesNotMatch(text, /geo premium/);
+});
+
+test("the fleet total names the geo premium too, since that is the number read", async () => {
+  const one = CostLedger.ephemeral();
+  await one.record("us.anthropic.claude-opus-5", usage({ output: 1_000_000 }), { rounds: 1 });
+  const text = plain(
+    formatFleetReport({
+      entries: [{ name: "solo", ledger: one }],
+      cacheTtl: "1h",
+      home: "/home/co",
+      now: at("2026-07-27"),
+    }),
+  );
+  // `co cost` is what the captain actually opens, so the premium has to be here
+  // and not only on the per-instance /cost.
+  assert.match(text, /geo premium \+10%/);
+  assert.match(text, /\$2\.50 of the above/);
 });

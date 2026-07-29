@@ -168,17 +168,27 @@ export function paneWaitSec(): number {
 /**
  * Model used when BEDROCK_MODEL_ID is unset.
  *
- * The `us.` prefix is load-bearing, not decorative — this is a cross-region
- * inference profile id, and the bare foundation id is rejected for on-demand
+ * SOME prefix is load-bearing: the bare foundation id is rejected for on-demand
  * throughput ("Retry your request with the ID or ARN of an inference profile").
- * Confirmed for opus-4-8, sonnet-4-6 and sonnet-5 on 2026-07-27.
+ * Which prefix is a pricing decision.
  *
- * The Sonnet tier runs at a materially lower per-token rate and was briefly the
- * default; `us.anthropic.claude-sonnet-4-6` and `us.anthropic.claude-sonnet-5`
- * are both known to answer on this account if cost ever outranks capability.
- * Note Sonnet 4.6 does not accept effort=xhigh — see effortLevelsFor.
+ * Anthropic documents a 10% premium on Bedrock's regional and geo endpoints over
+ * the global one, on every token class. `us.anthropic.claude-opus-5` and
+ * `global.anthropic.claude-opus-5` are the same model; the `us.` prefix buys
+ * US-and-Canada data residency, and it costs a tenth of the entire bill. So
+ * global is the default and residency is the opt-in, rather than the reverse.
+ * Verified answering on the runtime path with a Bedrock bearer token 2026-07-29.
+ *
+ * One honest caveat: a geo profile routes across a narrower pool and may produce
+ * FEWER cache writes than global under load. The 10% is a list-price saving, and
+ * `/cost`'s rebuild line is what says whether it survived contact.
+ *
+ * The Sonnet tier runs at a materially lower per-token rate;
+ * `global.anthropic.claude-sonnet-5` answers on this account if cost ever
+ * outranks capability. Note Sonnet 4.6 does not accept effort=xhigh — see
+ * effortLevelsFor.
  */
-export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-4-8";
+export const DEFAULT_MODEL_ID = "global.anthropic.claude-opus-5";
 
 export interface ModelConfig {
   region: string;

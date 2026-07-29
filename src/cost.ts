@@ -70,11 +70,16 @@ export interface Rates {
 }
 
 /**
- * Bedrock prices cache traffic as fixed multiples of a model's base input rate.
- * Confirmed against the published Opus 4.8 row on 2026-07-27: input $6.00,
- * 5-minute write $7.50 (1.25x), 1-hour write $12.00 (2x), read $0.60 (0.1x).
- * Deriving the cache rates rather than transcribing four numbers per model
- * means a new model only needs its input/output pair.
+ * Cache traffic is priced as fixed multiples of a model's base input rate, and
+ * these three multiples are the best-established numbers in this file: Anthropic
+ * publishes them as a table (5-minute write 1.25x, 1-hour write 2x, read 0.1x),
+ * and Bedrock applies the same shape. Deriving from them means a new model needs
+ * only its input/output pair.
+ *
+ * The 20:1 ratio between the 1-hour write and the read is the single fact that
+ * drives most of this app's cost design: re-reading cached bytes costs a
+ * twentieth of rewriting them, which is why the cache keep-alive exists and why
+ * history compaction has to be rare to pay for itself.
  */
 const WRITE_5M_MULTIPLE = 1.25;
 const WRITE_1H_MULTIPLE = 2;
@@ -107,35 +112,75 @@ interface RateEntry {
 }
 
 /**
- * BEDROCK rates, not Anthropic's first-party list price. This matters: the same
- * Opus 4.8 that costs $5/$25 per million on the Anthropic API costs $6/$30 on
- * Bedrock, so pricing this app against the first-party table would understate
- * every invoice by 20%. Taken from aws.amazon.com/bedrock/pricing on 2026-07-27.
+ * Bedrock rates for the GLOBAL endpoint. A geo-scoped profile adds GEO_PREMIUM
+ * on top (see below), which is where the `us.` prefix this app ships with lands.
  *
- * Keyed by the id with its geo prefix stripped (see normalizeModelId), so
- * `us.anthropic.claude-opus-4-8` and a future `eu.` variant share one entry.
+ * Keyed by the id with its geo and provider prefixes stripped (see
+ * normalizeModelId), so `us.`, `global.` and a bare id share one entry.
  *
- * A model that is not in here is not a failure — `/cost` still reports its
- * tokens and says plainly that it has no rate on file, rather than inventing a
- * number. Adding one is a single line.
+ * EVERY OPUS-TIER RATE HERE IS DERIVED AND FLAGGED AS SUCH, because AWS does not
+ * publish a row this app could transcribe. What the evidence actually says, read
+ * 2026-07-29:
  *
- * One entry is DERIVED rather than quoted, and flagged as such. Opus 5 has no
- * row on the Bedrock pricing page (checked 2026-07-27), but Anthropic documents
- * it as a drop-in upgrade "at Opus 4.8's pricing" — $5/$25 first-party, exactly
- * what Opus 4.8 costs there — and Bedrock resells that tier at a flat 1.2x
- * ($6/$30). Leaving it unpriced would mean the meter reports nothing for the
- * model this app is actually pointed at, which is worse than a well-founded
- * estimate that announces itself. Replace with the published row the moment AWS
- * lists one.
+ *  - Anthropic prices Opus 5 and Opus 4.8 at $5/$25 first-party, and states that
+ *    Bedrock pricing matches the direct API in standard regions.
+ *  - Independent trackers list Bedrock Opus 5 at $5/$25 global and $5.50/$27.50
+ *    regional, with cache classes at exactly 1.1x. That the two differ by
+ *    precisely the documented regional premium is the strongest check available.
+ *  - AWS's own pricing page renders no Opus 5 row at all, and the $6.00 figure
+ *    this table used to carry is consistent with a RETIRED model's Extended
+ *    Access row (Claude 3.5 Sonnet shows $6/$30 against a $3/$15 first-party
+ *    price — 2x, not the 1.2x a flat resale markup would imply).
+ *
+ * So: priced, because a meter that reports nothing for the model in use is worse
+ * than a well-founded estimate that announces itself — and flagged, because the
+ * only authoritative figure is the invoice. Reconcile against the Bedrock bill
+ * and replace these the moment AWS publishes a row.
+ *
+ * A model that is not in here is not a failure: /cost still reports its tokens
+ * and says plainly it has no rate on file. Adding one is a single line.
  */
 const BEDROCK_RATES: Record<string, RateEntry> = {
-  "claude-opus-5": { rates: rates(6, 30, /*confirmed*/ false) },
-  "claude-opus-4-8": { rates: rates(6, 30) },
+  "claude-opus-5": { rates: rates(5, 25, /*confirmed*/ false) },
+  "claude-opus-4-8": { rates: rates(5, 25, /*confirmed*/ false) },
   "claude-sonnet-5": {
-    rates: rates(3, 15),
-    promo: { rates: rates(2, 10), through: "2026-08-31" },
+    rates: rates(3, 15, /*confirmed*/ false),
+    promo: { rates: rates(2, 10, /*confirmed*/ false), through: "2026-08-31" },
   },
 };
+
+/**
+ * The premium a geo-scoped inference profile carries over the global one.
+ *
+ * Anthropic documents this plainly for Bedrock: "Regional endpoints carry a 10%
+ * pricing premium over global endpoints", scoped to Opus 4.5, Sonnet 4.5, Haiku
+ * 4.5 "and all future models". It applies to every token class, not just input.
+ *
+ * This is the most actionable number in the file. `us.anthropic.claude-opus-5`
+ * and `global.anthropic.claude-opus-5` are the same model; the prefix is a
+ * data-residency choice, and choosing US-and-Canada residency costs 10% of the
+ * entire bill. Modelled here so /cost shows the difference rather than hiding it
+ * behind a single blended rate — otherwise there is no way to see what the
+ * choice costs, and it is one environment variable.
+ */
+const GEO_PREMIUM = 1.1;
+
+/** True for a geo-scoped inference profile (`us.`, `eu.`, `au.`, …) as opposed
+ *  to `global.` or a bare model id. */
+export function isGeoScoped(modelId: string): boolean {
+  return /^(us|eu|apac|au|jp)\./.test(modelId.toLowerCase());
+}
+
+function withGeoPremium(r: Rates): Rates {
+  return {
+    input: money(r.input * GEO_PREMIUM),
+    output: money(r.output * GEO_PREMIUM),
+    cacheWrite5m: money(r.cacheWrite5m * GEO_PREMIUM),
+    cacheWrite1h: money(r.cacheWrite1h * GEO_PREMIUM),
+    cacheRead: money(r.cacheRead * GEO_PREMIUM),
+    confirmed: r.confirmed,
+  };
+}
 
 /** Strip the inference-profile geo prefix and the provider prefix. */
 export function normalizeModelId(modelId: string): string {
@@ -153,8 +198,9 @@ export function ratesFor(
 ): Rates | null {
   const entry = BEDROCK_RATES[normalizeModelId(modelId)];
   if (!entry) return null;
-  if (entry.promo && today <= entry.promo.through) return entry.promo.rates;
-  return entry.rates;
+  const base = entry.promo && today <= entry.promo.through ? entry.promo.rates : entry.rates;
+  // The prefix is not decoration: it decides the bill by 10% (see GEO_PREMIUM).
+  return isGeoScoped(modelId) ? withGeoPremium(base) : base;
 }
 
 /**
@@ -816,6 +862,20 @@ export function formatCostReport(opts: {
         : `  ${modelId} — no bedrock rate on file; tokens are counted, cost is not`,
     ),
   );
+  // Named only when it applies, and priced in dollars rather than left as a
+  // percentage, because "10% of everything" is easy to nod at and $8 is not.
+  // The same model is one environment variable away; what the prefix actually
+  // buys is US-and-Canada data residency, so this is a choice to make knowingly
+  // rather than one to have inherited.
+  if (r && isGeoScoped(modelId)) {
+    const global = allTime.cost / GEO_PREMIUM;
+    out.push(
+      c.dim(
+        `  geo premium +10% for US/Canada residency · ${fmtUsd(allTime.cost - global)} of the` +
+          ` above · global.${normalizeModelId(modelId)} is the same model without it`,
+      ),
+    );
+  }
   out.push(
     c.dim(
       allTime.turns > 0
@@ -990,6 +1050,21 @@ export function formatFleetReport(opts: {
               `${fmtTokens(t.output)} out` +
               (r.confirmed ? "" : "  [rate derived, not published by AWS]")
           : `  ${modelId} — no bedrock rate on file; ${fmtTokens(t.output)} out, cost not counted`,
+      ),
+    );
+  }
+  // The fleet view is what `co cost` prints, so the premium belongs here too —
+  // this is the total the captain actually looks at. Reported once per priced
+  // geo-scoped model rather than as a fleet-wide line, since instances can be
+  // pointed at different endpoints.
+  for (const [modelId, t] of Object.entries(allModels)) {
+    const r = ratesFor(modelId, today);
+    if (!r || !isGeoScoped(modelId)) continue;
+    const spent = costOf(t, r, cacheTtl);
+    out.push(
+      c.dim(
+        `  geo premium +10% for US/Canada residency · ${fmtUsd(spent - spent / GEO_PREMIUM)}` +
+          ` of the above · global.${normalizeModelId(modelId)} is the same model without it`,
       ),
     );
   }

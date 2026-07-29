@@ -1,5 +1,10 @@
 import type { Tool, ToolUseBlock, ToolResult } from "../model.js";
-import { LOG_NAMES, type InstancePaths, type LiveFile, type LogName } from "../paths.js";
+import {
+  LOG_NAMES,
+  type InstancePaths,
+  type LiveFile,
+  type LogName,
+} from "../paths.js";
 import type { ResearchConfig } from "../config.js";
 import {
   appendLog,
@@ -34,6 +39,7 @@ import { taskDisplayOrder } from "../taskorder.js";
 import {
   isProtocolSection,
   protocolBody,
+  protocolSectionsFor,
   PROTOCOL_SECTIONS,
   type ProtocolSection,
 } from "./protocols.js";
@@ -63,7 +69,13 @@ export const DOC_COMMANDS = [
 ] as const;
 export type DocCommand = (typeof DOC_COMMANDS)[number];
 
-export const TASK_COMMANDS = ["add", "status", "rename", "retire", "list"] as const;
+export const TASK_COMMANDS = [
+  "add",
+  "status",
+  "rename",
+  "retire",
+  "list",
+] as const;
 export type TaskCommand = (typeof TASK_COMMANDS)[number];
 
 /**
@@ -80,7 +92,11 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
       name: "read_live_memory",
       description:
         "Re-read the live-state files (projectbrief, activeContext). They are already provided at session start; call this only to refresh after a rewrite. For documents under docs/, use the doc tool instead.",
-      input_schema: { type: "object", properties: {}, additionalProperties: false },
+      input_schema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
     },
     {
       name: "search_log",
@@ -142,7 +158,8 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
         properties: {
           entry: {
             type: "string",
-            description: "The decision, with context and rationale. Do not include the id; it is minted.",
+            description:
+              "The decision, with context and rationale. Do not include the id; it is minted.",
           },
         },
         required: ["entry"],
@@ -179,16 +196,21 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
           name: {
             type: "string",
             description:
-              "The doc filename, e.g. \"plan.md\". Bare markdown filename, no directories. Omit for list.",
+              'The doc filename, e.g. "plan.md". Bare markdown filename, no directories. Omit for list.',
           },
-          content: { type: "string", description: "Full document text, for create and overwrite." },
+          content: {
+            type: "string",
+            description: "Full document text, for create and overwrite.",
+          },
           old_str: {
             type: "string",
-            description: "For str_replace: the exact text to replace. Must appear exactly once.",
+            description:
+              "For str_replace: the exact text to replace. Must appear exactly once.",
           },
           new_str: {
             type: "string",
-            description: "For str_replace: the replacement text. Omit or pass \"\" to delete the matched text.",
+            description:
+              'For str_replace: the replacement text. Omit or pass "" to delete the matched text.',
           },
         },
         required: ["command"],
@@ -210,8 +232,8 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
       description:
         "Search the web for candidate sources via the configured provider. Returns titles, URLs, and snippets. Prefer primary sources; corroborate before concluding.\n\n" +
         "Recency is your call, per query, based on intent:\n" +
-        "- Set published_within_days to a recent window (e.g. 30, 90, 365) for queries about up-to-date, current, latest, or \"is this still the standard\" implementations. Semantic search otherwise surfaces canonical-but-stale results, so clamp the pool when you want what's current.\n" +
-        "- OMIT published_within_days for historical, conceptual, or \"what have people done over time\" prior-art queries, where old canonical sources are exactly what you want.\n" +
+        '- Set published_within_days to a recent window (e.g. 30, 90, 365) for queries about up-to-date, current, latest, or "is this still the standard" implementations. Semantic search otherwise surfaces canonical-but-stale results, so clamp the pool when you want what\'s current.\n' +
+        '- OMIT published_within_days for historical, conceptual, or "what have people done over time" prior-art queries, where old canonical sources are exactly what you want.\n' +
         "- Set fresh_content: true when it matters that the page content is live rather than cached (e.g. a fast-moving doc or changelog). Leave it off otherwise.",
       input_schema: {
         type: "object",
@@ -269,7 +291,8 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
           },
           headline: {
             type: "string",
-            description: "One line summarising the outcome, shown in the inbox list.",
+            description:
+              "One line summarising the outcome, shown in the inbox list.",
           },
           body: {
             type: "string",
@@ -279,7 +302,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
           job_id: {
             type: "string",
             description:
-              "Optional. The crew job this reviews (e.g. \"job-002\"). Defaults to the run you were just handed; use \"manual\" for a report the captain relayed by hand.",
+              'Optional. The crew job this reviews (e.g. "job-002"). Defaults to the run you were just handed; use "manual" for a report the captain relayed by hand.',
           },
           feature: {
             type: "string",
@@ -337,24 +360,25 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
   // session loop, which is the structural interlock. The feature levers drive
   // the parallel-worktree flow: create a feature's isolated worktree, target a
   // dispatch at it, and land it through the Ctrl-O review gate.
-  if (opts.dispatch) {
-    tools.push({
-      name: "read_protocol",
-      description:
-        "Read one section of the dispatch protocol reference. These sections are NOT in your system prompt — they are exact procedures with real failure modes, and they are kept out of every turn's context because most sessions never need them. Call this BEFORE you act, not after: `features` for creating/landing/enqueueing/abandoning a feature or dispatching into one, `lanes` before dispatching into a worktree that already holds a live crew agent, `pr-message` before you compose the prTitle/prBody for feature_enqueue. Reading a section costs a moment; guessing at one costs the captain a broken landing or a pull request written to the wrong shape. feature_enqueue will refuse a prBody until you have read `pr-message` this session.",
-      input_schema: {
-        type: "object",
-        properties: {
-          section: {
-            type: "string",
-            enum: [...PROTOCOL_SECTIONS],
-            description: "Which protocol section to put in front of you.",
-          },
+  tools.push({
+    name: "read_protocol",
+    description:
+      "Read one section of the protocol reference. These sections are NOT in your system prompt — they are exact procedures with real failure modes, and they are kept out of every turn's context because most sessions never need them. Call this BEFORE you act, not after: `orders` before writing ANY order for the crew, `features` for creating/landing/enqueueing/abandoning a feature or dispatching into one, `lanes` before dispatching into a worktree that already holds a live crew agent, `pr-message` before you compose the prTitle/prBody for feature_enqueue. Reading a section costs a moment; guessing at one costs the captain a broken landing or a pull request written to the wrong shape. feature_enqueue will refuse a prBody until you have read `pr-message` this session.",
+    input_schema: {
+      type: "object",
+      properties: {
+        section: {
+          type: "string",
+          enum: protocolSectionsFor(opts),
+          description: "Which protocol section to put in front of you.",
         },
-        required: ["section"],
-        additionalProperties: false,
       },
-    });
+      required: ["section"],
+      additionalProperties: false,
+    },
+  });
+
+  if (opts.dispatch) {
     tools.push({
       name: "dispatch_order",
       description:
@@ -387,7 +411,8 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
         properties: {
           name: {
             type: "string",
-            description: "The feature name (a human handle, e.g. \"user auth\"). Slugged for the branch.",
+            description:
+              'The feature name (a human handle, e.g. "user auth"). Slugged for the branch.',
           },
           type: {
             type: "string",
@@ -412,7 +437,10 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
       input_schema: {
         type: "object",
         properties: {
-          name: { type: "string", description: "The feature to land (name or slug)." },
+          name: {
+            type: "string",
+            description: "The feature to land (name or slug).",
+          },
         },
         required: ["name"],
         additionalProperties: false,
@@ -425,16 +453,20 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
       input_schema: {
         type: "object",
         properties: {
-          name: { type: "string", description: "The feature to enqueue (name or slug). Must already be created." },
+          name: {
+            type: "string",
+            description:
+              "The feature to enqueue (name or slug). Must already be created.",
+          },
           prTitle: {
             type: "string",
             description:
-              "The pull request's title: one concise imperative line saying what this PR does (e.g. \"Add passkey login to the web app\"), specific enough to stand alone as the permanent history entry — never \"Fix bug\", \"Update .gitignore\", or \"Changes per feedback\". Write it as a developer would — no bot voice, no attribution, nothing about how the work was produced. Omitted, the title falls back to the branch's commit subject.",
+              'The pull request\'s title: one concise imperative line saying what this PR does (e.g. "Add passkey login to the web app"), specific enough to stand alone as the permanent history entry — never "Fix bug", "Update .gitignore", or "Changes per feedback". Write it as a developer would — no bot voice, no attribution, nothing about how the work was produced. Omitted, the title falls back to the branch\'s commit subject.',
           },
           prBody: {
             type: "string",
             description:
-              "The pull request's description. Call `read_protocol` with section \"pr-message\" and write it to the template there — this tool refuses a body until you have. The template is not restated here on purpose: one copy, read when it is actually needed. Omitted, the description falls back to a one-line mechanical summary.",
+              'The pull request\'s description. Call `read_protocol` with section "pr-message" and write it to the template there — this tool refuses a body until you have. The template is not restated here on purpose: one copy, read when it is actually needed. Omitted, the description falls back to a one-line mechanical summary.',
           },
         },
         required: ["name"],
@@ -445,19 +477,31 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
       name: "feature_merge_head",
       description:
         "DO NOT reach for this to merge a ready head — merging is not yours to do. When the queue head is `ready`, the captain's Ctrl-O queue tab is already showing its pull request and checks result with a live [m], and pressing it merges that PR on GitHub, tears down its worktree, advances the queue and processes the next head, none of which involves you. In an interactive session this tool merges NOTHING: it returns the head's current state immediately and tells you the [m] is live. It exists only as a fallback for a session with no panel at all (piped/non-TTY), where there is no key to press and a ready head is merged directly. Use feature_list/feature_status to report queue state instead. Never say a feature landed because you called this, and never wait on the captain's keystroke — you are not in that loop.",
-      input_schema: { type: "object", properties: {}, additionalProperties: false },
+      input_schema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
     });
     tools.push({
       name: "feature_resolve_head",
       description:
         "Dispatch a FRESH crew agent to unblock the current merge-queue HEAD when it is `blocked` by a rebase conflict or a red CI check on its pull request. The agent runs in the FEATURE'S OWN isolated worktree, on its own feature branch (never `dev`): it fetches, rebases onto the current `origin/dev` tip, resolves the conflict, fixes whatever the failing checks reported (the order names them and links their runs), and commits — it does NOT push, open a PR, or merge. Like every dispatch this is CONFIRM-GATED: it ARMS the resolver order (shown to the captain with the target worktree) and fires only when the captain types `confirm`; it launches nothing on its own. While the agent works, the head is `resolving`; when it finishes the head is automatically re-processed (rebase + push + a fresh read of the PR's checks) and becomes `ready` if green or `blocked`/`awaiting-checks` if not. Bounded to a few attempts per head; after the limit the head stays blocked for the captain to resolve by hand or abandon. Use this on a blocked head instead of resolving conflicts yourself.",
-      input_schema: { type: "object", properties: {}, additionalProperties: false },
+      input_schema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
     });
     tools.push({
       name: "feature_list",
       description:
         "List every tracked feature: its branch, worktree path, provision status, which crew agents are live in it and in which lane (`agents` gives each one's job id and role, `writerActive` says whether one of them is a WRITER), its dispatched jobs, and — for enqueued features — its merge-queue position and head state (queued / head-processing / awaiting-checks / ready / blocked / resolving). Also returns the full merge queue in landing order. Use to see what is in flight across the parallel-worktree flow. Only a WRITER blocks enqueuing, landing and abandoning; a worktree with only read-only auditors in it lands normally.",
-      input_schema: { type: "object", properties: {}, additionalProperties: false },
+      input_schema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
     });
     tools.push({
       name: "feature_status",
@@ -466,7 +510,10 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
       input_schema: {
         type: "object",
         properties: {
-          name: { type: "string", description: "The feature to inspect (name or slug)." },
+          name: {
+            type: "string",
+            description: "The feature to inspect (name or slug).",
+          },
         },
         required: ["name"],
         additionalProperties: false,
@@ -479,7 +526,10 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
       input_schema: {
         type: "object",
         properties: {
-          name: { type: "string", description: "The feature to abandon (name or slug)." },
+          name: {
+            type: "string",
+            description: "The feature to abandon (name or slug).",
+          },
         },
         required: ["name"],
         additionalProperties: false,
@@ -535,7 +585,9 @@ export interface ExecutorContext {
   onArmDispatch?: (
     order: string,
     feature?: string,
-  ) => Promise<{ armed: true; summary: string } | { armed: false; reason: string }>;
+  ) => Promise<
+    { armed: true; summary: string } | { armed: false; reason: string }
+  >;
   /**
    * The feature levers (feature_create/land/list/status/abandon). Supplied only
    * when the instance is linked. Absent means the tools report dispatch is
@@ -550,7 +602,9 @@ export interface ExecutorContext {
    * resolvable head, retry bound spent). Marking the head "resolving" happens at
    * fire time, not here, so a cancelled arm burns no attempt.
    */
-  onArmResolve?: () => Promise<{ armed: true; summary: string } | { armed: false; reason: string }>;
+  onArmResolve?: () => Promise<
+    { armed: true; summary: string } | { armed: false; reason: string }
+  >;
   /**
    * File a structured review into the rolling inbox (file_review tool). The REPL
    * supplies this; it persists the record and owns the level-gated chat output
@@ -573,7 +627,10 @@ const FEATURE_UNAVAILABLE =
   "Feature tools are not available: this instance is not linked to a repo. Run `co link` first.";
 
 function ok(id: string, obj: unknown): ToolResult {
-  return { tool_use_id: id, content: typeof obj === "string" ? obj : JSON.stringify(obj) };
+  return {
+    tool_use_id: id,
+    content: typeof obj === "string" ? obj : JSON.stringify(obj),
+  };
 }
 function err(id: string, msg: string): ToolResult {
   return { tool_use_id: id, content: msg, is_error: true };
@@ -604,7 +661,11 @@ export function makeExecutor(ctx: ExecutorContext) {
           return ok(id, live);
         }
         case "search_log": {
-          const hits = await searchLog(paths, input.log as LogName, String(input.query ?? ""));
+          const hits = await searchLog(
+            paths,
+            input.log as LogName,
+            String(input.query ?? ""),
+          );
           return ok(id, { hits });
         }
         case "read_log_range": {
@@ -617,23 +678,39 @@ export function makeExecutor(ctx: ExecutorContext) {
           return ok(id, { text });
         }
         case "append_progress": {
-          const r = await appendLog(paths, "progress", String(input.entry ?? ""));
+          const r = await appendLog(
+            paths,
+            "progress",
+            String(input.entry ?? ""),
+          );
           effects.logsTouched.add("progress");
           return ok(id, { saved: true, file: r.file });
         }
         case "append_research": {
-          const r = await appendLog(paths, "research", String(input.entry ?? ""));
+          const r = await appendLog(
+            paths,
+            "research",
+            String(input.entry ?? ""),
+          );
           effects.logsTouched.add("research");
           return ok(id, { saved: true, file: r.file });
         }
         case "append_decision": {
-          const r = await appendLog(paths, "decisions", String(input.entry ?? ""));
+          const r = await appendLog(
+            paths,
+            "decisions",
+            String(input.entry ?? ""),
+          );
           effects.logsTouched.add("decisions");
           if (r.id) effects.decisionsRecorded.push(r.id);
           return ok(id, { saved: true, id: r.id, file: r.file });
         }
         case "rewrite_active_context": {
-          await rewriteLive(paths, "activeContext.md", String(input.content ?? ""));
+          await rewriteLive(
+            paths,
+            "activeContext.md",
+            String(input.content ?? ""),
+          );
           effects.liveRewritten.add("activeContext.md");
           return ok(id, { rewritten: "activeContext.md" });
         }
@@ -647,9 +724,15 @@ export function makeExecutor(ctx: ExecutorContext) {
               case "read":
                 return ok(id, { name, content: await readDoc(paths, name) });
               case "create":
-                return ok(id, await createDoc(paths, name, String(input.content ?? "")));
+                return ok(
+                  id,
+                  await createDoc(paths, name, String(input.content ?? "")),
+                );
               case "overwrite":
-                return ok(id, await overwriteDoc(paths, name, String(input.content ?? "")));
+                return ok(
+                  id,
+                  await overwriteDoc(paths, name, String(input.content ?? "")),
+                );
               case "str_replace":
                 return ok(
                   id,
@@ -673,24 +756,42 @@ export function makeExecutor(ctx: ExecutorContext) {
             }
           } catch (e) {
             if (e instanceof DocError) {
-              return err(id, JSON.stringify({ error: e.code, message: e.message }));
+              return err(
+                id,
+                JSON.stringify({ error: e.code, message: e.message }),
+              );
             }
             throw e;
           }
         }
         case "rewrite_projectbrief": {
-          await rewriteLive(paths, "projectbrief.md", String(input.content ?? ""));
+          await rewriteLive(
+            paths,
+            "projectbrief.md",
+            String(input.content ?? ""),
+          );
           effects.liveRewritten.add("projectbrief.md");
           return ok(id, { rewritten: "projectbrief.md" });
         }
         case "search_web": {
-          const count = Number.isFinite(Number(input.count)) ? Number(input.count) : 6;
+          const count = Number.isFinite(Number(input.count))
+            ? Number(input.count)
+            : 6;
           const options: SearchOptions = {};
-          if (input.published_within_days !== undefined && Number.isFinite(Number(input.published_within_days))) {
+          if (
+            input.published_within_days !== undefined &&
+            Number.isFinite(Number(input.published_within_days))
+          ) {
             options.publishedWithinDays = Number(input.published_within_days);
           }
-          if (input.fresh_content !== undefined) options.freshContent = Boolean(input.fresh_content);
-          const res = await searchWeb(research, String(input.query ?? ""), count, options);
+          if (input.fresh_content !== undefined)
+            options.freshContent = Boolean(input.fresh_content);
+          const res = await searchWeb(
+            research,
+            String(input.query ?? ""),
+            count,
+            options,
+          );
           ctx.onNotice?.(`searched the web (${res.provider})`);
           return ok(id, res);
         }
@@ -705,18 +806,35 @@ export function makeExecutor(ctx: ExecutorContext) {
           }
           const level = input.level;
           if (!isReviewLevel(level)) {
-            return err(id, `file_review needs a level of ${REVIEW_LEVELS.join(", ")}.`);
+            return err(
+              id,
+              `file_review needs a level of ${REVIEW_LEVELS.join(", ")}.`,
+            );
           }
           const verdict = input.verdict;
           if (!isReviewVerdict(verdict)) {
-            return err(id, `file_review needs a verdict of ${REVIEW_VERDICTS.join(", ")}.`);
+            return err(
+              id,
+              `file_review needs a verdict of ${REVIEW_VERDICTS.join(", ")}.`,
+            );
           }
           const headline = String(input.headline ?? "").trim();
-          if (!headline) return err(id, "file_review requires a non-empty headline.");
+          if (!headline)
+            return err(id, "file_review requires a non-empty headline.");
           const body = String(input.body ?? "").trim();
-          if (!body) return err(id, "file_review requires a non-empty body (the full review).");
-          const jobId = input.job_id === undefined ? undefined : String(input.job_id).trim() || undefined;
-          const feature = input.feature === undefined ? undefined : String(input.feature).trim() || undefined;
+          if (!body)
+            return err(
+              id,
+              "file_review requires a non-empty body (the full review).",
+            );
+          const jobId =
+            input.job_id === undefined
+              ? undefined
+              : String(input.job_id).trim() || undefined;
+          const feature =
+            input.feature === undefined
+              ? undefined
+              : String(input.feature).trim() || undefined;
           const res = await ctx.onFileReview({
             level,
             verdict,
@@ -728,7 +846,8 @@ export function makeExecutor(ctx: ExecutorContext) {
           return ok(id, res);
         }
         case "task_table": {
-          if (!ctx.tasks) return err(id, "The task table is unavailable in this session.");
+          if (!ctx.tasks)
+            return err(id, "The task table is unavailable in this session.");
           const tasks = ctx.tasks;
           const command = String(input.command ?? "") as TaskCommand;
           // Every `table` this tool hands back — the listing, the echo after a
@@ -770,21 +889,32 @@ export function makeExecutor(ctx: ExecutorContext) {
             // told exactly which row it named and what the table actually holds,
             // so its next call can be right rather than a guess.
             if (e instanceof TaskError) {
-              return err(id, JSON.stringify({ error: e.code, message: e.message, table: table() }));
+              return err(
+                id,
+                JSON.stringify({
+                  error: e.code,
+                  message: e.message,
+                  table: table(),
+                }),
+              );
             }
             throw e;
           }
         }
         case "dispatch_order": {
           const order = String(input.order ?? "").trim();
-          if (!order) return err(id, "dispatch_order requires a non-empty order.");
+          if (!order)
+            return err(id, "dispatch_order requires a non-empty order.");
           if (!ctx.onArmDispatch) {
             return err(
               id,
               "Dispatch is not available: this instance is not linked to a repo. Run `co link` first, or write the order as plain text for the captain to copy.",
             );
           }
-          const feature = input.feature === undefined ? undefined : String(input.feature).trim() || undefined;
+          const feature =
+            input.feature === undefined
+              ? undefined
+              : String(input.feature).trim() || undefined;
           const res = await ctx.onArmDispatch(order, feature);
           if (!res.armed) return err(id, res.reason);
           // Armed, not run. The model must now stop and let the captain confirm;
@@ -799,12 +929,17 @@ export function makeExecutor(ctx: ExecutorContext) {
         case "feature_create": {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
           const name = String(input.name ?? "").trim();
-          if (!name) return err(id, "feature_create requires a non-empty name.");
-          const intent = input.intent === undefined ? undefined : String(input.intent);
-          const type = input.type === undefined ? undefined : String(input.type);
+          if (!name)
+            return err(id, "feature_create requires a non-empty name.");
+          const intent =
+            input.intent === undefined ? undefined : String(input.intent);
+          const type =
+            input.type === undefined ? undefined : String(input.type);
           const res = await ctx.features.create(name, intent, type);
           ctx.onNotice?.(
-            res.created ? `provisioned worktree for feature ${res.feature.slug}` : `feature ${res.feature.slug} already provisioned`,
+            res.created
+              ? `provisioned worktree for feature ${res.feature.slug}`
+              : `feature ${res.feature.slug} already provisioned`,
           );
           return ok(id, res);
         }
@@ -818,12 +953,15 @@ export function makeExecutor(ctx: ExecutorContext) {
         case "feature_enqueue": {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
           const name = String(input.name ?? "").trim();
-          if (!name) return err(id, "feature_enqueue requires a non-empty name.");
+          if (!name)
+            return err(id, "feature_enqueue requires a non-empty name.");
           // Each half of the PR message is an independent override: an omitted
           // field leaves whatever this feature already has stored, so a retry
           // enqueue never wipes a message the co wrote earlier.
-          const prTitle = input.prTitle === undefined ? undefined : String(input.prTitle);
-          const prBody = input.prBody === undefined ? undefined : String(input.prBody);
+          const prTitle =
+            input.prTitle === undefined ? undefined : String(input.prTitle);
+          const prBody =
+            input.prBody === undefined ? undefined : String(input.prBody);
           // The one hard gate on the on-demand protocol split. The PR template
           // left the system prompt, so the co can no longer see it by default —
           // and a body composed from memory instead of the template is exactly
@@ -831,10 +969,13 @@ export function makeExecutor(ctx: ExecutorContext) {
           // and nobody notices the shape is wrong for weeks. An inline trigger
           // is a hope; refusing here is enforcement. Cheap to satisfy: one tool
           // call, once per session.
-          if (prBody !== undefined && !effects.protocolsRead.has("pr-message")) {
+          if (
+            prBody !== undefined &&
+            !effects.protocolsRead.has("pr-message")
+          ) {
             return err(
               id,
-              "call read_protocol with section \"pr-message\" first, then re-send this" +
+              'call read_protocol with section "pr-message" first, then re-send this' +
                 " enqueue with the body written to that template. The feature is not" +
                 " enqueued and nothing has changed.",
             );
@@ -843,7 +984,8 @@ export function makeExecutor(ctx: ExecutorContext) {
             ...(prTitle === undefined ? {} : { prTitle }),
             ...(prBody === undefined ? {} : { prBody }),
           });
-          if (res.enqueued) ctx.onNotice?.(`enqueued feature ${name} for landing`);
+          if (res.enqueued)
+            ctx.onNotice?.(`enqueued feature ${name} for landing`);
           return ok(id, res);
         }
         case "feature_merge_head": {
@@ -853,7 +995,8 @@ export function makeExecutor(ctx: ExecutorContext) {
           // panel it merges directly and returns. Either way it never waits on a
           // human, so the co's turn is never held open (D-20260724-12).
           const res = await ctx.features.mergeHead();
-          if (res.merged) ctx.onNotice?.(`merged ${res.feature} onto ${res.target}`);
+          if (res.merged)
+            ctx.onNotice?.(`merged ${res.feature} onto ${res.target}`);
           return ok(id, res);
         }
         case "feature_resolve_head": {
@@ -877,12 +1020,16 @@ export function makeExecutor(ctx: ExecutorContext) {
         }
         case "feature_list": {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
-          return ok(id, { features: ctx.features.list(), queue: ctx.features.queueView() });
+          return ok(id, {
+            features: ctx.features.list(),
+            queue: ctx.features.queueView(),
+          });
         }
         case "feature_status": {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
           const name = String(input.name ?? "").trim();
-          if (!name) return err(id, "feature_status requires a non-empty name.");
+          if (!name)
+            return err(id, "feature_status requires a non-empty name.");
           const res = await ctx.features.status(name);
           if (!res) return ok(id, { found: false, feature: name });
           return ok(id, { found: true, ...res });
@@ -890,7 +1037,8 @@ export function makeExecutor(ctx: ExecutorContext) {
         case "feature_abandon": {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
           const name = String(input.name ?? "").trim();
-          if (!name) return err(id, "feature_abandon requires a non-empty name.");
+          if (!name)
+            return err(id, "feature_abandon requires a non-empty name.");
           const res = await ctx.features.abandon(name);
           if (res.abandoned) ctx.onNotice?.(`abandoned feature ${name}`);
           return ok(id, res);

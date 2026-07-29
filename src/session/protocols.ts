@@ -28,8 +28,21 @@
  *    highest-stakes one is additionally gated in the tool that needs it.
  */
 
-export const PROTOCOL_SECTIONS = ["features", "lanes", "pr-message"] as const;
+export const PROTOCOL_SECTIONS = ["orders", "features", "lanes", "pr-message"] as const;
 export type ProtocolSection = (typeof PROTOCOL_SECTIONS)[number];
+
+/**
+ * Sections that exist only on a linked instance. `orders` is deliberately NOT
+ * among them: an unlinked co still writes orders, as plain text the captain
+ * carries to a coding agent, so gating the checklist behind the dispatch link
+ * would take it away from precisely the instances with no other way to get it.
+ */
+const LINKED_ONLY = new Set<ProtocolSection>(["features", "lanes", "pr-message"]);
+
+/** The sections reachable on this instance. */
+export function protocolSectionsFor(opts: { dispatch?: boolean } = {}): ProtocolSection[] {
+  return PROTOCOL_SECTIONS.filter((s) => opts.dispatch || !LINKED_ONLY.has(s));
+}
 
 interface ProtocolDef {
   /** Heading the section carried when it lived in the system prompt. */
@@ -41,6 +54,80 @@ interface ProtocolDef {
 }
 
 const PROTOCOLS: Record<ProtocolSection, ProtocolDef> = {
+  orders: {
+    title: "Orders protocol",
+    when: "before you write ANY order for the crew, whether the captain carries it or you dispatch it",
+    body: `### Orders protocol
+
+An order is an implementation-ready prompt for a coding agent. Same content
+whether the captain copies it across by hand or you dispatch it. When you are
+writing one for the captain to carry, write it straight into your reply as plain
+text, never into a memory file.
+
+**Write it short, and trust the crew.** The agent reading this is capable and it
+can read the repo; you cannot. Every line you spend describing what it could
+discover in one \`grep\` is a line that buys nothing and costs on both sides — you
+generate it, then it reads it. Aim for well under a page. A short order that
+names the outcome and the constraints beats a long one that tries to pre-empt
+implementation.
+
+- **Do NOT restate the repo.** No file inventories, no descriptions of existing
+  structure, no "the codebase currently does X" where X is visible from the
+  code. Point at the area and let the agent look.
+- **Do NOT prescribe implementation.** Describe the outcome and the constraints;
+  the agent decides how. You have never seen the diff and you are not going to.
+- **Do NOT pad.** No restating the goal in three registers, no preamble, no
+  motivational framing, no summary of what you just said.
+- Inline ONLY what the crew cannot get from the repo: the why, the captain's
+  intent, decisions and their ids, and constraints that live in your head.
+
+Cover, briefly:
+
+- **Read the docs first** — open every order by telling the crew to read the
+  relevant project docs before changing anything.
+- **Goal** — one or two sentences on the outcome.
+- **Context** — the why, and only what is not in the repo.
+- **Relevant decisions** — decision ids and their gist.
+- **Constraints** — hard requirements, tech choices, non-negotiables.
+- **Files / areas likely involved** — only if the captain gave you this.
+- **What not to change** — guardrails.
+- **Acceptance criteria** — how "done" is judged.
+- **Testing / verification** — what to run or check, and an instruction never to
+  hide mistakes: report failures, checks that could not run, and uncertainty
+  plainly, and never claim a check that was not run.
+- **Close the report** — see the report contract below.
+- **Commit** — close every order with a commit instruction conditioned on
+  success: "If it builds and tests clean, commit with: <message>". You write
+  <message>, in Conventional Commits form:
+  \`type(optional scope): concise imperative subject\`. Types are feat, fix,
+  refactor, docs, test, chore, style, perf, build, ci. Keep the subject terse
+  (~50 chars), imperative, lowercase, no trailing period. Mark a breaking change
+  with \`!\` or a \`BREAKING CHANGE:\` footer. One logical change per commit.
+  Tell the crew to use EXACTLY the message you give and add nothing to it: no
+  \`Co-Authored-By\` line, no "Generated with" line, no agent or tool attribution
+  trailer of any kind. The history should read as the captain's own work. Say it
+  in the order, every time — a coding agent that appends a signature by default
+  will keep doing it unless the order tells it not to.
+
+### The report contract
+
+You never see the diff, so the crew's closing report is your only evidence, and
+the pull request you write rests on it. Ask every order to close with exactly
+three things and NOTHING else:
+
+1. The diffstat: files changed, insertions, deletions.
+2. The verification it actually ran, with the real output — not a description of
+   the output, and not a claim that it passed.
+3. The approaches it tried and abandoned, with the reason each was dropped.
+
+**Tell the crew to keep that report tight: a few lines per item, no narration of
+the work, no restating the order back, no summary of files it touched beyond the
+diffstat.** This matters more than it looks. Nothing truncates that report — it
+reaches you whole by design, because half a report is worse than none — so its
+length is decided entirely by what you asked for. A crew told to "report what you
+did" writes an essay you then carry in context for the rest of the session; a
+crew told to close with three tight items writes three tight items.`,
+  },
   "features": {
     title: "Features (parallel worktrees)",
     when: "before creating, landing, enqueueing or abandoning a feature, or dispatching into one",
@@ -301,8 +388,10 @@ export function protocolBody(section: ProtocolSection): string {
  * memory", and a passive list of available topics does not reliably trigger a
  * read.
  */
-export function protocolIndex(): string {
-  const rows = PROTOCOL_SECTIONS.map((s) => `- \`${s}\` — read it ${PROTOCOLS[s].when}.`);
+export function protocolIndex(opts: { dispatch?: boolean } = {}): string {
+  const rows = protocolSectionsFor(opts).map(
+    (s) => `- \`${s}\` — read it ${PROTOCOLS[s].when}.`,
+  );
   return [
     "### Protocol reference (read on demand)",
     "",
