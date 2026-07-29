@@ -171,6 +171,93 @@ test("status takes the two words and nothing else", async () => {
   assert.equal(store.list()[0]!.status, "building", "and the row is as it was");
 });
 
+/**
+ * Renaming a row (D-20260729-5). The row's text used to be immutable, so fixing
+ * a typo meant retire-and-re-add — which lost the two things a row carries
+ * besides its words: its status and its place. So this is one operation, and
+ * what these pin is that neither moves.
+ */
+test("rename rewrites a row's text, keeping its status and its place", async () => {
+  const store = TaskStore.ephemeral([
+    { task: "one", status: "queued" },
+    { task: "typo in teh middle", status: "building" },
+    { task: "three", status: "queued" },
+  ]);
+  const row = await store.rename("typo in teh middle", "  typo in   the middle  ");
+  // Folded like every other cell: a row is one line in a table.
+  assert.deepEqual(row, { task: "typo in the middle", status: "building" });
+  assert.deepEqual(store.list(), [
+    { task: "one", status: "queued" },
+    { task: "typo in the middle", status: "building" },
+    { task: "three", status: "queued" },
+  ], "same status, same position, and the neighbours untouched");
+});
+
+test("rename survives the restart, and heals the file like every other write", async () => {
+  const { paths, cleanup } = await tmpPaths();
+  try {
+    const store = await TaskStore.load(paths);
+    await store.add("ctrl-o overhual");
+    await store.setStatus("ctrl-o overhual", "building");
+    await store.add("bedrock retry backoff");
+    await store.rename("ctrl-o overhual", "ctrl-o overhaul");
+
+    assert.deepEqual((await TaskStore.load(paths)).list(), [
+      { task: "ctrl-o overhaul", status: "building" },
+      { task: "bedrock retry backoff", status: "queued" },
+    ]);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("renaming a row to the text it already has is a successful no-op", async () => {
+  const store = TaskStore.ephemeral(ROWS);
+  const row = await store.rename("ctrl-o overhaul", "ctrl-o overhaul");
+  // The collision check must not see the row itself, or the one case that
+  // reaches it most often — opening the field and changing nothing — would fail.
+  assert.deepEqual(row, { task: "ctrl-o overhaul", status: "building" });
+  assert.deepEqual(store.list(), ROWS);
+});
+
+test("rename refuses on all four counts, and changes nothing when it does", async () => {
+  const store = TaskStore.ephemeral(ROWS);
+
+  // 1. The old text matches no row, and the error says what IS there.
+  const missing = await refusal(() => store.rename("no such row", "something"));
+  assert.equal(missing.code, "NO_MATCH");
+  assert.match(missing.message, /ctrl-o overhaul/);
+
+  // 2. It matches more than one, so there is no way to tell which was meant.
+  const dupes = TaskStore.ephemeral([
+    { task: "same", status: "queued" },
+    { task: "same", status: "building" },
+  ]);
+  assert.equal((await refusal(() => dupes.rename("same", "different"))).code, "MULTIPLE_MATCHES");
+  assert.deepEqual(dupes.list().map((r) => r.task), ["same", "same"]);
+
+  // 3. The new text is empty, or only whitespace, or not text at all.
+  for (const bad of ["", "   ", "\n\t ", undefined, 7]) {
+    const { code } = await refusal(() => store.rename("ctrl-o overhaul", bad));
+    assert.equal(code, "EMPTY_TASK", `${JSON.stringify(bad)} is not a task`);
+  }
+
+  // 4. It would read the same as a DIFFERENT row — the duplicate-addressability
+  //    rule `add` is held to, which two identical rows cannot be recovered from.
+  const clash = await refusal(() => store.rename("ctrl-o overhaul", "bedrock retry backoff"));
+  assert.equal(clash.code, "DUPLICATE_TASK");
+  assert.match(clash.message, /Another row already reads/);
+
+  assert.deepEqual(store.list(), ROWS, "and every refusal left the table exactly as it was");
+});
+
+test("the address is resolved before the new text is judged", async () => {
+  // Both wrong at once: which row was meant is the harder question and the one
+  // whose answer the co needs, so it is the one it is told about.
+  const store = TaskStore.ephemeral(ROWS);
+  assert.equal((await refusal(() => store.rename("no such row", "  "))).code, "NO_MATCH");
+});
+
 test("retire lifts a row out of the table and keeps it, timestamped, in done", async () => {
   const { paths, cleanup } = await tmpPaths();
   try {
@@ -364,11 +451,12 @@ test("the task_table tool is declared, linked or not, and dispatches on a comman
     assert.ok(tool, `declared with dispatch=${dispatch}`);
     assert.deepEqual(tool.input_schema.required, ["command"]);
     const props = tool.input_schema.properties as Record<string, { enum?: string[] }>;
-    assert.deepEqual(props.command?.enum, ["add", "status", "retire", "list"]);
+    assert.deepEqual(props.command?.enum, ["add", "status", "rename", "retire", "list"]);
     assert.deepEqual(props.status?.enum, ["building", "queued"], "and the status enum is the gate");
+    assert.ok("new_task" in props, "rename needs a second text, and it is declared");
     assert.ok(!("tasks" in props), "the whole-table array is gone from the contract");
   }
-  assert.deepEqual([...TASK_COMMANDS], ["add", "status", "retire", "list"]);
+  assert.deepEqual([...TASK_COMMANDS], ["add", "status", "rename", "retire", "list"]);
 });
 
 test("the tool adds, moves and retires one named row, and lists the table", async () => {
@@ -434,6 +522,88 @@ test("a refusal comes back as an error the co can read, carrying the real table"
   const unavailable = await callTool(undefined, { command: "list" });
   assert.equal(unavailable.is_error, true);
   assert.match(unavailable.content, /task table is unavailable/);
+});
+
+test("the tool renames one named row, and refuses in the shape the co can read", async () => {
+  const store = TaskStore.ephemeral([
+    { task: "ctrl-o overhual", status: "building" },
+    { task: "bedrock retry backoff", status: "queued" },
+  ]);
+
+  const renamed = await callTool(store, {
+    command: "rename",
+    task: "ctrl-o overhual",
+    new_task: "ctrl-o overhaul",
+  });
+  assert.ok(!renamed.is_error, renamed.content);
+  assert.deepEqual(store.list(), [
+    { task: "ctrl-o overhaul", status: "building" },
+    { task: "bedrock retry backoff", status: "queued" },
+  ], "status and position both kept");
+  assert.match(renamed.content, /"renamed"/, "the tool says which row moved");
+
+  // Every refusal comes back as an is_error carrying the code, the sentence and
+  // the REAL table, so the co's next call can be right rather than a guess.
+  for (const [input, code] of [
+    [{ command: "rename", task: "not on the table", new_task: "x" }, "NO_MATCH"],
+    [{ command: "rename", task: "ctrl-o overhaul", new_task: "   " }, "EMPTY_TASK"],
+    [{ command: "rename", task: "ctrl-o overhaul" }, "EMPTY_TASK"],
+    [{ command: "rename", task: "ctrl-o overhaul", new_task: "bedrock retry backoff" }, "DUPLICATE_TASK"],
+  ] as const) {
+    const res = await callTool(store, input);
+    assert.equal(res.is_error, true, JSON.stringify(input));
+    assert.match(res.content, new RegExp(code));
+    assert.match(res.content, /"table"/, "and it carries the table as it actually is");
+    assert.match(res.content, /ctrl-o overhaul/);
+  }
+
+  const dupes = TaskStore.ephemeral([
+    { task: "same", status: "queued" },
+    { task: "same", status: "building" },
+  ]);
+  const ambiguous = await callTool(dupes, { command: "rename", task: "same", new_task: "other" });
+  assert.equal(ambiguous.is_error, true);
+  assert.match(ambiguous.content, /MULTIPLE_MATCHES/);
+
+  // A rename to the row's own text is not a collision with itself.
+  const noop = await callTool(store, {
+    command: "rename",
+    task: "ctrl-o overhaul",
+    new_task: "ctrl-o overhaul",
+  });
+  assert.ok(!noop.is_error, noop.content);
+  assert.deepEqual(store.list()[0], { task: "ctrl-o overhaul", status: "building" });
+});
+
+/**
+ * The tool and the panel must agree about what the table looks like, or the co
+ * and the captain are describing different tables to each other. So every
+ * `table` this tool hands back — the listing, the echo after a write, the one
+ * carried by a refusal — is in the same display order the Home tab paints.
+ */
+test("every table the tool returns is building-first, like the panel's", async () => {
+  const store = TaskStore.ephemeral([
+    { task: "first added", status: "queued" },
+    { task: "second added", status: "queued" },
+    { task: "third added", status: "building" },
+  ]);
+  const tableOf = (content: string): string[] =>
+    ((JSON.parse(content) as { table: TaskRow[] }).table ?? []).map((r) => r.task);
+
+  const listed = await callTool(store, { command: "list" });
+  assert.deepEqual(tableOf(listed.content), ["third added", "first added", "second added"]);
+
+  // The stored order is untouched by the display order — `add` still appends.
+  assert.deepEqual(store.list().map((r) => r.task), ["first added", "second added", "third added"]);
+
+  // A status change re-sorts what is READ without rewriting what is STORED.
+  const moved = await callTool(store, { command: "status", task: "first added", status: "building" });
+  assert.deepEqual(tableOf(moved.content), ["first added", "third added", "second added"]);
+  assert.deepEqual(store.list().map((r) => r.task), ["first added", "second added", "third added"]);
+
+  const refused = await callTool(store, { command: "retire", task: "nothing reads this" });
+  assert.equal(refused.is_error, true);
+  assert.deepEqual(tableOf(refused.content), ["first added", "third added", "second added"]);
 });
 
 test("a status outside the enum is refused by the tool, never coerced into the table", async () => {

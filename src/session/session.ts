@@ -356,16 +356,22 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
         // so a row either writer added shows on the next paint. Wired whether or
         // not the instance is linked, so Ctrl-O always has a Home.
         //
-        // The three writes are the captain's own keys (a/x/s), calling straight
+        // The four writes are the captain's own keys (a/e/x/s), calling straight
         // into the SAME store the co's task_table tool holds — one table with
         // two writers, not two copies of one. Each names a single row, so
         // neither writer can clobber the other's, and a refusal (a full table, a
         // row that has since moved) comes back as a line the panel prints rather
         // than an exception.
+        //
+        // `list` hands over STORED order; the panel paints it building-first
+        // through the shared helper, exactly as the tool and the live-state
+        // block do. Sorting here instead would give the panel one order and the
+        // tool another the day one of them stopped calling it.
         tasks: {
           list: () => taskStore.list(),
           add: (task) => taskWrite(taskStore.add(task)),
           setStatus: (task, status) => taskWrite(taskStore.setStatus(task, status)),
+          rename: (task, next) => taskWrite(taskStore.rename(task, next)),
           retire: (task) => taskWrite(taskStore.retire(task)),
         },
         // The merge-queue panel tab only exists when the instance is linked (a
