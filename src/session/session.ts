@@ -67,6 +67,8 @@ import { readOnlyEnforcement, type ActiveAgent, type DispatchLane } from "./lane
 import { FeatureManager } from "./features.js";
 import { FeatureStore } from "./featurestore.js";
 import { TaskError, TaskStore } from "./taskstore.js";
+import { startCacheKeepAlive, type KeepAlive } from "./keepalive.js";
+import { applyCompaction, planCompaction } from "./compaction.js";
 import type { MergeHeadResult } from "./mergequeue.js";
 import {
   DEFAULT_FEATURE_BRANCH_TYPE,
@@ -136,6 +138,24 @@ interface SessionState {
    * that lands cleanly queues NOTHING: co is deliberately not in that loop.
    */
   queueNotices: string[];
+  /**
+   * `Date.now()` when the last model turn finished, or null before the first.
+   *
+   * Exists to measure the gap the captain spends thinking between turns, which
+   * is the thing the cache TTL is a bet on: the entry lives 5 minutes or an hour
+   * from its last hit, so the distribution of these gaps decides whether we are
+   * paying a 2x write premium for protection we need or for pauses that were
+   * never long enough to matter. Kept on the session rather than the provider
+   * because it measures the CAPTAIN's time, not the model's — the provider only
+   * ever sees the intervals it was awake for.
+   */
+  lastTurnEndedAt: number | null;
+  /** True while a model turn is in flight, so the cache keep-alive stands down
+   *  rather than racing a real request for the same cache entry. */
+  inTurn: boolean;
+  /** The cache keep-alive, or null when disabled. Owned here so every turn can
+   *  reset its clock and the exit path can stop it. */
+  keepAlive: KeepAlive | null;
   /** The rolling record of filed crew reviews (the Ctrl-O Inbox tab). Loaded at
    *  session start, so it carries the previous sessions' reviews. */
   inbox: ReviewInbox;
@@ -429,6 +449,9 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     io,
     transcript,
     userTurns: 0,
+    lastTurnEndedAt: null,
+    inTurn: false,
+    keepAlive: null,
     dispatch,
     registry: null,
     features: null,
@@ -542,6 +565,33 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     await runOpeningGreeting(state);
   }
 
+  // Started after the greeting, so the first thing it can ever refresh is a
+  // prefix a real turn has already written. Interactive sessions only: a piped
+  // or scripted run has no thinking pauses to protect and must stay
+  // deterministic.
+  if (tui && cfg.model.cacheKeepAliveMs > 0) {
+    state.keepAlive = startCacheKeepAlive({
+      intervalMs: cfg.model.cacheKeepAliveMs,
+      maxConsecutive: cfg.model.cacheKeepAliveMax,
+      isBusy: () => state.inTurn,
+      // Read fresh on every probe rather than captured once: the history grows
+      // all session, and a stale snapshot would refresh a prefix that no longer
+      // matches what the next turn will send.
+      snapshot: () =>
+        state.messages.length === 0
+          ? null
+          : {
+              system: state.system,
+              messages: state.messages,
+              tools: toolDefinitions({ dispatch: Boolean(state.dispatch) }),
+            },
+      refresh: (s) => state.model.refreshCache(s),
+      // Metered apart from turns: real spend, but not a turn (see cost.ts).
+      record: (usage, ms) => state.costs.recordKeepAlive(state.model.modelId, usage, { ms }),
+      ...(cfg.model.debugTiming ? { onNote: (l) => io.appendBlock(c.dim(`  ⏱ ${l}`)) } : {}),
+    });
+  }
+
   try {
     while (true) {
       // Deliver any completed crew reviews BEFORE idling on input. This is the
@@ -639,6 +689,11 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     }
   } finally {
     state.registry?.stop();
+    // Stopped BEFORE the exit guard, which runs a real model turn of its own: a
+    // probe firing alongside the distill would race it for the same entry, and
+    // there is nothing left to keep warm afterwards either way.
+    state.keepAlive?.stop();
+    state.keepAlive = null;
     // The end-of-session guard runs inside the live UI so its prompts render
     // in-session; then we tear the UI down and leave a short, persistent
     // footprint on the user's primary screen.
@@ -659,9 +714,32 @@ function printClosingSummary(state: SessionState): void {
   line(c.dim(`  memory: ${state.paths.root}`));
 }
 
+/**
+ * Tokens a compaction must release to be worth the rewrite it costs. Below this
+ * it fires, pays to rewrite the whole retained tail, and saves almost nothing —
+ * which is how a cost feature turns into a cost.
+ */
+const COMPACT_MIN_RELEASE_TOKENS = 15_000;
+
+const COMPACT_REQUEST =
+  "Session compaction (bookkeeping, not a question from the captain). This" +
+  " conversation has grown long enough to be worth compressing. Write a summary" +
+  " of everything we have discussed SO FAR that you would want in front of you" +
+  " to carry on without a gap. Keep: decisions reached and the reasoning behind" +
+  " them, what is currently in flight, anything unresolved or awaiting the" +
+  " captain, constraints and corrections he has given you, and the thread of" +
+  " what we were doing. Drop: pleasantries, superseded working detail, and" +
+  " anything already written to memory or the logs, which you can search. Write" +
+  " it as notes to yourself in plain prose, no preamble, no sign-off. Do not" +
+  " address the captain and do not call any tools.";
+
 async function runUserTurn(state: SessionState, userText: string): Promise<void> {
   state.messages.push({ role: "user", content: userText });
   await drive(state);
+  // After the turn, never before: compacting first would summarise a history
+  // that is about to grow anyway, and the captain would wait through a
+  // summarising call before getting an answer to what they actually asked.
+  await maybeCompact(state);
 }
 
 /**
@@ -720,9 +798,14 @@ async function runOpeningGreeting(state: SessionState): Promise<void> {
 async function drive(
   state: SessionState,
   opts: { effort?: Effort; quiet?: boolean } = {},
-): Promise<void> {
+): Promise<string> {
   const { effort, quiet } = opts;
   const { io } = state;
+  // Stamped before any model work so the gap measured is the captain's thinking
+  // pause, not the pause plus this turn's latency.
+  const turnStartedAt = Date.now();
+  const idleMs = state.lastTurnEndedAt === null ? 0 : turnStartedAt - state.lastTurnEndedAt;
+  state.inTurn = true;
   const executor = makeExecutor({
     paths: state.paths,
     research: state.cfg.research,
@@ -818,7 +901,20 @@ async function drive(
     // billed; a quiet turn (the exit distill) is metered exactly like a spoken
     // one, because it costs exactly like one.
     const spent = state.model.drainUsage();
-    await state.costs.record(state.model.modelId, spent.usage, { ms: spent.ms });
+    await state.costs.record(state.model.modelId, spent.usage, {
+      ms: spent.ms,
+      rounds: spent.rounds,
+      rebuild: spent.rebuild,
+      idleMs,
+    });
+    // Set even on a turn that threw: the cache clock started ticking from the
+    // last request the model actually served, not from the last one that
+    // succeeded, so a failed turn still resets the gap.
+    state.lastTurnEndedAt = Date.now();
+    state.inTurn = false;
+    // The turn just touched every cache entry a probe would have, so the
+    // keep-alive's clock restarts from here rather than from the last probe.
+    state.keepAlive?.noteTurn();
   }
 
   // If the model produced no streamed text but a final string exists, show it
@@ -836,6 +932,63 @@ async function drive(
 
   // Persist the co's turn as soon as it lands — the "save along the way" path.
   await appendTranscript(state.transcript, "co", answer);
+  // Returned for the callers that need the words rather than the side effects:
+  // compaction feeds the reply straight back into the history as its summary.
+  return answer;
+}
+
+/**
+ * Put a ceiling on the message history, once, when a session runs long.
+ *
+ * Everything about the shape of this is driven by one price ratio: a cached read
+ * is billed at 0.1x base input and a 1-hour write at 2x, so compacting has to
+ * save twenty read tokens for every write token it costs. Since every compaction
+ * rewrites the retained tail, firing eagerly is a reliable way to spend more than
+ * doing nothing — on this app's measured sessions the break-even sits around 24
+ * turns. Hence a high trigger, a minimum release, and the expectation that a
+ * normal session never reaches it.
+ *
+ * Nothing is lost that the co cannot get back. The transcript is written every
+ * turn and the logs are append-only and searchable, so this moves detail out of
+ * the live window, not off the disk.
+ */
+async function maybeCompact(state: SessionState): Promise<void> {
+  const trigger = state.cfg.model.compactAtTokens;
+  if (trigger <= 0) return;
+  const plan = planCompaction(state.messages, {
+    triggerTokens: trigger,
+    keepTurns: state.cfg.model.compactKeepTurns,
+    minReleaseTokens: COMPACT_MIN_RELEASE_TOKENS,
+  });
+  if (!plan) return;
+
+  // Snapshot the length before the summarising turn appends to it, so the cut
+  // index computed above still addresses the same messages afterwards.
+  const before = state.messages.length;
+  state.messages.push({ role: "user", content: COMPACT_REQUEST });
+  // Low effort deliberately: this is a summary of context the model is already
+  // holding, the same call the cold-start greeting makes, and reasoning depth
+  // buys nothing here while being billed on every token of it.
+  const summary = await drive(state, { quiet: true, effort: "low" });
+  if (summary.trim() === "") {
+    // No usable summary: leave the history exactly as it was. A compaction that
+    // dropped turns and replaced them with nothing would be worse than the cost
+    // it was trying to avoid.
+    state.messages = state.messages.slice(0, before);
+    return;
+  }
+
+  state.messages = applyCompaction(state.messages.slice(0, before), plan.cut, summary);
+
+  // Said out loud, unlike every other piece of the co's bookkeeping. Memory
+  // writes are invisible because they change nothing the captain can observe;
+  // this changes what the co can recall mid-conversation, and a co that quietly
+  // stops remembering something you both said an hour ago is a bug report
+  // waiting to happen. One dim line, once.
+  const freed = plan.before - plan.after;
+  state.io.appendBlock(
+    c.dim(`  · compacted earlier conversation (~${freed.toLocaleString("en-US")} tokens)`),
+  );
 }
 
 // --- the review inbox --------------------------------------------------------

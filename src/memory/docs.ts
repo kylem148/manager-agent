@@ -255,11 +255,46 @@ export interface SurfacedDoc {
   content: string;
 }
 
+/**
+ * Character budget for a doc surfaced into the system prompt.
+ *
+ * These docs get a privileged cold-start read, which means they sit in the cache
+ * prefix and are re-sent on every ROUND of every turn for the whole session — so
+ * an unbounded one is charged tens of times per session for content most turns
+ * never touch. On measured instances `architecture.md` had reached 19,276
+ * characters, a fifth of the entire prefix, with no size discipline anywhere in
+ * this path.
+ *
+ * A budget rather than a hard failure: the doc is the captain's, the co only
+ * borrows it, and a session must never refuse to start over the size of a
+ * markdown file. Over budget it is truncated with a pointer to the `doc` tool,
+ * which can read the whole thing on demand.
+ */
+export const SURFACED_DOC_MAX_CHARS = 8_000;
+
+/** Cut at a paragraph boundary where possible, so the tail is not a half
+ *  sentence, and say plainly that there is more. */
+function budget(name: string, content: string, max: number): string {
+  if (content.length <= max) return content;
+  const head = content.slice(0, max);
+  const brk = head.lastIndexOf("\n\n");
+  const kept = brk > max * 0.6 ? head.slice(0, brk) : head;
+  return (
+    kept +
+    `\n\n_[Truncated at ${max.toLocaleString("en-US")} characters to keep it out of` +
+    ` every turn's context. This document is longer than what you see here: read` +
+    ` the whole of it with \`doc read ${name}\` when you need the rest, and consider` +
+    ` proposing a trim to the captain.]_`
+  );
+}
+
 export async function readSurfacedDocs(paths: InstancePaths): Promise<SurfacedDoc[]> {
   const out: SurfacedDoc[] = [];
   for (const name of SURFACED_DOCS) {
     const content = await readIfExists(paths.docFile(name));
-    if (content !== null && content.trim()) out.push({ name, content });
+    if (content !== null && content.trim()) {
+      out.push({ name, content: budget(name, content, SURFACED_DOC_MAX_CHARS) });
+    }
   }
   return out;
 }

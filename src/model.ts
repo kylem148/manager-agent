@@ -166,6 +166,39 @@ function fmtMs(ms: number): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 }
 
+/**
+ * Output cap on a cache-refresh probe. The reply is discarded, so this only has
+ * to be large enough that the request is legal and does not error — every token
+ * of it is waste, and adaptive thinking is on, so the model will almost always
+ * hit this cap rather than finish. That is fine and expected: at the Opus 5
+ * output rate this ceiling costs a tenth of a cent, against the dollars a
+ * rebuilt prefix costs.
+ */
+const CACHE_PROBE_MAX_TOKENS = 64;
+
+/**
+ * The history truncated to end on the last user-role message, or null if there
+ * isn't one.
+ *
+ * This is what makes a refresh free of side effects. The obvious probe — append
+ * a throwaway message and send that — writes a NEW cache entry for the appended
+ * bytes, and Opus 5 rejects a trailing assistant message outright, so the
+ * history cannot simply be replayed as it stands either. Cutting back to the
+ * last user turn sidesteps both: the prefix is byte-identical to one a real
+ * round already wrote, so the probe is a pure read that resets the clock on an
+ * entry the NEXT turn will actually want.
+ *
+ * Cutting from the end can only ever orphan a `tool_use` by removing the
+ * `tool_result` that answered it, never the reverse, and a completed turn always
+ * ends assistant-side — so the pairs left behind are intact.
+ */
+function throughLastUserTurn(messages: MessageParam[]): MessageParam[] | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.role === "user") return messages.slice(0, i + 1);
+  }
+  return null;
+}
+
 export class ModelProvider {
   private client: AnthropicBedrock;
   private cfg: ModelConfig;
@@ -182,6 +215,31 @@ export class ModelProvider {
    *  captain actually waited, which is the other half of "what did this cost".
    *  Measured for every turn, not just under CO_DEBUG_TIMING. */
   private pendingMs = 0;
+  /**
+   * Model calls made since the last drain. A "turn" is one thing the captain
+   * asked for; a ROUND is one HTTP request to the model, and a turn that uses
+   * tools makes several. This is the multiplier on the whole prompt side of the
+   * bill: the entire prefix and the entire history are re-sent on every round,
+   * so cost-per-turn is rounds x (prefix + history), and a per-turn average
+   * cannot be read without knowing rounds. Counted unconditionally for the same
+   * reason the tokens are — the requests happened whether or not anyone watched.
+   */
+  private pendingRounds = 0;
+  /**
+   * Cache-write tokens billed on the FIRST round of each turn since the drain.
+   *
+   * This is the expiry meter, and it is the one number that decides whether a
+   * cache keep-alive is worth building. By the first round of turn N the prefix
+   * has already been written by turn N-1, so a warm cache should write almost
+   * nothing here — just the new user message. A large figure means the entry
+   * lapsed during the captain's thinking pause and the whole prefix was rebuilt
+   * at the 2x write rate, which is 20x what reading it would have cost.
+   *
+   * Deliberately first-round-only. Later rounds in a turn legitimately write the
+   * tool_use/tool_result blocks they just created, and folding those in would
+   * bury the signal under normal growth.
+   */
+  private pendingRebuild = 0;
 
   constructor(cfg: ModelConfig) {
     this.cfg = cfg;
@@ -252,10 +310,17 @@ export class ModelProvider {
    * gives us no usage for a message that never finalized. The elapsed time is
    * still counted: the captain waited for it either way.)
    */
-  drainUsage(): { usage: TokenUsage; ms: number } {
-    const drained = { usage: this.pending, ms: this.pendingMs };
+  drainUsage(): { usage: TokenUsage; ms: number; rounds: number; rebuild: number } {
+    const drained = {
+      usage: this.pending,
+      ms: this.pendingMs,
+      rounds: this.pendingRounds,
+      rebuild: this.pendingRebuild,
+    };
     this.pending = emptyUsage();
     this.pendingMs = 0;
+    this.pendingRounds = 0;
+    this.pendingRebuild = 0;
     return drained;
   }
 
@@ -365,11 +430,15 @@ export class ModelProvider {
       // load-bearing thing in this file, and a missing usage block must cost an
       // inaccurate /cost line, never the captain's turn.
       const billed = message.usage;
+      this.pendingRounds += 1;
       if (billed) {
         this.pending.input += billed.input_tokens ?? 0;
         this.pending.cacheWrite += billed.cache_creation_input_tokens ?? 0;
         this.pending.cacheRead += billed.cache_read_input_tokens ?? 0;
         this.pending.output += billed.output_tokens ?? 0;
+        // Only the opening round of the turn: see pendingRebuild. A big number
+        // here is a lapsed cache, not a big prompt.
+        if (round === 0) this.pendingRebuild += billed.cache_creation_input_tokens ?? 0;
       }
 
       if (timing) {
@@ -422,6 +491,65 @@ export class ModelProvider {
     // Ran out of tool rounds; return whatever text we have.
     timing?.(`turn: ${fmtMs(Date.now() - turnStart)} — hit the ${maxRounds}-round cap`);
     return { messages, finalText };
+  }
+
+  /**
+   * Touch the cached prefix so its TTL restarts, instead of letting it lapse and
+   * paying to rebuild it.
+   *
+   * The economics are the whole justification and they are lopsided. A cache hit
+   * is billed at 0.1x base input; a 1-hour write is billed at 2x. So re-reading
+   * a prefix costs a TWENTIETH of re-writing the same bytes, and Bedrock resets
+   * the TTL on every successful hit — AWS's own guidance is explicit that a
+   * regularly-hit entry "will continue to be refreshed at no additional charge".
+   * A co-manager is a thinking partner, so the captain reads an answer and comes
+   * back twenty minutes later; without this, each of those pauses that outlives
+   * the TTL bills the entire prefix at the premium rate.
+   *
+   * Deliberately built to send a prefix byte-identical to a real round: same
+   * system text, same tool list, same breakpoints, same thinking and effort
+   * params. Any difference and it writes a fresh entry rather than hitting the
+   * one we are trying to keep alive, which would make it strictly worse than
+   * doing nothing. That is also why nothing here is "optimised" into a smaller
+   * request.
+   *
+   * Returns null when there is nothing to refresh (no user turn yet). Never
+   * throws: a probe is an optimisation, and a failed one must cost an unrefreshed
+   * cache, never the captain's session.
+   */
+  async refreshCache(args: {
+    system: string;
+    messages: MessageParam[];
+    tools: Tool[];
+  }): Promise<{ usage: TokenUsage; ms: number } | null> {
+    const replay = throughLastUserTurn(args.messages);
+    if (!replay) return null;
+
+    const startedAt = Date.now();
+    const usage = emptyUsage();
+    try {
+      const message = await this.client.messages.create({
+        model: this.cfg.modelId,
+        max_tokens: CACHE_PROBE_MAX_TOKENS,
+        system: [{ type: "text", text: args.system, cache_control: CACHE_CONTROL }],
+        messages: withMessageBreakpoints(replay),
+        ...(args.tools.length ? { tools: withToolBreakpoint(args.tools) } : {}),
+        ...this.baseParams(),
+      });
+      const billed = message.usage;
+      if (billed) {
+        usage.input += billed.input_tokens ?? 0;
+        usage.cacheWrite += billed.cache_creation_input_tokens ?? 0;
+        usage.cacheRead += billed.cache_read_input_tokens ?? 0;
+        usage.output += billed.output_tokens ?? 0;
+      }
+    } catch {
+      // Swallowed on purpose. A refused or timed-out probe leaves the cache
+      // exactly as it was; surfacing it would put an error in front of the
+      // captain about work they never asked for.
+      return null;
+    }
+    return { usage, ms: Date.now() - startedAt };
   }
 
   /** A minimal non-streaming ping used by `co doctor` to test connectivity. */

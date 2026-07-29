@@ -1415,7 +1415,10 @@ test("the feature_enqueue TOOL declares the message and threads it to the pull r
   assert.equal(props.prBody?.type, "string");
   assert.deepEqual(def.input_schema.required, ["name"], "both halves are optional");
   assert.match(props.prTitle?.description ?? "", /concise imperative line/);
-  assert.match(props.prBody?.description ?? "", /what the PR accomplishes and why/);
+  // The template itself lives in protocols.ts now: one copy, read when needed.
+  // The schema's job is to send the co there, and to say the gate exists.
+  assert.match(props.prBody?.description ?? "", /read_protocol/);
+  assert.match(props.prBody?.description ?? "", /refuses a body until you have/);
   assert.match(def.description, /pass `prTitle` and `prBody`/, "the description tells co to write it");
   assert.match(def.description, /keeps the message you already wrote/, "and that omitting preserves it");
 
@@ -1423,15 +1426,31 @@ test("the feature_enqueue TOOL declares the message and threads it to the pull r
   try {
     const a = await fx.features.create("tooled");
     await commitIn(a.feature.worktreePath, "t.txt", "t\n", "job: tooled");
+    const effects = newSideEffects();
     const execute = makeExecutor({
       paths: fx.paths,
       research: {} as ResearchConfig,
-      effects: newSideEffects(),
+      effects,
       features: fx.features,
     });
     let n = 0;
     const call = (input: Record<string, unknown>) =>
       execute({ type: "tool_use", id: `t${++n}`, name: "feature_enqueue", input });
+
+    // A body written without the template is refused — and the refusal HANDS THE
+    // TEMPLATE OVER rather than pointing at a tool the co might not call. The PR
+    // body is the permanent record of a feature and co writes it without ever
+    // seeing the diff, so improvising its shape is the failure that would never
+    // announce itself. There must be no path to writing one uninformed.
+    const ungated = await call({ name: "tooled", prBody: "written from memory" });
+    assert.ok(ungated.is_error);
+    assert.match(String(ungated.content), /## Other Notes/, "the template itself comes back");
+    assert.match(String(ungated.content), /Nothing has been staged/);
+    assert.match(String(ungated.content), /Do not simply resend what you had/);
+    assert.ok(!(await FeatureStore.load(fx.paths)).prMessage("tooled"), "nothing was stored");
+
+    // The body is now in the conversation, so the retry proceeds. One refusal per
+    // session, never a loop.
 
     const res = await call({
       name: "tooled",

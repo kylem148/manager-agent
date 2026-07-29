@@ -168,17 +168,27 @@ export function paneWaitSec(): number {
 /**
  * Model used when BEDROCK_MODEL_ID is unset.
  *
- * The `us.` prefix is load-bearing, not decorative — this is a cross-region
- * inference profile id, and the bare foundation id is rejected for on-demand
+ * SOME prefix is load-bearing: the bare foundation id is rejected for on-demand
  * throughput ("Retry your request with the ID or ARN of an inference profile").
- * Confirmed for opus-4-8, sonnet-4-6 and sonnet-5 on 2026-07-27.
+ * Which prefix is a pricing decision.
  *
- * The Sonnet tier runs at a materially lower per-token rate and was briefly the
- * default; `us.anthropic.claude-sonnet-4-6` and `us.anthropic.claude-sonnet-5`
- * are both known to answer on this account if cost ever outranks capability.
- * Note Sonnet 4.6 does not accept effort=xhigh — see effortLevelsFor.
+ * Anthropic documents a 10% premium on Bedrock's regional and geo endpoints over
+ * the global one, on every token class. `us.anthropic.claude-opus-5` and
+ * `global.anthropic.claude-opus-5` are the same model; the `us.` prefix buys
+ * US-and-Canada data residency, and it costs a tenth of the entire bill. So
+ * global is the default and residency is the opt-in, rather than the reverse.
+ * Verified answering on the runtime path with a Bedrock bearer token 2026-07-29.
+ *
+ * One honest caveat: a geo profile routes across a narrower pool and may produce
+ * FEWER cache writes than global under load. The 10% is a list-price saving, and
+ * `/cost`'s rebuild line is what says whether it survived contact.
+ *
+ * The Sonnet tier runs at a materially lower per-token rate;
+ * `global.anthropic.claude-sonnet-5` answers on this account if cost ever
+ * outranks capability. Note Sonnet 4.6 does not accept effort=xhigh — see
+ * effortLevelsFor.
  */
-export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-4-8";
+export const DEFAULT_MODEL_ID = "global.anthropic.claude-opus-5";
 
 export interface ModelConfig {
   region: string;
@@ -200,6 +210,38 @@ export interface ModelConfig {
    * does not document as having full feature parity — see model.ts.
    */
   debugTiming: boolean;
+  /**
+   * Cache keep-alive: how long an idle prompt waits before touching the cached
+   * prefix to restart its TTL, in milliseconds. 0 disables it.
+   *
+   * Default is 45 minutes, chosen against the 1-hour TTL in model.ts with a
+   * generous margin — a probe that lands after the entry has already lapsed pays
+   * the rebuild it existed to prevent, so being early is free and being late is
+   * the whole cost. If CACHE_TTL ever drops back to the 5-minute default this
+   * has to come down with it (roughly 4 minutes), which is why they are worth
+   * keeping in view of each other.
+   */
+  cacheKeepAliveMs: number;
+  /**
+   * How many probes in a row, with no real turn between them, before the
+   * keep-alive gives up. Bounds the cost of a terminal left open overnight.
+   * Three probes at the default interval covers a bit over two hours of thinking
+   * time, which is longer than any real pause and short enough that an abandoned
+   * session stops billing.
+   */
+  cacheKeepAliveMax: number;
+  /**
+   * Compact the message history once it passes this many estimated tokens.
+   * 0 disables it.
+   *
+   * Set high on purpose. Compaction trades cheap reads for expensive writes (see
+   * compaction.ts), so on a normal session it should never fire — this is a
+   * guard against the session left running all day, not routine housekeeping.
+   */
+  compactAtTokens: number;
+  /** Intact exchanges kept verbatim when compacting. Everything older becomes a
+   *  summary. */
+  compactKeepTurns: number;
 }
 
 export type SearchProviderName = "auto" | "exa" | "brave" | "tavily" | "searxng" | "none";
@@ -277,6 +319,18 @@ export function loadConfig(): Config {
       thinking,
       effort,
       debugTiming: (env("CO_DEBUG_TIMING") ?? "").toLowerCase() === "true",
+      // parseIntOr rejects 0 as "not a positive int" and falls back, so the
+      // off switch is its own env var rather than CO_CACHE_KEEPALIVE_MS=0.
+      cacheKeepAliveMs:
+        (env("CO_CACHE_KEEPALIVE") ?? "").toLowerCase() === "off"
+          ? 0
+          : parseIntOr("CO_CACHE_KEEPALIVE_MS", 45 * 60 * 1000),
+      cacheKeepAliveMax: parseIntOr("CO_CACHE_KEEPALIVE_MAX", 3),
+      compactAtTokens:
+        (env("CO_COMPACT") ?? "").toLowerCase() === "off"
+          ? 0
+          : parseIntOr("CO_COMPACT_AT_TOKENS", 60_000),
+      compactKeepTurns: parseIntOr("CO_COMPACT_KEEP_TURNS", 6),
     },
     research: {
       searchProvider,

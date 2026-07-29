@@ -21,6 +21,8 @@ const CFG: ModelConfig = {
   thinking: "adaptive",
   effort: "high",
   debugTiming: false,
+  cacheKeepAliveMs: 45 * 60 * 1000,
+  cacheKeepAliveMax: 3,
 };
 
 interface SentParams {
@@ -190,4 +192,145 @@ test("a tool round still respects the breakpoint ceiling", async () => {
   await provider.runTurn(turn([{ role: "user", content: "hi" }]));
 
   assert.ok(countBreakpoints(sent[1]!) <= 4, `expected <= 4, got ${countBreakpoints(sent[1]!)}`);
+});
+
+// --- the cache keep-alive probe -----------------------------------------------
+//
+// A probe is only worth sending if it HITS the entry it is trying to keep alive,
+// which means its prefix has to be byte-identical to one a real round already
+// wrote. Any drift and it writes a fresh entry instead — strictly worse than not
+// probing at all, and silent. These tests pin the shape.
+
+/** Stub the non-streaming create() path that refreshCache uses. */
+function stubCreate(
+  provider: ModelProvider,
+  reply: unknown | (() => never) = { content: [], stop_reason: "max_tokens", usage: {} },
+): SentParams[] {
+  const sent: SentParams[] = [];
+  (provider as any).client = {
+    messages: {
+      create: async (params: any) => {
+        sent.push(params);
+        if (typeof reply === "function") (reply as () => never)();
+        return reply;
+      },
+    },
+  };
+  return sent;
+}
+
+test("a cache probe replays the prefix a real turn would send", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  const sent = stubCreate(provider);
+  const messages: MessageParam[] = [
+    { role: "user", content: "first" },
+    { role: "assistant", content: "reply" },
+    { role: "user", content: "second" },
+  ];
+  await provider.refreshCache({ system: "system prompt", messages, tools: TOOLS });
+
+  assert.equal(sent.length, 1);
+  const p = sent[0]!;
+  // Same system block with its breakpoint, same tools prefix — otherwise the two
+  // biggest cached tiers are missed.
+  assert.deepEqual(p.system, [
+    { type: "text", text: "system prompt", cache_control: { type: "ephemeral", ttl: "1h" } },
+  ]);
+  assert.ok((p.tools as any[])[1].cache_control, "the tools prefix must still be closed");
+  assert.ok(countBreakpoints(p) <= 4, "a probe is still bound by Bedrock's ceiling");
+});
+
+test("a probe stops at the last user turn rather than prefilling an assistant one", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  const sent = stubCreate(provider);
+  const messages: MessageParam[] = [
+    { role: "user", content: "first" },
+    { role: "assistant", content: "reply" },
+    { role: "user", content: "second" },
+    { role: "assistant", content: "second reply" },
+  ];
+  await provider.refreshCache({ system: "s", messages, tools: TOOLS });
+
+  const outbound = sent[0]!.messages;
+  // Opus 5 rejects a trailing assistant message outright, so the history cannot
+  // be replayed as it stands; and appending a throwaway user turn would write a
+  // new entry rather than hit the existing one. Cutting back to the last real
+  // user turn is the only shape that is a pure read.
+  assert.equal(outbound.length, 3);
+  assert.equal(outbound[outbound.length - 1]!.role, "user");
+});
+
+test("a probe leaves the caller's history untouched", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  stubCreate(provider);
+  const messages: MessageParam[] = [{ role: "user", content: "only" }];
+  await provider.refreshCache({ system: "s", messages, tools: TOOLS });
+  // Same invariant the turn path holds: markers must never accumulate in the
+  // session's own array.
+  assert.deepEqual(messages, [{ role: "user", content: "only" }]);
+});
+
+test("there is nothing to refresh before the first user turn", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  const sent = stubCreate(provider);
+  assert.equal(await provider.refreshCache({ system: "s", messages: [], tools: TOOLS }), null);
+  assert.equal(
+    await provider.refreshCache({
+      system: "s",
+      messages: [{ role: "assistant", content: "hi" }],
+      tools: TOOLS,
+    }),
+    null,
+  );
+  assert.equal(sent.length, 0, "no request should go out at all");
+});
+
+test("a refused probe resolves null instead of throwing at the session", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  stubCreate(provider, () => {
+    throw new Error("throttled");
+  });
+  const out = await provider.refreshCache({
+    system: "s",
+    messages: [{ role: "user", content: "x" }],
+    tools: TOOLS,
+  });
+  // The captain never asked for this request; a failure must not reach them.
+  assert.equal(out, null);
+});
+
+test("a probe reports what it read and wrote so the trade can be audited", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  stubCreate(provider, {
+    content: [],
+    stop_reason: "max_tokens",
+    usage: { input_tokens: 3, cache_read_input_tokens: 24_000, cache_creation_input_tokens: 0, output_tokens: 64 },
+  });
+  const out = await provider.refreshCache({
+    system: "s",
+    messages: [{ role: "user", content: "x" }],
+    tools: TOOLS,
+  });
+  assert.equal(out!.usage.cacheRead, 24_000);
+  assert.equal(out!.usage.cacheWrite, 0, "a hit is the whole point; a write means it lapsed");
+  assert.equal(out!.usage.output, 64);
+});
+
+test("a probe is not folded into the turn meter", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  stubCreate(provider, {
+    content: [],
+    stop_reason: "max_tokens",
+    usage: { cache_read_input_tokens: 24_000, output_tokens: 64 },
+  });
+  await provider.refreshCache({
+    system: "s",
+    messages: [{ role: "user", content: "x" }],
+    tools: TOOLS,
+  });
+  // Counting a probe as a turn would understate cost-per-turn and dilute the
+  // rounds average — the two numbers the keep-alive has to be judged by.
+  const drained = provider.drainUsage();
+  assert.equal(drained.rounds, 0);
+  assert.equal(drained.usage.cacheRead, 0);
 });

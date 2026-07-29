@@ -70,11 +70,16 @@ export interface Rates {
 }
 
 /**
- * Bedrock prices cache traffic as fixed multiples of a model's base input rate.
- * Confirmed against the published Opus 4.8 row on 2026-07-27: input $6.00,
- * 5-minute write $7.50 (1.25x), 1-hour write $12.00 (2x), read $0.60 (0.1x).
- * Deriving the cache rates rather than transcribing four numbers per model
- * means a new model only needs its input/output pair.
+ * Cache traffic is priced as fixed multiples of a model's base input rate, and
+ * these three multiples are the best-established numbers in this file: Anthropic
+ * publishes them as a table (5-minute write 1.25x, 1-hour write 2x, read 0.1x),
+ * and Bedrock applies the same shape. Deriving from them means a new model needs
+ * only its input/output pair.
+ *
+ * The 20:1 ratio between the 1-hour write and the read is the single fact that
+ * drives most of this app's cost design: re-reading cached bytes costs a
+ * twentieth of rewriting them, which is why the cache keep-alive exists and why
+ * history compaction has to be rare to pay for itself.
  */
 const WRITE_5M_MULTIPLE = 1.25;
 const WRITE_1H_MULTIPLE = 2;
@@ -107,35 +112,75 @@ interface RateEntry {
 }
 
 /**
- * BEDROCK rates, not Anthropic's first-party list price. This matters: the same
- * Opus 4.8 that costs $5/$25 per million on the Anthropic API costs $6/$30 on
- * Bedrock, so pricing this app against the first-party table would understate
- * every invoice by 20%. Taken from aws.amazon.com/bedrock/pricing on 2026-07-27.
+ * Bedrock rates for the GLOBAL endpoint. A geo-scoped profile adds GEO_PREMIUM
+ * on top (see below), which is where the `us.` prefix this app ships with lands.
  *
- * Keyed by the id with its geo prefix stripped (see normalizeModelId), so
- * `us.anthropic.claude-opus-4-8` and a future `eu.` variant share one entry.
+ * Keyed by the id with its geo and provider prefixes stripped (see
+ * normalizeModelId), so `us.`, `global.` and a bare id share one entry.
  *
- * A model that is not in here is not a failure — `/cost` still reports its
- * tokens and says plainly that it has no rate on file, rather than inventing a
- * number. Adding one is a single line.
+ * EVERY OPUS-TIER RATE HERE IS DERIVED AND FLAGGED AS SUCH, because AWS does not
+ * publish a row this app could transcribe. What the evidence actually says, read
+ * 2026-07-29:
  *
- * One entry is DERIVED rather than quoted, and flagged as such. Opus 5 has no
- * row on the Bedrock pricing page (checked 2026-07-27), but Anthropic documents
- * it as a drop-in upgrade "at Opus 4.8's pricing" — $5/$25 first-party, exactly
- * what Opus 4.8 costs there — and Bedrock resells that tier at a flat 1.2x
- * ($6/$30). Leaving it unpriced would mean the meter reports nothing for the
- * model this app is actually pointed at, which is worse than a well-founded
- * estimate that announces itself. Replace with the published row the moment AWS
- * lists one.
+ *  - Anthropic prices Opus 5 and Opus 4.8 at $5/$25 first-party, and states that
+ *    Bedrock pricing matches the direct API in standard regions.
+ *  - Independent trackers list Bedrock Opus 5 at $5/$25 global and $5.50/$27.50
+ *    regional, with cache classes at exactly 1.1x. That the two differ by
+ *    precisely the documented regional premium is the strongest check available.
+ *  - AWS's own pricing page renders no Opus 5 row at all, and the $6.00 figure
+ *    this table used to carry is consistent with a RETIRED model's Extended
+ *    Access row (Claude 3.5 Sonnet shows $6/$30 against a $3/$15 first-party
+ *    price — 2x, not the 1.2x a flat resale markup would imply).
+ *
+ * So: priced, because a meter that reports nothing for the model in use is worse
+ * than a well-founded estimate that announces itself — and flagged, because the
+ * only authoritative figure is the invoice. Reconcile against the Bedrock bill
+ * and replace these the moment AWS publishes a row.
+ *
+ * A model that is not in here is not a failure: /cost still reports its tokens
+ * and says plainly it has no rate on file. Adding one is a single line.
  */
 const BEDROCK_RATES: Record<string, RateEntry> = {
-  "claude-opus-5": { rates: rates(6, 30, /*confirmed*/ false) },
-  "claude-opus-4-8": { rates: rates(6, 30) },
+  "claude-opus-5": { rates: rates(5, 25, /*confirmed*/ false) },
+  "claude-opus-4-8": { rates: rates(5, 25, /*confirmed*/ false) },
   "claude-sonnet-5": {
-    rates: rates(3, 15),
-    promo: { rates: rates(2, 10), through: "2026-08-31" },
+    rates: rates(3, 15, /*confirmed*/ false),
+    promo: { rates: rates(2, 10, /*confirmed*/ false), through: "2026-08-31" },
   },
 };
+
+/**
+ * The premium a geo-scoped inference profile carries over the global one.
+ *
+ * Anthropic documents this plainly for Bedrock: "Regional endpoints carry a 10%
+ * pricing premium over global endpoints", scoped to Opus 4.5, Sonnet 4.5, Haiku
+ * 4.5 "and all future models". It applies to every token class, not just input.
+ *
+ * This is the most actionable number in the file. `us.anthropic.claude-opus-5`
+ * and `global.anthropic.claude-opus-5` are the same model; the prefix is a
+ * data-residency choice, and choosing US-and-Canada residency costs 10% of the
+ * entire bill. Modelled here so /cost shows the difference rather than hiding it
+ * behind a single blended rate — otherwise there is no way to see what the
+ * choice costs, and it is one environment variable.
+ */
+const GEO_PREMIUM = 1.1;
+
+/** True for a geo-scoped inference profile (`us.`, `eu.`, `au.`, …) as opposed
+ *  to `global.` or a bare model id. */
+export function isGeoScoped(modelId: string): boolean {
+  return /^(us|eu|apac|au|jp)\./.test(modelId.toLowerCase());
+}
+
+function withGeoPremium(r: Rates): Rates {
+  return {
+    input: money(r.input * GEO_PREMIUM),
+    output: money(r.output * GEO_PREMIUM),
+    cacheWrite5m: money(r.cacheWrite5m * GEO_PREMIUM),
+    cacheWrite1h: money(r.cacheWrite1h * GEO_PREMIUM),
+    cacheRead: money(r.cacheRead * GEO_PREMIUM),
+    confirmed: r.confirmed,
+  };
+}
 
 /** Strip the inference-profile geo prefix and the provider prefix. */
 export function normalizeModelId(modelId: string): string {
@@ -153,8 +198,9 @@ export function ratesFor(
 ): Rates | null {
   const entry = BEDROCK_RATES[normalizeModelId(modelId)];
   if (!entry) return null;
-  if (entry.promo && today <= entry.promo.through) return entry.promo.rates;
-  return entry.rates;
+  const base = entry.promo && today <= entry.promo.through ? entry.promo.rates : entry.rates;
+  // The prefix is not decoration: it decides the bill by 10% (see GEO_PREMIUM).
+  return isGeoScoped(modelId) ? withGeoPremium(base) : base;
 }
 
 /**
@@ -221,6 +267,39 @@ export function dayBefore(day: string, n: number): string {
 export interface ModelTotals extends TokenUsage {
   turns: number;
   ms: number;
+  /**
+   * Model calls, not turns. A tool-using turn makes several rounds and re-sends
+   * the whole prompt on each one, so rounds-per-turn is the multiplier on the
+   * entire input side of the bill. Without it, "cache read per turn" is a number
+   * you cannot act on: 200k over two rounds is a 100k prompt, over five rounds
+   * it is a 40k prompt, and those call for opposite fixes.
+   */
+  rounds: number;
+  /**
+   * Cache-write tokens billed on the opening round of each turn — the cost of
+   * the cache having lapsed between turns. See ModelProvider.pendingRebuild.
+   * Near-zero means the cache is surviving the captain's thinking pauses; large
+   * means the prefix is being rebuilt at the 2x write rate instead of read at
+   * 0.1x, which is the single most expensive avoidable thing this app can do.
+   */
+  rebuild: number;
+  /**
+   * Wall-clock the captain spent NOT waiting on the model: the gap between one
+   * turn finishing and the next starting, summed. Recorded because the cache TTL
+   * is a bet on the length of these gaps — a co-manager is a thinking partner,
+   * so they are long by design, and their distribution is what decides whether
+   * the 5-minute or 1-hour entry is the right one to be paying for.
+   */
+  idleMs: number;
+  /**
+   * Cache-refresh probes sent (see ModelProvider.refreshCache). Counted apart
+   * from `turns` because a probe is not a turn: it answers nothing, and folding
+   * it in would quietly halve the per-turn averages while the captain's actual
+   * turns stayed the same. Its TOKENS are folded into the usage totals, though —
+   * it is real spend, and a keep-alive that cost more than the rebuilds it
+   * prevented has to be visible as such or there is no way to tell.
+   */
+  keepAlives: number;
 }
 
 /** A day's spend, still split per model so it can be priced correctly. */
@@ -250,7 +329,22 @@ export interface LedgerData {
 export const DAY_RETENTION = 400;
 
 function emptyTotals(): ModelTotals {
-  return { ...emptyUsage(), turns: 0, ms: 0 };
+  return { ...emptyUsage(), turns: 0, ms: 0, rounds: 0, rebuild: 0, idleMs: 0, keepAlives: 0 };
+}
+
+/** Sum two buckets, tokens and counters alike. One place to change when a
+ *  counter is added, so a new field cannot be summed in one roll-up and
+ *  silently dropped in the other. */
+function addTotals(a: ModelTotals, b: ModelTotals): ModelTotals {
+  return {
+    ...addUsage(a, b),
+    turns: a.turns + b.turns,
+    ms: a.ms + b.ms,
+    rounds: a.rounds + b.rounds,
+    rebuild: a.rebuild + b.rebuild,
+    idleMs: a.idleMs + b.idleMs,
+    keepAlives: a.keepAlives + b.keepAlives,
+  };
 }
 
 function num(v: unknown): number {
@@ -267,6 +361,15 @@ function coerceTotals(v: unknown): ModelTotals | null {
     output: num(t.output),
     turns: num(t.turns),
     ms: num(t.ms),
+    // Absent in ledgers written before these counters existed. Zero-filled
+    // rather than back-filled: a rounds figure we never measured would make the
+    // per-turn averages read as though early sessions ran at one round each,
+    // which is exactly the wrong conclusion. `/cost` suppresses the line until
+    // there is real data behind it.
+    rounds: num(t.rounds),
+    rebuild: num(t.rebuild),
+    idleMs: num(t.idleMs),
+    keepAlives: num(t.keepAlives),
   };
 }
 
@@ -384,15 +487,37 @@ export class CostLedger {
   async record(
     modelId: string,
     usage: TokenUsage,
-    opts: { ms?: number; now?: Date } = {},
+    opts: {
+      ms?: number;
+      now?: Date;
+      /** Model calls this turn made (see ModelTotals.rounds). */
+      rounds?: number;
+      /** Cache-write tokens on the turn's opening round (see ModelTotals.rebuild). */
+      rebuild?: number;
+      /** Idle gap before this turn started (see ModelTotals.idleMs). */
+      idleMs?: number;
+    } = {},
   ): Promise<void> {
     if (isEmptyUsage(usage)) return;
     const now = opts.now ?? new Date();
     const ms = Math.max(0, Math.round(opts.ms ?? 0));
+    // A turn that billed tokens made at least one round, whatever the caller
+    // passed: the counters are diagnostics and must never contradict the meter.
+    const rounds = Math.max(1, Math.round(opts.rounds ?? 1));
+    const rebuild = Math.max(0, Math.round(opts.rebuild ?? 0));
+    const idleMs = Math.max(0, Math.round(opts.idleMs ?? 0));
 
     const bump = (into: Record<string, ModelTotals>) => {
       const prev = into[modelId] ?? emptyTotals();
-      into[modelId] = { ...addUsage(prev, usage), turns: prev.turns + 1, ms: prev.ms + ms };
+      into[modelId] = {
+        ...addUsage(prev, usage),
+        turns: prev.turns + 1,
+        ms: prev.ms + ms,
+        rounds: prev.rounds + rounds,
+        rebuild: prev.rebuild + rebuild,
+        idleMs: prev.idleMs + idleMs,
+        keepAlives: prev.keepAlives,
+      };
     };
     bump(this.sessionTotals);
     bump(this.data.models);
@@ -406,6 +531,52 @@ export class CostLedger {
     if (this.data.since === "") this.data.since = this.data.last;
 
     if (this.filePath === "") return;
+    await this.persist();
+  }
+
+  /**
+   * Fold in one cache-refresh probe (see ModelProvider.refreshCache).
+   *
+   * Separate from `record` because a probe is spend without being a turn. Its
+   * tokens belong in every dollar figure the report prints — it is billed like
+   * anything else — but counting it as a turn would understate cost-per-turn and
+   * dilute the rounds average, which are the two numbers the keep-alive is meant
+   * to be judged by. So: usage yes, turn no, and its own counter so the trade can
+   * actually be audited.
+   */
+  async recordKeepAlive(
+    modelId: string,
+    usage: TokenUsage,
+    opts: { ms?: number; now?: Date } = {},
+  ): Promise<void> {
+    if (isEmptyUsage(usage)) return;
+    const now = opts.now ?? new Date();
+    const ms = Math.max(0, Math.round(opts.ms ?? 0));
+
+    const bump = (into: Record<string, ModelTotals>) => {
+      const prev = into[modelId] ?? emptyTotals();
+      into[modelId] = {
+        ...addUsage(prev, usage),
+        turns: prev.turns,
+        ms: prev.ms + ms,
+        rounds: prev.rounds,
+        rebuild: prev.rebuild,
+        idleMs: prev.idleMs,
+        keepAlives: prev.keepAlives + 1,
+      };
+    };
+    bump(this.sessionTotals);
+    bump(this.data.models);
+    const key = localDay(now);
+    bump((this.data.days[key] ??= {}));
+    trimDays(this.data.days);
+
+    this.data.last = now.toISOString();
+    if (this.filePath === "") return;
+    await this.persist();
+  }
+
+  private async persist(): Promise<void> {
     const snapshot = JSON.stringify(this.data, null, 2) + "\n";
     await serializeWrite(async () => {
       await fsp.mkdir(path.dirname(this.filePath), { recursive: true });
@@ -460,6 +631,14 @@ interface Summary {
   tokens: TokenUsage;
   /** Models with tokens but no rate on file — their spend is NOT in `cost`. */
   unpriced: string[];
+  rounds: number;
+  rebuild: number;
+  idleMs: number;
+  keepAlives: number;
+  /** What the `rebuild` tokens cost, priced at each model's own write rate.
+   *  Computed here rather than in the renderer because only this loop knows
+   *  which model each bucket belongs to. */
+  rebuildCost: number;
 }
 
 function summarize(
@@ -474,15 +653,27 @@ function summarize(
     ms: 0,
     tokens: emptyUsage(),
     unpriced: [],
+    rounds: 0,
+    rebuild: 0,
+    idleMs: 0,
+    keepAlives: 0,
+    rebuildCost: 0,
   };
   for (const [modelId, t] of Object.entries(totals)) {
     s.output += t.output;
     s.turns += t.turns;
     s.ms += t.ms;
+    s.rounds += t.rounds;
+    s.rebuild += t.rebuild;
+    s.idleMs += t.idleMs;
+    s.keepAlives += t.keepAlives;
     s.tokens = addUsage(s.tokens, t);
     const r = ratesFor(modelId, today);
-    if (r) s.cost += costOf(t, r, cacheTtl);
-    else if (t.output > 0) s.unpriced.push(modelId);
+    if (r) {
+      s.cost += costOf(t, r, cacheTtl);
+      const write = cacheTtl === "1h" ? r.cacheWrite1h : r.cacheWrite5m;
+      s.rebuildCost += (t.rebuild * write) / 1_000_000;
+    } else if (t.output > 0) s.unpriced.push(modelId);
   }
   return s;
 }
@@ -611,6 +802,54 @@ export function formatCostReport(opts: {
     ),
   );
 
+  // --- the cache line ---
+  //
+  // The three numbers that explain the prompt side, and the only place the app
+  // says anything about its own efficiency. Suppressed entirely on a ledger
+  // written before these counters existed (rounds == 0 with turns > 0), because
+  // a zero there means "never measured", not "one round per turn".
+  //
+  // `rebuild` is the actionable one. It is cache-write tokens billed on the
+  // OPENING round of a turn, i.e. what it cost to rediscover a prefix that had
+  // already been written and then lapsed. Reading that prefix instead would have
+  // cost a twentieth as much (0.1x read against a 2x write), so a large share
+  // here is the cheapest money in the whole program to stop spending.
+  if (allTime.rounds > 0) {
+    const perTurn = (n: number, t: number) => (t > 0 ? n / t : 0);
+    const rebuildShare = allTime.cost > 0 ? (allTime.rebuildCost / allTime.cost) * 100 : 0;
+    out.push(
+      c.dim(
+        `  rounds     ${perTurn(allTime.rounds, allTime.turns).toFixed(1)} per turn · ` +
+          `${fmtTokens(Math.round(perTurn(allTime.tokens.cacheRead, allTime.rounds)))} read per round`,
+      ),
+    );
+    out.push(
+      c.dim(
+        `  rebuilds   ${fmtTokens(Math.round(perTurn(allTime.rebuild, allTime.turns)))} tok per turn · ` +
+          `${fmtUsd(allTime.rebuildCost)} (${rebuildShare.toFixed(0)}% of spend) re-writing a lapsed cache`,
+      ),
+    );
+    if (allTime.idleMs > 0) {
+      out.push(
+        c.dim(
+          `  idle gap   ${fmtDuration(perTurn(allTime.idleMs, allTime.turns))} average between turns` +
+            ` (cache ttl ${cacheTtl})`,
+        ),
+      );
+    }
+    // Only once the keep-alive has actually run. Shown beside the rebuild line
+    // on purpose: those two numbers ARE the trade, and the probes are only worth
+    // sending while they cost less than the rebuilds they prevent.
+    if (allTime.keepAlives > 0) {
+      out.push(
+        c.dim(
+          `  keep-alive ${fmtTokens(allTime.keepAlives)} probe(s) to hold the cache open` +
+            ` (not counted as turns)`,
+        ),
+      );
+    }
+  }
+
   const r = ratesFor(modelId, today);
   const write = r ? (cacheTtl === "1h" ? r.cacheWrite1h : r.cacheWrite5m) : 0;
   const rate = (n: number) => `$${n.toFixed(2)}`;
@@ -623,6 +862,20 @@ export function formatCostReport(opts: {
         : `  ${modelId} — no bedrock rate on file; tokens are counted, cost is not`,
     ),
   );
+  // Named only when it applies, and priced in dollars rather than left as a
+  // percentage, because "10% of everything" is easy to nod at and $8 is not.
+  // The same model is one environment variable away; what the prefix actually
+  // buys is US-and-Canada data residency, so this is a choice to make knowingly
+  // rather than one to have inherited.
+  if (r && isGeoScoped(modelId)) {
+    const global = allTime.cost / GEO_PREMIUM;
+    out.push(
+      c.dim(
+        `  geo premium +10% for US/Canada residency · ${fmtUsd(allTime.cost - global)} of the` +
+          ` above · global.${normalizeModelId(modelId)} is the same model without it`,
+      ),
+    );
+  }
   out.push(
     c.dim(
       allTime.turns > 0
@@ -659,7 +912,7 @@ function mergeDays(entries: FleetEntry[]): Record<string, DayTotals> {
       const bucket = (merged[day] ??= {});
       for (const [id, t] of Object.entries(byModel)) {
         const prev = bucket[id] ?? emptyTotals();
-        bucket[id] = { ...addUsage(prev, t), turns: prev.turns + t.turns, ms: prev.ms + t.ms };
+        bucket[id] = addTotals(prev, t);
       }
     }
   }
@@ -672,7 +925,7 @@ function mergeModels(entries: FleetEntry[]): Record<string, ModelTotals> {
   for (const { ledger } of entries) {
     for (const [id, t] of Object.entries(ledger.lifetime().models)) {
       const prev = merged[id] ?? emptyTotals();
-      merged[id] = { ...addUsage(prev, t), turns: prev.turns + t.turns, ms: prev.ms + t.ms };
+      merged[id] = addTotals(prev, t);
     }
   }
   return merged;
@@ -797,6 +1050,21 @@ export function formatFleetReport(opts: {
               `${fmtTokens(t.output)} out` +
               (r.confirmed ? "" : "  [rate derived, not published by AWS]")
           : `  ${modelId} — no bedrock rate on file; ${fmtTokens(t.output)} out, cost not counted`,
+      ),
+    );
+  }
+  // The fleet view is what `co cost` prints, so the premium belongs here too —
+  // this is the total the captain actually looks at. Reported once per priced
+  // geo-scoped model rather than as a fleet-wide line, since instances can be
+  // pointed at different endpoints.
+  for (const [modelId, t] of Object.entries(allModels)) {
+    const r = ratesFor(modelId, today);
+    if (!r || !isGeoScoped(modelId)) continue;
+    const spent = costOf(t, r, cacheTtl);
+    out.push(
+      c.dim(
+        `  geo premium +10% for US/Canada residency · ${fmtUsd(spent - spent / GEO_PREMIUM)}` +
+          ` of the above · global.${normalizeModelId(modelId)} is the same model without it`,
       ),
     );
   }
