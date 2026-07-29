@@ -1437,21 +1437,20 @@ test("the feature_enqueue TOOL declares the message and threads it to the pull r
     const call = (input: Record<string, unknown>) =>
       execute({ type: "tool_use", id: `t${++n}`, name: "feature_enqueue", input });
 
-    // A body before the template has been read is refused, and nothing changes.
-    // The PR body is the permanent record of a feature and co writes it without
-    // ever seeing the diff, so improvising its shape is the failure that would
-    // never announce itself.
+    // A body written without the template is refused — and the refusal HANDS THE
+    // TEMPLATE OVER rather than pointing at a tool the co might not call. The PR
+    // body is the permanent record of a feature and co writes it without ever
+    // seeing the diff, so improvising its shape is the failure that would never
+    // announce itself. There must be no path to writing one uninformed.
     const ungated = await call({ name: "tooled", prBody: "written from memory" });
     assert.ok(ungated.is_error);
-    assert.match(String(ungated.content), /read_protocol/);
+    assert.match(String(ungated.content), /## Other Notes/, "the template itself comes back");
+    assert.match(String(ungated.content), /Nothing has been staged/);
+    assert.match(String(ungated.content), /Do not simply resend what you had/);
     assert.ok(!(await FeatureStore.load(fx.paths)).prMessage("tooled"), "nothing was stored");
 
-    await execute({
-      type: "tool_use",
-      id: "p1",
-      name: "read_protocol",
-      input: { section: "pr-message" },
-    });
+    // The body is now in the conversation, so the retry proceeds. One refusal per
+    // session, never a loop.
 
     const res = await call({
       name: "tooled",

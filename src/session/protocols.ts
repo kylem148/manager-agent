@@ -23,9 +23,13 @@
  *    round is the correct outcome.
  *  - The co has to KNOW to read it. A section moved out with no trigger left
  *    behind does not degrade loudly; it degrades by the co composing a PR body
- *    from memory and nobody noticing for a week. So every section keeps an
- *    imperative one-line trigger in the prompt (see protocolIndex), and the
- *    highest-stakes one is additionally gated in the tool that needs it.
+ *    from memory and nobody noticing for a week. Every section keeps an
+ *    imperative trigger in the prompt (see protocolIndex), but a trigger is a
+ *    hope. Where acting uninformed produces something durable — an order that
+ *    runs, a PR body that merges — the tool REFUSES and hands the section over
+ *    in the refusal (see requireProtocol in tools.ts). There is then no path to
+ *    acting without the contract in context, and the trigger's remaining job is
+ *    to save the co writing the thing twice.
  */
 
 export const PROTOCOL_SECTIONS = ["orders", "features", "lanes", "pr-message"] as const;

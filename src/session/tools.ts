@@ -363,7 +363,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
   tools.push({
     name: "read_protocol",
     description:
-      "Read one section of the protocol reference. These sections are NOT in your system prompt — they are exact procedures with real failure modes, and they are kept out of every turn's context because most sessions never need them. Call this BEFORE you act, not after: `orders` before writing ANY order for the crew, `features` for creating/landing/enqueueing/abandoning a feature or dispatching into one, `lanes` before dispatching into a worktree that already holds a live crew agent, `pr-message` before you compose the prTitle/prBody for feature_enqueue. Reading a section costs a moment; guessing at one costs the captain a broken landing or a pull request written to the wrong shape. feature_enqueue will refuse a prBody until you have read `pr-message` this session.",
+      "Read one section of the protocol reference. These sections are NOT in your system prompt — they are exact procedures with real failure modes, and they are kept out of every turn's context because most sessions never need them. Call this BEFORE you act, not after: `orders` before writing ANY order for the crew, `features` for creating/landing/enqueueing/abandoning a feature or dispatching into one, `lanes` before dispatching into a worktree that already holds a live crew agent, `pr-message` before you compose the prTitle/prBody for feature_enqueue. Reading a section costs a moment; guessing at one costs the captain a broken landing or a pull request written to the wrong shape. `dispatch_order` and `feature_enqueue` will REFUSE a call made without the relevant section and hand you the whole thing in the error, so you can never act on a guess — but that costs you writing the order or the body twice. Read first and it costs you nothing.",
     input_schema: {
       type: "object",
       properties: {
@@ -625,6 +625,42 @@ export interface ExecutorContext {
 
 const FEATURE_UNAVAILABLE =
   "Feature tools are not available: this instance is not linked to a repo. Run `co link` first.";
+
+/**
+ * Gate a tool on a protocol section, and SUPPLY the section rather than merely
+ * demand it.
+ *
+ * The obvious gate — "call read_protocol first, then try again" — leaves the co
+ * one forgotten tool call away from improvising, and improvising is the failure
+ * that does not announce itself: an order that restates the repo, a PR body in
+ * the wrong shape. Both read plausibly, both ship, and nobody notices for weeks.
+ *
+ * So the refusal carries the protocol with it. There is no path to acting
+ * without the contract in context, because the only way to be refused is to be
+ * handed it. `read_protocol` still earns its place on the good path: reading
+ * BEFORE writing a long order avoids generating that order twice.
+ *
+ * Marking the section read here is correct rather than a shortcut — the body is
+ * in this tool result, so it is in the conversation exactly as if the tool had
+ * fetched it. Without that, the retry would be refused for the same reason
+ * forever.
+ */
+function requireProtocol(
+  effects: ToolSideEffects,
+  section: ProtocolSection,
+  id: string,
+  lead: string,
+): ToolResult | null {
+  if (effects.protocolsRead.has(section)) return null;
+  effects.protocolsRead.add(section);
+  return err(
+    id,
+    `${lead}\n\nNothing has been staged and nothing has changed. The contract` +
+      ` follows in full — read it, then send this call again with the content` +
+      ` rewritten to it. Do not simply resend what you had.\n\n` +
+      protocolBody(section),
+  );
+}
 
 function ok(id: string, obj: unknown): ToolResult {
   return {
@@ -911,6 +947,17 @@ export function makeExecutor(ctx: ExecutorContext) {
               "Dispatch is not available: this instance is not linked to a repo. Run `co link` first, or write the order as plain text for the captain to copy.",
             );
           }
+          // Before arming, so a refused call leaves nothing staged and the co
+          // cannot report a dispatch that did not happen. The refusal hands the
+          // checklist over rather than pointing at a tool it might not call —
+          // see requireProtocol.
+          const gate = requireProtocol(
+            effects,
+            "orders",
+            id,
+            "This order was written without the orders protocol in front of you.",
+          );
+          if (gate) return gate;
           const feature =
             input.feature === undefined
               ? undefined
@@ -966,19 +1013,17 @@ export function makeExecutor(ctx: ExecutorContext) {
           // left the system prompt, so the co can no longer see it by default —
           // and a body composed from memory instead of the template is exactly
           // the failure that degrades silently: it reads plausibly, it merges,
-          // and nobody notices the shape is wrong for weeks. An inline trigger
-          // is a hope; refusing here is enforcement. Cheap to satisfy: one tool
-          // call, once per session.
-          if (
-            prBody !== undefined &&
-            !effects.protocolsRead.has("pr-message")
-          ) {
-            return err(
+          // and nobody notices the shape is wrong for weeks. The refusal carries
+          // the template with it (see requireProtocol), so the co cannot end up
+          // writing one without the contract in front of it.
+          if (prBody !== undefined) {
+            const gate = requireProtocol(
+              effects,
+              "pr-message",
               id,
-              'call read_protocol with section "pr-message" first, then re-send this' +
-                " enqueue with the body written to that template. The feature is not" +
-                " enqueued and nothing has changed.",
+              "This pull request body was written without the template in front of you.",
             );
+            if (gate) return gate;
           }
           const res = await ctx.features.enqueue(name, {
             ...(prTitle === undefined ? {} : { prTitle }),
