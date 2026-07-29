@@ -200,6 +200,26 @@ export interface ModelConfig {
    * does not document as having full feature parity — see model.ts.
    */
   debugTiming: boolean;
+  /**
+   * Cache keep-alive: how long an idle prompt waits before touching the cached
+   * prefix to restart its TTL, in milliseconds. 0 disables it.
+   *
+   * Default is 45 minutes, chosen against the 1-hour TTL in model.ts with a
+   * generous margin — a probe that lands after the entry has already lapsed pays
+   * the rebuild it existed to prevent, so being early is free and being late is
+   * the whole cost. If CACHE_TTL ever drops back to the 5-minute default this
+   * has to come down with it (roughly 4 minutes), which is why they are worth
+   * keeping in view of each other.
+   */
+  cacheKeepAliveMs: number;
+  /**
+   * How many probes in a row, with no real turn between them, before the
+   * keep-alive gives up. Bounds the cost of a terminal left open overnight.
+   * Three probes at the default interval covers a bit over two hours of thinking
+   * time, which is longer than any real pause and short enough that an abandoned
+   * session stops billing.
+   */
+  cacheKeepAliveMax: number;
 }
 
 export type SearchProviderName = "auto" | "exa" | "brave" | "tavily" | "searxng" | "none";
@@ -277,6 +297,13 @@ export function loadConfig(): Config {
       thinking,
       effort,
       debugTiming: (env("CO_DEBUG_TIMING") ?? "").toLowerCase() === "true",
+      // parseIntOr rejects 0 as "not a positive int" and falls back, so the
+      // off switch is its own env var rather than CO_CACHE_KEEPALIVE_MS=0.
+      cacheKeepAliveMs:
+        (env("CO_CACHE_KEEPALIVE") ?? "").toLowerCase() === "off"
+          ? 0
+          : parseIntOr("CO_CACHE_KEEPALIVE_MS", 45 * 60 * 1000),
+      cacheKeepAliveMax: parseIntOr("CO_CACHE_KEEPALIVE_MAX", 3),
     },
     research: {
       searchProvider,

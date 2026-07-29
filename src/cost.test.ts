@@ -261,6 +261,7 @@ test("garbage fields in the meter file coerce to zero rather than NaN", async ()
       rounds: 0,
       rebuild: 0,
       idleMs: 0,
+      keepAlives: 0,
     });
   } finally {
     await cleanup();
@@ -714,4 +715,65 @@ test("the fleet roll-up sums the new counters instead of dropping them", async (
   );
   assert.match(text, /total/);
   assert.equal(a.lifetime().models.m!.rounds + b.lifetime().models.m!.rounds, 8);
+});
+
+test("a keep-alive probe is metered as spend but not as a turn", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("m", usage({ cacheRead: 50_000, output: 900 }), { rounds: 3 });
+  await ledger.recordKeepAlive("m", usage({ cacheRead: 24_000, output: 64 }), { ms: 800 });
+
+  const t = ledger.lifetime().models.m!;
+  // The tokens are real money and must land in every dollar figure.
+  assert.equal(t.cacheRead, 74_000);
+  assert.equal(t.output, 964);
+  assert.equal(t.ms, 800);
+  // But it answered nothing, so it is not a turn and it did not add a round.
+  assert.equal(t.turns, 1);
+  assert.equal(t.rounds, 3);
+  assert.equal(t.keepAlives, 1);
+});
+
+test("a probe that billed nothing is not recorded at all", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.recordKeepAlive("m", emptyUsage());
+  assert.deepEqual(ledger.lifetime().models, {});
+});
+
+test("probes land in the day bucket and survive a restart", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const first = await CostLedger.load(paths);
+    await first.record("m", usage({ output: 1 }), { rounds: 1, now: at("2026-07-27") });
+    await first.recordKeepAlive("m", usage({ cacheRead: 1_000 }), { now: at("2026-07-27") });
+    assert.equal(first.day("2026-07-27").m!.keepAlives, 1);
+
+    const second = await CostLedger.load(paths);
+    assert.equal(second.lifetime().models.m!.keepAlives, 1);
+    assert.equal(second.lifetime().models.m!.turns, 1, "the probe still is not a turn");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the report names the keep-alive beside the rebuilds it is meant to prevent", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("us.anthropic.claude-opus-5", usage({ cacheRead: 50_000, output: 900 }), {
+    rounds: 3,
+    rebuild: 0,
+    idleMs: 60_000,
+    now: at("2026-07-27"),
+  });
+  await ledger.recordKeepAlive("us.anthropic.claude-opus-5", usage({ cacheRead: 24_000 }), {
+    now: at("2026-07-27"),
+  });
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-5",
+      cacheTtl: "1h",
+      now: at("2026-07-27"),
+    }),
+  );
+  assert.match(text, /keep-alive 1 probe\(s\) to hold the cache open/);
+  assert.match(text, /not counted as turns/);
 });

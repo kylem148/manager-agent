@@ -245,6 +245,15 @@ export interface ModelTotals extends TokenUsage {
    * the 5-minute or 1-hour entry is the right one to be paying for.
    */
   idleMs: number;
+  /**
+   * Cache-refresh probes sent (see ModelProvider.refreshCache). Counted apart
+   * from `turns` because a probe is not a turn: it answers nothing, and folding
+   * it in would quietly halve the per-turn averages while the captain's actual
+   * turns stayed the same. Its TOKENS are folded into the usage totals, though —
+   * it is real spend, and a keep-alive that cost more than the rebuilds it
+   * prevented has to be visible as such or there is no way to tell.
+   */
+  keepAlives: number;
 }
 
 /** A day's spend, still split per model so it can be priced correctly. */
@@ -274,7 +283,7 @@ export interface LedgerData {
 export const DAY_RETENTION = 400;
 
 function emptyTotals(): ModelTotals {
-  return { ...emptyUsage(), turns: 0, ms: 0, rounds: 0, rebuild: 0, idleMs: 0 };
+  return { ...emptyUsage(), turns: 0, ms: 0, rounds: 0, rebuild: 0, idleMs: 0, keepAlives: 0 };
 }
 
 /** Sum two buckets, tokens and counters alike. One place to change when a
@@ -288,6 +297,7 @@ function addTotals(a: ModelTotals, b: ModelTotals): ModelTotals {
     rounds: a.rounds + b.rounds,
     rebuild: a.rebuild + b.rebuild,
     idleMs: a.idleMs + b.idleMs,
+    keepAlives: a.keepAlives + b.keepAlives,
   };
 }
 
@@ -313,6 +323,7 @@ function coerceTotals(v: unknown): ModelTotals | null {
     rounds: num(t.rounds),
     rebuild: num(t.rebuild),
     idleMs: num(t.idleMs),
+    keepAlives: num(t.keepAlives),
   };
 }
 
@@ -459,6 +470,7 @@ export class CostLedger {
         rounds: prev.rounds + rounds,
         rebuild: prev.rebuild + rebuild,
         idleMs: prev.idleMs + idleMs,
+        keepAlives: prev.keepAlives,
       };
     };
     bump(this.sessionTotals);
@@ -473,6 +485,52 @@ export class CostLedger {
     if (this.data.since === "") this.data.since = this.data.last;
 
     if (this.filePath === "") return;
+    await this.persist();
+  }
+
+  /**
+   * Fold in one cache-refresh probe (see ModelProvider.refreshCache).
+   *
+   * Separate from `record` because a probe is spend without being a turn. Its
+   * tokens belong in every dollar figure the report prints — it is billed like
+   * anything else — but counting it as a turn would understate cost-per-turn and
+   * dilute the rounds average, which are the two numbers the keep-alive is meant
+   * to be judged by. So: usage yes, turn no, and its own counter so the trade can
+   * actually be audited.
+   */
+  async recordKeepAlive(
+    modelId: string,
+    usage: TokenUsage,
+    opts: { ms?: number; now?: Date } = {},
+  ): Promise<void> {
+    if (isEmptyUsage(usage)) return;
+    const now = opts.now ?? new Date();
+    const ms = Math.max(0, Math.round(opts.ms ?? 0));
+
+    const bump = (into: Record<string, ModelTotals>) => {
+      const prev = into[modelId] ?? emptyTotals();
+      into[modelId] = {
+        ...addUsage(prev, usage),
+        turns: prev.turns,
+        ms: prev.ms + ms,
+        rounds: prev.rounds,
+        rebuild: prev.rebuild,
+        idleMs: prev.idleMs,
+        keepAlives: prev.keepAlives + 1,
+      };
+    };
+    bump(this.sessionTotals);
+    bump(this.data.models);
+    const key = localDay(now);
+    bump((this.data.days[key] ??= {}));
+    trimDays(this.data.days);
+
+    this.data.last = now.toISOString();
+    if (this.filePath === "") return;
+    await this.persist();
+  }
+
+  private async persist(): Promise<void> {
     const snapshot = JSON.stringify(this.data, null, 2) + "\n";
     await serializeWrite(async () => {
       await fsp.mkdir(path.dirname(this.filePath), { recursive: true });
@@ -530,6 +588,7 @@ interface Summary {
   rounds: number;
   rebuild: number;
   idleMs: number;
+  keepAlives: number;
   /** What the `rebuild` tokens cost, priced at each model's own write rate.
    *  Computed here rather than in the renderer because only this loop knows
    *  which model each bucket belongs to. */
@@ -551,6 +610,7 @@ function summarize(
     rounds: 0,
     rebuild: 0,
     idleMs: 0,
+    keepAlives: 0,
     rebuildCost: 0,
   };
   for (const [modelId, t] of Object.entries(totals)) {
@@ -560,6 +620,7 @@ function summarize(
     s.rounds += t.rounds;
     s.rebuild += t.rebuild;
     s.idleMs += t.idleMs;
+    s.keepAlives += t.keepAlives;
     s.tokens = addUsage(s.tokens, t);
     const r = ratesFor(modelId, today);
     if (r) {
@@ -727,6 +788,17 @@ export function formatCostReport(opts: {
         c.dim(
           `  idle gap   ${fmtDuration(perTurn(allTime.idleMs, allTime.turns))} average between turns` +
             ` (cache ttl ${cacheTtl})`,
+        ),
+      );
+    }
+    // Only once the keep-alive has actually run. Shown beside the rebuild line
+    // on purpose: those two numbers ARE the trade, and the probes are only worth
+    // sending while they cost less than the rebuilds they prevent.
+    if (allTime.keepAlives > 0) {
+      out.push(
+        c.dim(
+          `  keep-alive ${fmtTokens(allTime.keepAlives)} probe(s) to hold the cache open` +
+            ` (not counted as turns)`,
         ),
       );
     }

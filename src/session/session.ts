@@ -67,6 +67,7 @@ import { readOnlyEnforcement, type ActiveAgent, type DispatchLane } from "./lane
 import { FeatureManager } from "./features.js";
 import { FeatureStore } from "./featurestore.js";
 import { TaskError, TaskStore } from "./taskstore.js";
+import { startCacheKeepAlive, type KeepAlive } from "./keepalive.js";
 import type { MergeHeadResult } from "./mergequeue.js";
 import {
   DEFAULT_FEATURE_BRANCH_TYPE,
@@ -148,6 +149,12 @@ interface SessionState {
    * ever sees the intervals it was awake for.
    */
   lastTurnEndedAt: number | null;
+  /** True while a model turn is in flight, so the cache keep-alive stands down
+   *  rather than racing a real request for the same cache entry. */
+  inTurn: boolean;
+  /** The cache keep-alive, or null when disabled. Owned here so every turn can
+   *  reset its clock and the exit path can stop it. */
+  keepAlive: KeepAlive | null;
   /** The rolling record of filed crew reviews (the Ctrl-O Inbox tab). Loaded at
    *  session start, so it carries the previous sessions' reviews. */
   inbox: ReviewInbox;
@@ -442,6 +449,8 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     transcript,
     userTurns: 0,
     lastTurnEndedAt: null,
+    inTurn: false,
+    keepAlive: null,
     dispatch,
     registry: null,
     features: null,
@@ -555,6 +564,33 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     await runOpeningGreeting(state);
   }
 
+  // Started after the greeting, so the first thing it can ever refresh is a
+  // prefix a real turn has already written. Interactive sessions only: a piped
+  // or scripted run has no thinking pauses to protect and must stay
+  // deterministic.
+  if (tui && cfg.model.cacheKeepAliveMs > 0) {
+    state.keepAlive = startCacheKeepAlive({
+      intervalMs: cfg.model.cacheKeepAliveMs,
+      maxConsecutive: cfg.model.cacheKeepAliveMax,
+      isBusy: () => state.inTurn,
+      // Read fresh on every probe rather than captured once: the history grows
+      // all session, and a stale snapshot would refresh a prefix that no longer
+      // matches what the next turn will send.
+      snapshot: () =>
+        state.messages.length === 0
+          ? null
+          : {
+              system: state.system,
+              messages: state.messages,
+              tools: toolDefinitions({ dispatch: Boolean(state.dispatch) }),
+            },
+      refresh: (s) => state.model.refreshCache(s),
+      // Metered apart from turns: real spend, but not a turn (see cost.ts).
+      record: (usage, ms) => state.costs.recordKeepAlive(state.model.modelId, usage, { ms }),
+      ...(cfg.model.debugTiming ? { onNote: (l) => io.appendBlock(c.dim(`  ⏱ ${l}`)) } : {}),
+    });
+  }
+
   try {
     while (true) {
       // Deliver any completed crew reviews BEFORE idling on input. This is the
@@ -652,6 +688,11 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     }
   } finally {
     state.registry?.stop();
+    // Stopped BEFORE the exit guard, which runs a real model turn of its own: a
+    // probe firing alongside the distill would race it for the same entry, and
+    // there is nothing left to keep warm afterwards either way.
+    state.keepAlive?.stop();
+    state.keepAlive = null;
     // The end-of-session guard runs inside the live UI so its prompts render
     // in-session; then we tear the UI down and leave a short, persistent
     // footprint on the user's primary screen.
@@ -740,6 +781,7 @@ async function drive(
   // pause, not the pause plus this turn's latency.
   const turnStartedAt = Date.now();
   const idleMs = state.lastTurnEndedAt === null ? 0 : turnStartedAt - state.lastTurnEndedAt;
+  state.inTurn = true;
   const executor = makeExecutor({
     paths: state.paths,
     research: state.cfg.research,
@@ -845,6 +887,10 @@ async function drive(
     // last request the model actually served, not from the last one that
     // succeeded, so a failed turn still resets the gap.
     state.lastTurnEndedAt = Date.now();
+    state.inTurn = false;
+    // The turn just touched every cache entry a probe would have, so the
+    // keep-alive's clock restarts from here rather than from the last probe.
+    state.keepAlive?.noteTurn();
   }
 
   // If the model produced no streamed text but a final string exists, show it
