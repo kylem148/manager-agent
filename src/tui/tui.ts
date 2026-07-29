@@ -258,6 +258,15 @@ export function fieldWindow(
 const TASK_STATUS_W = "building".length;
 const TASK_STATUS_GAP = "   ";
 
+/** The rows the task block opens with — a blank, the heading, a blank — and the
+ *  heading itself. Counted rather than written twice because the block's own row
+ *  offsets are recorded against the whole Home body, and because whether the
+ *  block fits the viewport is a question about these rows too. */
+const TASK_HEAD_ROWS = 3;
+function taskHead(heading: string): string[] {
+  return ["", "  " + c.dim(heading), ""];
+}
+
 /** Where a worktree's description hangs when it will not fit beside the columns:
  *  in past the row's own two-space indent and its marker, so it reads as part of
  *  the row above rather than as a row of its own. */
@@ -5921,16 +5930,47 @@ export class Tui implements SessionIO {
    * alternative — an index quietly sliding onto a neighbour — is the failure
    * this whole two-writer design exists to avoid, and `x` is the key it would
    * hand the wrong row to.
+   *
+   * THE TABLE IS UNBOUNDED, and the block paints every row of it. Home is one
+   * scrolling body — the panel clamps its viewport to the row count, pages it
+   * with space/b/d/u/g/G and the wheel, and the footer already counts what is
+   * below — so a table taller than the pane is the case that machinery exists
+   * for, not a new one. A display ceiling was the alternative and is worse here:
+   * the rows past it would still be selectable (the cursor walks the store, not
+   * the paint), so `x` would retire a row the captain could not see, and no
+   * amount of paging would bring it into view. What the ceiling WOULD have given
+   * is the honest bit, so the heading takes it instead: once the block outgrows
+   * the viewport it says how many rows there are, which is the question you only
+   * ask when you can no longer count them.
    */
   private taskTableRows(): string[] {
     const panel = this.panel;
-    const rows: string[] = ["", "  " + c.dim("Tasks"), ""];
     this.homeTaskStarts.clear();
-    if (!this.tasks) return [...rows, ...this.homeNote("The task table isn't available in this session.")];
+    if (!this.tasks) {
+      return [...taskHead("Tasks"), ...this.homeNote("The task table isn't available in this session.")];
+    }
     const table = taskDisplayOrder(this.tasks.list());
     if (panel && panel.taskSel !== null && !table.some((t) => t.task === panel.taskSel)) {
       panel.taskSel = null;
     }
+    const body = this.taskRowsOf(table);
+    // The count is the overflow indicator, and it appears on exactly the
+    // condition that makes it worth printing: the block, heading rows included,
+    // no longer fits the viewport, so "is that all of them?" has become a real
+    // question. Below that it would be furniture on a table you can see.
+    const heading = TASK_HEAD_ROWS + body.length > this.overlayViewport()
+      ? `Tasks (${table.length})`
+      : "Tasks";
+    return [...taskHead(heading), ...body];
+  }
+
+  /** The task rows themselves, without the heading. Every row start recorded
+   *  here is a row that really is painted, which is what `ensureTaskVisible`
+   *  scrolls to — and it is recorded against the whole Home body, so the
+   *  heading's own rows are counted back in. */
+  private taskRowsOf(table: TaskPanelRow[]): string[] {
+    const panel = this.panel;
+    const rows: string[] = [];
     if (table.length === 0) {
       rows.push(
         ...this.homeNote("Nothing on the table."),
@@ -5942,12 +5982,12 @@ export class Tui implements SessionIO {
       // The row being rewritten hands its line to the field, keeping its own
       // status word: the field IS that row for as long as it is open.
       if (field && field.renaming === t.task) {
-        this.homeTaskStarts.set(t.task, rows.length);
+        this.homeTaskStarts.set(t.task, TASK_HEAD_ROWS + rows.length);
         rows.push(...this.taskFieldRows(field, this.taskStatusLabel(t.status)));
         continue;
       }
       const selected = t.task === panel?.taskSel;
-      this.homeTaskStarts.set(t.task, rows.length);
+      this.homeTaskStarts.set(t.task, TASK_HEAD_ROWS + rows.length);
       // Padded by VISIBLE width, never by String.padEnd: the status carries
       // colour, and padding the raw string would count the escape bytes as
       // characters and collapse the column. The marker replaces the indent

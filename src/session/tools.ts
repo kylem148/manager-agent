@@ -29,7 +29,7 @@ import {
   type FileReviewInput,
   type FileReviewResult,
 } from "./reviewinbox.js";
-import { TaskError, TASK_STATUSES, TASK_TABLE_CAP, type TaskStore } from "./taskstore.js";
+import { TaskError, TASK_STATUSES, type TaskStore } from "./taskstore.js";
 import { taskDisplayOrder } from "../taskorder.js";
 
 /**
@@ -297,7 +297,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
         "A row is addressed BY ITS EXACT TASK TEXT, never by position — the captain edits the same table between your turns, so a position you read last turn may be a different row now. Text matching no row, or more than one, is an ERROR rather than a guess; `list` first and copy the text.\n\n" +
         "The table comes back in the order it is DISPLAYED in — every `building` row first, then every `queued` one, each keeping the order it was stored in. That is what the captain's panel paints, so you and he are reading the same table. It is a display order only: it never says which row was added first, and nothing you can call reorders the stored table.\n\n" +
         "You cannot replace, clear or reorder the table, and no call can touch a row it did not name. That is deliberate: a whole-table write would silently delete rows the captain had just typed.\n\n" +
-        `The DEFAULT IS NOT TO ADD A ROW. A row belongs here only when the captain asks for one, or when the item is plainly a major future workstream. Intermediate and mechanical steps never belong in the table, however real they are. ${TASK_TABLE_CAP} rows maximum (an add beyond that FAILS — nothing is evicted for you), and usually far fewer. Never assume a row you did not add is stale: if you did not put it there, the captain did.`,
+        "The DEFAULT IS NOT TO ADD A ROW. A row belongs here only when the captain asks for one, or when the item is plainly a major future workstream. Intermediate and mechanical steps never belong in the table, however real they are. There is no row limit and nothing will stop you, which is exactly why the restraint is YOURS to keep: the table is the captain's notepad and his rows are not your budget to spend. Never assume a row you did not add is stale: if you did not put it there, the captain did.",
       input_schema: {
         type: "object",
         properties: {

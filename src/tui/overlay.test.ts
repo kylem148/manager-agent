@@ -2380,7 +2380,8 @@ function fakeFeatures(
 /**
  * A task source with the captain's three writes wired, standing in for the real
  * store: one table, addressed by exact row text, refusing what the store refuses
- * (a full table, a row that isn't there) rather than throwing.
+ * (a duplicate row, a row that isn't there) rather than throwing. It refuses
+ * nothing on a row COUNT, because the store no longer does either.
  *
  * `writes` records what the panel actually asked for, which is the half a frame
  * assertion cannot see — a key that repaints a row it never persisted would look
@@ -2389,11 +2390,9 @@ function fakeFeatures(
 type FakeTasks = TaskPanelSource & {
   set(v: TaskPanelRow[]): void;
   writes: string[];
-  /** Set to refuse the next write with this message, as a full table would. */
+  /** Set to refuse the next write with this message, as a duplicate row would. */
   refuse: string | null;
 };
-
-const FAKE_TASK_CAP = 5;
 
 function fakeTasks(initial: TaskPanelRow[], opts: { readOnly?: boolean } = {}): FakeTasks {
   let cur = initial;
@@ -2414,8 +2413,8 @@ function fakeTasks(initial: TaskPanelRow[], opts: { readOnly?: boolean } = {}): 
   api.add = (task) => {
     const refused = guard(`add:${task}`);
     if (refused) return Promise.resolve(refused);
-    if (cur.length >= FAKE_TASK_CAP) {
-      return Promise.resolve({ ok: false, message: `The table already holds its maximum of ${FAKE_TASK_CAP} rows.` });
+    if (cur.some((r) => r.task === task)) {
+      return Promise.resolve({ ok: false, message: `The table already holds "${task}".` });
     }
     cur = [...cur, { task, status: "queued" }];
     return Promise.resolve({ ok: true });
@@ -2805,6 +2804,110 @@ test("Home pages a long list; nothing is silently clipped", async () => {
   h.stop();
 });
 
+// --- a table taller than the pane --------------------------------------------
+//
+// The row cap is gone from the store, so the table can now outgrow the panel.
+// Home was already ONE scrolling body — viewport clamped to the row count, paged
+// by space/b/d/u/g/G — and that is deliberately still the whole mechanism: a
+// display ceiling would leave rows selectable but unpaintable, and `x` would then
+// retire something the captain could not see. What the ceiling would have given
+// is the count, so the heading takes that job when the block stops fitting.
+//
+// A frame assertion cannot judge how this LOOKS on a real terminal. What it can
+// hold is that the panel paints exactly its viewport, that nothing is clipped or
+// lost, that every row is reachable, and that the far end is still editable.
+
+const MANY_TASKS: TaskPanelRow[] = Array.from({ length: 24 }, (_, n) => ({
+  task: `task number ${String(n + 1).padStart(2, "0")}`,
+  status: "queued" as const,
+}));
+
+test("a table taller than the pane paints its viewport and nothing else", async () => {
+  const h = harness(undefined, 80, 14, undefined, undefined, fakeFeatures(FEATURES), fakeTasks(MANY_TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+
+  // The panel is a fixed grid: one bar, a viewport, one footer. A body longer
+  // than the viewport must change none of that.
+  const rows = screenRows(h);
+  assert.equal(rows.length, 14, "the frame is still exactly the screen");
+  for (const r of rows) assert.ok(visibleWidth(r) <= 80, `row overflows the width: ${JSON.stringify(r)}`);
+
+  assert.match(h.lastFramePlain(), /task number 01/, "it opens at the top of the table");
+  assert.ok(!h.lastFramePlain().includes("task number 24"), "the tail is off screen, not dropped");
+  assert.match(screenRows(h).at(-1) ?? "", /more below/, "and the footer says there is more");
+
+  h.send("G");
+  await settle();
+  assert.match(h.lastFramePlain(), /task number 24/, "G reaches the last row");
+  assert.match(h.lastFramePlain(), /co\/feat-checkout/, "and the worktrees are still under it");
+  h.send("g");
+  await settle();
+  assert.match(h.lastFramePlain(), /task number 01/, "g returns to the top");
+  h.stop();
+});
+
+test("the heading counts the rows once the block outgrows the pane, and not before", async () => {
+  const short = harness(undefined, 80, 24, undefined, undefined, fakeFeatures([]), fakeTasks(TASKS));
+  short.tui.question();
+  short.send(CTRL_O);
+  await settle();
+  assert.match(short.lastFramePlain(), /\bTasks\b/, "a table you can see is just `Tasks`");
+  assert.ok(!/Tasks \(\d+\)/.test(short.lastFramePlain()), "no count on a table that fits");
+  short.stop();
+
+  const tall = harness(undefined, 80, 14, undefined, undefined, fakeFeatures([]), fakeTasks(MANY_TASKS));
+  tall.tui.question();
+  tall.send(CTRL_O);
+  await settle();
+  assert.match(tall.lastFramePlain(), /Tasks \(24\)/, "the count is the overflow indicator");
+  tall.stop();
+});
+
+test("every row of a long table is selectable, painted when selected, and editable", async () => {
+  const tasks = fakeTasks(MANY_TASKS);
+  const h = harness(undefined, 80, 14, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+
+  // Walk the cursor to the last row. The paint has to follow it: a selection on
+  // a row that is never painted is the failure a display ceiling would have
+  // introduced, and it is `x` that would act on it.
+  for (let n = 0; n < 24; n++) h.send("j");
+  await settle();
+  assert.match(selectedRow(h), /task number 24/, "the cursor is on the last row");
+  assert.match(h.lastFramePlain(), /task number 24/, "and that row is on screen");
+
+  h.send("x");
+  await settle();
+  assert.deepEqual(tasks.writes, ["retire:task number 24"], "the far end of the table is editable");
+  assert.equal(tasks.list().length, 23);
+  h.stop();
+});
+
+test("`a` puts a sixth row on a five-row table: the panel has no cap of its own", async () => {
+  const five: TaskPanelRow[] = Array.from({ length: 5 }, (_, n) => ({
+    task: `task ${n + 1}`,
+    status: "queued" as const,
+  }));
+  const tasks = fakeTasks(five);
+  const h = harness(undefined, 80, 24, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("a");
+  h.send("a sixth thing");
+  h.send("\r");
+  await settle();
+  assert.deepEqual(tasks.writes, ["add:a sixth thing"], "the write was asked for, not refused ahead of time");
+  assert.equal(tasks.list().length, 6, "and it landed");
+  assert.match(h.lastFramePlain(), /a sixth thing/, "painted as an ordinary row");
+  assert.ok(!h.lastFramePlain().includes("maximum"), "with nothing said about a limit");
+  h.stop();
+});
+
 test("Home reads its feature source fresh: a feature created while the panel is open shows up", async () => {
   const src = fakeFeatures([FEATURES[2]!]);
   const h = harness(undefined, 80, 20, undefined, undefined, src, fakeTasks([]));
@@ -2862,10 +2965,12 @@ test("Ctrl-O closes the panel from Home", async () => {
 const ARROW_UP = "\x1b[A";
 const ARROW_DOWN = "\x1b[B";
 
-/** The painted task rows, in order: the marked one carries the ▸. */
+/** The painted task rows, in order: the marked one carries the ▸. The heading
+ *  carries a row count when the block outgrows the pane, so it is matched by
+ *  prefix rather than by equality. */
 function taskRows(h: Harness): string[] {
   const rows = screenRows(h);
-  const head = rows.findIndex((r) => r.trim() === "Tasks");
+  const head = rows.findIndex((r) => /^Tasks( \(\d+\))?$/.test(r.trim()));
   const out: string[] = [];
   for (let i = head + 1; i < rows.length; i++) {
     if (rows[i]!.trim() === "Worktrees") break;
@@ -3031,13 +3136,13 @@ test("a refused add keeps the field open with the text, and says why", async () 
   h.tui.question();
   h.send(CTRL_O);
   await settle();
-  tasks.refuse = "The table already holds its maximum of 5 rows. Retire something first.";
+  tasks.refuse = 'The table already holds "one too many".';
   h.send("a");
   h.send("one too many");
   h.send("\r");
   await settle();
   const frame = h.lastFramePlain();
-  assert.match(frame, /maximum of 5 rows/, "the refusal is printed");
+  assert.match(frame, /The table already holds/, "the refusal is printed");
   assert.match(frame, /one too many/, "with the typed text still there to edit");
   assert.deepEqual(tasks.list(), [], "and nothing was stored");
   h.stop();

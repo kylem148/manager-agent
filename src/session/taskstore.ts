@@ -79,17 +79,28 @@ export interface RetiredTask {
 }
 
 /**
- * How many rows the table keeps. The table is an at-a-glance summary, not a
- * tracker — the prompt asks only for major items, and says the co's default is
- * not to add a row at all — so this is a backstop against a table nobody can
- * scan, not a budget to fill. An `add` over the cap FAILS and says so; it never
- * silently drops the row or evicts someone else's.
+ * THE TABLE HAS NO ROW LIMIT, and the reason it once did is worth keeping.
+ *
+ * The five-row cap was a discipline aimed at the CO: an at-a-glance board that
+ * grows a row per step is a tracker, and the co is the writer with the reflex to
+ * add one. But the cap lived in the store, and the store has two writers — so the
+ * one it actually stopped was the CAPTAIN, who uses the table as a notepad and
+ * whose sixth row is not a design failure. One shared number conflated a model's
+ * restraint with a person's notes, and the person paid for it: a refused add left
+ * him jamming two unrelated tasks onto one row.
+ *
+ * So the restraint stays where restraint belongs — the prompt and the tool
+ * description tell the co its default is not to add a row at all — and the store
+ * refuses nothing on count. A cap that fails a write is the wrong shape for
+ * guidance anyway: it cannot tell which writer it is talking to, and it turns a
+ * judgement call into an error the co has to route around mid-turn.
+ *
+ * Nothing here evicts, either, which was true before and stays true: rows leave
+ * the table when someone names one, never to make room.
  */
-export const TASK_TABLE_CAP = 5;
 
 export type TaskErrorCode =
   | "EMPTY_TASK"
-  | "TABLE_FULL"
   | "DUPLICATE_TASK"
   | "BAD_STATUS"
   | "NO_MATCH"
@@ -145,8 +156,12 @@ function coerceRow(raw: unknown): TaskRow | undefined {
   return { task, status: status(o.status) };
 }
 
-/** Drop anything that isn't a usable row, and cap the list. A hand-edited or
- *  half-written file can never poison the panel or the next write. */
+/** Drop anything that isn't a usable row. A hand-edited or half-written file can
+ *  never poison the panel or the next write.
+ *
+ *  Nothing is truncated on the way in. A read that dropped the tail would be the
+ *  worst version of a cap: the captain's row is written, persisted, and then
+ *  silently gone at the next restart, with nothing anywhere saying so. */
 export function coerceTasks(raw: unknown): TaskRow[] {
   if (!Array.isArray(raw)) return [];
   const out: TaskRow[] = [];
@@ -154,7 +169,7 @@ export function coerceTasks(raw: unknown): TaskRow[] {
     const row = coerceRow(item);
     if (row) out.push(row);
   }
-  return out.slice(0, TASK_TABLE_CAP);
+  return out;
 }
 
 /** Coerce the retired list. Uncapped: it is the only record that a row ever
@@ -242,11 +257,11 @@ export class TaskStore {
    * is the captain's own spec — so `add` takes no status and `status` is the
    * separate step that says work has begun.
    *
-   * Refuses rather than absorbs: no text, text already on the table (which would
-   * make BOTH rows unaddressable), or a full table. A full table is not silently
-   * truncated and nothing is evicted to make room — evicting would be this
-   * store deleting a row nobody named, which is the whole thing it exists to
-   * prevent.
+   * Refuses on two things and nothing else: no text, and text already on the
+   * table (which would make BOTH rows unaddressable). There is deliberately no
+   * count to exceed — see the note above the error codes — so the captain's
+   * sixth row lands like his first, and the co's restraint is guidance rather
+   * than a wall it hits mid-turn.
    */
   async add(task: unknown): Promise<TaskRow> {
     const text = cell(task);
@@ -257,12 +272,6 @@ export class TaskStore {
       throw new TaskError(
         "DUPLICATE_TASK",
         `The table already holds "${text}". Rows are addressed by their exact text, so it cannot hold two.`,
-      );
-    }
-    if (this.rows.length >= TASK_TABLE_CAP) {
-      throw new TaskError(
-        "TABLE_FULL",
-        `The table already holds its maximum of ${TASK_TABLE_CAP} rows. Retire something first: ${this.quoted()}.`,
       );
     }
     const row: TaskRow = { task: text, status: "queued" };
