@@ -545,8 +545,10 @@ it can only ever see what has already been committed.
 **On macOS with Ghostty**, a confirmed dispatch opens a visible split pane in your
 current tab and runs the agent there interactively, so you can watch it and answer
 its questions live. Placement follows a fixed scheme: designate the crew pane once
-with `co pane my-saas` — it gives you a few seconds to click the pane you want crew
-jobs to grow from, then records that terminal's stable id (Ghostty's API can't tag
+with `co pane my-saas` — it counts down 2 seconds while you click the pane you want
+crew jobs to grow from (set `CO_PANE_WAIT` in seconds if you want longer; nothing is
+being waited for, it is purely your window to reach the pane), then records that
+terminal's stable id (Ghostty's API can't tag
 a pane, so the id is the handle; a dispatch verifies it still exists and asks you
 to re-run `co pane` if you've since closed it). The first job takes over that
 anchor pane, and each later job splits the newest crew pane, alternating

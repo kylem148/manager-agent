@@ -1,6 +1,6 @@
 import path from "node:path";
 import * as readline from "node:readline";
-import type { Config } from "../config.js";
+import { paneWaitSec, type Config } from "../config.js";
 import { instancePaths, isValidInstanceName } from "../paths.js";
 import { instanceExists } from "../memory/memory.js";
 import {
@@ -157,17 +157,19 @@ export async function runLink(cfg: Config, name: string | undefined): Promise<nu
   return 0;
 }
 
-/** Seconds you get to switch to the crew pane after starting `co pane`. */
-const PANE_COUNTDOWN_SEC = 5;
-
 /**
  * `co pane <name>` — designate the crew anchor pane (one-time, macOS + Ghostty).
  *
- * Flow: run it, then within a few seconds click/focus the Ghostty pane you want
- * crew jobs to grow from. When the countdown ends it grabs whatever terminal is
- * focused and stores it as the anchor. A countdown (rather than "press Enter
+ * Flow: run it, then within a couple of seconds click/focus the Ghostty pane you
+ * want crew jobs to grow from. When the countdown ends it grabs whatever terminal
+ * is focused and stores it as the anchor. A countdown (rather than "press Enter
  * once focused") is required because focusing another pane steals your
  * keystrokes — you could never press Enter back here.
+ *
+ * The countdown is a plain human-reaction window, not a wait on Ghostty: nothing
+ * is being polled or probed, and the AppleScript read happens after it. So its
+ * length trades the captain's time against how far he has to reach — 2 seconds
+ * by default, retunable with CO_PANE_WAIT (see paneWaitSec).
  *
  * Ghostty's API can't tag a pane (a terminal's title is read-only), so we
  * persist the terminal's stable id; dispatch verifies it still exists and asks
@@ -193,13 +195,14 @@ export async function runPaneAnchor(cfg: Config, name: string | undefined): Prom
     return 1;
   }
 
+  const countdownSec = paneWaitSec();
   line();
   line(c.bold(`co pane ${name}`));
   line(c.dim(`  Click the Ghostty pane you want crew jobs to grow from now — you have`));
-  line(c.dim(`  ${PANE_COUNTDOWN_SEC} seconds. Whatever pane is focused when the countdown ends is tagged.`));
+  line(c.dim(`  ${countdownSec} seconds. Whatever pane is focused when the countdown ends is tagged.`));
   line(c.dim("  (Staying in this pane is fine too; it just designates this one.)"));
   line();
-  for (let s = PANE_COUNTDOWN_SEC; s > 0; s--) {
+  for (let s = countdownSec; s > 0; s--) {
     write(`\r  grabbing the focused pane in ${s}… `);
     await sleep(1000);
   }
