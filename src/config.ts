@@ -143,6 +143,28 @@ export function visualsLevel(): VisualsLevel {
   return parseVisualsLevel(process.env.CO_VISUALS) ?? "full";
 }
 
+/** Seconds `co pane` gives you to click the pane you want, when CO_PANE_WAIT is unset. */
+export const DEFAULT_PANE_WAIT_SEC = 2;
+
+/**
+ * How long `co pane` counts down before grabbing the focused pane (CO_PANE_WAIT,
+ * in seconds).
+ *
+ * This is a pure human-reaction window — nothing is being waited FOR, so the
+ * only cost of a short value is the captain not reaching the pane in time, never
+ * a failed designation. It was a hardcoded 5, which is a long time to sit and
+ * watch a countdown for a command run this often. Two is enough to click a pane
+ * that is already on screen; raise it if you're reaching for a different window.
+ *
+ * Read lazily at the point of use rather than plumbed through Config, the same
+ * way CO_VISUALS and the TUI toggles resolve, so it picks up
+ * `~/co-managers/.env`. Anything non-numeric or <= 0 falls back to the default:
+ * a fat-fingered value should not turn `co pane` into an instant grab or a hang.
+ */
+export function paneWaitSec(): number {
+  return parseIntOr("CO_PANE_WAIT", DEFAULT_PANE_WAIT_SEC);
+}
+
 /**
  * Model used when BEDROCK_MODEL_ID is unset.
  *
