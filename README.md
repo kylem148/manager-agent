@@ -790,6 +790,14 @@ never at risk — it is split off before the buffer is filled and spliced back o
 underneath, exactly once. If `gh` fails, the failure is printed in the popup with
 your text still in it, so an edit is never quietly lost.
 
+A save that lands closes the popup and confirms itself in one green line at the
+top of the queue tab, and the next key you press takes that line away — it is a
+receipt like the panel's copy one, and the tab underneath it is already showing
+the new message. A line that reports something *not* happening is not a receipt
+and does not go anywhere: an edit you discarded, or the reason `e` had nothing to
+open, stands until it is replaced. A failed save is neither, and stays in the
+popup over the text it could not write.
+
 `e` is only there when the head actually has a pull request (it says so when it
 doesn't), and it merges nothing: `[m]` remains a separate, deliberate keystroke
 and the head's checks, its state and the queue's order are untouched by an edit.

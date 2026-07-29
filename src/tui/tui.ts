@@ -1512,8 +1512,18 @@ export class Tui implements SessionIO {
   // What the PR message editor has to say on the queue tab after it closes: the
   // save that landed, or the reason `e` had nothing to open. It banners at the
   // top of the tab (like queueMergeError, and for the same reason: a flash on
-  // the separator is invisible while the panel owns the screen) and is replaced
-  // by the next thing worth saying rather than timing out.
+  // the separator is invisible while the panel owns the screen).
+  //
+  // `ok` is what it is worth, not just its colour, and it decides how long the
+  // line lives (see clearQueueEditReceipt). An ok line is a RECEIPT: the write
+  // already landed and the tab beneath it already shows the result, so it is
+  // worth exactly as long as the captain is still looking at the tab it landed
+  // on, and the next key retires it — the same life the panel's copy receipt
+  // has. A not-ok line is not a receipt: a refusal to open, or an edit
+  // discarded, is the only record of something that did NOT happen, so it
+  // stands until the next thing worth saying replaces it. A failed SAVE is
+  // neither — it never reaches this line at all, because the popup stays open
+  // over the captain's text and prints it there (see savePrMessage).
   private queueEditNotice: { text: string; ok: boolean } | null = null;
   // A merge review awaiting the captain's [m]/[r]/[d], tracked apart from the
   // panel's open/closed state: openLandingReview sets it and flashes a hint (it
@@ -3460,6 +3470,15 @@ export class Tui implements SessionIO {
     // It also means every view change clears the selection for free: they are
     // all key-driven, and a row index means something else on the next view.
     this.clearPanelSelection();
+    // A landed save's receipt on the queue tab goes the same way, in the same
+    // breath and for the same reason. Cleared BEFORE routing so `e` sets a fresh
+    // one on the way through, and so the key that dismisses it still does its own
+    // job — dismissing is a side effect of the next keystroke, never a key of its
+    // own. HERE and not in clearPanelSelection, whose other callers are a doc
+    // refresh, a docs-list load and a resize: retiring the receipt on one of
+    // those would make it vanish with no keystroke behind it, which is the timed
+    // flash this is deliberately not.
+    this.clearQueueEditReceipt();
     // Ctrl-O toggles the panel shut from any view — the same key that opened it.
     // It takes each view's OWN escape exit rather than a second, divergent close
     // path, so it inherits their rules (notably the review view's mid-merge
@@ -3798,6 +3817,16 @@ export class Tui implements SessionIO {
     panel.selection = null;
     panel.selecting = false;
     panel.copyNotice = null;
+    this.paint();
+  }
+
+  /** Retire the queue tab's save receipt, the way clearPanelSelection retires a
+   *  copy one: same rule, same moment, one line each. Only an `ok` line is a
+   *  receipt — a refusal or a discarded edit is a standing message and is left
+   *  exactly where it is (see queueEditNotice). */
+  private clearQueueEditReceipt(): void {
+    if (!this.queueEditNotice?.ok) return;
+    this.queueEditNotice = null;
     this.paint();
   }
 

@@ -873,6 +873,127 @@ test("a thrown save is caught the same way — the panel never wedges on it", as
   h.stop();
 });
 
+/**
+ * How long the queue tab's line lives, which is the whole of what separates a
+ * receipt from a message.
+ *
+ * A landed save's line is a RECEIPT: the write is already on GitHub and the tab
+ * beneath it already shows the result, so it confirms and then gets out of the
+ * way on the next key, the way the panel's copy receipt does. Anything that
+ * reports something NOT happening has to stand until it is replaced, and a
+ * failed save never reaches this line at all — it stays in the popup, over the
+ * text it failed to write.
+ */
+test("a landed save's receipt is retired by the very next key", async () => {
+  const q = editQueue();
+  const h = await openEditor(q);
+  h.send(CTRL_E);
+  h.send(" v2");
+  h.send(CTRL_S);
+  q.resolveEdit({ saved: true, summary: "PR #42 message updated: feat: stripe checkout v2" });
+  await settle();
+  assert.match(h.frame(), /PR #42 message updated/, "the save is confirmed on the way out");
+
+  h.send("j"); // any key at all: the receipt is a side effect of the next keystroke
+  assert.ok(
+    !h.frame().includes("PR #42 message updated"),
+    `the receipt is gone: ${JSON.stringify(h.frame().slice(0, 400))}`,
+  );
+  assert.match(h.frame(), /checkout\s+\[ready\]/, "and the queue tab is otherwise exactly where it was");
+
+  // Not merely repainted away: it is gone from the state, so it cannot come back
+  // on a later paint of the same tab.
+  h.send("2");
+  await settle();
+  assert.ok(!h.frame().includes("PR #42 message updated"), "still gone after leaving and re-entering the tab");
+  h.stop();
+});
+
+test("re-opening the editor after a landed save shows the saved text, clean", async () => {
+  const q = editQueue();
+  const h = await openEditor(q);
+  h.send(CTRL_E);
+  h.send(" v2");
+  h.send(CTRL_S);
+  // The real source re-reads the PR off GitHub and replaces the head's cached
+  // copy before it resolves (features.editHeadPrMessage), so the reopened editor
+  // is filled from what GitHub stored, not from what was typed.
+  const saved = `feat: stripe checkout v2\n\n${PROSE}\n\n${EVIDENCE}\n`;
+  q.setDetail(
+    readyDetail({
+      pr: {
+        number: 42,
+        url: "https://github.com/acme/repo/pull/42",
+        title: "feat: stripe checkout v2",
+        body: saved,
+        prose: splitEvidence(saved).prose,
+      },
+    } as Partial<QueueHeadDetail>),
+  );
+  q.resolveEdit({ saved: true, summary: "PR #42 message updated: feat: stripe checkout v2" });
+  await settle();
+
+  h.send("e");
+  assert.equal(buffer(h)[0], "feat: stripe checkout v2", "it opens on the saved title");
+  assert.ok(buffer(h).slice(2).join(" ").includes("saved-card path"), "and the saved prose");
+  assert.match(
+    messageLine(h),
+    /line 1 is the title/,
+    `a freshly opened buffer is not dirty: ${JSON.stringify(messageLine(h))}`,
+  );
+  assert.ok(!messageLine(h).includes("edited"), "no unsaved-changes hint over a saved message");
+  h.stop();
+});
+
+test("a failed save stays on screen and is retired by nothing", async () => {
+  const q = editQueue();
+  const h = await openEditor(q);
+  h.send(CTRL_E);
+  h.send(" v2");
+  h.send(CTRL_S);
+  q.resolveEdit({
+    saved: false,
+    summary: "the PR message was not written: gh pr edit exited 1",
+    error: "gh pr edit 42 exited 1: could not update pull request",
+  });
+  await settle();
+
+  // Keys keep arriving — the captain types, moves, thinks. None of them are an
+  // acknowledgement, and a silently dismissed failure would read as a save.
+  h.send(RIGHT);
+  h.send("x");
+  h.send(LEFT + UP);
+  assert.match(h.frame(), /could not update pull request/, "the failure is still on screen");
+  assert.match(buffer(h)[0] ?? "", /^feat: stripe checkout v2/, "over the text that did not go through");
+  h.stop();
+});
+
+test("a line that reports something NOT happening is not a receipt, and stands", async () => {
+  // The discard notice.
+  const q = editQueue();
+  const h = await openEditor(q);
+  h.send(" edited");
+  h.send(ESC);
+  h.send(ESC);
+  assert.match(h.frame(), /discarded the unsaved edit to PR #42/, "it says what it did");
+  h.send("j");
+  h.send("k");
+  assert.match(h.frame(), /discarded the unsaved edit to PR #42/, "and keys do not sweep it away");
+  h.stop();
+
+  // The refusal to open, which is the only explanation of why `e` did nothing.
+  const blocked = harness(
+    editQueue({ kind: "blocked", feature: "checkout", target: "dev", reason: "no gh on PATH" } as QueueHeadDetail),
+  );
+  blocked.send(CTRL_O);
+  await settle();
+  blocked.send("e");
+  assert.match(blocked.frame(), /this head has no pull request yet/, "it says why");
+  blocked.send("j");
+  assert.match(blocked.frame(), /this head has no pull request yet/, "and it is still there to read");
+  blocked.stop();
+});
+
 // --- leaving -----------------------------------------------------------------
 
 test("Esc on a clean buffer leaves at once", async () => {
