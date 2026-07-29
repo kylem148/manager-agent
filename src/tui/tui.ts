@@ -209,6 +209,25 @@ export function packRow(lead: string, tokens: string[], width: number, indent: n
   return rows;
 }
 
+/**
+ * The visible window of a one-line input field `width` columns wide, plus where
+ * the caret sits inside it.
+ *
+ * A one-line field SCROLLS rather than wraps: the window is the tail ending at
+ * the caret, so typing past the right edge keeps what you are typing on screen
+ * instead of re-laying the row underneath you. Exported because it is pure
+ * arithmetic and the only part of the field a test can pin.
+ */
+export function fieldWindow(
+  text: string,
+  cursor: number,
+  width: number,
+): { shown: string; caret: number } {
+  const w = Math.max(1, width);
+  const from = cursor > w - 1 ? cursor - (w - 1) : 0;
+  return { shown: text.slice(from, from + w), caret: cursor - from };
+}
+
 /** The Home tab's task list: the status word in a fixed left column (sized to
  *  the longer of the two the contract allows), then a gap, then the name. Fixed
  *  rather than content-sized because a column that moves is a column you have to
@@ -637,15 +656,35 @@ export interface TaskPanelRow {
   status: "building" | "queued";
 }
 
+/** Whether a task write landed, and what to say when it did not. A refusal is a
+ *  normal outcome here (a full table, a row that moved between the paint and the
+ *  keystroke), so it is a value and never an exception. */
+export interface TaskWriteResult {
+  ok: boolean;
+  message?: string;
+}
+
 /**
  * Backs the Home tab's task table. Read fresh at paint time like every other
  * panel source — it is an in-memory list behind a small JSON file, so re-reading
- * is free and a table the co rewrote mid-session shows on the next paint without
- * a restart or a subscription.
+ * is free and a table either writer changed mid-session shows on the next paint
+ * without a restart or a subscription.
+ *
+ * The three write hooks are the captain's own keys. They are OPTIONAL: a source
+ * without them is a table the tab paints and cannot edit (a degraded session),
+ * which the keys then say rather than doing nothing silently. Each names ONE row
+ * by its exact text, because the co writes the same table from its own tool and
+ * a row index goes stale between paints.
  */
 export interface TaskPanelSource {
-  /** The table, in the co's own order. */
+  /** The table, in order. */
   list(): TaskPanelRow[];
+  /** Append `task` as a new `queued` row. */
+  add?(task: string): Promise<TaskWriteResult>;
+  /** Move the row whose text is exactly `task` to `status`. */
+  setStatus?(task: string, status: TaskPanelRow["status"]): Promise<TaskWriteResult>;
+  /** Take the row whose text is exactly `task` out of the table. */
+  retire?(task: string): Promise<TaskWriteResult>;
 }
 
 /**
@@ -1265,17 +1304,20 @@ const OVERLAY_LABELS = "abcdefghjklmnopqrstuvwxyz";
  * It has four home tabs, listed in a persistent bar across the top so the tabs
  * that exist are visible without knowing they do, and switched three ways that
  * never collide: Tab (or `i`) cycles, and `1`..`4` jump straight to one from any
- * view. In order: `home` (the co's task table over every tracked worktree —
- * read-only, it only pages), the `queue` tab ([m] merges the ready head, `e`
- * edits its PR message, and the rest pages its inline body), the `docs` tab
- * (a-z open a doc), and the `inbox` tab (a-z open a filed crew review). Opening
- * a doc drops into a `doc` view; selecting a review drops into an `inboxItem`
- * view. A pending feature_land review adds a fifth `review` tab for as long as it
- * is pending. All the body views page identically. Backspace/Esc walk back out.
+ * view. In order: `home` (the captain's task table over every tracked worktree —
+ * the table is editable, the worktree list is not), the `queue` tab ([m] merges
+ * the ready head, `e` edits its PR message, and the rest pages its inline body),
+ * the `docs` tab (a-z open a doc), and the `inbox` tab (a-z open a filed crew
+ * review). Opening a doc drops into a `doc` view; selecting a review drops into
+ * an `inboxItem` view. A pending feature_land review adds a fifth `review` tab
+ * for as long as it is pending. All the body views page identically.
+ * Backspace/Esc walk back out.
  *
- * HOME IS THE LANDING TAB and it acts on nothing (no [m], no selector), which is
- * what lets it be the thing the panel opens on: the first screen of a panel that
- * merges branches must not be one where a stray keypress can merge one.
+ * HOME IS THE LANDING TAB and nothing on it acts on ONE keystroke: it merges
+ * nothing, and its own edits are gated behind either text the captain submitted
+ * (`a`) or a row he selected first (`x`, `s`). That is what lets it be the thing
+ * the panel opens on: the first screen of a panel that merges branches must not
+ * be one where a stray keypress can merge one — or delete a note.
  *
  * THE QUEUE TAB IS THE MERGE (D-20260724-12). A green head renders its own diff,
  * commits and checks result right there and carries a live [m] that merges
@@ -1291,9 +1333,9 @@ const OVERLAY_LABELS = "abcdefghjklmnopqrstuvwxyz";
  * inline diff is expensive to wrap and a paint can happen every frame.
  */
 type PanelView =
-  /** The landing page: the co's task table, then every tracked feature worktree
-   *  with its state, branch and description. A read-only overview — it scrolls,
-   *  and nothing on it acts. */
+  /** The landing page: the captain's task table, then every tracked feature
+   *  worktree with its state, branch and description. The table is his to edit
+   *  here (a/x/s); the worktree list only scrolls. */
   | { kind: "home" }
   | { kind: "queue" }
   | { kind: "docs" }
@@ -1335,6 +1377,23 @@ interface PanelState {
    *  so unlike the docs/inbox lists it pages rather than clipping. */
   homeScroll: number;
   /**
+   * The highlighted task row, held as its TEXT rather than its index, and null
+   * (no selection) whenever the panel opens.
+   *
+   * Text, for the same reason the tool addresses rows by text: the co edits this
+   * table from its own side, so an index taken at paint time can name a
+   * different row a moment later — and the key that acts on it is `x`. A
+   * selection whose text has left the table simply reads as no selection, which
+   * is inert, rather than as some other row.
+   */
+  taskSel: string | null;
+  /** The open add-a-task field, or null. Non-null exactly while the captain is
+   *  typing a new row; it owns the keyboard while it is. */
+  taskAdd: TaskAddState | null;
+  /** What a task write had to say back — a refusal, mostly. Printed under the
+   *  table and cleared by the next Home key, like the popup's own message line. */
+  taskNotice: string | null;
+  /**
    * The copy confirmation, shown in the footer in place of the key hints, or
    * null. Sticky until the next panel key rather than timed out: it mirrors the
    * transcript's finished selection, which stays highlighted as its own receipt
@@ -1359,6 +1418,32 @@ interface PanelState {
    *  `prEdit`; kept on the panel rather than in the view so the buffer survives
    *  a resize and a repaint by identity. */
   prEdit: PrEditState | null;
+}
+
+/**
+ * The Home tab's add-a-task field (D-20260729-3): one line of text, opened with
+ * `a`, submitted with Enter, cancelled with Esc.
+ *
+ * It exists because of the property that makes Home the tab the panel opens on:
+ * no single stray keystroke may change anything. So the one key that CREATES a
+ * row opens a field instead of acting, and nothing is written until the captain
+ * submits text he typed. While it is open it owns the keyboard — the panel's own
+ * digits (which jump tabs) and letters (which page) would otherwise eat the
+ * characters of a task name.
+ *
+ * It runs on the shared TextEditor, so the line keys mean here what they mean in
+ * the prompt bar and the PR editor. The one difference is Enter, which submits:
+ * a task is one line, and the store folds any newline out of it anyway.
+ */
+interface TaskAddState {
+  editor: TextEditor;
+  /** A refusal from the store (a full table, a duplicate), shown under the field
+   *  with the typed text left intact so it can be edited rather than retyped. */
+  error: string | null;
+  /** Bracketed-paste state, kept here for the same reason the PR editor keeps
+   *  its own: while this field is open the panel's paste swallower never runs. */
+  pasting: boolean;
+  pasteBuf: string;
 }
 
 /**
@@ -1578,6 +1663,10 @@ export class Tui implements SessionIO {
   private readonly inbox?: InboxPanelSource;
   private readonly features?: FeaturePanelSource;
   private readonly tasks?: TaskPanelSource;
+  /** Where each task row starts in the Home body, rebuilt every time the tab is
+   *  laid out. It is what lets a moved selection scroll itself into view without
+   *  the key handler having to reproduce the table's wrapping arithmetic. */
+  private readonly homeTaskStarts = new Map<string, number>();
   private panel: PanelState | null = null;
   private unsubscribeDocs: (() => void) | null = null;
   // The panel-native merge (D-20260724-12). `queueMerging` names the feature
@@ -3007,8 +3096,9 @@ export class Tui implements SessionIO {
   // (the same key both ways — see togglePanel and the "close" panel input); it
   // never auto-pops. Four tabs, named in a bar across the top of every view and
   // reachable three ways (Tab, `i`, or the digit the bar shows beside each): the
-  // HOME tab is the landing page — the co's task table over EVERY tracked
-  // worktree, including the ones still being worked, which the queue never sees;
+  // HOME tab is the landing page — the captain's own task table (which he edits
+  // there, and the co edits through its tool) over EVERY tracked worktree,
+  // including the ones still being worked, which the queue never sees;
   // the QUEUE tab shows the ordered features and their state, with the ready
   // head's review actioned in-place ([m] merge / [e] edit its message / [d] drill
   // the full diff); the DOCS tab lists docs/ (selectable by letter) and opens one
@@ -3046,8 +3136,8 @@ export class Tui implements SessionIO {
    * when one is waiting (that one IS a gate — it holds a caller open, so it wins
    * the landing spot), else the FIRST tab in the bar, which is HOME whenever
    * there is a Home to show. Home leads because it is the orientation view and
-   * because it acts on nothing: the screen a keystroke lands on by default must
-   * not be one where a stray press can merge a branch. Subscribes to the doc
+   * because no single keystroke on it acts: the screen a keystroke lands on by
+   * default must not be one where a stray press can merge a branch. Subscribes to the doc
    * write queue for live refresh and loads the doc list asynchronously.
    */
   private openPanel(): void {
@@ -3089,6 +3179,11 @@ export class Tui implements SessionIO {
       queueRows: [],
       queueSig: "",
       homeScroll: 0,
+      // No selection when the panel opens: the tab it lands on is inert until
+      // the captain deliberately picks a row.
+      taskSel: null,
+      taskAdd: null,
+      taskNotice: null,
       copyNotice: null,
       selection: null,
       selecting: false,
@@ -3197,8 +3292,8 @@ export class Tui implements SessionIO {
    *  exists), docs (when a doc source exists), the review inbox (when an inbox
    *  source exists), and a feature_land review whenever one is pending.
    *
-   *  Home leads because it is the landing page and the one tab that acts on
-   *  nothing. The review gets its own tab even alongside the queue: the queue
+   *  Home leads because it is the landing page and the one tab where no single
+   *  keystroke acts. The review gets its own tab even alongside the queue: the queue
    *  tab's [m] is the panel-native queue merge, and two different merges must
    *  never share one key (D-20260724-12). Tab cycles these; `1`..`4` (and `5`
    *  when a review is pending) index straight into this list. */
@@ -3417,6 +3512,11 @@ export class Tui implements SessionIO {
     // into its buffer.
     if (this.panel?.view.kind === "prEdit") return this.consumePrEdit(data, i);
 
+    // The Home tab's add-a-task field takes it whole for the same reason, and
+    // one more: the panel's digits jump tabs and its letters page, so a task
+    // called "1 fix the parser" is untypeable unless this is routed first.
+    if (this.panel?.taskAdd) return this.consumeTaskAdd(data, i);
+
     // A bracketed paste on a panel TAB has nowhere to land, since no view out
     // here is a text buffer, so it is swallowed whole rather than let its
     // characters read as panel keys. That matters more than it sounds: `m` is
@@ -3627,21 +3727,349 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * The Home tab: an overview, and nothing else. It pages like the queue tab
-   * (the task table plus a long worktree list can outgrow the screen) and
-   * Esc/Backspace/q close the panel, but no key here acts on a feature — landing
-   * is the queue's [m], and creating, enqueuing and abandoning are the co's
-   * levers. Deliberately no [m] and no selector, so the tab the panel OPENS on
-   * can never be the thing that merged something.
+   * The Home tab. It shows two blocks and now EDITS one of them: the task table
+   * is the captain's surface (D-20260729-3), so `a` adds a row, `x` retires the
+   * highlighted one and `s` toggles its status. The worktree list underneath is
+   * still read-only — landing is the queue's [m], and creating, enqueuing and
+   * abandoning are the co's levers — and there is still no [m] here.
+   *
+   * The property that lets the panel OPEN on this tab is preserved deliberately:
+   * no single stray keystroke can change anything. `a` opens a field and writes
+   * nothing until text is submitted, and `x`/`s` are strict no-ops unless a row
+   * was deliberately selected first. Nothing is selected when the panel opens.
+   *
+   * The arrows and j/k move that selection instead of scrolling a line here,
+   * which is the one binding this tab repoints; every other paging key
+   * (space/f, b, d/u, g/G, PgUp/PgDn, the wheel) is untouched. `b` keeps its
+   * page-back meaning too, which is why the status toggle is `s` and not `b`.
    */
   private homeTabInput(input: OverlayInput): void {
+    // A notice describes something the LAST key did; this one supersedes it.
+    if (this.panel) this.panel.taskNotice = null;
     if ("nav" in input) {
+      if (input.nav === "up" && this.moveTaskSelection(-1)) return;
+      if (input.nav === "down" && this.moveTaskSelection(1)) return;
+      if (input.nav === "escape" && this.clearTaskSelection()) return;
       if (this.overlayScrollInput(input)) return;
       if (input.nav === "escape" || input.nav === "back") this.closePanel();
       return;
     }
+    switch (input.ch) {
+      case "a": this.openTaskAdd(); return;
+      case "x": this.retireSelectedTask(); return;
+      case "s": this.toggleSelectedTask(); return;
+      case "j": if (this.moveTaskSelection(1)) return; break;
+      case "k": if (this.moveTaskSelection(-1)) return; break;
+    }
     if (this.overlayScrollInput(input)) return;
     if (input.ch === "q" || input.ch === "Q") this.closePanel();
+  }
+
+  /**
+   * Move the task selection by one row, and report whether there was one to
+   * move. With nothing selected, down takes the first row and up the last — a
+   * selection is not a mutation, so starting one costs nothing.
+   *
+   * False means "this tab has no task rows", and the caller falls through to the
+   * paging that key used to do, so a Home tab with an empty table still scrolls
+   * with j/k exactly as before.
+   */
+  private moveTaskSelection(delta: 1 | -1): boolean {
+    const panel = this.panel;
+    const rows = this.tasks?.list() ?? [];
+    if (!panel || rows.length === 0) return false;
+    const cur = panel.taskSel === null ? -1 : rows.findIndex((r) => r.task === panel.taskSel);
+    const next =
+      cur < 0
+        ? delta > 0 ? 0 : rows.length - 1
+        : Math.max(0, Math.min(rows.length - 1, cur + delta));
+    panel.taskSel = rows[next]!.task;
+    this.ensureTaskVisible();
+    this.paint();
+    return true;
+  }
+
+  /** Esc's first meaning on Home: drop the selection and leave the tab inert
+   *  again. False when there was none, and Esc then closes the panel as always. */
+  private clearTaskSelection(): boolean {
+    const panel = this.panel;
+    if (!panel || panel.taskSel === null) return false;
+    panel.taskSel = null;
+    this.paint();
+    return true;
+  }
+
+  /** Keep the selected row on screen after a move. The table sits at the top of
+   *  the body, so this usually scrolls to 0; it earns its keep on a short
+   *  terminal where the worktree list has been paged into view. */
+  private ensureTaskVisible(): void {
+    const panel = this.panel;
+    if (!panel || panel.taskSel === null) return;
+    const body = this.homeTabRows(); // rebuilds this.homeTaskStarts at this width
+    const at = this.homeTaskStarts.get(panel.taskSel);
+    if (at === undefined) return;
+    const vp = this.overlayViewport();
+    const max = Math.max(0, body.length - vp);
+    let start = Math.min(panel.homeScroll, max);
+    if (at < start) start = at;
+    else if (at > start + vp - 1) start = at - vp + 1;
+    panel.homeScroll = Math.max(0, Math.min(start, max));
+  }
+
+  /** The task the captain has highlighted, or null. Reads the LIVE table, so a
+   *  row the co retired between the paint and the keystroke is already gone and
+   *  the key that names it is a no-op rather than a write against nothing. */
+  private selectedTask(): TaskPanelRow | null {
+    const sel = this.panel?.taskSel;
+    if (!sel) return null;
+    return this.tasks?.list().find((r) => r.task === sel) ?? null;
+  }
+
+  /** `x`: retire the highlighted row. A NO-OP with nothing highlighted — that is
+   *  the rule that keeps one stray keypress from deleting anything.
+   *
+   *  The selection is dropped as it fires, so a second `x` cannot fall through
+   *  onto a neighbouring row and take that one too. */
+  private retireSelectedTask(): void {
+    const panel = this.panel;
+    const row = this.selectedTask();
+    if (!panel || !row) return;
+    const source = this.tasks;
+    if (!source?.retire) {
+      this.taskNotice("retiring a task isn't available in this session.");
+      return;
+    }
+    panel.taskSel = null;
+    this.runTaskWrite(source.retire(row.task));
+  }
+
+  /** `s`: toggle the highlighted row between building and queued. A no-op with
+   *  nothing highlighted, like `x`. The selection stays, because the toggle is
+   *  reversible and the captain may want the other way. */
+  private toggleSelectedTask(): void {
+    const row = this.selectedTask();
+    if (!row) return;
+    const source = this.tasks;
+    if (!source?.setStatus) {
+      this.taskNotice("changing a task's status isn't available in this session.");
+      return;
+    }
+    this.runTaskWrite(source.setStatus(row.task, row.status === "building" ? "queued" : "building"));
+  }
+
+  /** Repaint at once (the store has already moved in memory), then print
+   *  whatever the write had to say when it settles. */
+  private runTaskWrite(write: Promise<TaskWriteResult>): void {
+    this.paint();
+    void write.then(
+      (res) => {
+        if (!res.ok) this.taskNotice(res.message ?? "the task table could not be written.");
+        else this.paint();
+      },
+      (e: unknown) => this.taskNotice(`the task table could not be written: ${String(e)}`),
+    );
+  }
+
+  private taskNotice(text: string): void {
+    if (!this.panel) return;
+    this.panel.taskNotice = text;
+    this.paint();
+  }
+
+  // --- the add-a-task field ----------------------------------------------------
+
+  /** `a`: open the one-line field. Adding is the one thing that needs no
+   *  selection, so this is the tab's only key that works on an empty table. */
+  private openTaskAdd(): void {
+    const panel = this.panel;
+    if (!panel) return;
+    if (!this.tasks?.add) {
+      this.taskNotice("adding a task isn't available in this session.");
+      return;
+    }
+    panel.taskAdd = { editor: new TextEditor(""), error: null, pasting: false, pasteBuf: "" };
+    panel.taskNotice = null;
+    this.clearPanelSelection();
+    this.paint();
+  }
+
+  /** Leave the field, writing nothing. Esc's meaning here, and Ctrl-O's: the
+   *  panel stays open, because the field is what you asked to leave. */
+  private closeTaskAdd(): void {
+    const panel = this.panel;
+    if (!panel?.taskAdd) return;
+    // A cancel can land mid-paste; hand the rest to the tab's own swallower
+    // rather than let its bytes arrive as panel keys.
+    if (panel.taskAdd.pasting) this.overlayPasting = true;
+    panel.taskAdd = null;
+    this.paint();
+  }
+
+  /**
+   * Enter: add what was typed, as `queued`. An empty field just closes — there
+   * is nothing to store and a blank row would render as a blank line.
+   *
+   * A refusal (a full table, a row that already reads the same) keeps the field
+   * open with the text intact, so it can be edited rather than retyped. Nothing
+   * is selected afterwards either way: the tab goes back to inert.
+   */
+  private submitTaskAdd(): void {
+    const panel = this.panel;
+    const state = panel?.taskAdd;
+    if (!panel || !state) return;
+    const text = state.editor.text.replace(/\s+/g, " ").trim();
+    if (text === "") {
+      this.closeTaskAdd();
+      return;
+    }
+    const add = this.tasks?.add;
+    if (!add || !this.tasks) {
+      state.error = "adding a task isn't available in this session.";
+      this.paint();
+      return;
+    }
+    void add.call(this.tasks, text).then(
+      (res) => {
+        if (this.panel?.taskAdd !== state) return; // cancelled while it was in flight
+        if (res.ok) this.panel.taskAdd = null;
+        else state.error = res.message ?? "the task could not be added.";
+        this.paint();
+      },
+      (e: unknown) => {
+        if (this.panel?.taskAdd !== state) return;
+        state.error = String(e);
+        this.paint();
+      },
+    );
+    this.paint();
+  }
+
+  /** Parse one key/sequence while the add field owns the keyboard. The same
+   *  shapes consumePrEdit handles, decoded by the same table, minus everything a
+   *  one-line field has no use for. */
+  private consumeTaskAdd(data: string, i: number): number {
+    const state = this.panel?.taskAdd;
+    if (!state) return 1;
+
+    if (state.pasting) {
+      const end = data.indexOf(PASTE_END, i);
+      if (end === -1) {
+        state.pasteBuf += data.slice(i);
+        return data.length - i;
+      }
+      state.pasteBuf += data.slice(i, end);
+      const text = state.pasteBuf;
+      state.pasting = false;
+      state.pasteBuf = "";
+      // A task is ONE line, so a pasted block is folded rather than refused:
+      // paste a sentence out of the transcript and it becomes the row.
+      if (text !== "") {
+        state.error = null;
+        state.editor.insert(text.replace(/\s+/g, " "));
+        this.paint();
+      }
+      return end - i + PASTE_END.length;
+    }
+    if (data.startsWith(PASTE_START, i)) {
+      state.pasting = true;
+      state.pasteBuf = "";
+      return PASTE_START.length;
+    }
+    if (data.startsWith(PASTE_END, i)) return PASTE_END.length;
+
+    const ch = data[i]!;
+    if (ch === ESC && data[i + 1] === "[") return this.consumeTaskAddCsi(data, i);
+    if (ch === ESC) {
+      this.closeTaskAdd();
+      return 1;
+    }
+    this.taskAddAction(classifyByte(ch));
+    return 1;
+  }
+
+  /** The CSI half: the arrows and Home/End that move inside the line, plus both
+   *  enhanced protocols' spellings (Ghostty sends Enter and Escape as CSI-u, so
+   *  without this the field could neither be submitted nor left). A mouse report
+   *  is swallowed — the field is one line and has no selection of its own. */
+  private consumeTaskAddCsi(data: string, i: number): number {
+    if (data[i + 2] === "<") {
+      const end = this.findMouseEnd(data, i + 3);
+      return end === -1 ? data.length - i : end - i + 1;
+    }
+    let j = i + 2;
+    while (j < data.length && !/[A-Za-z~]/.test(data[j]!)) j++;
+    if (j >= data.length) return data.length - i;
+    const final = data[j]!;
+    const params = data.slice(i + 2, j);
+    const consumed = j - i + 1;
+    const state = this.panel?.taskAdd;
+    if (!state) return consumed;
+
+    switch (final) {
+      case "u": {
+        const ev = parseCsiU(params);
+        if (ev) this.taskAddAction(classify(ev));
+        return consumed;
+      }
+      case "C": this.taskAddEdit(() => state.editor.right()); return consumed;
+      case "D": this.taskAddEdit(() => state.editor.left()); return consumed;
+      case "H": this.taskAddAction({ kind: "home" }); return consumed;
+      case "F": this.taskAddAction({ kind: "end" }); return consumed;
+      case "~": {
+        const other = parseModifyOtherKeys(params);
+        if (other) {
+          this.taskAddAction(classify(other));
+          return consumed;
+        }
+        const n = Number.parseInt(params, 10);
+        if (n === 3) this.taskAddEdit(() => state.editor.deleteForward());
+        else if (n === 1 || n === 7) this.taskAddAction({ kind: "home" });
+        else if (n === 4 || n === 8) this.taskAddAction({ kind: "end" });
+        return consumed;
+      }
+      default:
+        return consumed;
+    }
+  }
+
+  /**
+   * Apply one decoded action to the field. The line keys mean exactly what they
+   * mean in the prompt bar; the differences are that Enter (and every other
+   * spelling of a newline, since a task has only one line) SUBMITS, and Ctrl-O
+   * leaves the field rather than closing the panel out from under it.
+   *
+   * Everything else is deliberately swallowed. A key with no meaning in a text
+   * field must not fall through to the tab underneath, where `x` would retire a
+   * row the captain is only trying to type about.
+   */
+  private taskAddAction(action: Action): void {
+    const state = this.panel?.taskAdd;
+    if (!state) return;
+    state.error = null;
+    switch (action.kind) {
+      case "insert": state.editor.insert(action.text); break;
+      case "backspace": state.editor.backspace(); break;
+      case "home": state.editor.home(); break;
+      case "end": state.editor.end(); break;
+      case "kill-to-start": state.editor.killToStart(); break;
+      case "kill-to-end": state.editor.killToEnd(); break;
+      // One line, so a newline is a submit rather than a compose.
+      case "submit":
+      case "newline": this.submitTaskAdd(); return;
+      case "escape":
+      case "open-docs": this.closeTaskAdd(); return;
+      default: return; // no meaning here, and it must not reach the tab
+    }
+    this.paint();
+  }
+
+  /** One caret-only edit (the arrows, Delete), which no Action covers. */
+  private taskAddEdit(fn: () => void): void {
+    const state = this.panel?.taskAdd;
+    if (!state) return;
+    state.error = null;
+    fn();
+    this.paint();
   }
 
   private docsTabInput(input: OverlayInput, panel: PanelState): void {
@@ -5115,15 +5543,15 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * The Home tab: the panel's landing page, in two blocks — the co's at-a-glance
-   * task table, then every tracked feature worktree.
+   * The Home tab: the panel's landing page, in two blocks — the captain's
+   * at-a-glance task table, then every tracked feature worktree.
    *
    * The two answer the two questions the captain opens the panel with. The table
    * is what we are doing (it used to exist only as prose the co re-printed into
-   * the chat; it is a stored, painted thing now). The worktree list is what is in
-   * flight — the view the queue tab cannot give, because the queue holds only
-   * what has been marked done and everything still being worked is invisible
-   * there.
+   * the chat; it is a stored, painted, and now EDITABLE thing). The worktree
+   * list is what is in flight — the view the queue tab cannot give, because the
+   * queue holds only what has been marked done and everything still being worked
+   * is invisible there.
    *
    * Both are read fresh from their sources, so a table rewritten or a feature
    * created while the panel is open shows on the next paint — and rebuilt at the
@@ -5140,31 +5568,68 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * The task table: a spaced two-column list, status first.
+   * The task table: a spaced two-column list, status first, with the captain's
+   * selection marked and his add-a-task field sitting where the new row will.
    *
    * Status leads and sits in a fixed column so the eye runs straight down it —
    * "what is being built right now" is the question this block exists to answer,
    * and it was buried on the right behind two content-sized columns before. The
    * old `Type` column is gone: it never changed what the captain did next.
+   *
+   * Building the rows is also where the selection is RECONCILED with the table:
+   * a selected row the co retired mid-session is simply no longer selected. The
+   * alternative — an index quietly sliding onto a neighbour — is the failure
+   * this whole two-writer design exists to avoid, and `x` is the key it would
+   * hand the wrong row to.
    */
   private taskTableRows(): string[] {
+    const panel = this.panel;
     const rows: string[] = ["", "  " + c.dim("Tasks"), ""];
+    this.homeTaskStarts.clear();
     if (!this.tasks) return [...rows, ...this.homeNote("The task table isn't available in this session.")];
     const table = this.tasks.list();
+    if (panel && panel.taskSel !== null && !table.some((t) => t.task === panel.taskSel)) {
+      panel.taskSel = null;
+    }
     if (table.length === 0) {
-      return [
-        ...rows,
+      rows.push(
         ...this.homeNote("Nothing on the table."),
-        ...this.homeNote("The co keeps a handful of live items here — ask it where things stand."),
-      ];
+        ...this.homeNote("Press `a` to put one on it — yours and the co's, on the same table."),
+      );
     }
     for (const t of table) {
+      const selected = t.task === panel?.taskSel;
+      this.homeTaskStarts.set(t.task, rows.length);
       // Padded by VISIBLE width, never by String.padEnd: the status carries
       // colour, and padding the raw string would count the escape bytes as
-      // characters and collapse the column.
-      const lead = "  " + pad(this.taskStatusLabel(t.status), TASK_STATUS_W) + TASK_STATUS_GAP;
-      rows.push(...flowRow(lead, t.task, this.cols));
+      // characters and collapse the column. The marker replaces the indent
+      // rather than shifting the row, so a selected row stays in its columns.
+      const lead =
+        (selected ? c.cyan("▸") + " " : "  ") +
+        pad(this.taskStatusLabel(t.status), TASK_STATUS_W) +
+        TASK_STATUS_GAP;
+      rows.push(...flowRow(lead, t.task, this.cols, selected ? c.cyan : undefined));
     }
+    if (panel?.taskAdd) rows.push(...this.taskAddRows(panel.taskAdd));
+    if (panel?.taskNotice) rows.push("", ...flowRow("  ", panel.taskNotice, this.cols, c.yellow));
+    return rows;
+  }
+
+  /**
+   * The add-a-task field, painted as the row it is about to become: the same
+   * indent and the same name column, with `new` where a status will be.
+   *
+   * The caret is drawn in reverse video rather than placed as a hardware cursor.
+   * Every panel view but the PR popup hides the real caret, and a one-line field
+   * inside a scrolling body would have to be tracked back to a screen row to
+   * place one; a reversed cell says the same thing and cannot drift.
+   */
+  private taskAddRows(state: TaskAddState): string[] {
+    const lead = "  " + pad(c.dim("new"), TASK_STATUS_W) + TASK_STATUS_GAP;
+    const width = Math.max(8, this.cols - visibleWidth(lead) - 1);
+    const { shown, caret } = fieldWindow(state.editor.text, state.editor.cursor, width);
+    const rows = [lead + highlightRange(pad(shown, caret + 1), caret, caret + 1)];
+    if (state.error) rows.push(...flowRow("  ", state.error, this.cols, c.yellow));
     return rows;
   }
 
@@ -5388,8 +5853,23 @@ export class Tui implements SessionIO {
         left = " " + editHint + c.dim("space/b page · " + tabHint + "Esc close") + " ";
       }
     } else if (v?.kind === "home") {
-      // Nothing here acts, so the bar advertises only paging and the exits.
-      left = ` ${c.dim("space/b page · " + tabHint + "Esc close")} `;
+      // The tab's keys are not discoverable anywhere else, so they live here, in
+      // tiers: the two that EDIT the table survive a narrow terminal, and paging
+      // and the tab hint go first, because both are advertised elsewhere (the
+      // bar shows the digits; space/b is the panel-wide idiom).
+      if (this.panel?.taskAdd) {
+        left = ` ${c.cyan("Enter")}${c.dim(" add the task · ")}${c.cyan("Esc")}${c.dim(" cancel")} `;
+      } else {
+        const room = w - 2 - visibleWidth(right);
+        const tiers = [
+          `a add · j/k select · x retire · s status · space/b page · ${tabHint}Esc close`,
+          "a add · j/k select · x retire · s status · space/b page · Esc close",
+          "a add · j/k select · x retire · s status · Esc close",
+          "a add · x retire · s status · Esc close",
+          "a add · Esc close",
+        ];
+        left = ` ${c.dim(tiers.find((t) => t.length <= room) ?? tiers[tiers.length - 1]!)} `;
+      }
     } else if (v?.kind === "docs" || v?.kind === "inbox") {
       left = ` a-z open · ${tabHint}Esc close `;
     } else if (v?.kind === "doc") {

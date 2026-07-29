@@ -599,7 +599,7 @@ their rows `a)`, `b)`, `c)` rather than `1)`, `2)`, `3)`.
 
 | tab   | what it is                                                        | its keys                              |
 | ----- | ----------------------------------------------------------------- | ------------------------------------- |
-| home  | the task table, then every tracked worktree. Read-only            | paging only                           |
+| home  | the task table (yours to edit), then every tracked worktree       | `a` add, `x` retire, `s` status       |
 | queue | the merge queue and the head's pull request                       | `m` merge, `e` edit the PR message    |
 | docs  | everything in `docs/`, opened through the transcript's renderer   | `a`-`z` open, `y` copies an open doc  |
 | inbox | the last 20 filed crew reviews                                    | `a`-`z` open                          |
@@ -611,9 +611,8 @@ closes. A left-drag selects and copies on release, on every tab.
 ### Home: what we're doing, and what's in flight
 
 `Ctrl-O` opens on **Home**, which answers the two questions you open the panel
-with. On top, the co-manager's at-a-glance task table. Underneath, every feature
-worktree that exists — including the ones still being worked, which the queue
-never sees:
+with. On top, your at-a-glance task table. Underneath, every feature worktree
+that exists — including the ones still being worked, which the queue never sees:
 
 ```
   Tasks
@@ -630,13 +629,21 @@ never sees:
 ```
 
 The table is the same handful of live items the co-manager has always kept —
-"you are here", pruned hard — except that it is now **stored** rather than only
-spoken. The co writes the whole table through one tool whenever it changes, so
-the panel paints the current one instead of you having to ask for it and pay for
-a turn. It holds at most five rows and a row's status is one of exactly two
-words, `building` or `queued`: a table that grows a row per step is a tracker,
-and the point of this block is that it can be read at a glance. A missing or
-unreadable table file is an empty table, never a failed start.
+"you are here", pruned hard — except that it is **stored**, and it is **yours**.
+It holds at most five rows and a row's status is one of exactly two words,
+`building` or `queued`: a table that grows a row per step is a tracker, and the
+point of this block is that it can be read at a glance. A missing or unreadable
+table file is an empty table, never a failed start.
+
+**You write to it here, and the co-manager reads it.** `a` opens a one-line
+field (Enter adds the task as `queued`, Esc adds nothing); the arrows or `j`/`k`
+pick a row, `x` retires it, `s` flips it between `queued` and `building`, and
+`Esc` drops the selection. `x` and `s` do nothing at all until you have picked a
+row, so no single stray key can change the table. Changes are on disk
+immediately, and a retired row is kept with the time it left. The co-manager
+edits the same table through a tool, one row at a time — it can't overwrite what
+you typed — and the table is in what it reads at session start, so a note you
+jot here is context it actually has.
 
 The description beside a worktree is the **intent** the co-manager wrote when it
 created the feature — a plain authored line, not something regenerated per
@@ -656,10 +663,10 @@ queue up. A feature nothing else is happening to reads `[clean]` or `[dirty]`,
 from a real `git status` taken when you open the tab (and `[idle]` in the moment
 before that lands — never `[clean]`, which would be a claim nobody had checked).
 
-Nothing on this tab acts — no selector, no `[m]` — which is what lets it be the
-tab the panel opens on. Landing is the queue tab's keystroke, and creating,
-enqueuing and abandoning are the co-manager's levers; this is the overview you
-context-switch from.
+The worktree list itself acts on nothing — no selector, no `[m]` — which,
+with the task keys gated behind a submitted line or a picked row, is what lets
+this be the tab the panel opens on. Landing is the queue tab's keystroke, and
+creating, enqueuing and abandoning are the co-manager's levers.
 
 ### Landing work: one keystroke, `[m]`
 
@@ -1499,10 +1506,10 @@ by the source (`splitEvidence`), so the panel and the pull request cannot drift
 apart. `e` on that tab opens the same message in a popup EDITOR over it, through
 a second injected callback (`editPrMessage`) that is likewise the only thing that
 keystroke can reach — one buffer in `git commit` shape, prose only, saved with
-Ctrl-S and never merging anything. The home tab is
-read-only by construction (no selector, no `[m]`, it only pages), which is what
-lets the panel open on it: the tab a keystroke lands on by default can never be
-the thing that merged something. A pending `feature_land` review
+Ctrl-S and never merging anything. The home tab merges nothing
+and edits nothing on ONE key — its task keys need a submitted line or a picked
+row first — which is what lets the panel open on it: the tab a keystroke lands on
+by default can never be the thing that merged something. A pending `feature_land` review
 gets a fifth tab of its own for as long as it is pending, so the two merges never
 share a key. A doc and a filed review drill into the same paged body view. The
 panel body is one selection surface: a left-drag highlights and copies out of any
