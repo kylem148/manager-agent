@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import {
   Tui,
   clipCell,
+  flowRow,
   normalizeSelection,
   osc52,
+  packRow,
   pad,
   renderInboxItem,
   renderMarkdownDoc,
@@ -109,6 +111,10 @@ function fakeDocs(initial: Record<string, string>): DocSource & {
 interface Harness {
   tui: Tui;
   send(bytes: string): void;
+  /** Resize the terminal the way SIGWINCH does, with the panel still open. */
+  resize(cols: number, rows: number): void;
+  /** The width the terminal currently reports. */
+  cols(): number;
   lastFrame(): string;
   lastFramePlain(): string;
   /** Every byte written to the terminal, for assertions about sequences that
@@ -128,7 +134,16 @@ function harness(
 ): Harness {
   let listener: ((d: string) => void) | null = null;
   const writes: string[] = [];
-  const out: OutStream = { write: (s) => writes.push(String(s)), columns: cols, rows };
+  const size = { cols, rows };
+  const out: OutStream = {
+    write: (s) => writes.push(String(s)),
+    get columns(): number {
+      return size.cols;
+    },
+    get rows(): number {
+      return size.rows;
+    },
+  };
   const inp: InStream = {
     isTTY: true,
     setRawMode: () => {},
@@ -152,6 +167,12 @@ function harness(
   return {
     tui,
     send: (bytes) => listener?.(bytes),
+    resize: (c, r) => {
+      size.cols = c;
+      size.rows = r;
+      process.emit("SIGWINCH");
+    },
+    cols: () => size.cols,
     lastFrame: () => writes[writes.length - 1] ?? "",
     lastFramePlain: () => stripAnsi(writes[writes.length - 1] ?? ""),
     writes: () => writes,
@@ -203,6 +224,69 @@ test("clipCell cuts within a width, marks the cut, and closes any style it cut",
   assert.ok(visibleWidth(styled) <= 12, "measured in columns, not bytes");
   assert.ok(styled.endsWith("\x1b[0m"), "and the colour is closed, so it can't bleed down the row");
   assert.equal(clipCell("anything", 0), "", "no room is no cell, not a crash");
+});
+
+// --- flowRow / packRow: the wrap that replaced the clip ----------------------
+//
+// The Home tab's descriptions used to be cut with an ellipsis, which removed the
+// overflow and left the text unreadable — the actual complaint. These two are
+// the arithmetic that fixes it, and the properties below are the whole contract:
+// nothing wider than the width, and nothing lost.
+
+/** The words of a set of flowed rows, with the indent and the lead removed, so a
+ *  test can ask whether every character survived the wrap. */
+function words(rows: string[]): string[] {
+  return rows.join(" ").split(/\s+/).filter((w) => w !== "");
+}
+
+test("flowRow wraps a long description on word boundaries and loses nothing", () => {
+  const text =
+    "the resolver rebases the feature onto the current origin/dev tip and pushes it back with a lease";
+  const rows = flowRow("  building   ", text, 48);
+
+  assert.ok(rows.length > 1, "a description longer than the width is more than one row");
+  for (const row of rows) {
+    assert.ok(visibleWidth(row) <= 48, `no row is wider than the width: ${JSON.stringify(row)}`);
+  }
+  // Word boundaries, not columns: no row ends mid-word.
+  assert.deepEqual(words(rows).slice(1), text.split(" "), "every word survives, in order");
+  assert.equal(words(rows)[0], "building", "and the lead is still the lead");
+});
+
+test("flowRow indents continuations to the column the text started in", () => {
+  const rows = flowRow("  queued     ", "one two three four five six seven eight", 24);
+  assert.ok(rows.length > 1);
+  for (const row of rows.slice(1)) {
+    assert.match(row, /^ {13}\S/, "a continuation hangs under the text, not under the row");
+  }
+});
+
+test("flowRow styles each row separately, so a colour cannot bleed past the wrap", () => {
+  // colorEnabled is false under a test runner, so the style function stands in
+  // for c.dim: what matters is that it is applied per row and never spans one.
+  const rows = flowRow("  ", "a description with several words in it", 16, (s) => `<${s}>`);
+  assert.ok(rows.length > 1);
+  for (const row of rows) assert.match(row, /^ +<[^<>]*>$/, `styled whole: ${JSON.stringify(row)}`);
+});
+
+test("flowRow survives the degenerate widths without a crash or an empty row", () => {
+  assert.deepEqual(flowRow("", "", 40), [""], "no text is one empty row, not none");
+  const narrow = flowRow("          ", "supercalifragilistic", 8);
+  assert.ok(narrow.length >= 1);
+  assert.deepEqual(words(narrow).join(""), "supercalifragilistic", "hard-split, never dropped");
+});
+
+test("packRow lays a head across lines when its columns outgrow the terminal", () => {
+  const rows = packRow("  ▸ ", ["checkout", "[ready to merge]", "co/feat-checkout"], 28, 6);
+  assert.ok(rows.length > 1, "it did not fit on one");
+  for (const row of rows) assert.ok(visibleWidth(row) <= 28, JSON.stringify(row));
+  assert.deepEqual(words(rows), ["▸", "checkout", "[ready", "to", "merge]", "co/feat-checkout"]);
+  for (const row of rows.slice(1)) assert.match(row, /^ {6}\S/, "continuations hang");
+
+  // One token wider than the whole row is hard-split rather than dropped.
+  const long = packRow("  ▸ ", ["co/feat-a-very-long-branch-name-indeed"], 20, 6);
+  for (const row of long) assert.ok(visibleWidth(row) <= 20, JSON.stringify(row));
+  assert.equal(words(long).slice(1).join(""), "co/feat-a-very-long-branch-name-indeed");
 });
 
 // --- renderMarkdownDoc (the shared-renderer reuse) --------------------------
@@ -2438,6 +2522,82 @@ test("a feature with no intent renders a placeholder, never a blank tail", async
   const frame = h.lastFramePlain();
   assert.match(frame, /nameless\s+\[idle\]\s+co\/feat-nameless/);
   assert.match(frame, /no description/);
+  h.stop();
+});
+
+// --- nothing on Home runs off the right edge ---------------------------------
+//
+// The captain's complaint: the description beside a worktree is the only thing on
+// the row that says what the work is FOR, and it ran off the edge. It was cut
+// with an ellipsis, which is the same information loss with tidier punctuation.
+// So it wraps now, and these pin the property that matters — the WHOLE text is on
+// screen, at any width, across a resize.
+
+const LONG_INTENT =
+  "rebase the blocked head onto the current origin/dev tip, re-push it with a lease, " +
+  "and read the pull request's real checks back before the queue offers a merge again";
+
+/** The painted panel body as one whitespace-normalized string, so a test can ask
+ *  whether a description survived the wrap instead of where each piece landed. */
+function painted(h: Harness): string {
+  return screenRows(h).join(" ").replace(/\s+/g, " ").trim();
+}
+
+test("a description too long for its row wraps, and every word of it is on screen", async () => {
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([
+    { feature: "resolver", branch: "co/feat-resolver", intent: LONG_INTENT, status: "blocked", busy: false },
+  ]), fakeTasks([]));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+
+  const rows = screenRows(h);
+  assert.ok(painted(h).includes(LONG_INTENT), "the whole description is readable");
+  assert.ok(!painted(h).includes("…"), "nothing was cut to get it there");
+  // It is more than one row, and the continuations read as part of the row above
+  // rather than as new entries in the list.
+  const started = rows.findIndex((r) => r.includes("rebase the blocked head"));
+  assert.ok(started > 0);
+  assert.match(rows[started + 1]!, /^ {6}\S/, "the tail hangs under the row it belongs to");
+  h.stop();
+});
+
+test("a resize re-wraps the descriptions, with nothing stale and nothing clipped", async () => {
+  const h = harness(undefined, 120, 24, undefined, undefined, fakeFeatures([
+    { feature: "resolver", branch: "co/feat-resolver", intent: LONG_INTENT, status: "idle", busy: false },
+  ]), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const wide = screenRows(h).filter((r) => r !== "").length;
+  assert.ok(painted(h).includes(LONG_INTENT), "readable at 120 columns");
+
+  // Narrow the terminal under the open panel: the rows are rebuilt at the new
+  // width, so the same text takes more of them and still says all of it.
+  h.resize(60, 24);
+  await settle();
+  assert.ok(painted(h).includes(LONG_INTENT), "and still readable at 60");
+  assert.ok(!painted(h).includes("…"), "no row was cut to fit the narrower screen");
+  assert.ok(
+    screenRows(h).filter((r) => r !== "").length > wide,
+    "the same content really did re-wrap into more rows",
+  );
+  for (const row of screenRows(h)) {
+    assert.ok(visibleWidth(row) <= h.cols(), `inside the new width: ${JSON.stringify(row)}`);
+  }
+  h.stop();
+});
+
+test("a long branch name is wrapped with the row, never ellipsized out of it", async () => {
+  const branch = "co/feat-ctrl-o-home-tab-readability-pass";
+  const h = harness(undefined, 64, 20, undefined, undefined, fakeFeatures([
+    { feature: "home-cleanup", branch, intent: "make the panel readable", status: "idle", busy: false },
+  ]), fakeTasks([]));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.ok(painted(h).includes(branch), "the whole branch is there");
+  assert.ok(painted(h).includes("make the panel readable"), "and so is the description");
   h.stop();
 });
 

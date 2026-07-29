@@ -641,7 +641,9 @@ created the feature — a plain authored line, not something regenerated per
 refresh, and no model is called to produce it. It is stored per feature under
 `.dispatch/features.json`, so it is still there after a restart, including for
 worktrees the startup sweep rebuilt from disk. A feature created without one says
-so rather than showing a blank.
+so rather than showing a blank. Nothing on this tab is ever cut off at the right
+edge: a description too long to sit beside the columns wraps underneath them,
+indented, and a resize re-wraps it.
 
 The state word is derived from what the session already knows: a crew agent live
 in the worktree, a merge-queue position, a green head, a block, a resolver run.

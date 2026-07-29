@@ -138,6 +138,82 @@ export function pad(s: string, width: number): string {
   return s + " ".repeat(Math.max(0, width - visibleWidth(s)));
 }
 
+/**
+ * Flow `text` after a fixed `lead`, wrapping at word boundaries into rows no
+ * wider than `width`, with every continuation row indented to the column the
+ * text started in — so a description too long for one line reads as more of the
+ * SAME row rather than as new rows of the list.
+ *
+ * This is the Home tab's answer to text that used to be clipped. Truncation
+ * removed the overflow and left the information unreadable, which was the actual
+ * complaint; nothing here is ever dropped.
+ *
+ * `text` is UNSTYLED and `style` colours each row after the wrap. That order
+ * matters: a wrap point consumes the space run it breaks on, and a closing SGR
+ * reset rides on the character after the text it closes — so wrapping an
+ * already-styled string can eat the reset and bleed the colour down the panel.
+ */
+export function flowRow(
+  lead: string,
+  text: string,
+  width: number,
+  style: (s: string) => string = (s) => s,
+): string[] {
+  const col = visibleWidth(lead);
+  const gap = " ".repeat(col);
+  return wrapLine(text, Math.max(1, width - col)).map(
+    (row, i) => (i === 0 ? lead : gap) + style(row),
+  );
+}
+
+/**
+ * Pack already-styled `tokens` onto rows no wider than `width`, after `lead` on
+ * the first row and `indent` columns in on every continuation row. The fallback
+ * for a fixed-column row whose columns alone outgrow the terminal (a long branch
+ * name on a narrow screen), where the alternative is the painter clipping it.
+ *
+ * A token is never split at a space, because a styled token is atomic: its
+ * closing reset would be dropped with the space run the wrap consumed. A token
+ * wider than a whole row is hard-split by visible column instead, which keeps
+ * every escape attached to the character it styles.
+ */
+export function packRow(lead: string, tokens: string[], width: number, indent: number): string[] {
+  const hang = " ".repeat(Math.max(0, Math.min(indent, Math.max(0, width - 1))));
+  const rows: string[] = [];
+  let cur = lead;
+  let curW = visibleWidth(lead);
+  let bare = true; // no token on this row yet, so no separating space is owed
+  for (const tok of tokens.filter((t) => t !== "")) {
+    const w = visibleWidth(tok);
+    if (!bare && curW + 1 + w > width) {
+      rows.push(cur.replace(/\s+$/, ""));
+      cur = hang;
+      curW = hang.length;
+      bare = true;
+    }
+    if (bare && curW + w > width) {
+      // Wider than the row it starts on. Split it at the narrower of the two
+      // prefixes so every piece fits under either of them.
+      const parts = wrapLine(tok, Math.max(1, width - Math.max(curW, hang.length)));
+      for (let p = 0; p < parts.length - 1; p++) rows.push((p === 0 ? cur : hang) + parts[p]!);
+      cur = (parts.length > 1 ? hang : cur) + parts[parts.length - 1]!;
+      curW = visibleWidth(cur);
+      bare = false;
+      continue;
+    }
+    cur += (bare ? "" : " ") + tok;
+    curW += (bare ? 0 : 1) + w;
+    bare = false;
+  }
+  rows.push(cur.replace(/\s+$/, ""));
+  return rows;
+}
+
+/** Where a worktree's description hangs when it will not fit beside the columns:
+ *  in past the row's own two-space indent and its marker, so it reads as part of
+ *  the row above rather than as a row of its own. */
+const WORKTREE_HANG = 6;
+
 /** Count the lines in text, ignoring a single trailing newline. */
 function countLines(text: string): number {
   const parts = text.split("\n");
@@ -5032,7 +5108,7 @@ export class Tui implements SessionIO {
 
   /**
    * The Home tab: the panel's landing page, in two blocks — the co's at-a-glance
-   * task table, then every tracked feature worktree, one line each.
+   * task table, then every tracked feature worktree.
    *
    * The two answer the two questions the captain opens the panel with. The table
    * is what we are doing (it used to exist only as prose the co re-printed into
@@ -5042,10 +5118,14 @@ export class Tui implements SessionIO {
    * there.
    *
    * Both are read fresh from their sources, so a table rewritten or a feature
-   * created while the panel is open shows on the next paint. One line per
-   * worktree rather than two is what keeps typical content — a handful of tasks
-   * over five or six worktrees — on one screen; paging is the overflow fallback,
-   * not the normal way to read this.
+   * created while the panel is open shows on the next paint — and rebuilt at the
+   * CURRENT width every paint, so a resize re-wraps everything here for free.
+   *
+   * A worktree's description is the one thing on its row that says what the work
+   * is FOR, and cutting it with an ellipsis removed the overflow while leaving
+   * the information unreadable — which was the complaint. So text that outgrows
+   * its room wraps instead, and a long row costs a line or two rather than its
+   * meaning.
    */
   private homeTabRows(): string[] {
     return [...this.taskTableRows(), "", ...this.worktreeRows()];
@@ -5055,15 +5135,14 @@ export class Tui implements SessionIO {
    *  row can never push Status off a narrow screen. */
   private taskTableRows(): string[] {
     const rows: string[] = ["", "  " + c.dim("tasks")];
-    if (!this.tasks) {
-      rows.push("  " + c.dim("The task table isn't available in this session."));
-      return rows;
-    }
+    if (!this.tasks) return [...rows, ...this.homeNote("The task table isn't available in this session.")];
     const table = this.tasks.list();
     if (table.length === 0) {
-      rows.push("  " + c.dim("Nothing on the table."));
-      rows.push("  " + c.dim("The co keeps a handful of live items here — ask it where things stand."));
-      return rows;
+      return [
+        ...rows,
+        ...this.homeNote("Nothing on the table."),
+        ...this.homeNote("The co keeps a handful of live items here — ask it where things stand."),
+      ];
     }
     // Columns hug their content — a Task column stretched to the width would put
     // Type and Status somewhere off by the right edge, with a river of blank
@@ -5101,30 +5180,37 @@ export class Tui implements SessionIO {
     return status;
   }
 
+  /** A line of explanation under a Home heading, wrapped rather than clipped. */
+  private homeNote(text: string): string[] {
+    return flowRow("  ", text, this.cols, c.dim);
+  }
+
   /**
-   * Every tracked feature worktree, one compact line each: the handle, its state,
-   * its branch and as much of its intent as fits. The intent is the one thing git
-   * can't say about a branch — what it is FOR — read straight from the stored
-   * text. No model call is made to describe anything, at paint time or ever, and
-   * a feature that never got an intent says so rather than showing a blank.
+   * Every tracked feature worktree: the handle, its state, its branch and its
+   * intent. The intent is the one thing git can't say about a branch — what it is
+   * FOR — read straight from the stored text. No model call is made to describe
+   * anything, at paint time or ever, and a feature that never got an intent says
+   * so rather than showing a blank.
    */
   private worktreeRows(): string[] {
-    const rows: string[] = ["  " + c.dim("worktrees")];
+    const head: string[] = ["  " + c.dim("Worktrees"), ""];
     if (!this.features) {
-      rows.push("  " + c.dim("Feature worktrees aren't available in this session (not linked)."));
-      return rows;
+      return [...head, ...this.homeNote("Feature worktrees aren't available in this session (not linked).")];
     }
     const entries = this.features.list();
     if (entries.length === 0) {
-      rows.push("  " + c.dim("No feature worktrees yet."));
-      rows.push("  " + c.dim("Each feature the co creates gets its own branch and checkout, and shows up here."));
-      return rows;
+      return [
+        ...head,
+        ...this.homeNote("No feature worktrees yet."),
+        ...this.homeNote("Each feature the co creates gets its own branch and checkout, and shows up here."),
+      ];
     }
     // Columns as wide as their widest cell so the list reads DOWN — the states in
-    // one column, the branches in another — rather than as ragged prose. Each is
-    // capped so one long name or one long chip can't push the rest off a narrow
-    // screen. Chips are measured by VISIBLE width: they carry colour, and padding
-    // the raw string would count the escapes.
+    // one column, the branches in another — rather than as ragged prose. The caps
+    // bound the PADDING, not the text: a name or branch past its cap overflows
+    // its own column instead of being cut, so it costs that one row's alignment
+    // and never a character. Chips are measured by VISIBLE width: they carry
+    // colour, and padding the raw string would count the escapes.
     const chips = entries.map((e) => {
       const crew = e.busy && e.status !== "working" ? " " + c.cyan("[crew]") : "";
       return this.featureStateLabel(e) + crew;
@@ -5132,35 +5218,50 @@ export class Tui implements SessionIO {
     const nameW = Math.min(20, Math.max(...entries.map((e) => e.feature.length)));
     const chipW = Math.min(22, Math.max(...chips.map((s) => visibleWidth(s))));
     const branchW = Math.min(24, Math.max(...entries.map((e) => e.branch.length)));
+    const rows = [...head];
     entries.forEach((e, idx) => {
-      rows.push(this.worktreeLine(e, chips[idx]!, nameW, chipW, branchW));
+      rows.push(...this.worktreeLines(e, chips[idx]!, nameW, chipW, branchW));
     });
     return rows;
   }
 
-  /** One worktree as one line: marker, handle, state, branch, intent — the intent
-   *  truncated into whatever the fixed columns leave, so the line never wraps and
-   *  six worktrees stay six rows. */
-  private worktreeLine(
+  /**
+   * One worktree: marker, handle, state, branch, description.
+   *
+   * One line when the description fits beside the columns, which is the typical
+   * row and the reason six worktrees usually stay six rows. When it doesn't fit,
+   * the description drops underneath at a hanging indent and wraps to the FULL
+   * width — reading it across the panel beats reading it down a narrow gutter,
+   * and either way it is all there. The head keeps its own line in that case so
+   * the columns above and below it still line up; only a head that outgrows the
+   * terminal itself is packed across lines.
+   */
+  private worktreeLines(
     e: FeaturePanelEntry,
     chip: string,
     nameW: number,
     chipW: number,
     branchW: number,
-  ): string {
+  ): string[] {
     // A marker on the two states that want the eye: one that can be merged right
     // now, and one that is holding the queue up.
     const marker = e.status === "ready" ? c.green("▸") : e.status === "blocked" ? c.red("▸") : " ";
-    const name = pad(clipCell(e.feature, nameW), nameW);
-    const branch = pad(clipCell(e.branch, branchW), branchW);
-    const head = `  ${marker} ${c.bold(name)}  ${pad(chip, chipW)}  ${c.dim(branch)}`;
-    const room = this.cols - visibleWidth(head) - 2;
-    const intent = e.intent?.trim();
-    if (room < 8) return head;
-    const tail = intent
-      ? clipCell(intent, room)
-      : c.dim(clipCell("no description — created without an intent", room));
-    return `${head}  ${tail}`;
+    const name = c.bold(e.feature);
+    const branch = c.dim(e.branch);
+    const head = `  ${marker} ${pad(name, nameW)}  ${pad(chip, chipW)}  ${pad(branch, branchW)}`;
+    // Folded to one logical line before it is wrapped: a row is a row, and a
+    // stored newline would otherwise punch through the panel's own layout.
+    const intent = e.intent?.replace(/\s+/g, " ").trim();
+    const text = intent ?? "no description — created without an intent";
+    const style = intent ? undefined : c.dim;
+    if (this.cols - visibleWidth(head) - 2 >= visibleWidth(text)) {
+      return [`${head}  ${style ? style(text) : text}`];
+    }
+    const rows =
+      visibleWidth(head) <= this.cols
+        ? [head.replace(/\s+$/, "")]
+        : packRow(`  ${marker} `, [name, chip, branch], this.cols, WORKTREE_HANG);
+    return [...rows, ...flowRow(" ".repeat(WORKTREE_HANG), text, this.cols, style)];
   }
 
   /** The coloured one-word state chip for a feature, mirroring the queue tab's
