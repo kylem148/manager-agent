@@ -136,6 +136,18 @@ interface SessionState {
    * that lands cleanly queues NOTHING: co is deliberately not in that loop.
    */
   queueNotices: string[];
+  /**
+   * `Date.now()` when the last model turn finished, or null before the first.
+   *
+   * Exists to measure the gap the captain spends thinking between turns, which
+   * is the thing the cache TTL is a bet on: the entry lives 5 minutes or an hour
+   * from its last hit, so the distribution of these gaps decides whether we are
+   * paying a 2x write premium for protection we need or for pauses that were
+   * never long enough to matter. Kept on the session rather than the provider
+   * because it measures the CAPTAIN's time, not the model's — the provider only
+   * ever sees the intervals it was awake for.
+   */
+  lastTurnEndedAt: number | null;
   /** The rolling record of filed crew reviews (the Ctrl-O Inbox tab). Loaded at
    *  session start, so it carries the previous sessions' reviews. */
   inbox: ReviewInbox;
@@ -429,6 +441,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     io,
     transcript,
     userTurns: 0,
+    lastTurnEndedAt: null,
     dispatch,
     registry: null,
     features: null,
@@ -723,6 +736,10 @@ async function drive(
 ): Promise<void> {
   const { effort, quiet } = opts;
   const { io } = state;
+  // Stamped before any model work so the gap measured is the captain's thinking
+  // pause, not the pause plus this turn's latency.
+  const turnStartedAt = Date.now();
+  const idleMs = state.lastTurnEndedAt === null ? 0 : turnStartedAt - state.lastTurnEndedAt;
   const executor = makeExecutor({
     paths: state.paths,
     research: state.cfg.research,
@@ -818,7 +835,16 @@ async function drive(
     // billed; a quiet turn (the exit distill) is metered exactly like a spoken
     // one, because it costs exactly like one.
     const spent = state.model.drainUsage();
-    await state.costs.record(state.model.modelId, spent.usage, { ms: spent.ms });
+    await state.costs.record(state.model.modelId, spent.usage, {
+      ms: spent.ms,
+      rounds: spent.rounds,
+      rebuild: spent.rebuild,
+      idleMs,
+    });
+    // Set even on a turn that threw: the cache clock started ticking from the
+    // last request the model actually served, not from the last one that
+    // succeeded, so a failed turn still resets the gap.
+    state.lastTurnEndedAt = Date.now();
   }
 
   // If the model produced no streamed text but a final string exists, show it

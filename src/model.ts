@@ -182,6 +182,31 @@ export class ModelProvider {
    *  captain actually waited, which is the other half of "what did this cost".
    *  Measured for every turn, not just under CO_DEBUG_TIMING. */
   private pendingMs = 0;
+  /**
+   * Model calls made since the last drain. A "turn" is one thing the captain
+   * asked for; a ROUND is one HTTP request to the model, and a turn that uses
+   * tools makes several. This is the multiplier on the whole prompt side of the
+   * bill: the entire prefix and the entire history are re-sent on every round,
+   * so cost-per-turn is rounds x (prefix + history), and a per-turn average
+   * cannot be read without knowing rounds. Counted unconditionally for the same
+   * reason the tokens are — the requests happened whether or not anyone watched.
+   */
+  private pendingRounds = 0;
+  /**
+   * Cache-write tokens billed on the FIRST round of each turn since the drain.
+   *
+   * This is the expiry meter, and it is the one number that decides whether a
+   * cache keep-alive is worth building. By the first round of turn N the prefix
+   * has already been written by turn N-1, so a warm cache should write almost
+   * nothing here — just the new user message. A large figure means the entry
+   * lapsed during the captain's thinking pause and the whole prefix was rebuilt
+   * at the 2x write rate, which is 20x what reading it would have cost.
+   *
+   * Deliberately first-round-only. Later rounds in a turn legitimately write the
+   * tool_use/tool_result blocks they just created, and folding those in would
+   * bury the signal under normal growth.
+   */
+  private pendingRebuild = 0;
 
   constructor(cfg: ModelConfig) {
     this.cfg = cfg;
@@ -252,10 +277,17 @@ export class ModelProvider {
    * gives us no usage for a message that never finalized. The elapsed time is
    * still counted: the captain waited for it either way.)
    */
-  drainUsage(): { usage: TokenUsage; ms: number } {
-    const drained = { usage: this.pending, ms: this.pendingMs };
+  drainUsage(): { usage: TokenUsage; ms: number; rounds: number; rebuild: number } {
+    const drained = {
+      usage: this.pending,
+      ms: this.pendingMs,
+      rounds: this.pendingRounds,
+      rebuild: this.pendingRebuild,
+    };
     this.pending = emptyUsage();
     this.pendingMs = 0;
+    this.pendingRounds = 0;
+    this.pendingRebuild = 0;
     return drained;
   }
 
@@ -365,11 +397,15 @@ export class ModelProvider {
       // load-bearing thing in this file, and a missing usage block must cost an
       // inaccurate /cost line, never the captain's turn.
       const billed = message.usage;
+      this.pendingRounds += 1;
       if (billed) {
         this.pending.input += billed.input_tokens ?? 0;
         this.pending.cacheWrite += billed.cache_creation_input_tokens ?? 0;
         this.pending.cacheRead += billed.cache_read_input_tokens ?? 0;
         this.pending.output += billed.output_tokens ?? 0;
+        // Only the opening round of the turn: see pendingRebuild. A big number
+        // here is a lapsed cache, not a big prompt.
+        if (round === 0) this.pendingRebuild += billed.cache_creation_input_tokens ?? 0;
       }
 
       if (timing) {

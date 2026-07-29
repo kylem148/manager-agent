@@ -256,6 +256,11 @@ test("garbage fields in the meter file coerce to zero rather than NaN", async ()
       output: 0,
       turns: 0,
       ms: 0,
+      // Counters added after the first ledgers were written: absent on disk, so
+      // they must read as zero rather than undefined or NaN, same as the rest.
+      rounds: 0,
+      rebuild: 0,
+      idleMs: 0,
     });
   } finally {
     await cleanup();
@@ -585,4 +590,128 @@ test("the fleet view flags a derived rate and never pads rows with trailing spac
   for (const l of lines) {
     assert.equal(l, l.replace(/\s+$/, ""), `line has trailing whitespace: ${JSON.stringify(l)}`);
   }
+});
+
+// --- rounds, rebuilds, idle gaps ---------------------------------------------
+//
+// The three counters that explain the prompt side. What has to hold: a turn's
+// rounds are counted (not assumed to be one), the cost of a lapsed cache is
+// separated from the cost of legitimate new content, and a ledger written before
+// any of this existed stays silent rather than reporting measured-looking zeroes.
+
+test("rounds are accumulated per turn, not assumed to be one", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("m", usage({ output: 1 }), { rounds: 4, now: at("2026-07-27") });
+  await ledger.record("m", usage({ output: 1 }), { rounds: 2, now: at("2026-07-27") });
+  const t = ledger.lifetime().models.m!;
+  assert.equal(t.turns, 2);
+  assert.equal(t.rounds, 6);
+  assert.equal(ledger.day("2026-07-27").m!.rounds, 6);
+});
+
+test("a turn that billed tokens counts at least one round even if none was passed", async () => {
+  const ledger = CostLedger.ephemeral();
+  // A caller that forgot to pass rounds must not make the meter claim a turn
+  // happened with no model call behind it.
+  await ledger.record("m", usage({ output: 1 }));
+  assert.equal(ledger.lifetime().models.m!.rounds, 1);
+});
+
+test("rebuild tokens and idle gaps accumulate", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("m", usage({ output: 1 }), { rebuild: 20_000, idleMs: 600_000 });
+  await ledger.record("m", usage({ output: 1 }), { rebuild: 0, idleMs: 30_000 });
+  const t = ledger.lifetime().models.m!;
+  assert.equal(t.rebuild, 20_000);
+  assert.equal(t.idleMs, 630_000);
+});
+
+test("negative or fractional counters are coerced rather than trusted", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("m", usage({ output: 1 }), { rounds: 2.6, rebuild: -5, idleMs: -1 });
+  const t = ledger.lifetime().models.m!;
+  assert.equal(t.rounds, 3);
+  assert.equal(t.rebuild, 0);
+  assert.equal(t.idleMs, 0);
+});
+
+test("the report prices a lapsed cache as its own share of spend", async () => {
+  const ledger = CostLedger.ephemeral();
+  // One turn that read a warm prefix cheaply, and one that had to rebuild it.
+  await ledger.record("m", usage({ cacheRead: 100_000, output: 1_000 }), {
+    rounds: 3,
+    rebuild: 0,
+    idleMs: 20_000,
+    now: at("2026-07-27"),
+  });
+  await ledger.record("m", usage({ cacheWrite: 25_000, cacheRead: 0, output: 1_000 }), {
+    rounds: 3,
+    rebuild: 25_000,
+    idleMs: 3_600_000,
+    now: at("2026-07-27"),
+  });
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-5",
+      cacheTtl: "1h",
+      now: at("2026-07-27"),
+    }),
+  );
+  assert.match(text, /rounds\s+3\.0 per turn/);
+  // 25,000 tok at the 1h write rate — the number that says whether a keep-alive
+  // is worth building, expressed as a share so it can be compared to the total.
+  assert.match(text, /rebuilds\s+12,500 tok per turn/);
+  assert.match(text, /re-writing a lapsed cache/);
+  assert.match(text, /idle gap\s+30m 10s average between turns \(cache ttl 1h\)/);
+});
+
+test("a ledger with no rounds recorded stays silent instead of reporting zeroes", async () => {
+  // Written before the counters existed: turns are real, rounds are unknown. A
+  // "0.0 rounds per turn" line would be a measurement we never took.
+  const ledger = CostLedger.ephemeral({
+    models: {
+      "us.anthropic.claude-opus-5": {
+        ...emptyUsage(),
+        output: 5_000,
+        turns: 10,
+        ms: 1_000,
+        rounds: 0,
+        rebuild: 0,
+        idleMs: 0,
+      },
+    },
+  });
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-5",
+      cacheTtl: "1h",
+      now: at("2026-07-27"),
+    }),
+  );
+  assert.doesNotMatch(text, /rounds/);
+  assert.doesNotMatch(text, /rebuilds/);
+});
+
+test("the fleet roll-up sums the new counters instead of dropping them", async () => {
+  const a = CostLedger.ephemeral();
+  await a.record("m", usage({ output: 1 }), { rounds: 3, rebuild: 100, idleMs: 1_000 });
+  const b = CostLedger.ephemeral();
+  await b.record("m", usage({ output: 1 }), { rounds: 5, rebuild: 200, idleMs: 2_000 });
+  // Exercised through the report rather than the private merge helpers: a
+  // counter dropped in a roll-up is only ever visible here.
+  const text = plain(
+    formatFleetReport({
+      entries: [
+        { name: "a", ledger: a },
+        { name: "b", ledger: b },
+      ],
+      cacheTtl: "1h",
+      home: "/home/co",
+      now: at("2026-07-27"),
+    }),
+  );
+  assert.match(text, /total/);
+  assert.equal(a.lifetime().models.m!.rounds + b.lifetime().models.m!.rounds, 8);
 });

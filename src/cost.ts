@@ -221,6 +221,30 @@ export function dayBefore(day: string, n: number): string {
 export interface ModelTotals extends TokenUsage {
   turns: number;
   ms: number;
+  /**
+   * Model calls, not turns. A tool-using turn makes several rounds and re-sends
+   * the whole prompt on each one, so rounds-per-turn is the multiplier on the
+   * entire input side of the bill. Without it, "cache read per turn" is a number
+   * you cannot act on: 200k over two rounds is a 100k prompt, over five rounds
+   * it is a 40k prompt, and those call for opposite fixes.
+   */
+  rounds: number;
+  /**
+   * Cache-write tokens billed on the opening round of each turn — the cost of
+   * the cache having lapsed between turns. See ModelProvider.pendingRebuild.
+   * Near-zero means the cache is surviving the captain's thinking pauses; large
+   * means the prefix is being rebuilt at the 2x write rate instead of read at
+   * 0.1x, which is the single most expensive avoidable thing this app can do.
+   */
+  rebuild: number;
+  /**
+   * Wall-clock the captain spent NOT waiting on the model: the gap between one
+   * turn finishing and the next starting, summed. Recorded because the cache TTL
+   * is a bet on the length of these gaps — a co-manager is a thinking partner,
+   * so they are long by design, and their distribution is what decides whether
+   * the 5-minute or 1-hour entry is the right one to be paying for.
+   */
+  idleMs: number;
 }
 
 /** A day's spend, still split per model so it can be priced correctly. */
@@ -250,7 +274,21 @@ export interface LedgerData {
 export const DAY_RETENTION = 400;
 
 function emptyTotals(): ModelTotals {
-  return { ...emptyUsage(), turns: 0, ms: 0 };
+  return { ...emptyUsage(), turns: 0, ms: 0, rounds: 0, rebuild: 0, idleMs: 0 };
+}
+
+/** Sum two buckets, tokens and counters alike. One place to change when a
+ *  counter is added, so a new field cannot be summed in one roll-up and
+ *  silently dropped in the other. */
+function addTotals(a: ModelTotals, b: ModelTotals): ModelTotals {
+  return {
+    ...addUsage(a, b),
+    turns: a.turns + b.turns,
+    ms: a.ms + b.ms,
+    rounds: a.rounds + b.rounds,
+    rebuild: a.rebuild + b.rebuild,
+    idleMs: a.idleMs + b.idleMs,
+  };
 }
 
 function num(v: unknown): number {
@@ -267,6 +305,14 @@ function coerceTotals(v: unknown): ModelTotals | null {
     output: num(t.output),
     turns: num(t.turns),
     ms: num(t.ms),
+    // Absent in ledgers written before these counters existed. Zero-filled
+    // rather than back-filled: a rounds figure we never measured would make the
+    // per-turn averages read as though early sessions ran at one round each,
+    // which is exactly the wrong conclusion. `/cost` suppresses the line until
+    // there is real data behind it.
+    rounds: num(t.rounds),
+    rebuild: num(t.rebuild),
+    idleMs: num(t.idleMs),
   };
 }
 
@@ -384,15 +430,36 @@ export class CostLedger {
   async record(
     modelId: string,
     usage: TokenUsage,
-    opts: { ms?: number; now?: Date } = {},
+    opts: {
+      ms?: number;
+      now?: Date;
+      /** Model calls this turn made (see ModelTotals.rounds). */
+      rounds?: number;
+      /** Cache-write tokens on the turn's opening round (see ModelTotals.rebuild). */
+      rebuild?: number;
+      /** Idle gap before this turn started (see ModelTotals.idleMs). */
+      idleMs?: number;
+    } = {},
   ): Promise<void> {
     if (isEmptyUsage(usage)) return;
     const now = opts.now ?? new Date();
     const ms = Math.max(0, Math.round(opts.ms ?? 0));
+    // A turn that billed tokens made at least one round, whatever the caller
+    // passed: the counters are diagnostics and must never contradict the meter.
+    const rounds = Math.max(1, Math.round(opts.rounds ?? 1));
+    const rebuild = Math.max(0, Math.round(opts.rebuild ?? 0));
+    const idleMs = Math.max(0, Math.round(opts.idleMs ?? 0));
 
     const bump = (into: Record<string, ModelTotals>) => {
       const prev = into[modelId] ?? emptyTotals();
-      into[modelId] = { ...addUsage(prev, usage), turns: prev.turns + 1, ms: prev.ms + ms };
+      into[modelId] = {
+        ...addUsage(prev, usage),
+        turns: prev.turns + 1,
+        ms: prev.ms + ms,
+        rounds: prev.rounds + rounds,
+        rebuild: prev.rebuild + rebuild,
+        idleMs: prev.idleMs + idleMs,
+      };
     };
     bump(this.sessionTotals);
     bump(this.data.models);
@@ -460,6 +527,13 @@ interface Summary {
   tokens: TokenUsage;
   /** Models with tokens but no rate on file — their spend is NOT in `cost`. */
   unpriced: string[];
+  rounds: number;
+  rebuild: number;
+  idleMs: number;
+  /** What the `rebuild` tokens cost, priced at each model's own write rate.
+   *  Computed here rather than in the renderer because only this loop knows
+   *  which model each bucket belongs to. */
+  rebuildCost: number;
 }
 
 function summarize(
@@ -474,15 +548,25 @@ function summarize(
     ms: 0,
     tokens: emptyUsage(),
     unpriced: [],
+    rounds: 0,
+    rebuild: 0,
+    idleMs: 0,
+    rebuildCost: 0,
   };
   for (const [modelId, t] of Object.entries(totals)) {
     s.output += t.output;
     s.turns += t.turns;
     s.ms += t.ms;
+    s.rounds += t.rounds;
+    s.rebuild += t.rebuild;
+    s.idleMs += t.idleMs;
     s.tokens = addUsage(s.tokens, t);
     const r = ratesFor(modelId, today);
-    if (r) s.cost += costOf(t, r, cacheTtl);
-    else if (t.output > 0) s.unpriced.push(modelId);
+    if (r) {
+      s.cost += costOf(t, r, cacheTtl);
+      const write = cacheTtl === "1h" ? r.cacheWrite1h : r.cacheWrite5m;
+      s.rebuildCost += (t.rebuild * write) / 1_000_000;
+    } else if (t.output > 0) s.unpriced.push(modelId);
   }
   return s;
 }
@@ -611,6 +695,43 @@ export function formatCostReport(opts: {
     ),
   );
 
+  // --- the cache line ---
+  //
+  // The three numbers that explain the prompt side, and the only place the app
+  // says anything about its own efficiency. Suppressed entirely on a ledger
+  // written before these counters existed (rounds == 0 with turns > 0), because
+  // a zero there means "never measured", not "one round per turn".
+  //
+  // `rebuild` is the actionable one. It is cache-write tokens billed on the
+  // OPENING round of a turn, i.e. what it cost to rediscover a prefix that had
+  // already been written and then lapsed. Reading that prefix instead would have
+  // cost a twentieth as much (0.1x read against a 2x write), so a large share
+  // here is the cheapest money in the whole program to stop spending.
+  if (allTime.rounds > 0) {
+    const perTurn = (n: number, t: number) => (t > 0 ? n / t : 0);
+    const rebuildShare = allTime.cost > 0 ? (allTime.rebuildCost / allTime.cost) * 100 : 0;
+    out.push(
+      c.dim(
+        `  rounds     ${perTurn(allTime.rounds, allTime.turns).toFixed(1)} per turn · ` +
+          `${fmtTokens(Math.round(perTurn(allTime.tokens.cacheRead, allTime.rounds)))} read per round`,
+      ),
+    );
+    out.push(
+      c.dim(
+        `  rebuilds   ${fmtTokens(Math.round(perTurn(allTime.rebuild, allTime.turns)))} tok per turn · ` +
+          `${fmtUsd(allTime.rebuildCost)} (${rebuildShare.toFixed(0)}% of spend) re-writing a lapsed cache`,
+      ),
+    );
+    if (allTime.idleMs > 0) {
+      out.push(
+        c.dim(
+          `  idle gap   ${fmtDuration(perTurn(allTime.idleMs, allTime.turns))} average between turns` +
+            ` (cache ttl ${cacheTtl})`,
+        ),
+      );
+    }
+  }
+
   const r = ratesFor(modelId, today);
   const write = r ? (cacheTtl === "1h" ? r.cacheWrite1h : r.cacheWrite5m) : 0;
   const rate = (n: number) => `$${n.toFixed(2)}`;
@@ -659,7 +780,7 @@ function mergeDays(entries: FleetEntry[]): Record<string, DayTotals> {
       const bucket = (merged[day] ??= {});
       for (const [id, t] of Object.entries(byModel)) {
         const prev = bucket[id] ?? emptyTotals();
-        bucket[id] = { ...addUsage(prev, t), turns: prev.turns + t.turns, ms: prev.ms + t.ms };
+        bucket[id] = addTotals(prev, t);
       }
     }
   }
@@ -672,7 +793,7 @@ function mergeModels(entries: FleetEntry[]): Record<string, ModelTotals> {
   for (const { ledger } of entries) {
     for (const [id, t] of Object.entries(ledger.lifetime().models)) {
       const prev = merged[id] ?? emptyTotals();
-      merged[id] = { ...addUsage(prev, t), turns: prev.turns + t.turns, ms: prev.ms + t.ms };
+      merged[id] = addTotals(prev, t);
     }
   }
   return merged;
