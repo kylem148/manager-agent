@@ -23,6 +23,12 @@ import { judgePane, pidAlive, psTtyProbe, type TtyProbe } from "./paneoccupancy.
 import { installCrewStopHook, type InstallResult } from "./crewhook.js";
 import { stopCaptureFile, type StopCapture } from "./crewstophook.js";
 import {
+  applyLane,
+  readOnlyEnforcement,
+  type ActiveAgent,
+  type DispatchLane,
+} from "./lanes.js";
+import {
   defaultWorktreeBase,
   featureBranch,
   featureSlug,
@@ -131,8 +137,19 @@ export type JobStatus = "running" | "done" | "failed";
 
 export interface Job {
   id: string;
-  /** The full order text handed to the agent. */
+  /** The full order text handed to the agent — the LAUNCH PROMPT itself, so a
+   *  read-only run's order already carries the mandate blurb (lanes.ts). The
+   *  transcript locator matches a run by its first user message, so this must
+   *  stay byte-identical to what was sent. */
   order: string;
+  /** Which lane this run holds: a full-access `writer`, or the gated read-only
+   *  `reader` that may not touch the tree. Always set; a plain dispatch is a
+   *  writer, exactly as every dispatch used to be. */
+  lane: DispatchLane;
+  /** For a reader: whether the read-only mandate is backed by tool-permission
+   *  flags at launch, or is advisory only for the agent that ran. Absent on a
+   *  writer, where the question doesn't arise. */
+  readOnlyEnforced?: boolean;
   /** A short human label for notices (first line of the order, trimmed). */
   label: string;
   /** The crew agent this job launched with (the confirm-time override or the
@@ -227,6 +244,12 @@ export interface DispatchOptions {
    *  feature's isolated checkout on its own `<type>/<slug>` branch, never the
    *  primary tree. Omit for the plain repo-cwd dispatch. */
   feature?: string;
+  /** The lane the run holds (lanes.ts). Defaults to `writer`, the full-access
+   *  run every dispatch used to be. `reader` prepends the read-only mandate to
+   *  the order and denies write-capable tools at launch where the agent's CLI
+   *  supports that. The lane is DECIDED ABOVE this layer — the captain's typed
+   *  confirm verb picks it — and the registry only carries it out. */
+  lane?: DispatchLane;
 }
 
 /** The fresh reading one dispatch places against (see surveyPanes). */
@@ -433,6 +456,35 @@ export class DispatchRegistry {
   }
 
   /**
+   * The crew agents live in a feature's worktree RIGHT NOW, with the role each
+   * holds. This is the per-feature active-agent tracking the lane gate needs
+   * (D-20260729-6): a collection, not a boolean, because "is anything running
+   * here" and "is a WRITER running here" are different questions and only the
+   * second one may block a landing.
+   *
+   * Derived from the live job map rather than kept as a second ledger, so it
+   * cannot drift from what is actually running. That also makes it correctly
+   * ephemeral: a restart clears it, which is right — the agents are in panes the
+   * captain can see, and nothing is half-done by a forgotten lane.
+   */
+  activeAgents(feature: string): ActiveAgent[] {
+    return this.jobsForFeature(feature)
+      .filter((j) => j.status === "running")
+      .map((j) => ({
+        jobId: j.id,
+        lane: j.lane,
+        ...(j.agentName ? { agentName: j.agentName } : {}),
+      }));
+  }
+
+  /** Whether a WRITING crew agent is live in the feature's worktree. This, not
+   *  "any agent", is what gates landing, enqueuing and abandoning: a reader
+   *  cannot move the index or leave a byte behind, so it has no claim on those. */
+  hasActiveWriter(feature: string): boolean {
+    return this.activeAgents(feature).some((a) => a.lane === "writer");
+  }
+
+  /**
    * Re-read the dispatch config from disk and return the current in-memory copy.
    * This is the SAME refresh a dispatch does, exposed so the arming banner shows
    * exactly what the next dispatch will run — otherwise the banner reads a config
@@ -490,11 +542,17 @@ export class DispatchRegistry {
    * With `opts.feature`, the dispatch is scoped to that feature: its worktree is
    * provisioned if this is the feature's first dispatch (ensureFeatureWorktree),
    * reused otherwise, and the crew process runs with the worktree as its cwd;
-   * the agent binds to the isolated checkout by being launched inside it. A
-   * worktree is worked serially (agents in one checkout would trample each
-   * other's index and files), so a second dispatch to a feature whose job is
-   * still running fails cleanly instead of launching. Provisioning failures take
-   * the same marked-failed-and-notified path as launch failures.
+   * the agent binds to the isolated checkout by being launched inside it.
+   * Provisioning failures take the same marked-failed-and-notified path as
+   * launch failures.
+   *
+   * A second dispatch into an occupied worktree is NOT refused here (the old
+   * one-agent cap is gone, D-20260729-5). The hazard is two concurrent WRITERS
+   * sharing one index and one build dir, and the gate for that is the captain's
+   * typed confirm verb one layer up: a bare `confirm` grants `opts.lane =
+   * "reader"`, and only `confirm write` grants a second writer. The registry's
+   * job is to carry the lane out faithfully — prepend the mandate, deny the
+   * write tools where it can — and to keep the roles readable (activeAgents).
    */
   async dispatch(order: string, agentName?: string, opts: DispatchOptions = {}): Promise<Job> {
     // Pick up a `co pane` / `co link` change made since the session started (or
@@ -508,7 +566,17 @@ export class DispatchRegistry {
     await this.ensureStopHook(agentName);
 
     const id = this.nextJobId();
+    // The label comes from the order the CALLER wrote, before the lane is
+    // applied: a reader's launch prompt opens with the mandate blurb, and a
+    // notice line reading "READ-ONLY RUN. Another agent is working in…" for
+    // every audit would name the lane instead of the job.
     const label = firstLine(order);
+    const lane: DispatchLane = opts.lane ?? "writer";
+    // The order as the agent will actually receive it. Stored on the job, so the
+    // transcript locator (which matches a run by its first user message) and the
+    // review record both see exactly what was sent.
+    const prompt = applyLane(order, lane);
+    const enforcement = readOnlyEnforcement(resolveAgentCommand(this.config, agentName));
     // The capture/identity key is unique per DISPATCH: the job id (stable, for
     // display) plus the session runTag plus a per-dispatch random nonce. The
     // runTag alone stops a previous session's job-001.log from being overwritten
@@ -518,7 +586,9 @@ export class DispatchRegistry {
     const captureFile = this.paths.captureFile(`${id}-${this.runTag}-${this.dispatchNonce()}`);
     const job: Job = {
       id,
-      order,
+      order: prompt,
+      lane,
+      ...(lane === "reader" ? { readOnlyEnforced: enforcement.enforced } : {}),
       label,
       ...(agentName ? { agentName } : {}),
       ...(opts.feature ? { feature: opts.feature } : {}),
@@ -560,15 +630,6 @@ export class DispatchRegistry {
       // marked-failed-and-notified path as launch failures: a bad provision
       // (a half-state worktree, a missing repo) can't crash the session.
       if (job.feature) {
-        const clash = this.list().find(
-          (j) => j.id !== job.id && j.feature === job.feature && j.status === "running",
-        );
-        if (clash) {
-          throw new Error(
-            `feature '${job.feature}' already has an active job (${clash.id}); ` +
-              `a feature's worktree runs one agent at a time`,
-          );
-        }
         const record = await this.ensureFeatureWorktree(job.feature);
         job.cwd = record.worktreePath;
       }
@@ -872,6 +933,7 @@ export class DispatchRegistry {
       order: job.order,
       captureFile: job.captureFile,
       placement,
+      lane: job.lane,
       ...(job.agentName ? { agentName: job.agentName } : {}),
       ...(job.cwd ? { cwd: job.cwd } : {}),
       ...(this.paneStartTimeoutMs !== undefined

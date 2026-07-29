@@ -22,6 +22,7 @@ import {
   defaultWorktreeBase,
 } from "./worktrees.js";
 import type { LandingGateHost } from "./landinggate.js";
+import type { ActiveAgent } from "./lanes.js";
 import type { LandingReview } from "../tui/tui.js";
 import { makeFakeForge, type FakeForge } from "./forgefake.test.js";
 import type { ChecksPolicy } from "./checks.js";
@@ -362,6 +363,20 @@ function approvingHost(seen: LandingReview[]): LandingGateHost {
   };
 }
 
+/**
+ * Pretend crew agents are live in a feature's worktree, with the roles they
+ * hold. The registry derives its active-agent list from real running jobs, and a
+ * real job needs a Ghostty pane these fixtures deliberately do not have — so the
+ * list is stubbed on the registry INSTANCE. `hasActiveWriter` is left alone on
+ * purpose: it is implemented over `activeAgents`, so stubbing the one keeps the
+ * two answers consistent instead of letting a test set up a state the real
+ * registry could never produce.
+ */
+function crewIn(fx: Fixture, agents: Record<string, ActiveAgent[]>): void {
+  (fx.registry as unknown as { activeAgents: (f: string) => ActiveAgent[] }).activeAgents = (f) =>
+    agents[f] ?? [];
+}
+
 function rejectingHost(seen: LandingReview[]): LandingGateHost {
   return {
     async openLandingReview(review) {
@@ -534,6 +549,99 @@ test("a landed feature's intent is dropped from the store, so the slug can be re
     const next = await fx.restart();
     await next.reconcileAtBoot();
     assert.deepEqual(next.overview(), [], "nothing tracked, nothing described");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a live WRITER blocks landing, enqueuing and abandoning", async () => {
+  const seen: LandingReview[] = [];
+  const fx = await makeFixture(approvingHost(seen));
+  try {
+    const created = await fx.features.create("busy-one", "someone is in here");
+    await commitIn(created.feature.worktreePath, "f.txt", "work\n", "job: the work");
+    crewIn(fx, { "busy-one": [{ jobId: "job-001", lane: "writer", agentName: "cc" }] });
+
+    // The queue will not rebase a checkout out from under a writer: the head is
+    // held "queued" rather than processed.
+    const enq = await fx.features.enqueue("busy-one");
+    assert.equal(enq.enqueued, true);
+    assert.equal(enq.head?.status, "queued", "held, not rebased under the writer");
+    assert.match(enq.summary, /a crew agent is still working it/);
+
+    // Landing refuses, and names the writer rather than saying "an agent". On a
+    // feature of its own, because an enqueued feature is refused earlier for a
+    // different reason (it lands as the queue head or not at all).
+    const direct = await fx.features.create("busy-two", "someone is in here too");
+    await commitIn(direct.feature.worktreePath, "f.txt", "work\n", "job: the work");
+    crewIn(fx, {
+      "busy-one": [{ jobId: "job-001", lane: "writer", agentName: "cc" }],
+      "busy-two": [{ jobId: "job-001", lane: "writer", agentName: "cc" }],
+    });
+    const landed = await fx.features.land("busy-two");
+    assert.equal(landed.outcome, "rejected");
+    assert.match(landed.summary, /WRITING crew agent \(job-001 \[cc\]\)/);
+
+    // So does abandoning: tearing the checkout down under a live writer
+    // destroys work that has not reached the index yet.
+    const dropped = await fx.features.abandon("busy-one");
+    assert.equal(dropped.abandoned, false);
+    assert.match(dropped.reason ?? "", /WRITING crew agent \(job-001 \[cc\]\)/);
+    assert.ok(fs.existsSync(created.feature.worktreePath), "and the worktree is still there");
+    assert.deepEqual(seen, [], "the landing gate was never even opened");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a live READER blocks nothing: a feature with only auditors in it lands normally", async () => {
+  const seen: LandingReview[] = [];
+  const fx = await makeFixture(approvingHost(seen));
+  try {
+    const created = await fx.features.create("audited", "an auditor is reading it");
+    await commitIn(created.feature.worktreePath, "f.txt", "work\n", "job: the work");
+    crewIn(fx, { audited: [{ jobId: "job-002", lane: "reader", agentName: "cc" }] });
+
+    // The role is visible, and the two questions are kept apart: something IS
+    // running here, and yet nothing is writing.
+    const status = await fx.features.status("audited");
+    assert.equal(status?.busy, true, "an agent is live, and the panel must not hide it");
+    assert.equal(status?.writerActive, false, "but nothing is writing");
+    assert.deepEqual(status?.agents, [{ jobId: "job-002", lane: "reader", agentName: "cc" }]);
+    // feature_list carries the same roles, for the same reason.
+    assert.deepEqual(fx.features.list().find((f) => f.slug === "audited")?.agents, [
+      { jobId: "job-002", lane: "reader", agentName: "cc" },
+    ]);
+
+    // The reader holds no index and leaves no bytes, so the head processes.
+    const enq = await fx.features.enqueue("audited");
+    assert.equal(enq.head?.status, "ready", "the head rebased and went green with the reader still live");
+
+    // And it merges, with the reader still in the worktree.
+    const merged = await fx.features.mergeReadyHead();
+    assert.equal(merged.merged, true, merged.summary);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a reader does not stop feature_land or feature_abandon either", async () => {
+  const seen: LandingReview[] = [];
+  const fx = await makeFixture(approvingHost(seen));
+  try {
+    const landing = await fx.features.create("read-while-landing", "audited on the way out");
+    await commitIn(landing.feature.worktreePath, "f.txt", "work\n", "job: the work");
+    crewIn(fx, {
+      "read-while-landing": [{ jobId: "job-003", lane: "reader" }],
+      "read-while-dropping": [{ jobId: "job-004", lane: "reader" }],
+    });
+    const res = await fx.features.land("read-while-landing");
+    assert.equal(res.outcome, "merged", res.summary);
+
+    const dropping = await fx.features.create("read-while-dropping", "audited on the way out");
+    assert.ok(fs.existsSync(dropping.feature.worktreePath));
+    const dropped = await fx.features.abandon("read-while-dropping");
+    assert.equal(dropped.abandoned, true, dropped.reason);
   } finally {
     await fx.cleanup();
   }

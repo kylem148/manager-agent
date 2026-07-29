@@ -499,6 +499,49 @@ order stays armed — it lists the valid names and waits for you to retype, so a
 typo never fires the wrong agent or forces a re-draft. This typed confirm is a
 hard interlock, not a nicety — there is no code path that dispatches without it.
 
+### Two agents in one worktree: the read-only lane
+
+A feature worktree can hold more than one agent, and the confirm verb decides
+which of them may **write**. Dispatching into a worktree that already has a live
+crew agent is not refused; the arm banner names who is in there and offers you
+two verbs:
+
+| you type         | what it grants                                                     |
+| ---------------- | ------------------------------------------------------------------ |
+| `confirm`        | a **read-only** lane: an auditor that may not touch the tree        |
+| `confirm write`  | a **second writing** lane: both agents write the same checkout      |
+
+Anything that isn't a confirm still cancels, and `confirm write` on an empty
+worktree is just a synonym for `confirm` — it changes nothing there.
+
+The reason the safe one is the default: a worktree has one `.git/index`, one
+`dist/` and one `node_modules`. Two writers in it risk something invisible
+rather than loud — the second drops a scratch file, a coverage dir or a build
+artifact, and the first then runs `git add -A && git commit` and sweeps it into
+a commit that looks legitimate and isn't. A strictly read-only second agent has
+none of that, so it costs one typed word to get the risky one.
+
+The read-only lane is held two ways, and the banner tells you which you're
+getting. Every read-only order is prefixed with a mandate forbidding *every*
+write — not just commits: no edits, no new files, no `git add` / `commit` /
+`stash`, no `npm install`, no build, no test run that emits artifacts. On top of
+that, an agent whose CLI takes tool-permission flags (Claude Code does) is
+launched with its write-capable tools denied outright. For an agent with no such
+flag the lane is **advisory**, and the banner says so rather than claiming an
+enforcement that isn't there.
+
+What comes back is different too. A read-only run built nothing, so it is not
+reviewed and nothing is filed in the inbox: its findings are handed to the
+co-manager as context, and it answers you with what the audit found. Only a
+**writer** blocks the levers, as well — a feature with an auditor still reading
+it enqueues, lands and abandons normally, while a live writer refuses all three
+by name.
+
+This is what makes auditing work-in-progress possible at all. The auditor reads
+the *same* checkout as the implementer, uncommitted changes included; a separate
+sibling worktree was the obvious alternative and was rejected precisely because
+it can only ever see what has already been committed.
+
 **On macOS with Ghostty**, a confirmed dispatch opens a visible split pane in your
 current tab and runs the agent there interactively, so you can watch it and answer
 its questions live. Placement follows a fixed scheme: designate the crew pane once
@@ -557,7 +600,8 @@ review on its own — you never paste anything back, and every job reports
 independently (a later job finishing while an earlier one still runs delivers
 its own review). The session stays fully interactive the whole time, including
 with several jobs running at once; a failed or timed-out job never takes the
-session down.
+session down. A read-only audit run is the one exception, and files no review at
+all (see "Two agents in one worktree" above).
 
 ### Reviews are filed, not shouted
 
@@ -580,6 +624,10 @@ The full review body is never printed to the chat at any level — it lives in t
 inbox. So a clean chore costs you no attention, a mixed result costs you one
 line, and only a run that genuinely needs a decision interrupts you, with the
 decision and nothing else.
+
+A **read-only audit** never enters this at all: there is no diff to accept or
+rework, so it gets no verdict, no level and no inbox row. The co-manager simply
+answers you with what the audit found.
 
 ### The Ctrl-O panel: tabs and keys
 

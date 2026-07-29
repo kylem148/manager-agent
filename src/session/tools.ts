@@ -335,7 +335,8 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "dispatch_order",
       description:
-        "Arm a direct dispatch of an implementation-ready order to the crew (the registered coding agent). This does NOT run anything: it stages the order and shows the captain the exact order text plus the resolved command and target, and waits. The dispatch fires only if the captain then types `confirm`; any other input cancels it. Use this instead of writing plain-text orders when the captain wants the order run directly. Draft the full order (same checklist as a written order: read-docs-first, goal, context, decisions, constraints, acceptance, verification, close-the-report, commit) as the `order` argument. Optionally scope it to a feature with `feature`: the crew then runs inside that feature's isolated worktree (provisioned on first use) instead of the bare main tree. Arm at most one order per turn.",
+        "Arm a direct dispatch of an implementation-ready order to the crew (the registered coding agent). This does NOT run anything: it stages the order and shows the captain the exact order text plus the resolved command and target, and waits. The dispatch fires only if the captain then types `confirm`; any other input cancels it. Use this instead of writing plain-text orders when the captain wants the order run directly. Draft the full order (same checklist as a written order: read-docs-first, goal, context, decisions, constraints, acceptance, verification, close-the-report, commit) as the `order` argument. Optionally scope it to a feature with `feature`: the crew then runs inside that feature's isolated worktree (provisioned on first use) instead of the bare main tree. Arm at most one order per turn.\n\n" +
+        "TARGETING A WORKTREE THAT ALREADY HAS A LIVE AGENT is allowed and is LANE-GATED, not refused. The arm banner then names the live agent and offers the captain two verbs: a bare `confirm` grants a READ-ONLY lane (the order is prefixed with a mandate forbidding every write to the tree — no edits, no new files, no `git add`/`commit`/`stash`, no install, no build, no artifact-emitting test run — and the agent's write-capable tools are denied at launch where its CLI supports that), while `confirm write` grants a second WRITING lane, with both agents writing one git index and one build dir. The captain picks; you do not. So write the order for the lane you expect: an audit order asks for findings, and if the work genuinely needs to write, say so and let them choose. A read-only run's result comes back to you as CONTEXT to answer with — no review is filed for it.",
       input_schema: {
         type: "object",
         properties: {
@@ -432,13 +433,13 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "feature_list",
       description:
-        "List every tracked feature: its branch, worktree path, provision status, whether a crew agent is currently working it, its dispatched jobs, and — for enqueued features — its merge-queue position and head state (queued / head-processing / awaiting-checks / ready / blocked / resolving). Also returns the full merge queue in landing order. Use to see what is in flight across the parallel-worktree flow.",
+        "List every tracked feature: its branch, worktree path, provision status, which crew agents are live in it and in which lane (`agents` gives each one's job id and role, `writerActive` says whether one of them is a WRITER), its dispatched jobs, and — for enqueued features — its merge-queue position and head state (queued / head-processing / awaiting-checks / ready / blocked / resolving). Also returns the full merge queue in landing order. Use to see what is in flight across the parallel-worktree flow. Only a WRITER blocks enqueuing, landing and abandoning; a worktree with only read-only auditors in it lands normally.",
       input_schema: { type: "object", properties: {}, additionalProperties: false },
     });
     tools.push({
       name: "feature_status",
       description:
-        "Show one feature's full picture: branch, worktree path, provision status, whether its worktree has uncommitted changes, whether a crew agent is active, its jobs, and — if it is enqueued — its merge-queue position and head state (queued / head-processing / awaiting-checks / ready / blocked / resolving), including whether a block is a conflict or a red CI check, and whether a ready head is ungated (its PR reports no checks at all). Returns not-found if nothing is tracked under that name or slug.",
+        "Show one feature's full picture: branch, worktree path, provision status, whether its worktree has uncommitted changes, which crew agents are live in it and in which lane (`agents` gives each one's job id and role; `writerActive` says whether one of them is a WRITER, which is the only thing that blocks landing), its jobs, and — if it is enqueued — its merge-queue position and head state (queued / head-processing / awaiting-checks / ready / blocked / resolving), including whether a block is a conflict or a red CI check, and whether a ready head is ungated (its PR reports no checks at all). Returns not-found if nothing is tracked under that name or slug.",
       input_schema: {
         type: "object",
         properties: {
@@ -451,7 +452,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "feature_abandon",
       description:
-        "Tear down a feature's worktree WITHOUT landing it: remove the checkout and delete its branch only if it is already contained in `origin/dev`. Refuses (reports, never forces) a worktree with uncommitted changes — discarding unsaved work is the captain's call. Committed-but-unmerged work is preserved: the branch is kept and the reason reported. Use to drop an abandoned or superseded feature.",
+        "Tear down a feature's worktree WITHOUT landing it: remove the checkout and delete its branch only if it is already contained in `origin/dev`. Refuses (reports, never forces) a worktree that still has a live WRITING crew agent in it, and one with uncommitted changes — discarding unsaved work is the captain's call. A read-only auditor in the worktree does not refuse it. Committed-but-unmerged work is preserved: the branch is kept and the reason reported. Use to drop an abandoned or superseded feature.",
       input_schema: {
         type: "object",
         properties: {

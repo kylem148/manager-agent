@@ -439,6 +439,87 @@ test("the table's contract is two columns, two status words, and a bias against 
   }
 });
 
+test("the two lanes are in the protocol: which verb grants which, and who is enforced", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    // The old cap is gone from the prose as well as the code. A prompt that
+    // still said a second dispatch is refused would have the co decline work the
+    // harness now allows, and no test would catch it.
+    assert.ok(
+      !prompt.includes("a second dispatch while one is live is refused"),
+      "the one-agent cap is gone from the protocol",
+    );
+    assert.match(prompt, /Two lanes in one worktree/);
+    // The hazard, named — this is what makes the default the read-only one.
+    assert.match(
+      prompt,
+      /one \\?`\.git\/index\\?`, one \\?`dist\/\\?` and one \\?`node_modules\\?`/,
+      "why two writers are a hazard at all",
+    );
+    assert.match(
+      prompt,
+      /sweeps it into a commit that looks legitimate and\s+is not/,
+      "and that the failure is invisible rather than loud",
+    );
+    // The two verbs, each bound to its lane. These are the words the captain
+    // types, so they are pinned literally.
+    assert.match(prompt, /\*\*\\?`confirm\\?` grants the READ-ONLY lane\.\*\*/);
+    assert.match(prompt, /\*\*\\?`confirm write\\?` grants a SECOND WRITING lane\.\*\*/);
+    assert.match(prompt, /Anything else still cancels/, "the interlock is otherwise unchanged");
+    // The mandate forbids every write, not merely commits.
+    assert.match(
+      prompt,
+      /no \\?`git add\\?` \/\s+\\?`commit\\?` \/ \\?`stash\\?`, no install, no build, no test run that emits artifacts/,
+      "the read-only mandate is total, not commit-shaped",
+    );
+    // And the honesty rule about enforcement, which is the thing a prompt could
+    // most easily over-claim.
+    assert.match(
+      prompt,
+      /for an agent with no such flags the lane is advisory, and you should say so\s+plainly/,
+      "an advisory lane is never described as sandboxed",
+    );
+    assert.match(prompt, /The captain chooses the lane, not you/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("an audit run files no review, and only a writer blocks the levers", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    // The routing rule. The co files a review for EVERY completion by standing
+    // instruction, so the exception has to be explicit or an audit lands in the
+    // inbox with an accept/rework verdict for work that was never done.
+    assert.match(prompt, /\*\*A read-only run's result is NOT a review\.\*\*/);
+    assert.match(prompt, /Do NOT call \\?`file_review\\?` for it/);
+    assert.match(prompt, /do not give\s+it a verdict/);
+    assert.match(prompt, /Answer\s+the captain with what it found/);
+    // The review protocol's own completion bullet has to agree with it.
+    assert.match(
+      prompt,
+      /that comes back as\s+context to answer with, and you file no review for it/,
+      "stated where the co reads about completions, not only in the lanes section",
+    );
+    // The role-aware guard, and the consequence the co would otherwise misread.
+    assert.match(prompt, /\*\*Only a WRITER blocks the levers\.\*\*/);
+    assert.match(
+      prompt,
+      /A feature with only readers in it enqueues, lands and abandons\s+normally/,
+      "a reader holds no index, so it has no claim on a landing",
+    );
+    assert.match(
+      prompt,
+      /a landing\s+you expected to be held may simply proceed; that is correct/,
+      "said plainly, so the co does not report a working landing as a bug",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
 test("an ungated head comes with the offer to add a CI workflow, and never a held merge", async () => {
   const { paths, cleanup } = await makeInstance();
   try {

@@ -3,6 +3,7 @@ import fsp from "node:fs/promises";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveCommandLine, resolveAgentCommand, shellQuote, type DispatchConfig } from "./dispatchconfig.js";
+import { withReadOnlyFlags, type DispatchLane } from "./lanes.js";
 import type { InstancePaths } from "../paths.js";
 import { CrewPaneLayout, type PlacementDecision, type PlacementInput } from "./crewpanes.js";
 import { normalizeTty, type PaneIdentity } from "./paneoccupancy.js";
@@ -175,15 +176,22 @@ export const paneExists = anchorExists;
  * template that references {repo} must agree with that launch directory: an
  * agent told to run in the worktree but pointed at the primary tree would write
  * to the wrong checkout.
+ *
+ * `lane` is the READ-ONLY gate (lanes.ts). A reader's template gets the agent's
+ * write-capable tools denied at launch where its CLI supports that; where it
+ * does not, the template is unchanged and the lane rides on the mandate in the
+ * order alone (the arm banner says which of the two the captain is getting).
  */
 export function jobCommandLine(
   config: DispatchConfig,
   order: string,
   agentName?: string,
   cwd?: string,
+  lane: DispatchLane = "writer",
 ): string {
   const command = resolveAgentCommand(config, agentName);
-  return resolveCommandLine(command, { prompt: order, repo: cwd ?? config.repoPath });
+  const template = lane === "reader" ? withReadOnlyFlags(command) : command;
+  return resolveCommandLine(template, { prompt: order, repo: cwd ?? config.repoPath });
 }
 
 /**
@@ -570,6 +578,10 @@ export async function launchGhostty(args: {
    *  passes the feature's worktree path so the agent operates in that isolated
    *  checkout. Omitted, the linked repo is the cwd, exactly as before. */
   cwd?: string;
+  /** The lane this run holds (lanes.ts). A reader launches with write-capable
+   *  tools denied where the agent's CLI takes such flags. Defaults to writer,
+   *  which is the unchanged full-access launch. */
+  lane?: DispatchLane;
   /** Capture file override (the registry namespaces these per session); defaults
    *  to the instance's captureFile(jobId) for direct callers and tests. */
   captureFile?: string;
@@ -587,7 +599,7 @@ export async function launchGhostty(args: {
 
   const decision = layout.plan(args.placement ?? {});
 
-  const crewCommand = jobCommandLine(config, order, agentName, args.cwd);
+  const crewCommand = jobCommandLine(config, order, agentName, args.cwd, args.lane ?? "writer");
   // The job script owns everything fragile: cd, the (possibly multi-line) order,
   // capture, exit sidecar, sentinel. The pane only ever sees the launch line.
   const scriptPath = jobScriptFile(captureFile);

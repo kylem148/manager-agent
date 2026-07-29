@@ -244,9 +244,11 @@ export interface HeadPullRequest {
  *  or removal implies. Kept as a narrow interface so the queue is unit-testable
  *  with a fake host and no registry. */
 export interface MergeQueueHost {
-  /** Whether a crew agent is currently running or queued in the feature's
-   *  worktree. A worktree is worked serially, so the queue must never rebase or
-   *  merge one out from under a live agent. */
+  /** Whether a WRITING crew agent is currently live in the feature's worktree:
+   *  the queue must never rebase or merge a checkout out from under an agent
+   *  that is mid-edit or holds the index. A read-only auditor (lanes.ts) is not
+   *  such an agent and never sets this — a feature with only readers in it lands
+   *  normally (D-20260729-6). */
   isBusy(feature: string): boolean;
   /** Drop the feature's tracking (registry record + any stored prose) after it
    *  has landed or been removed from the queue. */

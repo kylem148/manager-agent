@@ -22,6 +22,7 @@ import {
   type QueueView,
 } from "./mergequeue.js";
 import type { DispatchRegistry } from "./registry.js";
+import type { ActiveAgent } from "./lanes.js";
 import {
   featureBranch,
   featureSlug,
@@ -114,9 +115,16 @@ export interface FeatureView {
   intent?: string;
   /** Jobs the registry has dispatched under this feature (id + status + label). */
   jobs: { id: string; status: string; label: string }[];
-  /** Whether a crew agent is currently running in the worktree. A feature runs
-   *  one agent at a time. */
+  /** Whether ANY crew agent is currently running in the worktree, of either
+   *  role. Use `writerActive` for the question that gates landing. */
   busy: boolean;
+  /** The agents live in the worktree right now, each with its role: `writer`
+   *  (full access) or `reader` (the gated read-only audit lane). Empty when
+   *  nothing is running. */
+  agents: ActiveAgent[];
+  /** Whether one of those agents is a WRITER. This is what blocks enqueuing,
+   *  landing and abandoning; a worktree with only readers in it lands normally. */
+  writerActive: boolean;
   /** The feature's place in the serial merge queue, when it is enqueued: its
    *  position, whether it is the head, and its queue status (queued /
    *  head-processing / awaiting-checks / ready / blocked). Absent when the
@@ -301,7 +309,11 @@ export class FeatureManager {
       ...(this.remote ? { remote: this.remote } : {}),
       ...(this.run ? { run: this.run } : {}),
       host: {
-        isBusy: (feature) => this.isBusy(feature),
+        // WRITER-only, deliberately. The queue's question is "may I rebase and
+        // push this worktree out from under whatever is in it", and only a
+        // writer can be mid-edit or hold the index. A read-only auditor reading
+        // the tree does not stop a landing (D-20260729-6).
+        isBusy: (feature) => this.hasWriter(feature),
         forget: (feature) => {
           this.registry.removeFeature(feature);
           // Fire-and-forget: the in-memory drop is synchronous, and the file
@@ -314,11 +326,28 @@ export class FeatureManager {
     });
   }
 
-  /** Whether a crew agent is currently running in the feature's worktree — a
-   *  feature is worked one agent at a time, so this gates landing and queue
-   *  processing. */
+  /** Whether ANY crew agent is currently running in the feature's worktree,
+   *  reader or writer. This is the panel's "something is happening here" chip,
+   *  never a gate — see hasWriter for that. */
   private isBusy(feature: string): boolean {
-    return this.registry.jobsForFeature(feature).some((j) => j.status === "running");
+    return this.registry.activeAgents(feature).length > 0;
+  }
+
+  /** Whether a WRITING agent is live in the worktree. The gate on every verb
+   *  that moves or destroys the checkout (enqueue via the queue host, land,
+   *  abandon): a reader holds no index and leaves no bytes, so it blocks
+   *  nothing. */
+  private hasWriter(feature: string): boolean {
+    return this.registry.hasActiveWriter(feature);
+  }
+
+  /** One line naming the live writers, for a refusal message. */
+  private describeWriters(feature: string): string {
+    const writers = this.registry
+      .activeAgents(feature)
+      .filter((a) => a.lane === "writer")
+      .map((a) => (a.agentName ? `${a.jobId} [${a.agentName}]` : a.jobId));
+    return writers.join(", ");
   }
 
   /**
@@ -363,7 +392,7 @@ export class FeatureManager {
     const jobs = this.registry
       .jobsForFeature(record.feature)
       .map((j) => ({ id: j.id, status: j.status, label: j.label }));
-    const busy = this.isBusy(record.feature);
+    const agents = this.registry.activeAgents(record.feature);
     const intent = this.store.intent(record.slug);
     const queue = this.queue.viewFor(record.feature);
     return {
@@ -374,7 +403,9 @@ export class FeatureManager {
       provisionStatus: record.provisionStatus,
       ...(intent ? { intent } : {}),
       jobs,
-      busy,
+      busy: agents.length > 0,
+      agents,
+      writerActive: agents.some((a) => a.lane === "writer"),
       ...(queue ? { queue } : {}),
     };
   }
@@ -526,13 +557,18 @@ export class FeatureManager {
         error: "feature is enqueued; it merges as the queue head",
       };
     }
-    if (this.isBusy(feature)) {
+    // Only a WRITER blocks. A read-only auditor in the same worktree is reading
+    // a tree the landing is about to rebase, which costs it a stale view and
+    // costs the landing nothing (D-20260729-6).
+    if (this.hasWriter(feature)) {
       return {
         feature,
         outcome: "rejected",
         prepared: "failed",
-        summary: `Feature '${feature}' still has a crew agent working; let it finish before landing.`,
-        error: "a crew agent is still active in the worktree",
+        summary: `Feature '${feature}' still has a WRITING crew agent (${this.describeWriters(
+          feature,
+        )}); let it finish before landing.`,
+        error: "a writing crew agent is still active in the worktree",
       };
     }
 
@@ -596,10 +632,23 @@ export class FeatureManager {
    * The feature is identified by its own worktree, so this can only ever act on
    * a checkout co provisioned; the tracked record's branch is passed through as
    * the fallback for the case where that checkout is already gone.
+   *
+   * A live WRITER refuses it outright, ahead of the dirty check: tearing a
+   * checkout down under an agent that is mid-edit destroys work that has not
+   * reached the index yet, and the dirty check alone would only catch it by
+   * luck. A live READER does not refuse it (D-20260729-6) — it holds nothing.
    */
   async abandon(name: string): Promise<AbandonResult> {
     const record = this.findRecord(name);
     const feature = record?.feature ?? name;
+    if (this.hasWriter(feature)) {
+      return {
+        abandoned: false,
+        reason:
+          `'${feature}' still has a WRITING crew agent (${this.describeWriters(feature)}); refusing to ` +
+          `tear its worktree down underneath it. Let it finish, or stop it in its pane, then abandon.`,
+      };
+    }
     const entry = await findFeatureWorktree(this.worktreeOptions(), feature);
     if (entry && fs.existsSync(entry.path) && (await isWorktreeDirty(entry.path))) {
       return {
