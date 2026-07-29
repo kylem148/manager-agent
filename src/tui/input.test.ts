@@ -92,14 +92,14 @@ test("plain Enter still submits", async () => {
   assert.equal(await submitAfter("hello"), "hello");
 });
 
-test("Enter with no pending read does not submit a phantom line", async () => {
+test("Enter with no pending read queues the line rather than dropping it", async () => {
   const h = harness();
-  h.send("stray\r"); // nobody is reading yet
+  h.send("stray\r"); // nobody is reading yet: this queues
   const answer = h.tui.question();
-  h.send(" text\r");
-  // The buffer survived the Enter that had no reader, and only the real Enter
-  // submitted — once.
-  assert.equal(await answer, "stray text");
+  // Delivered exactly once, whole, to the read that follows. It used to sit in
+  // the buffer waiting for a second Enter; it is now the answer to this read.
+  // The queue's own behaviour is pinned in queued.test.ts.
+  assert.equal(await answer, "stray");
   h.stop();
 });
 

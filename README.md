@@ -322,6 +322,16 @@ The session is a scrollable terminal UI, not a plain read-out:
   **`Ctrl-J`** inserts a newline and works everywhere; `Alt/Option+Enter` also
   works if your terminal sends Option as Meta. Set `CO_KEYS=off` to skip the
   protocol request entirely — you lose Shift+Enter, `Ctrl-J` still composes.
+- **Type while the co is working.** The prompt line stays live during a turn, so
+  you compose at the spinner instead of waiting on it. `Enter` then **queues** the
+  message rather than sending it; several can queue, they're listed above the
+  input bar with a count, and they go out in order — one turn each — as the turn
+  in flight ends. `Backspace` on an empty line lifts the newest one back onto the
+  line to rephrase it; `Esc Esc` on an empty line drops the whole queue. One
+  deliberate exception: while a dispatch is armed the queue is **held** and says
+  so, because the armed gate reads the next line as your `confirm` or as a
+  cancellation — it only ever gets a key you actually pressed. Piped/non-TTY
+  sessions read ahead the way they always have.
 - **Word wrap** breaks long lines at word boundaries and is ANSI-aware, so
   colored text never gets split mid-escape or mid-word at the column edge.
 - **Selecting text** while the app captures the mouse: hold your terminal's
