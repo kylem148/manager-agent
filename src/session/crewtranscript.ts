@@ -160,14 +160,30 @@ interface Block {
 
 /**
  * Render a Claude Code JSONL transcript into compact, readable review text:
- * message text in full (truncated per-message), tool calls as one-liners, tool
- * results trimmed hard — the review needs what the crew said and did, not every
- * byte a build printed. Unparseable lines are skipped (a tail-truncated read
- * may cut the first line). Output is capped at `maxChars`, keeping the TAIL,
- * where the run's conclusion lives.
+ * every word the crew SAID in full, tool calls as one-liners, tool results
+ * trimmed hard — the review needs what the crew said and did, not every byte a
+ * build printed. Unparseable lines are skipped (a tail-truncated read may cut
+ * the first line).
+ *
+ * THE CREW'S COMPLETION REPORT IS NEVER CUT. It is the whole point of the
+ * review, it is the last thing the crew says, and it is the one thing an order
+ * explicitly asks the crew to close with a diffstat, its verification output and
+ * the approaches it dropped. So the render splits in two: the run's CONTEXT
+ * (everything up to the crew's last spoken message) is bounded by `maxChars`,
+ * keeping its tail; the REPORT is appended whole, however long it is, and the
+ * budget does not apply to it.
+ *
+ * An earlier revision clipped EVERY message at 2000 characters and kept the
+ * head, so a report longer than that reached the reviewing co-manager cut
+ * mid-sentence with its diffstat and verification silently missing. Nothing
+ * here cuts silently any more: every bound that bites says so inline, naming
+ * bytes shown against bytes captured.
  */
 export function renderTranscriptForReview(jsonl: string, maxChars: number): string {
   const out: string[] = [];
+  // Where the crew's final spoken message starts in `out`. Everything from here
+  // down is the report and is exempt from the context budget.
+  let reportAt = -1;
   for (const line of jsonl.split("\n")) {
     if (!line.trim()) continue;
     let obj: unknown;
@@ -180,20 +196,44 @@ export function renderTranscriptForReview(jsonl: string, maxChars: number): stri
     if (o.type !== "user" && o.type !== "assistant") continue;
     const content = o.message?.content;
     if (typeof content === "string") {
-      out.push(`[prompt] ${clip(content, 2000)}`);
+      // The launch prompt: the order itself, verbatim — the review reads the
+      // report against what was actually asked for.
+      out.push(`[prompt] ${trimEnd(content)}`);
       continue;
     }
     if (!Array.isArray(content)) continue;
+    // A message's own text blocks open a new candidate report: the last message
+    // that says anything is the one carrying the completion report.
+    let saidSomething = false;
     for (const b of content) {
-      if (b.type === "text" && b.text) out.push(`[crew] ${clip(b.text, 2000)}`);
-      else if (b.type === "tool_use") out.push(`[tool] ${b.name ?? "?"} ${clip(JSON.stringify(b.input ?? ""), 300)}`);
-      else if (b.type === "tool_result") out.push(`[result] ${clip(flattenResult(b.content), 400)}`);
+      if (b.type === "text" && b.text) {
+        if (!saidSomething && o.type === "assistant") {
+          saidSomething = true;
+          reportAt = out.length;
+        }
+        out.push(`[crew] ${trimEnd(b.text)}`);
+      } else if (b.type === "tool_use") {
+        out.push(`[tool] ${b.name ?? "?"} ${clip(JSON.stringify(b.input ?? ""), 300)}`);
+      } else if (b.type === "tool_result") {
+        out.push(`[result] ${clip(flattenResult(b.content), 400)}`);
+      }
       // thinking blocks are deliberately dropped: never render thinking.
     }
   }
-  const text = out.join("\n");
-  if (text.length <= maxChars) return text;
-  return "…[transcript truncated to the last part]\n" + text.slice(-maxChars);
+  // No spoken message at all (a run that only called tools): there is no report
+  // to protect, so the whole record is context.
+  const split = reportAt < 0 ? out.length : reportAt;
+  const context = out.slice(0, split).join("\n");
+  const report = out.slice(split).join("\n");
+  if (context.length <= maxChars) return [context, report].filter((s) => s).join("\n");
+  return [
+    `…[co: the earlier part of this record was trimmed — showing the last ${maxChars} of ` +
+      `${context.length} bytes of run context. The crew's final report below is complete.]`,
+    context.slice(-maxChars),
+    report,
+  ]
+    .filter((s) => s)
+    .join("\n");
 }
 
 function flattenResult(content: unknown): string {
@@ -206,7 +246,20 @@ function flattenResult(content: unknown): string {
   return "";
 }
 
+function trimEnd(s: string): string {
+  return s.replace(/\s+$/g, "");
+}
+
+/**
+ * Bound a one-liner — a tool call's input, a tool result — and SAY SO when the
+ * bound bites, naming bytes shown against bytes captured. A build's stdout is
+ * the runaway this exists for, and it is legitimately not worth its bytes in a
+ * review; a cut nobody is told about is a different thing entirely, and is the
+ * defect this whole path was rebuilt to remove. The crew's own words never come
+ * through here — see renderTranscriptForReview.
+ */
 function clip(s: string, max: number): string {
-  const t = s.replace(/\s+$/g, "");
-  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+  const t = trimEnd(s);
+  if (t.length <= max) return t;
+  return t.slice(0, max) + `…[co: ${max} of ${t.length} bytes shown]`;
 }

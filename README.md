@@ -915,6 +915,15 @@ instead of terminal escape soup. If no transcript can be read (a non-Claude
 agent, say), the review falls back to the hook's captured last message, then to
 the capture file, and says plainly when a run left no recording.
 
+**The crew's completion report is never cut.** Whatever its length, the crew's
+last message reaches the review whole — it is the one thing an order asks the
+crew to close with a diffstat, its verification output, and the approaches it
+dropped, and half of that is worse than none. What the co bounds is the run
+*around* it: the earlier context, and a build log that would otherwise arrive by
+the megabyte. Every one of those bounds names itself in the record it hands over
+(`…[co: 400 of 9812 bytes shown]`), so a short record is never mistaken for a
+short run.
+
 A bad repo path fails the `cd` loudly and gets captured instead of silently
 running the agent somewhere else. An interactive pane hands back no clean exit
 code, so completion is detected by

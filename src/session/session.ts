@@ -62,7 +62,7 @@ import {
   resolveAgentCommand,
   type DispatchConfig,
 } from "./dispatchconfig.js";
-import { DispatchRegistry, readFileTail, type Job } from "./registry.js";
+import { DispatchRegistry, type Job } from "./registry.js";
 import { FeatureManager } from "./features.js";
 import { FeatureStore } from "./featurestore.js";
 import { TaskStore } from "./taskstore.js";
@@ -73,8 +73,7 @@ import {
   defaultWorktreeBase,
   featureSlug,
 } from "./worktrees.js";
-import { scrubCapture } from "./transport.js";
-import { findCrewTranscript, renderTranscriptForReview } from "./crewtranscript.js";
+import { resolveReviewRecord } from "./reviewrecord.js";
 
 /**
  * Interactive terminal session for one co-manager instance.
@@ -1228,55 +1227,9 @@ async function drainReviews(state: SessionState): Promise<void> {
       }
     }
 
-    let record = "";
-    let source = "";
-    const config = state.dispatch;
-
-    // 1. The Stop hook's exact transcript path for this job's session, if any.
-    if (job.transcriptPath) {
-      try {
-        const raw = await readFileTail(job.transcriptPath, 4 * 1024 * 1024);
-        record = renderTranscriptForReview(raw, 16000);
-        if (record) source = "the crew agent's own session transcript";
-      } catch {
-        /* fall through to locating it by order text */
-      }
-    }
-    // 2. Locate the transcript by matching the order text (no hook, or its path
-    //    was unreadable).
-    if (!record && config) {
-      try {
-        const transcript = await findCrewTranscript({
-          agentCommand: resolveAgentCommand(config, job.agentName),
-          repoPath: config.repoPath,
-          order: job.order,
-          startedAtMs: job.startedAt ?? 0,
-        });
-        if (transcript) {
-          const raw = await readFileTail(transcript, 4 * 1024 * 1024);
-          record = renderTranscriptForReview(raw, 16000);
-          if (record) source = "the crew agent's own session transcript";
-        }
-      } catch {
-        /* fall through to the hook message / capture */
-      }
-    }
-    // 3. The hook's captured last assistant message — a real result even when no
-    //    transcript could be read.
-    if (!record && job.lastAssistantMessage) {
-      record = job.lastAssistantMessage;
-      source = "the crew agent's final message";
-    }
-    // 4. The raw capture (background print-mode output, or a degrade note).
-    if (!record) {
-      try {
-        record = await readCapture(state, job.captureFile);
-        source = "the raw run capture";
-      } catch {
-        record = "(no transcript was found and the capture file could not be read)";
-        source = "nothing — no record was recoverable";
-      }
-    }
+    // Resolve the run's record (reviewrecord.ts): the four sources in order of
+    // trust, and — the point of that module — nothing cut without saying so.
+    const { record, source } = await resolveReviewRecord(job, state.dispatch);
 
     state.userTurns++;
     state.messages.push({
@@ -1311,18 +1264,6 @@ async function drainReviews(state: SessionState): Promise<void> {
       state.reviewingJob = null;
     }
   }
-}
-
-/** Read a capture file for review, capping its size so a runaway log can't blow
- *  the context window. Reads only the file tail, scrubs terminal escape noise
- *  into readable text, and keeps the last MAX characters — where the run's
- *  conclusion and the sentinel live. (Pane captures hold just probe + sentinel;
- *  this mainly serves background-run captures and degrade notes.) */
-async function readCapture(_state: SessionState, file: string): Promise<string> {
-  const raw = await readFileTail(file, 256 * 1024);
-  const clean = scrubCapture(raw);
-  const MAX = 16000;
-  return clean.length > MAX ? "…[capture truncated to the last part]\n" + clean.slice(-MAX) : clean;
 }
 
 function firstLineOf(order: string): string {
