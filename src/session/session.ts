@@ -68,6 +68,7 @@ import { FeatureManager } from "./features.js";
 import { FeatureStore } from "./featurestore.js";
 import { TaskError, TaskStore } from "./taskstore.js";
 import { startCacheKeepAlive, type KeepAlive } from "./keepalive.js";
+import { applyCompaction, planCompaction } from "./compaction.js";
 import type { MergeHeadResult } from "./mergequeue.js";
 import {
   DEFAULT_FEATURE_BRANCH_TYPE,
@@ -713,9 +714,32 @@ function printClosingSummary(state: SessionState): void {
   line(c.dim(`  memory: ${state.paths.root}`));
 }
 
+/**
+ * Tokens a compaction must release to be worth the rewrite it costs. Below this
+ * it fires, pays to rewrite the whole retained tail, and saves almost nothing —
+ * which is how a cost feature turns into a cost.
+ */
+const COMPACT_MIN_RELEASE_TOKENS = 15_000;
+
+const COMPACT_REQUEST =
+  "Session compaction (bookkeeping, not a question from the captain). This" +
+  " conversation has grown long enough to be worth compressing. Write a summary" +
+  " of everything we have discussed SO FAR that you would want in front of you" +
+  " to carry on without a gap. Keep: decisions reached and the reasoning behind" +
+  " them, what is currently in flight, anything unresolved or awaiting the" +
+  " captain, constraints and corrections he has given you, and the thread of" +
+  " what we were doing. Drop: pleasantries, superseded working detail, and" +
+  " anything already written to memory or the logs, which you can search. Write" +
+  " it as notes to yourself in plain prose, no preamble, no sign-off. Do not" +
+  " address the captain and do not call any tools.";
+
 async function runUserTurn(state: SessionState, userText: string): Promise<void> {
   state.messages.push({ role: "user", content: userText });
   await drive(state);
+  // After the turn, never before: compacting first would summarise a history
+  // that is about to grow anyway, and the captain would wait through a
+  // summarising call before getting an answer to what they actually asked.
+  await maybeCompact(state);
 }
 
 /**
@@ -774,7 +798,7 @@ async function runOpeningGreeting(state: SessionState): Promise<void> {
 async function drive(
   state: SessionState,
   opts: { effort?: Effort; quiet?: boolean } = {},
-): Promise<void> {
+): Promise<string> {
   const { effort, quiet } = opts;
   const { io } = state;
   // Stamped before any model work so the gap measured is the captain's thinking
@@ -908,6 +932,63 @@ async function drive(
 
   // Persist the co's turn as soon as it lands — the "save along the way" path.
   await appendTranscript(state.transcript, "co", answer);
+  // Returned for the callers that need the words rather than the side effects:
+  // compaction feeds the reply straight back into the history as its summary.
+  return answer;
+}
+
+/**
+ * Put a ceiling on the message history, once, when a session runs long.
+ *
+ * Everything about the shape of this is driven by one price ratio: a cached read
+ * is billed at 0.1x base input and a 1-hour write at 2x, so compacting has to
+ * save twenty read tokens for every write token it costs. Since every compaction
+ * rewrites the retained tail, firing eagerly is a reliable way to spend more than
+ * doing nothing — on this app's measured sessions the break-even sits around 24
+ * turns. Hence a high trigger, a minimum release, and the expectation that a
+ * normal session never reaches it.
+ *
+ * Nothing is lost that the co cannot get back. The transcript is written every
+ * turn and the logs are append-only and searchable, so this moves detail out of
+ * the live window, not off the disk.
+ */
+async function maybeCompact(state: SessionState): Promise<void> {
+  const trigger = state.cfg.model.compactAtTokens;
+  if (trigger <= 0) return;
+  const plan = planCompaction(state.messages, {
+    triggerTokens: trigger,
+    keepTurns: state.cfg.model.compactKeepTurns,
+    minReleaseTokens: COMPACT_MIN_RELEASE_TOKENS,
+  });
+  if (!plan) return;
+
+  // Snapshot the length before the summarising turn appends to it, so the cut
+  // index computed above still addresses the same messages afterwards.
+  const before = state.messages.length;
+  state.messages.push({ role: "user", content: COMPACT_REQUEST });
+  // Low effort deliberately: this is a summary of context the model is already
+  // holding, the same call the cold-start greeting makes, and reasoning depth
+  // buys nothing here while being billed on every token of it.
+  const summary = await drive(state, { quiet: true, effort: "low" });
+  if (summary.trim() === "") {
+    // No usable summary: leave the history exactly as it was. A compaction that
+    // dropped turns and replaced them with nothing would be worse than the cost
+    // it was trying to avoid.
+    state.messages = state.messages.slice(0, before);
+    return;
+  }
+
+  state.messages = applyCompaction(state.messages.slice(0, before), plan.cut, summary);
+
+  // Said out loud, unlike every other piece of the co's bookkeeping. Memory
+  // writes are invisible because they change nothing the captain can observe;
+  // this changes what the co can recall mid-conversation, and a co that quietly
+  // stops remembering something you both said an hour ago is a bug report
+  // waiting to happen. One dim line, once.
+  const freed = plan.before - plan.after;
+  state.io.appendBlock(
+    c.dim(`  · compacted earlier conversation (~${freed.toLocaleString("en-US")} tokens)`),
+  );
 }
 
 // --- the review inbox --------------------------------------------------------

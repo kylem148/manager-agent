@@ -220,6 +220,18 @@ export interface ModelConfig {
    * session stops billing.
    */
   cacheKeepAliveMax: number;
+  /**
+   * Compact the message history once it passes this many estimated tokens.
+   * 0 disables it.
+   *
+   * Set high on purpose. Compaction trades cheap reads for expensive writes (see
+   * compaction.ts), so on a normal session it should never fire — this is a
+   * guard against the session left running all day, not routine housekeeping.
+   */
+  compactAtTokens: number;
+  /** Intact exchanges kept verbatim when compacting. Everything older becomes a
+   *  summary. */
+  compactKeepTurns: number;
 }
 
 export type SearchProviderName = "auto" | "exa" | "brave" | "tavily" | "searxng" | "none";
@@ -304,6 +316,11 @@ export function loadConfig(): Config {
           ? 0
           : parseIntOr("CO_CACHE_KEEPALIVE_MS", 45 * 60 * 1000),
       cacheKeepAliveMax: parseIntOr("CO_CACHE_KEEPALIVE_MAX", 3),
+      compactAtTokens:
+        (env("CO_COMPACT") ?? "").toLowerCase() === "off"
+          ? 0
+          : parseIntOr("CO_COMPACT_AT_TOKENS", 60_000),
+      compactKeepTurns: parseIntOr("CO_COMPACT_KEEP_TURNS", 6),
     },
     research: {
       searchProvider,
