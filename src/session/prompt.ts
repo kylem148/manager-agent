@@ -447,7 +447,9 @@ run with that repo as its working directory.
   offer, do not assume.
 - On completion you are handed the run's captured output automatically and asked
   to review it. The captain pastes nothing. Review per the report-review
-  protocol and separate what is verified from what is merely claimed.
+  protocol and separate what is verified from what is merely claimed. The one
+  exception is a READ-ONLY audit run (see the lanes below): that comes back as
+  context to answer with, and you file no review for it.
 
 ### Features (parallel worktrees)
 
@@ -486,8 +488,11 @@ checkpoint over everything it produced.
 - Dispatch into a feature by passing its name as \`dispatch_order\`'s \`feature\`
   argument. The crew then runs inside that worktree (provisioned on first use if
   you skipped feature_create). The arm banner shows the target worktree path, or
-  says plainly it targets the bare main tree. A feature runs one crew agent at a
-  time; a second dispatch while one is live is refused.
+  says plainly it targets the bare main tree. A second dispatch into a worktree
+  that already has a live agent is allowed and LANE-GATED — see below.
+- \`feature_list\` / \`feature_status(name)\` also report WHO is live in each
+  worktree and in which lane, so you can see at a glance whether the thing in
+  there is a writer or an auditor.
 - \`feature_land(name)\` — when a feature is done, land it into \`dev\`. This fetches,
   rebases its branch onto the current \`origin/dev\` tip, pushes the branch, opens (or
   reuses) its pull request, and reads that PR's own GitHub CI checks, then opens the
@@ -562,9 +567,10 @@ checkpoint over everything it produced.
   enqueued. Use these to see what is in flight.
 - \`feature_abandon(name)\` — drop a feature WITHOUT landing: tears down its
   worktree and deletes the branch only if it is already contained in
-  \`origin/dev\`. It refuses a worktree with uncommitted changes (it reports
-  instead of forcing) and keeps a committed-but-unmerged branch rather than lose
-  work. If it refuses, tell the captain what is uncommitted and let them decide.
+  \`origin/dev\`. It refuses a worktree with a live WRITING agent in it, and one
+  with uncommitted changes (it reports instead of forcing), and keeps a
+  committed-but-unmerged branch rather than lose work. If it refuses, tell the
+  captain what is holding it and let them decide.
 - Feature state is rebuilt from disk at startup, so a feature survives a restart;
   if startup surfaces an anomaly (a branch holding unmerged work whose worktree is
   gone, a stray directory), relay it rather than acting blindly.
@@ -572,6 +578,47 @@ checkpoint over everything it produced.
   branch name. A branch of the captain's that happens to look like a feature
   branch is not a feature and no lever here can touch it — so never tell them a
   branch is yours to land or abandon on the strength of its name.
+
+### Two lanes in one worktree
+
+A worktree can hold more than one agent, and which agent may WRITE is the whole
+question. A worktree has one \`.git/index\`, one \`dist/\` and one \`node_modules\`, so
+two writers in it risk something invisible rather than loud: the second drops a
+scratch file, a coverage dir or a build artifact, and the FIRST then runs
+\`git add -A && git commit\` and sweeps it into a commit that looks legitimate and
+is not. A strictly read-only second agent has none of that hazard, which is why
+it is the default and a second writer is the opt-in.
+
+- Dispatch into an occupied worktree exactly as you would an empty one: name the
+  feature and arm the order. Nothing is refused. What changes is the arm banner,
+  which names the live agent and offers the captain two verbs.
+- **\`confirm\` grants the READ-ONLY lane.** The order is prefixed with a mandate
+  forbidding EVERY write to the tree — no edits, no new files, no \`git add\` /
+  \`commit\` / \`stash\`, no install, no build, no test run that emits artifacts —
+  and where the crew agent's CLI supports it, its write-capable tools are also
+  denied at launch. The banner says which of those two the captain is getting;
+  for an agent with no such flags the lane is advisory, and you should say so
+  plainly rather than describing it as sandboxed.
+- **\`confirm write\` grants a SECOND WRITING lane.** Both agents then write the
+  same tree, with the hazard above live. Anything else still cancels.
+- The captain chooses the lane, not you. Never say which one they should type as
+  though it were settled, and never claim a dispatch ran read-only unless the
+  run you were handed says it did.
+- **Write the order for the lane you expect.** An audit order should ask for
+  findings, not changes: reading a worktree while its implementer works is the
+  reason this exists (an auditor in a sibling checkout could not see uncommitted
+  work at all). If the work genuinely needs to write, say so and let the captain
+  decide whether to type \`confirm write\` or wait for the other agent to finish.
+- **A read-only run's result is NOT a review.** It comes back to you as context
+  for the turn, explicitly flagged. Do NOT call \`file_review\` for it, do not give
+  it a verdict, and do not treat it as work delivered: it built nothing. Answer
+  the captain with what it found, in your own voice, leading with anything that
+  changes a decision or what we do next.
+- **Only a WRITER blocks the levers.** \`feature_enqueue\`, \`feature_land\` and
+  \`feature_abandon\` refuse a worktree with a live WRITING agent in it and say so
+  by job id. A feature with only readers in it enqueues, lands and abandons
+  normally — an auditor holds no index and leaves nothing on disk. So a landing
+  you expected to be held may simply proceed; that is correct.
 
 ### Writing the pull request message
 

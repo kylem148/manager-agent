@@ -63,6 +63,7 @@ import {
   type DispatchConfig,
 } from "./dispatchconfig.js";
 import { DispatchRegistry, type Job } from "./registry.js";
+import { readOnlyEnforcement, type ActiveAgent, type DispatchLane } from "./lanes.js";
 import { FeatureManager } from "./features.js";
 import { FeatureStore } from "./featurestore.js";
 import { TaskError, TaskStore } from "./taskstore.js";
@@ -118,8 +119,11 @@ interface SessionState {
    *  callback; consumed by the confirm interlock in the input loop. `feature`
    *  scopes the dispatch to a feature's worktree (undefined = bare main tree).
    *  `resolve` marks a merge-queue resolver dispatch: on fire the head is moved
-   *  to "resolving" and re-processed when the agent finishes. */
-  armed: { order: string; feature?: string; resolve?: boolean } | null;
+   *  to "resolving" and re-processed when the agent finishes. `occupied` records
+   *  whether the target worktree already had a live crew agent when the banner
+   *  was shown — i.e. whether the captain was offered the lane choice at all
+   *  (D-20260729-5); the lane itself is decided fresh at fire time. */
+  armed: { order: string; feature?: string; resolve?: boolean; occupied?: boolean } | null;
   /** Completed jobs waiting for a review turn, drained on the next idle prompt. */
   reviewQueue: Job[];
   /**
@@ -590,7 +594,24 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
           state.armed = null;
           io.setConfirmBanner(null);
           await appendTranscript(state.transcript, "you", raw);
-          await fireDispatch(state, armed.order, confirm.agent, armed.feature, armed.resolve);
+          // The lane is decided HERE, from the verb the captain typed and a
+          // FRESH reading of the target worktree — never from the arm-time
+          // snapshot. If the other agent finished while the order sat armed,
+          // the worktree is unoccupied again and a bare `confirm` means what it
+          // has always meant there: full write access.
+          const lane = laneForConfirm(state, armed, Boolean(confirm.write));
+          // That is a wider grant than the banner offered, so it is said out
+          // loud. A lane the captain did not read about is exactly the surprise
+          // this gate exists to prevent.
+          if (armed.occupied && lane === "writer" && !confirm.write) {
+            io.appendBlock(
+              c.dim(
+                "  · the other agent has since finished, so the worktree is free and `confirm` granted" +
+                  " the full writing lane, not the read-only one the banner offered.",
+              ),
+            );
+          }
+          await fireDispatch(state, armed.order, confirm.agent, armed.feature, armed.resolve, lane);
           continue;
         }
         state.armed = null;
@@ -864,7 +885,11 @@ async function armDispatch(
     return { armed: false, reason: "No crew agent is registered. Re-run `co link` to set one." };
   }
   const target = feature && feature.trim() ? feature.trim() : undefined;
-  state.armed = { order, ...(target ? { feature: target } : {}) };
+  // Who is already in that worktree. This is the whole gate: an empty list is
+  // the ordinary dispatch, unchanged in every particular; anything in it turns
+  // the banner into a lane choice (D-20260729-5).
+  const live = target ? activeAgentsFor(state, target) : [];
+  state.armed = { order, ...(target ? { feature: target } : {}), ...(live.length ? { occupied: true } : {}) };
 
   const cmd = displayCommand(resolveAgentCommand(config), config.repoPath);
   // Dispatch is visible-only: a crew agent runs in a visible Ghostty pane or not
@@ -882,8 +907,30 @@ async function armDispatch(
   const others = config.agents.map((a) => a.name).filter((n) => n !== config.defaultAgent);
   const overrideHint =
     others.length > 0 ? `  or \`confirm <${others.join("|")}>\` to pick another agent` : "";
+  // The enforcement clause is stated for the agent a bare confirm would run.
+  // An override picks a different agent at fire time, and the dispatch line says
+  // what THAT one got — so nothing here ever over-claims for an agent that never ran.
+  const enforcement = readOnlyEnforcement(resolveAgentCommand(config));
   state.io.setConfirmBanner([
-    c.yellow(c.bold("  ⚑ dispatch armed — type `confirm` to launch, anything else cancels")),
+    live.length > 0
+      ? c.yellow(c.bold(`  ⚑ dispatch armed — feature '${target}' ALREADY HAS ${describeAgents(live)}`))
+      : c.yellow(c.bold("  ⚑ dispatch armed — type `confirm` to launch, anything else cancels")),
+    ...(live.length > 0
+      ? [
+          c.yellow(
+            "  ⚠ a second WRITER shares one git index, one dist/ and one node_modules: a scratch file," +
+              " a coverage dir or a build artifact it drops can be swept into the other agent's next" +
+              " `git add -A` commit, unseen by either of them.",
+          ),
+          c.dim(
+            `  \`confirm\` → READ-ONLY lane: the order is prefixed with a no-writes-of-any-kind mandate,` +
+              ` and for ${config.defaultAgent} that is ${enforcement.detail}.`,
+          ),
+          c.dim(
+            "  `confirm write` → a SECOND WRITING lane. Both agents write this worktree. Anything else cancels.",
+          ),
+        ]
+      : []),
     c.dim(`  transport: ${transport}   agent: ${config.defaultAgent}   command: ${cmd}`),
     c.dim(`  target: ${targetLine}`),
     ...(overrideHint ? [c.dim(overrideHint)] : []),
@@ -896,6 +943,14 @@ async function armDispatch(
           : ", provisioned on first use"
       }).`
     : " It targets the bare main tree (no feature).";
+  const laneSummary =
+    live.length > 0
+      ? ` NOTE: that worktree already has ${describeAgents(live)}, so this dispatch is LANE-GATED:` +
+        ` a bare \`confirm\` grants the READ-ONLY audit lane (${enforcement.detail} for ${config.defaultAgent})` +
+        ` and \`confirm write\` grants a second WRITING lane. The captain chooses, not you.` +
+        ` If it lands as a read-only run you will be handed its findings as context to answer with,` +
+        ` and you must NOT file a review for it.`
+      : "";
   return {
     armed: true,
     summary:
@@ -905,8 +960,54 @@ async function armDispatch(
             ? ` The captain can type \`confirm <${others.join("|")}>\` to pick another.`
             : "")
         : `No crew pane is available, so a dispatch will fail cleanly until one is designated with \`co pane\`.` +
-          ` The intended command is: ${cmd} (agent ${config.defaultAgent}).`) + targetSummary,
+          ` The intended command is: ${cmd} (agent ${config.defaultAgent}).`) +
+      targetSummary +
+      laneSummary,
   };
+}
+
+/**
+ * The crew agents live in a feature's worktree right now, with their roles. Goes
+ * through the FeatureManager first so a feature addressed by slug and one
+ * addressed by its created name resolve to the SAME worktree — the occupancy
+ * question must not come back empty just because the co armed under a different
+ * handle than the running job used. Falls back to the registry for a feature
+ * that has no record yet (nothing can be running in a worktree that does not
+ * exist, so that answer is empty too, but it stays honest rather than assumed).
+ */
+function activeAgentsFor(state: SessionState, feature: string): ActiveAgent[] {
+  const view = state.features?.list().find((f) => f.feature === feature || f.slug === feature);
+  if (view) return view.agents;
+  return state.registry?.activeAgents(feature) ?? [];
+}
+
+/** "a live crew agent (job-002 [cc], writing)" — the banner's subject line. */
+function describeAgents(agents: ActiveAgent[]): string {
+  const parts = agents.map(
+    (a) =>
+      `${a.jobId}${a.agentName ? ` [${a.agentName}]` : ""}, ${a.lane === "writer" ? "WRITING" : "read-only"}`,
+  );
+  return `${agents.length === 1 ? "a live crew agent" : `${agents.length} live crew agents`} (${parts.join("; ")})`;
+}
+
+/**
+ * Which lane a confirmed dispatch gets. Read fresh at fire time, never from the
+ * arm-time snapshot:
+ *
+ *  - `confirm write`, or no feature at all (the bare main tree), or a worktree
+ *    with nothing in it → the ordinary WRITING lane. This is every dispatch that
+ *    existed before the gate, unchanged.
+ *  - a bare `confirm` into a worktree that has a live agent → the READ-ONLY
+ *    lane. The safe default is the one that cannot corrupt the other agent's
+ *    commit, and buying the risky one costs one typed word.
+ */
+function laneForConfirm(
+  state: SessionState,
+  armed: { feature?: string },
+  write: boolean,
+): DispatchLane {
+  if (write || !armed.feature) return "writer";
+  return activeAgentsFor(state, armed.feature).length > 0 ? "reader" : "writer";
 }
 
 /**
@@ -1012,6 +1113,7 @@ async function fireDispatch(
   agentName?: string,
   feature?: string,
   resolve?: boolean,
+  lane: DispatchLane = "writer",
 ): Promise<void> {
   const { io, registry } = state;
   if (!registry) {
@@ -1030,7 +1132,10 @@ async function fireDispatch(
 
   let job: Job;
   try {
-    job = await registry.dispatch(order, agentName, feature ? { feature } : {});
+    job = await registry.dispatch(order, agentName, {
+      ...(feature ? { feature } : {}),
+      lane,
+    });
   } catch (e) {
     await flourish.settle();
     io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));
@@ -1054,12 +1159,26 @@ async function fireDispatch(
     }
     const agentNote = job.agentName ? ` [${job.agentName}]` : "";
     const featureNote = job.feature ? ` in feature '${job.feature}'` : "";
+    // A read-only run names its lane AND how it is held, every time. The one
+    // thing this must never do is let an advisory-only run read as an enforced
+    // one: the captain confirmed a lane, and which of the two they actually got
+    // depends on the agent that ran, which an override may have changed.
+    const laneNote =
+      job.lane === "reader"
+        ? ` (READ-ONLY audit lane — ${
+            job.readOnlyEnforced
+              ? "write tools denied at launch"
+              : "ADVISORY only for this agent: the mandate is in the order, nothing blocks a write"
+          })`
+        : "";
     const where = `running in a Ghostty pane (${job.paneId ?? "?"})`;
     const followup = resolve
       ? "I'll re-process the head when it finishes."
-      : "I'll review it when it finishes.";
+      : job.lane === "reader"
+        ? "I'll report what it found when it finishes."
+        : "I'll review it when it finishes.";
     io.appendBlock(
-      c.green(`  · dispatched ${job.id}${agentNote}${featureNote}: ${where}. ${followup}`),
+      c.green(`  · dispatched ${job.id}${agentNote}${featureNote}${laneNote}: ${where}. ${followup}`),
     );
   } catch (e) {
     // The launch itself is handled above; this covers the bookkeeping after it
@@ -1275,29 +1394,17 @@ async function drainReviews(state: SessionState): Promise<void> {
     const { record, source } = await resolveReviewRecord(job, state.dispatch);
 
     state.userTurns++;
-    state.messages.push({
-      role: "user",
-      content:
-        "SYSTEM: A crew dispatch you launched has finished; review it now for the captain. This is" +
-        " not something the captain typed — you triggered it. The agent ran in a separate coding" +
-        " session against the registered repo; below is the record of that run, taken from " +
-        source +
-        ". Review it per the report-review protocol (what went right, what went wrong, escalations," +
-        " then a verdict: accept / fix-commit / rework). Be concise. Do NOT ask the captain to paste" +
-        " anything; you already have the record. Separate verified from claimed. If the record is" +
-        " only a completion marker with no content, say plainly that the run left no reviewable" +
-        " record and what the exit code implies.\n\n" +
-        "FILE THE REVIEW: your review IS the file_review call. Decide the verdict, map it to a level" +
-        " (rework or a genuine escalation/fork → L1; fix-commit or accept-with-notes → L2; a clean" +
-        " accept → L3), and call file_review with {level, verdict, headline, body} — the body is the" +
-        " full three-part review. Then, in the chat: on L1 state ONLY the core decision the captain" +
-        " has to make; on L2 and L3 say nothing further. The captain reads the full review in the" +
-        " panel (Ctrl-O, Inbox tab), so never paste the body into the chat.\n\n" +
-        `Job: ${job.id} (${job.label})\nStatus: ${job.status}` +
-        (job.exitCode !== undefined ? ` (exit ${job.exitCode})` : "") +
-        `\n\n--- record of the run ---\n${record}` +
-        resolveNote,
-    });
+    state.messages.push({ role: "user", content: completionTurn(job, record, source, resolveNote) });
+
+    // A READ-ONLY run is not work delivered, so it never enters the review path
+    // (D-20260729-6). It also must not be NAMED as the run under review: that
+    // is what file_review defaults its jobId to, and an audit is precisely the
+    // run no review may be filed for.
+    if (job.lane === "reader") {
+      await drive(state);
+      continue;
+    }
+
     // Name the run under review so file_review can default its jobId/feature to
     // it; cleared on the way out so a later filing can't be misattributed.
     state.reviewingJob = job;
@@ -1309,28 +1416,130 @@ async function drainReviews(state: SessionState): Promise<void> {
   }
 }
 
+/**
+ * The system turn a finished job produces — the ROUTING decision, in one pure
+ * function so it can be tested without a model call.
+ *
+ * Two destinations, and which one a run takes is its LANE and nothing else:
+ *
+ *  - a WRITER built something, so it is reviewed and the review is filed;
+ *  - a READER was forbidden to change anything, so there is nothing to accept or
+ *    rework and nothing belongs in the inbox — it comes back as context the co
+ *    answers the captain with (D-20260729-6).
+ */
+export function completionTurn(job: Job, record: string, source: string, resolveNote = ""): string {
+  return job.lane === "reader"
+    ? auditTurn(job, record, source)
+    : reviewTurn(job, record, source, resolveNote);
+}
+
+/** The review turn: a crew run that produced work, handed over to be reviewed
+ *  and filed per the report-review protocol. */
+function reviewTurn(job: Job, record: string, source: string, resolveNote: string): string {
+  return (
+    "SYSTEM: A crew dispatch you launched has finished; review it now for the captain. This is" +
+    " not something the captain typed — you triggered it. The agent ran in a separate coding" +
+    " session against the registered repo; below is the record of that run, taken from " +
+    source +
+    ". Review it per the report-review protocol (what went right, what went wrong, escalations," +
+    " then a verdict: accept / fix-commit / rework). Be concise. Do NOT ask the captain to paste" +
+    " anything; you already have the record. Separate verified from claimed. If the record is" +
+    " only a completion marker with no content, say plainly that the run left no reviewable" +
+    " record and what the exit code implies.\n\n" +
+    "FILE THE REVIEW: your review IS the file_review call. Decide the verdict, map it to a level" +
+    " (rework or a genuine escalation/fork → L1; fix-commit or accept-with-notes → L2; a clean" +
+    " accept → L3), and call file_review with {level, verdict, headline, body} — the body is the" +
+    " full three-part review. Then, in the chat: on L1 state ONLY the core decision the captain" +
+    " has to make; on L2 and L3 say nothing further. The captain reads the full review in the" +
+    " panel (Ctrl-O, Inbox tab), so never paste the body into the chat.\n\n" +
+    `Job: ${job.id} (${job.label})\nStatus: ${job.status}` +
+    (job.exitCode !== undefined ? ` (exit ${job.exitCode})` : "") +
+    `\n\n--- record of the run ---\n${record}` +
+    resolveNote
+  );
+}
+
 function firstLineOf(order: string): string {
   const l = order.split("\n").find((x) => x.trim() !== "")?.trim() ?? "";
   return l.length > 80 ? l.slice(0, 77) + "…" : l;
 }
 
 /**
- * Parse a typed line against the confirm interlock. Pure so the interlock's
- * two decisions — is this a confirm, and does it name a crew agent — can be
- * unit-tested without arming a real dispatch (which needs a model call).
- *
- *   "confirm"        → { isConfirm: true }                 (use the default agent)
- *   "confirm ccw"    → { isConfirm: true, agent: "ccw" }   (override for this run)
- *   "CONFIRM"        → { isConfirm: true }                 (case-insensitive verb)
- *   anything else    → { isConfirm: false }                (cancels the dispatch)
- *
- * Only the verb and the first token after it matter; trailing words are ignored
- * so a fat-fingered "confirm cc please" still selects cc rather than cancelling.
+ * The turn a finished READ-ONLY run produces. Deliberately not the review turn:
+ * an audit is a question the captain asked, answered by an agent that was
+ * forbidden to change anything, so there is no delivery to accept, no verdict to
+ * reach, and nothing to file (D-20260729-6). Filing one would also put a
+ * headline and an accept/rework in the inbox for a run that built nothing, which
+ * is exactly the noise the inbox exists to prevent.
  */
-export function parseConfirm(raw: string): { isConfirm: boolean; agent?: string } {
-  const [verb, agentToken] = raw.trim().split(/\s+/, 2);
-  if (verb?.toLowerCase() !== "confirm") return { isConfirm: false };
-  return agentToken ? { isConfirm: true, agent: agentToken } : { isConfirm: true };
+function auditTurn(job: Job, record: string, source: string): string {
+  return (
+    "SYSTEM: A READ-ONLY AUDIT you dispatched has finished. This is not something the captain typed" +
+    " — you triggered it — and it is NOT a crew implementation run. The agent was launched into a" +
+    " worktree another agent is still working in, under a read-only mandate: no edits, no commits," +
+    " no builds, nothing written to disk at all" +
+    (job.readOnlyEnforced
+      ? " (its write-capable tools were also denied at launch)" +
+        ". So it produced no diff and changed nothing."
+      : " (advisory only for this agent — nothing mechanically blocked it, so if the record shows it" +
+        " wrote anything, say so plainly: that is a real problem worth raising)." +
+        " It was supposed to produce no diff and change nothing.") +
+    "\n\nDO NOT FILE A REVIEW FOR THIS RUN. Do not call file_review, do not give it a verdict" +
+    " (accept / fix-commit / rework), and do not treat it as work delivered. Its findings are" +
+    " CONTEXT FOR YOU TO ANSWER WITH: read the report below, and reply to the captain with what it" +
+    " found and what you make of it, in your own voice and at your usual length. Say plainly where" +
+    " the audit is uncertain or where it only looked at part of the picture, and separate what it" +
+    " verified from what it merely asserts. If it turned up something that changes a decision, the" +
+    " architecture, or what we do next, that is the part to lead with.\n\n" +
+    `Job: ${job.id} (${job.label})\nStatus: ${job.status}` +
+    (job.exitCode !== undefined ? ` (exit ${job.exitCode})` : "") +
+    (job.feature ? `\nWorktree: feature '${job.feature}'` : "") +
+    `\nRecord taken from ${source}.` +
+    `\n\n--- the audit's report ---\n${record}`
+  );
+}
+
+/**
+ * Parse a typed line against the confirm interlock. Pure so the interlock's
+ * three decisions — is this a confirm, which LANE does it grant, and does it
+ * name a crew agent — can be unit-tested without arming a real dispatch (which
+ * needs a model call).
+ *
+ *   "confirm"           → { isConfirm: true }
+ *   "confirm write"     → { isConfirm: true, write: true }
+ *   "confirm ccw"       → { isConfirm: true, agent: "ccw" }
+ *   "confirm write ccw" → { isConfirm: true, write: true, agent: "ccw" }
+ *   "CONFIRM"           → { isConfirm: true }              (case-insensitive verb)
+ *   anything else       → { isConfirm: false }             (cancels the dispatch)
+ *
+ * `write` is the WORD that buys a second writing lane in an occupied worktree
+ * (D-20260729-5). It is folded into the confirm verb rather than asked as a
+ * second question after it, because a free-text prompt after `confirm` is
+ * another cancel-trap: one wrong keystroke there discards an order the captain
+ * has already approved.
+ *
+ * On an UNOCCUPIED worktree `write` changes nothing — a bare `confirm` already
+ * grants full write access there — so it is accepted as a harmless synonym
+ * rather than rejected as noise.
+ *
+ * Only the verb, an optional `write`, and the next token matter; trailing words
+ * are ignored so a fat-fingered "confirm cc please" still selects cc rather than
+ * cancelling. A crew agent literally NAMED "write" cannot be selected by
+ * `confirm write` — the lane word wins — which is a fair trade for a lane verb
+ * that reads like English.
+ */
+export function parseConfirm(raw: string): { isConfirm: boolean; write?: boolean; agent?: string } {
+  const parts = raw.trim().split(/\s+/);
+  if (parts[0]?.toLowerCase() !== "confirm") return { isConfirm: false };
+  let next = 1;
+  const write = parts[next]?.toLowerCase() === "write";
+  if (write) next += 1;
+  const agent = parts[next];
+  return {
+    isConfirm: true,
+    ...(write ? { write: true } : {}),
+    ...(agent ? { agent } : {}),
+  };
 }
 
 type CommandResult = "ok" | "exit";

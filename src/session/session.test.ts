@@ -5,7 +5,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseConfirm } from "./session.js";
+import { completionTurn, parseConfirm } from "./session.js";
+import type { Job } from "./registry.js";
 
 /**
  * End-to-end tests for the piped / non-TTY read loop (PlainIO).
@@ -99,7 +100,7 @@ test("a final line with no trailing newline is still read", async () => {
   });
 });
 
-test("parseConfirm reads the interlock verb and an optional agent override", () => {
+test("parseConfirm reads the interlock verb, the lane word, and an optional agent override", () => {
   // Bare confirm → fire with the default agent (no override).
   assert.deepEqual(parseConfirm("confirm"), { isConfirm: true });
   // The verb is case-insensitive and tolerant of surrounding whitespace.
@@ -109,8 +110,79 @@ test("parseConfirm reads the interlock verb and an optional agent override", () 
   assert.deepEqual(parseConfirm("confirm cc"), { isConfirm: true, agent: "cc" });
   // Only the first token after the verb is the agent; trailing words are ignored.
   assert.deepEqual(parseConfirm("confirm cc please"), { isConfirm: true, agent: "cc" });
+
+  // `write` is the word that buys a second WRITING lane in an occupied worktree
+  // (D-20260729-5). It is part of the confirm verb, not a second question after
+  // it, so the typed-confirm interlock is still exactly one keystroke away from
+  // either outcome and neither one is a cancel-trap.
+  assert.deepEqual(parseConfirm("confirm write"), { isConfirm: true, write: true });
+  assert.deepEqual(parseConfirm("  CONFIRM  WRITE  "), { isConfirm: true, write: true });
+  // The lane word and an agent override compose, in that order.
+  assert.deepEqual(parseConfirm("confirm write ccw"), { isConfirm: true, write: true, agent: "ccw" });
+  assert.deepEqual(parseConfirm("confirm write cc please"), {
+    isConfirm: true,
+    write: true,
+    agent: "cc",
+  });
+
   // Anything that isn't the confirm verb cancels — never a partial confirm.
   assert.deepEqual(parseConfirm("cancel"), { isConfirm: false });
   assert.deepEqual(parseConfirm("confirmation"), { isConfirm: false });
   assert.deepEqual(parseConfirm(""), { isConfirm: false });
+  // Including the lane word on its own, and the two obvious near-misses. The
+  // gate is worth nothing if a stray line can be read as half a confirm.
+  assert.deepEqual(parseConfirm("write"), { isConfirm: false });
+  assert.deepEqual(parseConfirm("write confirm"), { isConfirm: false });
+  assert.deepEqual(parseConfirm("confirm-write"), { isConfirm: false });
+});
+
+/** A finished job, as the completion drain sees one. */
+function finished(lane: Job["lane"], extra: Partial<Job> = {}): Job {
+  return {
+    id: "job-007",
+    order: "do the thing",
+    lane,
+    label: "do the thing",
+    transport: "ghostty",
+    status: "done",
+    captureFile: "/tmp/job-007.log",
+    startedAt: 0,
+    exitCode: 0,
+    feature: "auth",
+    ...extra,
+  };
+}
+
+test("a writer's completion is a review to file; a reader's is context to answer with", () => {
+  const record = "diffstat: 3 files changed";
+  const writer = completionTurn(finished("writer"), record, "the crew agent's own session transcript");
+  // Unchanged: a run that produced work is reviewed and the review is filed.
+  assert.match(writer, /review it now for the captain/);
+  assert.match(writer, /FILE THE REVIEW: your review IS the file_review call/);
+  assert.match(writer, /accept \/ fix-commit \/ rework/);
+  assert.ok(writer.includes(record), "with the run's record attached");
+
+  const reader = completionTurn(finished("reader", { readOnlyEnforced: true }), record, "the crew agent's final message");
+  // The whole point: an audit never becomes an inbox record with a verdict.
+  assert.match(reader, /DO NOT FILE A REVIEW FOR THIS RUN/);
+  assert.ok(!reader.includes("FILE THE REVIEW"), "the filing instruction is gone, not merely softened");
+  assert.match(reader, /Do not call file_review/);
+  assert.match(reader, /do not give it a verdict/);
+  assert.match(reader, /CONTEXT FOR YOU TO ANSWER WITH/);
+  assert.ok(reader.includes(record), "and the findings are still handed over whole");
+});
+
+test("an advisory-only audit says so in the turn, instead of claiming it was enforced", () => {
+  const enforced = completionTurn(finished("reader", { readOnlyEnforced: true }), "found nothing", "src");
+  assert.match(enforced, /write-capable tools were also denied at launch/);
+  assert.match(enforced, /it produced no diff and changed nothing/);
+
+  const advisory = completionTurn(finished("reader", { readOnlyEnforced: false }), "found nothing", "src");
+  assert.match(advisory, /advisory only for this agent/);
+  assert.match(
+    advisory,
+    /if the record shows it wrote anything, say so plainly/,
+    "an unenforced lane is a thing the co has to actually check, not assume",
+  );
+  assert.match(advisory, /It was supposed to produce no diff/, "supposed to, not did");
 });

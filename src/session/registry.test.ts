@@ -18,6 +18,7 @@ import { setGhosttyAvailableForTest, setOsaRunnerForTest } from "./transport.js"
 import { PaneStore, type PaneRecord } from "./panestore.js";
 import type { TtyProcess, TtyProbe } from "./paneoccupancy.js";
 import { DispatchRegistry, type Job, type RegistryOptions } from "./registry.js";
+import { READ_ONLY_BLURB, READ_ONLY_FLAG } from "./lanes.js";
 
 /**
  * Tests for the job registry + capture watcher. Dispatch is VISIBLE-ONLY: a crew
@@ -1278,11 +1279,11 @@ test("a feature dispatch on the pane path cd's the job script into the worktree;
         assert.ok(script.includes(`cd '${worktree}' ||`), "the job script cd's into the feature worktree");
         assert.ok(!script.includes(`cd '${paths.root}' ||`), "not into the primary repo");
 
-        // One live agent per worktree: a second dispatch to the feature while
-        // its job runs fails cleanly instead of launching alongside.
-        const j2 = await reg.dispatch("two", undefined, { feature: "auth" });
-        assert.equal(j2.status, "failed");
-        assert.match(j2.error ?? "", /already has an active job/);
+        // A second dispatch into the SAME live worktree no longer refuses
+        // (D-20260729-5): the gate is the lane, one layer up, not a cap here.
+        const j2 = await reg.dispatch("two", undefined, { feature: "auth", lane: "reader" });
+        assert.equal(j2.status, "running", "the second dispatch launches alongside the first");
+        assert.equal(j2.cwd, worktree, "into the same worktree — that is the point of the audit lane");
 
         // A plain dispatch in the same session is untouched: repo cwd, no feature.
         const j3 = await reg.dispatch("three");
@@ -1290,6 +1291,145 @@ test("a feature dispatch on the pane path cd's the job script into the worktree;
         assert.equal(j3.feature, undefined);
         const plainScript = await fsp.readFile(`${j3.captureFile}.sh`, "utf8");
         assert.ok(plainScript.includes(`cd '${paths.root}' ||`), "the plain job still cd's into the repo");
+      },
+    );
+  } finally {
+    teardown();
+    await cleanup();
+  }
+});
+
+test("a second agent in a live worktree runs the read-only lane: mandate prepended, write tools denied", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    // A Claude Code crew, so the lane is mechanically enforceable.
+    config.agents = [{ name: "cc", command: "claude {prompt}" }];
+    config.defaultAgent = "cc";
+    const worktree = path.join(paths.root, "wt", "auth");
+    await fsp.mkdir(worktree, { recursive: true });
+
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        provisionWorktree: async (_opts, feature) => ({
+          feature,
+          slug: feature,
+          branch: `feat/${feature}`,
+          worktreePath: worktree,
+          provisionStatus: "ready",
+        }),
+      },
+      async (reg) => {
+        const writer = await reg.dispatch("build the thing", undefined, { feature: "auth" });
+        assert.equal(writer.status, "running");
+        assert.equal(writer.lane, "writer", "an ordinary dispatch is a writer, as every dispatch used to be");
+        assert.equal(writer.order, "build the thing", "and its order is untouched");
+        assert.equal(writer.readOnlyEnforced, undefined, "the question doesn't arise for a writer");
+        const writerScript = await fsp.readFile(`${writer.captureFile}.sh`, "utf8");
+        assert.ok(!writerScript.includes("--disallowedTools"), "a writer is launched unrestricted");
+
+        // The audit lane, into the SAME worktree, while the writer is live.
+        const reader = await reg.dispatch("audit the thing", undefined, {
+          feature: "auth",
+          lane: "reader",
+        });
+        assert.equal(reader.status, "running", "no cap: it launches alongside");
+        assert.equal(reader.cwd, worktree, "in the same checkout, so it can see the uncommitted work");
+        assert.ok(reader.order.startsWith(READ_ONLY_BLURB), "the mandate leads its launch prompt");
+        assert.ok(reader.order.endsWith("audit the thing"), "with the co's order behind it, whole");
+        assert.equal(reader.label, "audit the thing", "the label names the job, not the lane's blurb");
+        assert.equal(reader.readOnlyEnforced, true, "this agent's CLI takes the flags");
+
+        const readerScript = await fsp.readFile(`${reader.captureFile}.sh`, "utf8");
+        assert.ok(
+          readerScript.includes(READ_ONLY_FLAG),
+          "and the launch really denies the write tools, in the `=` form",
+        );
+        assert.ok(
+          readerScript.includes(`claude ${READ_ONLY_FLAG} '`),
+          "with the flag ahead of the prompt argument, not after it",
+        );
+
+        // Both are live, and their ROLES are readable — a collection, not a
+        // boolean, because only the writer may block a landing.
+        assert.deepEqual(
+          reg.activeAgents("auth"),
+          [
+            { jobId: writer.id, lane: "writer" },
+            { jobId: reader.id, lane: "reader" },
+          ],
+          "both agents, each with its role",
+        );
+        assert.equal(reg.hasActiveWriter("auth"), true);
+
+        // The writer finishes; the reader is still there and still blocks nothing.
+        await completeJob(reg, writer, 0);
+        assert.equal(reg.hasActiveWriter("auth"), false, "no writer left");
+        assert.deepEqual(
+          reg.activeAgents("auth").map((a) => a.lane),
+          ["reader"],
+          "the reader is still live, and still only a reader",
+        );
+
+        await completeJob(reg, reader, 0);
+        assert.deepEqual(reg.activeAgents("auth"), [], "and an idle worktree has nobody in it");
+      },
+    );
+  } finally {
+    teardown();
+    await cleanup();
+  }
+});
+
+test("an agent with no tool-permission flags gets the mandate alone, and says so", async () => {
+  const { paths, cleanup } = await tmpInstance();
+  const teardown = stubGhostty();
+  try {
+    const config = defaultDispatchConfig();
+    config.repoPath = paths.root;
+    config.anchor = { id: "anchor-1", title: crewPaneTitle("inst") };
+    config.agents = [{ name: "oc", command: "opencode run {prompt}" }];
+    config.defaultAgent = "oc";
+    const worktree = path.join(paths.root, "wt", "auth");
+    await fsp.mkdir(worktree, { recursive: true });
+
+    await withRegistry(
+      {
+        paths,
+        config,
+        onComplete: () => {},
+        skipAnchorCheck: true,
+        pollIntervalMs: 10_000,
+        provisionWorktree: async (_opts, feature) => ({
+          feature,
+          slug: feature,
+          branch: `feat/${feature}`,
+          worktreePath: worktree,
+          provisionStatus: "ready",
+        }),
+      },
+      async (reg) => {
+        const reader = await reg.dispatch("audit it", undefined, { feature: "auth", lane: "reader" });
+        assert.equal(reader.lane, "reader");
+        assert.ok(reader.order.startsWith(READ_ONLY_BLURB), "the mandate still leads — it is all there is");
+        assert.equal(
+          reader.readOnlyEnforced,
+          false,
+          "and the job records that nothing mechanical is holding it, so nothing downstream over-claims",
+        );
+        const script = await fsp.readFile(`${reader.captureFile}.sh`, "utf8");
+        assert.ok(
+          !script.includes("--disallowedTools"),
+          "a flag this CLI does not take would break the launch outright",
+        );
       },
     );
   } finally {
