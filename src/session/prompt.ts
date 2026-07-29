@@ -5,6 +5,7 @@ import { readSurfacedDocs } from "../memory/docs.js";
 import { describeSearch } from "../research.js";
 import type { ResearchConfig } from "../config.js";
 import type { TaskRow } from "./taskstore.js";
+import { taskDisplayOrder } from "../taskorder.js";
 
 /**
  * Assemble the system prompt in altitude order: absolute identity + constraints,
@@ -347,8 +348,9 @@ body. A new task always arrives \`queued\`; it becomes \`building\` when work on
 actually starts.
 
 **The table is the CAPTAIN'S, and you are the second writer on it.** He types
-rows into it himself, from the panel (Ctrl-O, Home tab): \`a\` adds one, \`x\`
-retires the highlighted row, \`s\` toggles its status. The current table is in
+rows into it himself, from the panel (Ctrl-O, Home tab): \`a\` adds one, \`e\`
+rewrites the highlighted row's text, \`x\` retires it, \`s\` toggles its status.
+The current table is in
 your live-state block at session start, so what he jotted there is context you
 have — treat it as his, and read a row you did not write as something he put
 there deliberately. Two rules follow and they are absolute: **never write over a
@@ -359,6 +361,9 @@ row looks wrong or finished to you, say so and let him call it.
 - \`list\` — the current table. Do this first if you are unsure what is there.
 - \`add\` — append one row, always \`queued\`.
 - \`status\` — move one row between \`building\` and \`queued\`.
+- \`rename\` — rewrite one row's TEXT (\`task\` is the row, \`new_task\` is its new
+  wording), keeping its status and its place. This is the fix for a typo or a
+  reworded task; retiring and re-adding would lose both.
 - \`retire\` — take one row OUT of the table. **This is what "done" means here:**
   finishing something retires it (it is kept, timestamped, in a \`done\` list),
   rather than sitting in the table under a third status word.
@@ -368,6 +373,19 @@ the captain edits the same table between your turns and a position you read
 earlier may be a different row now. Text that matches no row, or more than one,
 fails rather than guessing: \`list\` and copy the text. There is no whole-table
 write and no clear.
+
+\`rename\` fails on four things and changes nothing when it does: the old text
+matches no row, the old text matches more than one, \`new_task\` is empty or only
+whitespace, or \`new_task\` would read the same as a DIFFERENT row (two identical
+rows would make both unaddressable — the same rule \`add\` is held to). Renaming a
+row to the text it already has is a successful no-op.
+
+**The table is displayed \`building\` first**, then \`queued\`, each group keeping
+the order it was stored in — in your live-state block, in what \`task_table\`
+hands back, and on the captain's panel, all from one rule so the three cannot
+disagree. It is a DISPLAY order: the stored table keeps insertion order, so the
+position of a row in what you read says nothing about when it was added, and
+toggling a row's status moves it in the display without rewriting anything.
 
 So the store, not the chat, is where the table lives: update it in the same turn
 as the change it reflects — a crew review that moves an item on, a new next step,
@@ -698,16 +716,21 @@ export async function buildSystemPrompt(
  * Rendered from a snapshot taken ONCE at assembly. Nothing here is re-read per
  * turn and nothing carries a timestamp: this block sits inside the prompt-cache
  * prefix, so a byte that moves mid-session costs the whole cache.
+ *
+ * Painted `building`-first through the shared helper, which is the same call the
+ * panel and the tool make. That is also why the helper takes no clock: the same
+ * rows must render the same bytes every time this block is assembled.
  */
 function taskTableBlock(rows: TaskRow[]): string {
+  const shown = taskDisplayOrder(rows);
   const body =
-    rows.length === 0
+    shown.length === 0
       ? "(empty)"
-      : rows.map((r) => `${r.status.padEnd(8)}  ${r.task}`).join("\n");
+      : shown.map((r) => `${r.status.padEnd(8)}  ${r.task}`).join("\n");
   return (
     "### task table (the captain's, painted on Ctrl-O → Home)\n\n" +
-    "_As it stood when this session opened. He edits it there himself; call" +
-    " `task_table list` for the current one._\n\n" +
+    "_As it stood when this session opened, `building` rows first. He edits it" +
+    " there himself; call `task_table list` for the current one._\n\n" +
     body
   );
 }

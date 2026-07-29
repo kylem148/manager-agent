@@ -30,6 +30,7 @@ import {
   type FileReviewResult,
 } from "./reviewinbox.js";
 import { TaskError, TASK_STATUSES, TASK_TABLE_CAP, type TaskStore } from "./taskstore.js";
+import { taskDisplayOrder } from "../taskorder.js";
 
 /**
  * The co-manager's internal capability surface, exposed to the model as tools.
@@ -56,7 +57,7 @@ export const DOC_COMMANDS = [
 ] as const;
 export type DocCommand = (typeof DOC_COMMANDS)[number];
 
-export const TASK_COMMANDS = ["add", "status", "retire", "list"] as const;
+export const TASK_COMMANDS = ["add", "status", "rename", "retire", "list"] as const;
 export type TaskCommand = (typeof TASK_COMMANDS)[number];
 
 /**
@@ -291,8 +292,10 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
         "- list — the current table. Takes no other parameter. Call it before editing if you are unsure what is there.\n" +
         "- add — append `task` as a new row, always `queued`. A task is one short line of text and has no body.\n" +
         "- status — move the row named by `task` to `building` or `queued`. Work that has actually started is `building`.\n" +
+        "- rename — rewrite the TEXT of the row named by `task` to `new_task`, keeping its status and its place. For a typo or a reworded task; it is not retire-and-add, which would lose both. Fails if `new_task` is empty or would read the same as a different row. Renaming a row to the text it already has is a successful no-op.\n" +
         "- retire — take the row named by `task` OUT of the table. This is what `done` means here: retiring appends it to a kept `done` list and shrinks the table. There is no third status.\n\n" +
         "A row is addressed BY ITS EXACT TASK TEXT, never by position — the captain edits the same table between your turns, so a position you read last turn may be a different row now. Text matching no row, or more than one, is an ERROR rather than a guess; `list` first and copy the text.\n\n" +
+        "The table comes back in the order it is DISPLAYED in — every `building` row first, then every `queued` one, each keeping the order it was stored in. That is what the captain's panel paints, so you and he are reading the same table. It is a display order only: it never says which row was added first, and nothing you can call reorders the stored table.\n\n" +
         "You cannot replace, clear or reorder the table, and no call can touch a row it did not name. That is deliberate: a whole-table write would silently delete rows the captain had just typed.\n\n" +
         `The DEFAULT IS NOT TO ADD A ROW. A row belongs here only when the captain asks for one, or when the item is plainly a major future workstream. Intermediate and mechanical steps never belong in the table, however real they are. ${TASK_TABLE_CAP} rows maximum (an add beyond that FAILS — nothing is evicted for you), and usually far fewer. Never assume a row you did not add is stale: if you did not put it there, the captain did.`,
       input_schema: {
@@ -302,7 +305,12 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
           task: {
             type: "string",
             description:
-              "For add: the new row's text, one short line. For status and retire: the EXACT text of the row to act on, as `list` returns it.",
+              "For add: the new row's text, one short line. For status, rename and retire: the EXACT text of the row to act on, as `list` returns it.",
+          },
+          new_task: {
+            type: "string",
+            description:
+              "For rename only: the row's new text, one short line. It may not be empty, and it may not read the same as a different row on the table.",
           },
           status: {
             type: "string",
@@ -676,21 +684,30 @@ export function makeExecutor(ctx: ExecutorContext) {
           if (!ctx.tasks) return err(id, "The task table is unavailable in this session.");
           const tasks = ctx.tasks;
           const command = String(input.command ?? "") as TaskCommand;
+          // Every `table` this tool hands back — the listing, the echo after a
+          // write, and the one carried by a refusal — goes through the SAME
+          // display order the panel paints, so the co and the captain never
+          // describe the table to each other in two different orders.
+          const table = () => taskDisplayOrder(tasks.list());
           try {
             switch (command) {
               case "list":
-                return ok(id, { table: tasks.list() });
+                return ok(id, { table: table() });
               case "add": {
                 const added = await tasks.add(input.task);
-                return ok(id, { added, table: tasks.list() });
+                return ok(id, { added, table: table() });
               }
               case "status": {
                 const row = await tasks.setStatus(input.task, input.status);
-                return ok(id, { updated: row, table: tasks.list() });
+                return ok(id, { updated: row, table: table() });
+              }
+              case "rename": {
+                const renamed = await tasks.rename(input.task, input.new_task);
+                return ok(id, { renamed, table: table() });
               }
               case "retire": {
                 const retired = await tasks.retire(input.task);
-                return ok(id, { retired, table: tasks.list() });
+                return ok(id, { retired, table: table() });
               }
               default:
                 return err(
@@ -706,7 +723,7 @@ export function makeExecutor(ctx: ExecutorContext) {
             // told exactly which row it named and what the table actually holds,
             // so its next call can be right rather than a guess.
             if (e instanceof TaskError) {
-              return err(id, JSON.stringify({ error: e.code, message: e.message, table: tasks.list() }));
+              return err(id, JSON.stringify({ error: e.code, message: e.message, table: table() }));
             }
             throw e;
           }

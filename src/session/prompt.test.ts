@@ -254,11 +254,11 @@ test("the task table is a shared surface the captain owns, not the co's own bloc
   }
 });
 
-test("the four row commands are named, and addressed by exact text", async () => {
+test("the five row commands are named, and addressed by exact text", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
     const prompt = await buildSystemPrompt(paths, RESEARCH);
-    for (const command of ["list", "add", "status", "retire"]) {
+    for (const command of ["list", "add", "status", "rename", "retire"]) {
       assert.match(prompt, new RegExp(`- \\\`${command}\\\` —`), `${command} is described`);
     }
     assert.match(
@@ -275,6 +275,69 @@ test("the four row commands are named, and addressed by exact text", async () =>
       prompt,
       /\*\*This is what "done" means here:\*\*/,
       "done retires a row out of the table; it is not a third status",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+/**
+ * `rename` is the one command that can fail on the shape of its SECOND argument,
+ * and a model that does not know that writes a call it has to be told about. All
+ * four refusals are in the protocol, and so is the case that looks like a
+ * refusal and is not.
+ */
+test("rename is documented with what it keeps and every way it fails", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH);
+    assert.match(
+      prompt,
+      /rewrite one row's TEXT/,
+      "what it does, in the words that separate it from add-and-retire",
+    );
+    assert.match(prompt, /keeping its status and its place/, "and the two things that survive it");
+    assert.match(
+      prompt,
+      /the old text\s+matches no row, the old text matches more than one, \\?`new_task\\?` is empty or only\s+whitespace, or \\?`new_task\\?` would read the same as a DIFFERENT row/,
+      "all four refusals, named",
+    );
+    assert.match(
+      prompt,
+      /Renaming a\s+row to the text it already has is a successful no-op/,
+      "and the case that must NOT be read as the collision refusal",
+    );
+    assert.match(prompt, /changes nothing when it does/, "a refused rename is not a partial write");
+  } finally {
+    await cleanup();
+  }
+});
+
+/**
+ * The display order, stated where the co reads the table rather than left to be
+ * inferred from the rows it happens to be handed. Two halves matter: `building`
+ * comes first, and it is a VIEW — a co that read stored order out of the block
+ * would start reasoning about which row was added when.
+ */
+test("the prompt says the table is painted building-first, and that it is a view", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH);
+    assert.match(prompt, /\*\*The table is displayed \\?`building\\?` first\*\*/);
+    assert.match(
+      prompt,
+      /each group keeping\s+the order it was stored in/,
+      "stored order survives inside each group",
+    );
+    assert.match(
+      prompt,
+      /the stored table keeps insertion order/,
+      "so a position in the painted table is not a position in the store",
+    );
+    assert.match(
+      prompt,
+      /toggling a row's status moves it in the display without rewriting anything/,
+      "the consequence the co would otherwise have to be told twice",
     );
   } finally {
     await cleanup();
@@ -308,6 +371,30 @@ test("the table is in the live-state block, read once and stable for the session
 
     const empty = await buildSystemPrompt(paths, RESEARCH);
     assert.match(empty, /### task table[\s\S]*\(empty\)/, "an empty table says so rather than vanishing");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the live-state table is painted building-first, through the shared helper", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    // Stored order, deliberately not the display order: the row being worked was
+    // added last, which is exactly the case the change exists for.
+    const rows = [
+      { task: "waiting a", status: "queued" as const },
+      { task: "waiting b", status: "queued" as const },
+      { task: "being worked", status: "building" as const },
+    ];
+    const prompt = await buildSystemPrompt(paths, RESEARCH, { tasks: rows });
+    const block = prompt.slice(prompt.indexOf("### task table"));
+    const order = ["being worked", "waiting a", "waiting b"].map((t) => block.indexOf(t));
+    assert.ok(order.every((n) => n > 0), "every row is in the block");
+    assert.deepEqual([...order].sort((a, b) => a - b), order, "building first, stored order under it");
+
+    // The helper's determinism is what keeps this block inside the cache prefix:
+    // the same rows must render the same bytes on every assembly.
+    assert.equal(await buildSystemPrompt(paths, RESEARCH, { tasks: rows }), prompt);
   } finally {
     await cleanup();
   }

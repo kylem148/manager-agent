@@ -32,6 +32,13 @@ import { serializeWrite } from "../memory/writequeue.js";
  * something shrinks the table instead of growing a column of `done` rows nobody
  * scans past.
  *
+ * The order kept here is INSERTION order, and nothing below reorders it: `add`
+ * appends, `rename` rewrites a row's text in place, `retire` leaves the rest
+ * where they were, and a status toggle moves no row at all. The order the table
+ * is PAINTED in — `building` rows first — is a separate thing entirely and lives
+ * in ../taskorder.ts, so that a status toggle can change what the captain sees
+ * without rewriting the file underneath him.
+ *
  * Like the feature store it is a CACHE of a conversation, not a source of truth
  * about anything: a missing, corrupt or unwritable file is an empty table and
  * must never fail a session start. Writes swallow their own errors and ride the
@@ -278,6 +285,46 @@ export class TaskStore {
     }
     const row = this.rows[this.indexOf(task)]!;
     row.status = next;
+    await this.persist();
+    return { ...row };
+  }
+
+  /**
+   * Rewrite one row's TEXT, keeping its status and its place in the table.
+   *
+   * A row's text used to be immutable, so a typo or a reworded task meant
+   * retiring the row and adding it again — which lost both the things the row
+   * carried besides its words: it came back `queued` however far along it was,
+   * and it came back at the bottom. Neither is what "fix the wording" means, so
+   * this is one operation and the row never leaves the table.
+   *
+   * Refuses on the same grounds every other operation does, plus one of its own:
+   * the new text may not collide with a DIFFERENT row, because two rows reading
+   * the same would make both unaddressable (the rule `add` already enforces).
+   * Renaming a row to the text it already has is deliberately NOT a collision —
+   * it is a successful no-op, which is what the panel does when the captain
+   * opens the field and changes nothing.
+   */
+  async rename(task: unknown, next: unknown): Promise<TaskRow> {
+    // The row is addressed FIRST: "which row" is a harder question than "is the
+    // new text usable", and an ambiguous address must fail as an address rather
+    // than as whatever the second check happens to notice.
+    const index = this.indexOf(task);
+    const text = cell(next);
+    if (!text) {
+      throw new TaskError(
+        "EMPTY_TASK",
+        "A renamed row still needs some text: one short line saying what it is.",
+      );
+    }
+    if (this.rows.some((r, i) => i !== index && r.task === text)) {
+      throw new TaskError(
+        "DUPLICATE_TASK",
+        `Another row already reads "${text}". Rows are addressed by their exact text, so the table cannot hold two.`,
+      );
+    }
+    const row = this.rows[index]!;
+    row.task = text;
     await this.persist();
     return { ...row };
   }

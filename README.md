@@ -599,7 +599,7 @@ their rows `a)`, `b)`, `c)` rather than `1)`, `2)`, `3)`.
 
 | tab   | what it is                                                        | its keys                              |
 | ----- | ----------------------------------------------------------------- | ------------------------------------- |
-| home  | the task table (yours to edit), then every tracked worktree       | `a` add, `x` retire, `s` status       |
+| home  | the task table (yours to edit), then every tracked worktree       | `a` add, `e` edit, `x` retire, `s` status |
 | queue | the merge queue and the head's pull request                       | `m` merge, `e` edit the PR message    |
 | docs  | everything in `docs/`, opened through the transcript's renderer   | `a`-`z` open, `y` copies an open doc  |
 | inbox | the last 20 filed crew reviews                                    | `a`-`z` open                          |
@@ -635,15 +635,33 @@ It holds at most five rows and a row's status is one of exactly two words,
 point of this block is that it can be read at a glance. A missing or unreadable
 table file is an empty table, never a failed start.
 
+**`building` rows are painted first**, then the `queued` ones, each group in the
+order you put them in — so the thing actually being worked is the first line of
+the panel rather than wherever it happened to be typed. That is a display order
+only: the stored table keeps insertion order, so flipping a row's status moves it
+on screen without rewriting anything, and the row you retire disturbs nobody
+else's place. The same rule paints the table everywhere it is shown — this tab,
+what the co-manager's tool hands back, and the copy in its session-start context
+— so you and it are never reading differently-ordered tables.
+
 **You write to it here, and the co-manager reads it.** `a` opens a one-line
 field (Enter adds the task as `queued`, Esc adds nothing); the arrows or `j`/`k`
-pick a row, `x` retires it, `s` flips it between `queued` and `building`, and
-`Esc` drops the selection. `x` and `s` do nothing at all until you have picked a
-row, so no single stray key can change the table. Changes are on disk
-immediately, and a retired row is kept with the time it left. The co-manager
-edits the same table through a tool, one row at a time — it can't overwrite what
-you typed — and the table is in what it reads at session start, so a note you
-jot here is context it actually has.
+pick a row, `e` reopens that field on it to fix the wording, `x` retires it, `s`
+flips it between `queued` and `building`, and `Esc` drops the selection. `e`, `x`
+and `s` do nothing at all until you have picked a row, so no single stray key can
+change the table. Changes are on disk immediately, and a retired row is kept with
+the time it left. The co-manager edits the same table through a tool, one row at
+a time — it can't overwrite what you typed — and the table is in what it reads at
+session start, so a note you jot here is context it actually has.
+
+`e` is a rewrite of the words, not a new row: the field opens prefilled with the
+caret at the end, Ctrl-S or Enter commits, Esc leaves the row untouched, and what
+you commit replaces that row's text while its status and its place stay exactly
+as they were. Retiring and re-adding would have lost both. It refuses, and says
+so with your text still in the field, if the new wording would read the same as
+another row — two identical rows can't be told apart, which is the same reason
+`a` refuses a duplicate. The selection follows the row to its new name, so the
+next key you press still acts on the row you were just looking at.
 
 The description beside a worktree is the **intent** the co-manager wrote when it
 created the feature — a plain authored line, not something regenerated per

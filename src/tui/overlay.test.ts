@@ -2426,6 +2426,14 @@ function fakeTasks(initial: TaskPanelRow[], opts: { readOnly?: boolean } = {}): 
     cur = cur.map((r) => (r.task === task ? { ...r, status } : r));
     return Promise.resolve({ ok: true });
   };
+  // Rewrites the text IN PLACE, like the store: same status, same index. A fake
+  // that appended instead would hide the one thing the panel test is for.
+  api.rename = (task, next) => {
+    const refused = guard(`rename:${task}:${next}`);
+    if (refused) return Promise.resolve(refused);
+    cur = cur.map((r) => (r.task === task ? { ...r, task: next } : r));
+    return Promise.resolve({ ok: true });
+  };
   api.retire = (task) => {
     const refused = guard(`retire:${task}`);
     if (refused) return Promise.resolve(refused);
@@ -3057,6 +3065,186 @@ test("a selection whose row the co retired mid-session simply stops being one", 
   h.stop();
 });
 
+// --- `e`: rewriting a row's text in place ------------------------------------
+//
+// The row's text used to be immutable, so a typo cost the row its status and its
+// place (retire, re-add, and it comes back queued at the bottom). `e` opens the
+// same one-line field `a` uses, prefilled, and what it writes replaces the row's
+// words and nothing else.
+//
+// The half a frame assertion cannot see is the SELECTION: a rename that moved
+// the store and not the highlight leaves the captain marked on text that no
+// longer exists, which reads as no selection at all and silently disarms the
+// next key he presses. So every test here checks where the ▸ ended up.
+
+const CTRL_S = "\x13";
+
+test("`e` opens the field prefilled with the selected row, and Ctrl-S commits it", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j"); // ctrl-o overhaul
+  await settle();
+
+  h.send("e");
+  await settle();
+  assert.match(h.lastFramePlain(), /ctrl-o overhaul/, "the field opens on the row's own text");
+
+  // The caret opens at the END of the prefilled text, so a fix appends rather
+  // than pushing the row's words along in front of it.
+  h.send(" v2");
+  await settle();
+  assert.match(h.lastFramePlain(), /ctrl-o overhaul v2/);
+  assert.deepEqual(tasks.writes, [], "nothing is written while the field is open");
+
+  h.send(CTRL_S);
+  await settle();
+  assert.deepEqual(tasks.writes, ["rename:ctrl-o overhaul:ctrl-o overhaul v2"]);
+  assert.deepEqual(tasks.list(), [
+    // Same status, same place: the two things retire-and-re-add would have lost.
+    { task: "ctrl-o overhaul v2", status: "building" },
+    { task: "bedrock retry backoff", status: "queued" },
+    { task: "pricing table refresh", status: "queued" },
+  ]);
+  assert.match(selectedRow(h), /ctrl-o overhaul v2/, "and the selection came with it");
+  h.stop();
+});
+
+test("Enter commits the rename too, since the field is one line", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j");
+  h.send("e");
+  h.send(" reworded");
+  h.send("\r");
+  await settle();
+  assert.deepEqual(tasks.writes, ["rename:ctrl-o overhaul:ctrl-o overhaul reworded"]);
+  assert.match(selectedRow(h), /ctrl-o overhaul reworded/);
+  h.stop();
+});
+
+test("Esc leaves the row exactly as it was, selection included", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j");
+  h.send("e");
+  h.send(" and something I thought better of");
+  await settle();
+  assert.match(h.lastFramePlain(), /thought better of/, "the field shows what is typed");
+
+  h.send(ESC);
+  await settle();
+  assert.deepEqual(tasks.writes, [], "Esc wrote nothing");
+  assert.deepEqual(tasks.list(), TASKS, "the row is untouched");
+  assert.ok(!h.lastFramePlain().includes("thought better of"), "the field is gone");
+  assert.match(selectedRow(h), /ctrl-o overhaul/, "and the row is still the selected one");
+  h.stop();
+});
+
+test("`e` with nothing selected does nothing at all, exactly like `x`", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.equal(selectedRow(h), "", "the tab lands inert");
+
+  h.send("e");
+  await settle();
+  // No field, no write, and no keyboard grabbed: the next keys are the tab's
+  // own, which is what "does nothing" has to mean for a key that can open an
+  // editor. `2` still jumps a tab, so nothing swallowed it.
+  assert.deepEqual(tasks.writes, []);
+  assert.deepEqual(tasks.list(), TASKS);
+  assert.equal(selectedRow(h), "");
+  h.send("j");
+  await settle();
+  assert.match(selectedRow(h), /ctrl-o overhaul/, "and the tab's own keys still work");
+  h.stop();
+});
+
+test("an unchanged rename is not written at all, and keeps the selection", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j");
+  h.send("e");
+  h.send(CTRL_S);
+  await settle();
+  assert.deepEqual(tasks.writes, [], "opening the field and changing nothing costs no write");
+  assert.deepEqual(tasks.list(), TASKS);
+  assert.match(selectedRow(h), /ctrl-o overhaul/);
+  h.stop();
+});
+
+test("emptying the field cancels rather than erasing the row's text", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j");
+  h.send("e");
+  h.send("\x15"); // Ctrl-U: kill the line
+  h.send(CTRL_S);
+  await settle();
+  assert.deepEqual(tasks.writes, [], "a blank row is not a row, so nothing is written");
+  assert.deepEqual(tasks.list(), TASKS);
+  h.stop();
+});
+
+test("a refused rename keeps the field open with the text, and leaves the selection put", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j");
+  tasks.refuse = 'Another row already reads "bedrock retry backoff".';
+  h.send("e");
+  h.send("\x15bedrock retry backoff");
+  h.send(CTRL_S);
+  await settle();
+  const frame = h.lastFramePlain();
+  assert.match(frame, /Another row already reads/, "the refusal is printed");
+  assert.match(frame, /bedrock retry backoff/, "with the typed text still there to edit");
+  assert.deepEqual(tasks.list(), TASKS, "and nothing was stored");
+  h.send(ESC);
+  await settle();
+  assert.match(selectedRow(h), /ctrl-o overhaul/, "the row it refused to rename is still selected");
+  h.stop();
+});
+
+test("the rename field owns the keyboard: `x` is text, not a retire", async () => {
+  const tasks = fakeTasks(TASKS);
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(undefined, 90, 20, q, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j");
+  h.send("e");
+  // Every one of these acts on the tab underneath: 2 jumps to the queue, x
+  // retires, q closes, m would merge one tab over.
+  h.send("\x15" + "2 fix the xmq parser");
+  h.send(CTRL_S);
+  await settle();
+  assert.deepEqual(tasks.writes, ["rename:ctrl-o overhaul:2 fix the xmq parser"]);
+  assert.equal(q.calls, 0, "and nothing merged on the way through");
+  assert.match(selectedRow(h), /2 fix the xmq parser/, "still on Home, on the renamed row");
+  h.stop();
+});
+
 test("a source with no write hooks paints the table and says the keys aren't available", async () => {
   const tasks = fakeTasks(TASKS, { readOnly: true });
   const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
@@ -3070,7 +3258,123 @@ test("a source with no write hooks paints the table and says the keys aren't ava
   h.send("x");
   await settle();
   assert.match(h.lastFramePlain(), /retiring a task isn't available/);
+  h.send("e");
+  await settle();
+  assert.match(h.lastFramePlain(), /renaming a task isn't available/);
   assert.deepEqual(tasks.list(), TASKS);
+  h.stop();
+});
+
+// --- building rows paint first -----------------------------------------------
+//
+// A display order only (D-20260729-5): the store keeps insertion order, and the
+// same shared helper the tool and the live-state block call decides what the
+// captain sees. What matters on this tab is that the CURSOR walks the painted
+// order too — a highlight that moved through the stored sequence while the eye
+// read another would be unusable the first time `s` moved a row.
+
+const UNSORTED: TaskPanelRow[] = [
+  { task: "waiting first", status: "queued" },
+  { task: "waiting second", status: "queued" },
+  { task: "being worked", status: "building" },
+];
+
+test("the tab paints building rows above queued ones, whatever order they were stored in", async () => {
+  const tasks = fakeTasks(UNSORTED);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.deepEqual(
+    taskRows(h).map((r) => r.trim().replace(/^▸\s*/, "")),
+    ["building   being worked", "queued     waiting first", "queued     waiting second"],
+    "building first, and the stored order kept under it",
+  );
+  assert.deepEqual(
+    tasks.list().map((t) => t.task),
+    ["waiting first", "waiting second", "being worked"],
+    "the STORE is untouched: this is a view of it",
+  );
+  h.stop();
+});
+
+test("j/k walk the painted order, not the stored one", async () => {
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), fakeTasks(UNSORTED));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j");
+  await settle();
+  assert.match(selectedRow(h), /being worked/, "down from nothing takes the row painted first");
+  h.send("j");
+  await settle();
+  assert.match(selectedRow(h), /waiting first/, "then the one under it on screen");
+  h.stop();
+});
+
+test("`s` re-sorts the row on the next paint, and the highlight follows it", async () => {
+  const tasks = fakeTasks(UNSORTED);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j");
+  h.send("j"); // "waiting first", painted second
+  await settle();
+  assert.match(selectedRow(h), /waiting first/);
+
+  h.send("s");
+  await settle();
+  assert.deepEqual(tasks.writes, ["status:waiting first:building"]);
+  assert.deepEqual(
+    taskRows(h).map((r) => r.trim().replace(/^▸\s*/, "")),
+    // Above "being worked", not below it: inside the building group the STORED
+    // order still decides, and "waiting first" was stored first. A toggle moves
+    // a row between groups; it never appends it to the end of one.
+    ["building   waiting first", "building   being worked", "queued     waiting second"],
+    "it moved up into the building group, keeping its stored order inside it",
+  );
+  // The selection is held as TEXT, which is what lets it ride the move.
+  assert.match(selectedRow(h), /waiting first/, "and the highlight went with the row");
+  assert.deepEqual(
+    tasks.list().map((t) => t.task),
+    ["waiting first", "waiting second", "being worked"],
+    "with the stored order still untouched",
+  );
+  h.stop();
+});
+
+test("retiring a row disturbs the order of nothing else", async () => {
+  const tasks = fakeTasks(UNSORTED);
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j"); // "being worked", painted first
+  h.send("x");
+  await settle();
+  assert.deepEqual(
+    taskRows(h).map((r) => r.trim()),
+    ["queued     waiting first", "queued     waiting second"],
+    "the rest are where they were",
+  );
+  h.stop();
+});
+
+test("the rename field paints in the row's own place, under the row's own status", async () => {
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), fakeTasks(UNSORTED));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j"); // "being worked", the building row, painted first
+  h.send("e");
+  await settle();
+  const rows = taskRows(h).map((r) => r.trim());
+  // Rewriting a task's wording must not look like moving it, so the field sits
+  // where the row does and keeps its status word — `new` would be a lie.
+  assert.equal(rows.length, 3, "still three rows: the field IS the row");
+  assert.match(rows[0]!, /^building\s+being worked/);
+  assert.match(rows[1]!, /^queued\s+waiting first/);
   h.stop();
 });
 
@@ -3081,16 +3385,26 @@ test("Home's footer names the keys, because nothing else can", async () => {
   await settle();
   const footer = screenRows(h).at(-1) ?? "";
   assert.match(footer, /a add/);
+  assert.match(footer, /e edit/);
   assert.match(footer, /x retire/);
   assert.match(footer, /s status/);
   assert.match(footer, /space\/b page/, "and paging is still what it always was");
 
-  // While the field is open the footer names its two keys instead.
+  // While the field is open the footer names its two keys instead — and names
+  // the right verb, because the two openings commit different things.
   h.send("a");
   await settle();
   const typing = screenRows(h).at(-1) ?? "";
   assert.match(typing, /Enter add the task/);
   assert.match(typing, /Esc cancel/);
+
+  h.send(ESC);
+  h.send("j");
+  h.send("e");
+  await settle();
+  const renaming = screenRows(h).at(-1) ?? "";
+  assert.match(renaming, /Enter rename the task/);
+  assert.match(renaming, /Esc cancel/);
   h.stop();
 });
 
