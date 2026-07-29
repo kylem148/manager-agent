@@ -7,8 +7,23 @@ import { instancePaths, type InstancePaths } from "../paths.js";
 import { createInstance } from "../memory/memory.js";
 import { buildSystemPrompt } from "./prompt.js";
 import type { ResearchConfig } from "../config.js";
+import { PROTOCOL_SECTIONS, protocolBody, protocolIndex } from "./protocols.js";
+import { toolDefinitions } from "./tools.js";
+import { SURFACED_DOC_MAX_CHARS } from "../memory/docs.js";
 
 /**
+ * TWO TIERS, and the difference matters to every test below.
+ *
+ * The PERMANENT tier is the system prompt: re-sent on every round of every turn,
+ * so only what the co needs every turn belongs in it. The ON-DEMAND tier is
+ * protocols.ts, pulled in with `read_protocol` when the co is about to act.
+ *
+ * So a behavioural guarantee is "this prose is REACHABLE" (assert against
+ * `reachable()`), not "this prose is in the prompt" — moving a section between
+ * tiers is a cost decision and must not read as a behaviour regression. What
+ * tier each piece lives in is pinned separately and deliberately, at the bottom
+ * of this file, together with the prefix budget.
+ *
  * The parts of the system prompt that are load-bearing for what co's work LOOKS
  * LIKE in the repo afterwards: the commit message the crew is told to write, and
  * the branch a feature is cut on. Both are prose the model acts on rather than
@@ -58,6 +73,16 @@ const DISPATCH = {
   defaultAgent: "cc",
 };
 
+/**
+ * Everything the co can put in front of itself on a linked instance: the
+ * permanent prompt plus every on-demand protocol section. This is the surface a
+ * behavioural assertion should be made against.
+ */
+async function reachable(paths: InstancePaths): Promise<string> {
+  const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+  return [prompt, ...PROTOCOL_SECTIONS.map((s) => protocolBody(s))].join("\n\n");
+}
+
 test("the orders protocol tells the crew to commit with no attribution trailer", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
@@ -75,7 +100,7 @@ test("the orders protocol tells the crew to commit with no attribution trailer",
 test("the features protocol names branches <type>/<slug> and ownership by worktree", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
-    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    const prompt = await reachable(paths);
     assert.match(prompt, /<type>\/<slug>/, "the branch shape co should expect");
     assert.match(prompt, /feature_create\(name, type, intent\)/);
     assert.match(prompt, /fix\/stale-token-bug/, "with a worked example of choosing the type");
@@ -98,7 +123,7 @@ test("the features protocol names branches <type>/<slug> and ownership by worktr
 test("enqueue is where co writes the PR message, in the house style", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
-    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    const prompt = await reachable(paths);
     assert.match(prompt, /feature_enqueue\(name, prTitle, prBody\)/, "the lever carries the message");
     assert.match(prompt, /You write the pull request's message/);
     assert.match(prompt, /Writing the pull request message/, "and the template it is written to");
@@ -136,7 +161,7 @@ test("enqueue is where co writes the PR message, in the house style", async () =
 test("the PR body is the five-section template, verification separated from claim", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
-    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    const prompt = await reachable(paths);
     // The section list is the whole point of the template, and its ORDER is part
     // of it, so it is pinned as a sequence rather than five loose matches.
     assert.match(
@@ -219,7 +244,7 @@ test("every order makes the crew close its report with the material the PR needs
 test("the panel's `e` editor is in the protocol, with the captain's version winning", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
-    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    const prompt = await reachable(paths);
     // The co is the only thing that can tell the captain the key exists, so the
     // key itself is pinned, not just the idea of editing.
     assert.match(prompt, /`e` in the queue tab edits your PR message/);
@@ -473,7 +498,7 @@ test("the table's contract is two columns, two status words, and a bias against 
 test("the two lanes are in the protocol: which verb grants which, and who is enforced", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
-    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    const prompt = await reachable(paths);
     // The old cap is gone from the prose as well as the code. A prompt that
     // still said a second dispatch is refused would have the co decline work the
     // harness now allows, and no test would catch it.
@@ -520,7 +545,7 @@ test("the two lanes are in the protocol: which verb grants which, and who is enf
 test("an audit run files no review, and only a writer blocks the levers", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
-    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    const prompt = await reachable(paths);
     // The routing rule. The co files a review for EVERY completion by standing
     // instruction, so the exception has to be explicit or an audit lands in the
     // inbox with an accept/rework verdict for work that was never done.
@@ -554,7 +579,7 @@ test("an audit run files no review, and only a writer blocks the levers", async 
 test("an ungated head comes with the offer to add a CI workflow, and never a held merge", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
-    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    const prompt = await reachable(paths);
     assert.match(prompt, /An ungated head earns one nudge/);
     assert.match(
       prompt,
@@ -568,6 +593,137 @@ test("an ungated head comes with the offer to add a CI workflow, and never a hel
       /never\s+withhold or delay a merge over it/,
       "ungated stays a valid, mergeable state",
     );
+  } finally {
+    await cleanup();
+  }
+});
+
+// --- the two tiers, and the budget --------------------------------------------
+//
+// Everything above asserts behaviour is reachable. These assert WHERE it lives
+// and what it costs, which is a different guarantee and the one that rots.
+//
+// The prefix is re-sent on every round of every turn, so a section added to it
+// is paid for tens of times a session forever. It had grown to ~99,000 characters
+// before this split, 20% of that added by two feature PRs in a single week, and
+// nothing anywhere failed when it did. That is what these tests are for.
+
+/** The whole cache prefix: system prompt plus the tool schemas on the wire. */
+async function prefixChars(paths: InstancePaths): Promise<number> {
+  const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+  return prompt.length + JSON.stringify(toolDefinitions({ dispatch: true })).length;
+}
+
+test("the cache prefix stays inside its budget", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    // A fresh instance carries almost no live state, so this measures the
+    // CODE-OWNED prefix: protocol prose plus tool schemas. Live instances add
+    // their own memory on top, which is the captain's content and budgeted
+    // separately (SURFACED_DOC_MAX_CHARS).
+    //
+    // If this fails, the question is not "raise the budget". It is which tier the
+    // new prose belongs in: something needed every turn goes in the prompt and
+    // something needed occasionally goes in protocols.ts behind read_protocol.
+    // A RATCHET, not a target. It sits just above the current figure so any
+    // meaningful addition trips it, and it comes DOWN as more prose moves to the
+    // on-demand tier — it must never go up. Still to move, in rough order of
+    // size: the orders protocol, the task-table command reference, and the
+    // review protocol's detail (the level gate itself stays permanent). Those
+    // three are worth roughly another 7,000 characters.
+    const BUDGET = 53_000;
+    const actual = await prefixChars(paths);
+    assert.ok(
+      actual <= BUDGET,
+      `code-owned prefix is ${actual} chars, over the ${BUDGET} budget by ${actual - BUDGET}.` +
+        ` Move occasional prose into protocols.ts rather than raising this.`,
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the occasional protocol detail is NOT in the permanent prompt", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    // The five-section PR template, the queue mechanics and the lane rules are
+    // needed on the turns that dispatch or land, which most sessions never have.
+    // Each of these strings living in the prompt again means a silent regression
+    // to paying for them on every round of every turn.
+    assert.ok(!prompt.includes("## Other Notes"), "the PR template moved on demand");
+    assert.ok(!prompt.includes("Two lanes in one worktree"), "the lane rules moved on demand");
+    assert.ok(
+      !prompt.includes("feature_abandon(name)"),
+      "the feature lever reference moved on demand",
+    );
+    // And the co is told, imperatively, to go and get them.
+    assert.match(prompt, /read_protocol/);
+    for (const section of PROTOCOL_SECTIONS) {
+      assert.ok(prompt.includes(`\`${section}\``), `the index must name ${section}`);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the guardrails stay permanent, because they bind every turn", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    // These are not reference material the co looks up when it needs them: they
+    // constrain what it does on turns where it has no idea a rule applies. A
+    // guardrail behind a tool call is a guardrail that does not fire.
+    assert.match(prompt, /never announce, narrate, or ask\s+permission to write to memory/i);
+    assert.match(prompt, /never write over a\s+row you did not name/i);
+    assert.match(prompt, /You never inspect, edit, or run the user's source code/);
+    assert.match(prompt, /gated by the captain's typed\s+confirm/);
+    // The review level gate decides how much of a review reaches the chat, on
+    // every completion, with no lookup in between.
+    assert.match(prompt, /Never paste the review body into the chat/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("every protocol section is reachable and self-titled", () => {
+  for (const section of PROTOCOL_SECTIONS) {
+    const body = protocolBody(section);
+    assert.ok(body.length > 500, `${section} looks truncated at ${body.length} chars`);
+    assert.match(body, /^### /, `${section} must carry its own heading once pulled in`);
+    // The extraction from the prompt escaped backticks for a template literal;
+    // a stray escape would reach the model as a literal backslash.
+    assert.ok(!body.includes("\\`"), `${section} has escaped backticks in its value`);
+  }
+});
+
+test("the index tells the co when to read, not just what exists", () => {
+  const index = protocolIndex();
+  // A passive table of contents does not reliably trigger a read, and a section
+  // that is never read is prose the co improvises around.
+  assert.match(index, /BEFORE you act/);
+  assert.match(index, /read it before/i);
+  assert.equal(PROTOCOL_SECTIONS.every((s) => index.includes(s)), true);
+});
+
+test("a surfaced doc is truncated into the prefix, with a pointer to the rest", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const { createDoc } = await import("../memory/docs.js");
+    // architecture.md gets a privileged cold-start read, so an unbounded one is
+    // charged on every round of every turn. Measured instances had reached
+    // 19,276 characters with no discipline anywhere in that path.
+    const huge = Array.from({ length: 400 }, (_, i) => `paragraph ${i} of the design`).join(
+      "\n\n",
+    );
+    await createDoc(paths, "architecture.md", huge);
+    const prompt = await buildSystemPrompt(paths, RESEARCH, { dispatch: DISPATCH });
+    assert.ok(!prompt.includes("paragraph 399"), "the tail must not reach the prefix");
+    assert.match(prompt, /Truncated at/, "and the co must be told there is more");
+    assert.match(prompt, /doc read architecture\.md/, "with how to get the rest on demand");
+    // Budgeted, not refused: the doc is the captain's and a session must start.
+    assert.match(prompt, /paragraph 0 of the design/);
+    assert.ok(SURFACED_DOC_MAX_CHARS > 0);
   } finally {
     await cleanup();
   }

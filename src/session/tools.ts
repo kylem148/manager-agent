@@ -31,6 +31,12 @@ import {
 } from "./reviewinbox.js";
 import { TaskError, TASK_STATUSES, type TaskStore } from "./taskstore.js";
 import { taskDisplayOrder } from "../taskorder.js";
+import {
+  isProtocolSection,
+  protocolBody,
+  PROTOCOL_SECTIONS,
+  type ProtocolSection,
+} from "./protocols.js";
 
 /**
  * The co-manager's internal capability surface, exposed to the model as tools.
@@ -333,6 +339,23 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
   // dispatch at it, and land it through the Ctrl-O review gate.
   if (opts.dispatch) {
     tools.push({
+      name: "read_protocol",
+      description:
+        "Read one section of the dispatch protocol reference. These sections are NOT in your system prompt — they are exact procedures with real failure modes, and they are kept out of every turn's context because most sessions never need them. Call this BEFORE you act, not after: `features` for creating/landing/enqueueing/abandoning a feature or dispatching into one, `lanes` before dispatching into a worktree that already holds a live crew agent, `pr-message` before you compose the prTitle/prBody for feature_enqueue. Reading a section costs a moment; guessing at one costs the captain a broken landing or a pull request written to the wrong shape. feature_enqueue will refuse a prBody until you have read `pr-message` this session.",
+      input_schema: {
+        type: "object",
+        properties: {
+          section: {
+            type: "string",
+            enum: [...PROTOCOL_SECTIONS],
+            description: "Which protocol section to put in front of you.",
+          },
+        },
+        required: ["section"],
+        additionalProperties: false,
+      },
+    });
+    tools.push({
       name: "dispatch_order",
       description:
         "Arm a direct dispatch of an implementation-ready order to the crew (the registered coding agent). This does NOT run anything: it stages the order and shows the captain the exact order text plus the resolved command and target, and waits. The dispatch fires only if the captain then types `confirm`; any other input cancels it. Use this instead of writing plain-text orders when the captain wants the order run directly. Draft the full order (same checklist as a written order: read-docs-first, goal, context, decisions, constraints, acceptance, verification, close-the-report, commit) as the `order` argument. Optionally scope it to a feature with `feature`: the crew then runs inside that feature's isolated worktree (provisioned on first use) instead of the bare main tree. Arm at most one order per turn.\n\n" +
@@ -411,7 +434,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
           prBody: {
             type: "string",
             description:
-              "The pull request's description, written to the five-section template the dispatch protocol specifies (`## What`, `## Why`, `## How`, `## Testing`, `## Other Notes`, dropping any section you would leave empty): What and Why carry what the PR accomplishes and why, How carries the approaches tried and abandoned, Testing records ONLY the local verification the crew actually ran and its results, never a to-do list for the reader. Every section is a short bullet list and never a paragraph — three bullets typically, five at most, each one short sentence on one line. Never name who did the work (no attribution, no co-provenance, no first person), and never a commit list or a checks summary (co appends those itself). Omitted, the description falls back to a one-line mechanical summary.",
+              "The pull request's description. Call `read_protocol` with section \"pr-message\" and write it to the template there — this tool refuses a body until you have. The template is not restated here on purpose: one copy, read when it is actually needed. Omitted, the description falls back to a one-line mechanical summary.",
           },
         },
         required: ["name"],
@@ -472,6 +495,17 @@ export interface ToolSideEffects {
   logsTouched: Set<LogName>;
   liveRewritten: Set<LiveFile>;
   decisionsRecorded: string[];
+  /**
+   * Protocol sections the co has pulled into context this session.
+   *
+   * The point of moving a section out of the system prompt is that most sessions
+   * never pay for it. The risk is that the co then acts without it and nothing
+   * says so — it composes a PR body from memory and the shape is quietly wrong.
+   * An inline trigger is a hope; this is the enforcement, and feature_enqueue
+   * checks it. Session-scoped rather than per-turn on purpose: re-reading before
+   * every call would hand back the saving this exists to make.
+   */
+  protocolsRead: Set<ProtocolSection>;
 }
 
 export function newSideEffects(): ToolSideEffects {
@@ -479,6 +513,7 @@ export function newSideEffects(): ToolSideEffects {
     logsTouched: new Set(),
     liveRewritten: new Set(),
     decisionsRecorded: [],
+    protocolsRead: new Set(),
   };
 }
 
@@ -553,6 +588,17 @@ export function makeExecutor(ctx: ExecutorContext) {
     const input = (block.input ?? {}) as Record<string, unknown>;
     try {
       switch (block.name) {
+        case "read_protocol": {
+          const section = input.section;
+          if (!isProtocolSection(section)) {
+            return err(
+              id,
+              `unknown protocol section. Pick one of: ${PROTOCOL_SECTIONS.join(", ")}.`,
+            );
+          }
+          effects.protocolsRead.add(section);
+          return ok(id, { section, text: protocolBody(section) });
+        }
         case "read_live_memory": {
           const live = await readLiveMemory(paths);
           return ok(id, live);
@@ -778,6 +824,21 @@ export function makeExecutor(ctx: ExecutorContext) {
           // enqueue never wipes a message the co wrote earlier.
           const prTitle = input.prTitle === undefined ? undefined : String(input.prTitle);
           const prBody = input.prBody === undefined ? undefined : String(input.prBody);
+          // The one hard gate on the on-demand protocol split. The PR template
+          // left the system prompt, so the co can no longer see it by default —
+          // and a body composed from memory instead of the template is exactly
+          // the failure that degrades silently: it reads plausibly, it merges,
+          // and nobody notices the shape is wrong for weeks. An inline trigger
+          // is a hope; refusing here is enforcement. Cheap to satisfy: one tool
+          // call, once per session.
+          if (prBody !== undefined && !effects.protocolsRead.has("pr-message")) {
+            return err(
+              id,
+              "call read_protocol with section \"pr-message\" first, then re-send this" +
+                " enqueue with the body written to that template. The feature is not" +
+                " enqueued and nothing has changed.",
+            );
+          }
           const res = await ctx.features.enqueue(name, {
             ...(prTitle === undefined ? {} : { prTitle }),
             ...(prBody === undefined ? {} : { prBody }),
