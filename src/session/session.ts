@@ -961,9 +961,15 @@ async function maybeCompact(state: SessionState): Promise<void> {
   // stops remembering something you both said an hour ago is a bug report
   // waiting to happen. One dim line, once.
   const freed = plan.before - plan.after;
-  state.io.appendBlock(
-    c.dim(`  · compacted earlier conversation (~${freed.toLocaleString("en-US")} tokens)`),
-  );
+  const note = `compacted earlier conversation (~${freed.toLocaleString("en-US")} tokens)`;
+  state.io.appendBlock(c.dim(`  · ${note}`));
+  // Written to the transcript as well as the screen, unlike the screen-only
+  // notices elsewhere. A compaction is the one piece of bookkeeping whose effect
+  // outlives the session: it is why the co may not recall something later, and
+  // it is the only record that the ceiling ever engaged. The first attempt at
+  // auditing this feature failed precisely because the notice was on screen and
+  // nowhere else, so "did it fire?" was unanswerable after the fact.
+  await appendTranscript(state.transcript, "note", note);
 }
 
 // --- dispatch (arm → confirm → launch → review) ------------------------------

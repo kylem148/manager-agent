@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
-import { config as loadDotenv } from "dotenv";
+import { config as loadDotenv, parse as parseDotenv } from "dotenv";
 
 /**
  * Loads .env from the current working directory and from the co-manager home,
@@ -21,6 +21,26 @@ function env(name: string): string | undefined {
   const v = process.env[name];
   return v === undefined || v === "" ? undefined : v;
 }
+
+/**
+ * Keys that came from the ACTUAL environment, captured before any .env file is
+ * merged in.
+ *
+ * dotenv works by writing file values into `process.env`, which means that after
+ * loadEnvFiles() has run there is no way to look at `process.env` and tell a real
+ * `FOO=bar co …` from a line in `~/co-managers/.env`. Anything needing that
+ * distinction has to have taken a snapshot first — and per-instance overrides
+ * need it exactly, or the home file shadows the instance file and the override
+ * silently does nothing.
+ *
+ * Evaluated at module load, which is before loadConfig() can be called, so this
+ * is genuinely the pre-dotenv environment.
+ */
+const REAL_ENV: ReadonlySet<string> = new Set(
+  Object.entries(process.env)
+    .filter(([, v]) => v !== undefined && v !== "")
+    .map(([k]) => k),
+);
 
 /** Root directory holding all co-manager instances. */
 export function coHome(): string {
@@ -170,25 +190,35 @@ export function paneWaitSec(): number {
  *
  * SOME prefix is load-bearing: the bare foundation id is rejected for on-demand
  * throughput ("Retry your request with the ID or ARN of an inference profile").
- * Which prefix is a pricing decision.
+ * Which prefix is a cost decision, and it did NOT go the way the list price says.
  *
- * Anthropic documents a 10% premium on Bedrock's regional and geo endpoints over
- * the global one, on every token class. `us.anthropic.claude-opus-5` and
- * `global.anthropic.claude-opus-5` are the same model; the `us.` prefix buys
- * US-and-Canada data residency, and it costs a tenth of the entire bill. So
- * global is the default and residency is the opt-in, rather than the reverse.
- * Verified answering on the runtime path with a Bedrock bearer token 2026-07-29.
+ * On paper `global.` wins: Anthropic documents a 10% premium on Bedrock's geo
+ * endpoints over global, on every token class, for the same model. This default
+ * was moved to global on that basis on 2026-07-29, and moved back a day later
+ * because the meter disagreed.
  *
- * One honest caveat: a geo profile routes across a narrower pool and may produce
- * FEWER cache writes than global under load. The 10% is a list-price saving, and
- * `/cost`'s rebuild line is what says whether it survived contact.
+ * Measured over 71 real turns on global against 152 on `us.`:
+ *
+ *   cache write per turn   11,026  ->  37,151   (3.4x)
+ *   rebuilds as a share of all writes:  85%
+ *   cost per turn          $0.428  ->  $0.536   (+25%)
+ *
+ * Rebuilds are cache writes billed on a turn's OPENING round, and 85% of writes
+ * landing there means the prefix was being rebuilt at the start of nearly every
+ * turn — with an average gap between turns of 38 seconds, against a one-hour
+ * TTL. No expiry explains that. AWS warns that cross-region inference "may lead
+ * to increased cache writes", and global routes across the widest pool there is,
+ * so a request can simply land where the cache is not.
+ *
+ * The lesson generalises past this one setting: a 10% list-price saving is worth
+ * nothing next to a 20:1 write-to-read spread, and the only way to know which
+ * way a routing change lands is the rebuild line in `/cost`.
  *
  * The Sonnet tier runs at a materially lower per-token rate;
- * `global.anthropic.claude-sonnet-5` answers on this account if cost ever
- * outranks capability. Note Sonnet 4.6 does not accept effort=xhigh — see
- * effortLevelsFor.
+ * `us.anthropic.claude-sonnet-5` answers on this account if cost outranks
+ * capability. Note Sonnet 4.6 does not accept effort=xhigh — see effortLevelsFor.
  */
-export const DEFAULT_MODEL_ID = "global.anthropic.claude-opus-5";
+export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-5";
 
 export interface ModelConfig {
   region: string;
@@ -268,6 +298,79 @@ function parseIntOr(name: string, fallback: number): number {
   if (raw === undefined) return fallback;
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Model settings a single instance may override, in its own `.env`.
+ *
+ * Deliberately an allowlist rather than a general env layer. The point is to be
+ * able to run one co-manager on a different model than another — to A/B a
+ * cheaper tier against a control instance without guessing from one blended
+ * number — and that is worth exactly these keys. Anything wider turns "which
+ * config is in effect" into a question you have to go and answer.
+ *
+ * Precedence is home `.env` < instance `.env` < real environment variables. The
+ * environment still wins so a one-off `BEDROCK_MODEL_ID=… co testing` overrides
+ * the file, which is what you want when checking something quickly.
+ */
+const INSTANCE_KEYS = ["BEDROCK_MODEL_ID", "CO_EFFORT", "CO_THINKING", "CO_MAX_TOKENS"] as const;
+
+/**
+ * Apply an instance's own `.env` on top of the resolved config.
+ *
+ * Applied AFTER loadConfig rather than layered into it, because the instance is
+ * not known until the command line has been parsed and dotenv will not overwrite
+ * a key it has already set. Parsing the file directly sidesteps that ordering
+ * entirely and keeps the precedence rule explicit instead of emergent.
+ *
+ * A missing or unreadable file is simply no override — a per-instance setting is
+ * a convenience, and failing to read one must never stop a session opening.
+ */
+export function applyInstanceOverrides(
+  cfg: Config,
+  instanceRoot: string,
+  /** Injected only by tests; production always uses the module snapshot. */
+  opts: { realEnv?: ReadonlySet<string> } = {},
+): Config {
+  let raw: Record<string, string>;
+  try {
+    raw = parseDotenv(fs.readFileSync(path.join(instanceRoot, ".env"), "utf8"));
+  } catch {
+    return cfg;
+  }
+
+  const realEnv = opts.realEnv ?? REAL_ENV;
+  const pick = (key: (typeof INSTANCE_KEYS)[number]): string | undefined => {
+    // The real environment outranks the file, so a value set there is left alone
+    // rather than quietly replaced by the instance's default. Checked against the
+    // pre-dotenv snapshot, NOT process.env: by now the home .env has been merged
+    // into process.env and would otherwise look identical to a real variable,
+    // which would make every instance override a no-op.
+    if (realEnv.has(key)) return undefined;
+    const v = raw[key];
+    return v === undefined || v.trim() === "" ? undefined : v.trim();
+  };
+
+  const model = { ...cfg.model };
+  const modelId = pick("BEDROCK_MODEL_ID");
+  if (modelId) model.modelId = modelId;
+
+  const thinking = pick("CO_THINKING");
+  if (thinking) model.thinking = thinking.toLowerCase() === "off" ? "off" : "adaptive";
+
+  const maxTokens = pick("CO_MAX_TOKENS");
+  if (maxTokens) {
+    const n = Number.parseInt(maxTokens, 10);
+    if (Number.isFinite(n) && n > 0) model.maxTokens = n;
+  }
+
+  // Re-clamped against whichever model is now in effect, not the one the home
+  // config resolved against: an instance moved to a model with a shorter effort
+  // ladder must degrade rather than 400 every turn (see clampEffort).
+  const effort = parseEffort(pick("CO_EFFORT")) ?? model.effort;
+  if (effort) model.effort = clampEffort(effort, model.modelId);
+
+  return { ...cfg, model };
 }
 
 export function loadConfig(): Config {
