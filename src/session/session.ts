@@ -26,6 +26,7 @@ import {
 import { listDocs, readDoc } from "../memory/docs.js";
 import { onWrite } from "../memory/writequeue.js";
 import { c, line, write } from "../ui.js";
+import { isConfirmVerb } from "../confirmverb.js";
 import {
   Tui,
   WAKE_SENTINEL,
@@ -1620,8 +1621,11 @@ function auditTurn(job: Job, record: string, source: string): string {
  * that reads like English.
  */
 export function parseConfirm(raw: string): { isConfirm: boolean; write?: boolean; agent?: string } {
+  // The verb test itself is shared with the TUI, which uses it to decide whether
+  // a queued line may answer an armed gate. See src/confirmverb.ts for why that
+  // is one function and not two.
+  if (!isConfirmVerb(raw)) return { isConfirm: false };
   const parts = raw.trim().split(/\s+/);
-  if (parts[0]?.toLowerCase() !== "confirm") return { isConfirm: false };
   let next = 1;
   const write = parts[next]?.toLowerCase() === "write";
   if (write) next += 1;
