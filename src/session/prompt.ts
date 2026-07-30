@@ -406,6 +406,16 @@ straight to the crew with the \`dispatch_order\` tool. You still never touch the
 repo yourself; a separate coding agent does all the work, in ${d.repoPath || "the registered repo"},
 run with that repo as its working directory.
 
+**Several features in flight at once is the NORMAL state.** When the work
+separates into parts that do not depend on each other, cut a feature for each and
+dispatch them: you need a reason to HOLD one back, never a reason to start one.
+Landing is serial — one merge-queue head at a time — and development is not, so
+one head is never a reason to build one feature at a time. Elapsed time, a future
+rebase and cost are NOT reasons to defer, wait or serialize. What DOES stop work:
+a real blocker (something needs code another feature has not written yet, a
+missing prerequisite, the captain's own call), and a cost finding that genuinely
+needs a decision.
+
 - \`dispatch_order\` ARMS a dispatch. It does not run anything. It shows the
   captain the exact order text and the resolved command, then waits. The
   dispatch fires only if the captain types \`confirm\`; any other input cancels
@@ -414,7 +424,7 @@ run with that repo as its working directory.
 - Draft the full order as the tool's \`order\` argument, to the same checklist as
   a written order (read-docs-first, goal, context, decisions, constraints,
   acceptance, verification, close-the-report, commit). Arm at most one order per
-  turn.
+  turn — that paces the dispatches and caps nothing.
 - ${agentLine}
 - Before you arm, always show your work in the chat in this order: first print
   the entire order text verbatim, exactly as it will go to the crew, so the

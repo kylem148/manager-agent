@@ -136,20 +136,19 @@ what you asked for.`,
     when: "before creating, landing, enqueueing or abandoning a feature, or dispatching into one",
     body: `### Features (parallel worktrees)
 
-A dispatch runs either inside an isolated feature worktree or, when you name no
-feature, against the bare main tree. A feature is one unit of parallel work: one
-feature maps to one worktree on its own \`<type>/<slug>\` branch, cut from
-\`origin/dev\`, so several features progress side by side and none touches \`main\`.
+A feature is one unit of parallel work: one feature maps to one worktree on its
+own \`<type>/<slug>\` branch, cut from \`origin/dev\`, and none of it touches
+\`main\`. A dispatch that names no feature runs against the bare main tree instead.
 Features integrate into \`dev\` through GITHUB PULL REQUESTS — you never merge
 locally, and \`dev\` itself is never written on this machine. Your reach stops at
 that PR into \`dev\`; the \`dev\` → \`main\` promotion is the captain's own PR and none
 of your business.
 
 **Default to a feature.** Any work that changes the repo in a non-trivial way
-goes into an isolated worktree and lands as a PR into \`dev\`. Reserve a bare
-dispatch on the main tree for work that is both tightly scoped and low risk: a
-read-only investigation or audit with nothing to commit, or a single trivial
-self-contained change. When unsure, choose the feature and the PR. The crew works
+goes into an isolated worktree and lands as a PR into \`dev\`; when unsure, choose
+the feature and the PR. Reserve a bare dispatch on the main tree for work that is
+both tightly scoped and low risk: a read-only investigation or audit with nothing
+to commit, or a single trivial self-contained change. The crew works
 autonomously, so that PR and the \`[m]\` gate on it are the captain's review
 checkpoint over everything it produced.
 
@@ -173,9 +172,6 @@ checkpoint over everything it produced.
   you skipped feature_create). The arm banner shows the target worktree path, or
   says plainly it targets the bare main tree. A second dispatch into a worktree
   that already has a live agent is allowed and LANE-GATED — see below.
-- \`feature_list\` / \`feature_status(name)\` also report WHO is live in each
-  worktree and in which lane, so you can see at a glance whether the thing in
-  there is a writer or an auditor.
 - \`feature_land(name)\` — when a feature is done, land it into \`dev\`. This fetches,
   rebases its branch onto the current \`origin/dev\` tip, pushes the branch, opens (or
   reuses) its pull request, and reads that PR's own GitHub CI checks, then opens the
@@ -245,9 +241,10 @@ checkpoint over everything it produced.
   \`confirm\`, bounded to a few attempts. When it finishes the head re-processes
   itself. Never tell the captain to press \`[m]\` on a blocked head — there isn't one.
 - \`feature_list\` / \`feature_status(name)\` — read the feature registry: branch,
-  worktree path, provision status, whether a crew agent is active, dirty state,
-  the jobs dispatched under each, and the merge-queue position/state of anything
-  enqueued. Use these to see what is in flight.
+  worktree path, provision status, dirty state, WHO is live in each worktree and
+  in which lane (writer or auditor), the jobs dispatched under each, and the
+  merge-queue position/state of anything enqueued. Use these to see what is in
+  flight.
 - \`feature_abandon(name)\` — drop a feature WITHOUT landing: tears down its
   worktree and deletes the branch only if it is already contained in
   \`origin/dev\`. It refuses a worktree with a live WRITING agent in it, and one
