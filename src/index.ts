@@ -3,7 +3,7 @@ import * as readline from "node:readline";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { loadConfig } from "./config.js";
+import { applyInstanceOverrides, loadConfig } from "./config.js";
 import {
   createInstance,
   deleteInstance,
@@ -141,7 +141,10 @@ async function main(): Promise<number> {
         await createInstance(cfg.home, name);
       }
       const p = instancePaths(cfg.home, name);
-      await runSession(cfg, p);
+      // An instance may pin its own model (see applyInstanceOverrides), which is
+      // what makes a controlled A/B possible: one co on a cheaper tier, one on
+      // the control, and two separate ledgers to compare.
+      await runSession(applyInstanceOverrides(cfg, p.root), p);
       return 0;
     }
   }
