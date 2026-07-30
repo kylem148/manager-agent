@@ -313,7 +313,9 @@ The session is a scrollable terminal UI, not a plain read-out:
 - **`↑` / `↓` recall your own previous input** (like a shell), separate from
   transcript scrolling. Left/right, Home/End, Ctrl-A/E/U/K edit the input line;
   in a multi-line message they act on the line you're on, and `↑`/`↓` move
-  between its lines before falling through to history.
+  between its lines before falling through to anything else. `↑` has one more
+  meaning when messages are queued (below): the row above first, then the newest
+  queued message, then history — in that order, always.
 - **Multi-line messages**: `Shift+Enter` inserts a newline instead of sending,
   and `Enter` still sends. Shift+Enter needs a terminal that can report it —
   the app asks for the Kitty keyboard protocol on startup (Kitty, Ghostty,
@@ -324,14 +326,26 @@ The session is a scrollable terminal UI, not a plain read-out:
   protocol request entirely — you lose Shift+Enter, `Ctrl-J` still composes.
 - **Type while the co is working.** The prompt line stays live during a turn, so
   you compose at the spinner instead of waiting on it. `Enter` then **queues** the
-  message rather than sending it; several can queue, they're listed above the
-  input bar with a count, and they go out in order — one turn each — as the turn
-  in flight ends. `Backspace` on an empty line lifts the newest one back onto the
-  line to rephrase it; `Esc Esc` on an empty line drops the whole queue. One
-  deliberate exception: while a dispatch is armed the queue is **held** and says
-  so, because the armed gate reads the next line as your `confirm` or as a
-  cancellation — it only ever gets a key you actually pressed. Piped/non-TTY
-  sessions read ahead the way they always have.
+  message rather than sending it, and they go out in order — one turn each — as
+  the turn in flight ends. Each waiting message sits on its own line above the
+  input bar under a `›`, in the order you typed them, with one dim
+  `Press up to edit queued messages` under the list and no count anywhere: how
+  many you typed is a thing you can see, and what you typed is the question a
+  queue actually raises. (That shape is Claude Code's, in our prompt mark; the
+  key it names is the same key there.) `↑` lifts the newest one back onto the
+  line to rewrite it, or to simply not send it; `Esc Esc` on an empty line drops
+  the whole queue. On a short terminal the list has a ceiling — a third of the
+  screen — and elides the OLDEST behind a single `…`, never the newest, because
+  the newest is the one `↑` acts on. Piped/non-TTY sessions read ahead the way
+  they always have.
+- **A queued `confirm` reaches an armed dispatch.** While a dispatch is armed the
+  queue narrows to one line: a `confirm` (in any of its spellings — `confirm`,
+  `confirm write`, `confirm ccw`) is handed to the gate and fires the order, from
+  wherever it sits in the queue. Nothing else is, ever, because the armed gate
+  reads any other line as a cancellation — so a queued note can never kill an
+  order you approved. The rest of the queue keeps its place and its order and
+  goes out once the banner clears. Type `confirm` at the spinner while the co is
+  still drafting and it lands the moment the order is armed.
 - **Word wrap** breaks long lines at word boundaries and is ANSI-aware, so
   colored text never gets split mid-escape or mid-word at the column edge.
 - **Selecting text** while the app captures the mouse: hold your terminal's
@@ -507,6 +521,10 @@ and does not change the default. Type an agent name that isn't registered and th
 order stays armed — it lists the valid names and waits for you to retype, so a
 typo never fires the wrong agent or forces a re-draft. This typed confirm is a
 hard interlock, not a nicety — there is no code path that dispatches without it.
+You can type it early, at the spinner, before the order is even armed: a queued
+`confirm` is the one line the queue will hand an armed gate (see "Type while the
+co is working" above). It is still your keystroke and still the same interlock —
+only the waiting is gone.
 
 ### Two agents in one worktree: the read-only lane
 
@@ -1229,6 +1247,7 @@ they want, so a cold start only loads what it uses.
 ```
 src/
   index.ts config.ts paths.ts ui.ts model.ts research.ts cost.ts
+             taskorder.ts confirmverb.ts
   cli/       auth.ts doctor.ts modelsdoctor.ts link.ts cost.ts
   tui/       tui.ts editor.ts markdown.ts wrap.ts keys.ts banner.ts
              commands.ts visuals.ts
@@ -1256,6 +1275,11 @@ Tests live next to the code they cover (`src/tui/keys.test.ts`, etc.).
 - **`src/cost.ts`** — the spend meter: Bedrock rate table, four-class pricing,
   the durable per-instance ledger, and the `/cost` report. Silent by design;
   `model.ts` feeds it and nothing else reads it.
+- **`src/confirmverb.ts`** — one function, `isConfirmVerb`, and it is at the root
+  because two layers ask it. `session.ts` parses a confirm for what it grants
+  (which agent, which lane); the TUI only needs to know whether a line IS one, to
+  decide whether a queued line may answer an armed gate. Two spellings of that
+  test would drift, and the drift cancels dispatches.
 
 **`src/memory/`** — `memory.ts` holds instance scaffolding, live-state
 read/rewrite, append-only logs with decision-id minting, log search / range

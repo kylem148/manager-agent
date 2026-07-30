@@ -42,6 +42,7 @@ import { c, colorEnabled } from "../ui.js";
 // tool and the system prompt's live-state block. It is a top-level leaf like
 // ../ui, so using it here does not make the Tui depend on the session layer.
 import { taskDisplayOrder } from "../taskorder.js";
+import { isConfirmVerb } from "../confirmverb.js";
 import { classifyToken, completeCommand } from "./commands.js";
 import { MarkdownRenderer, renderTable, type Rendered } from "./markdown.js";
 import {
@@ -97,12 +98,17 @@ interface QueuedInput {
 }
 
 /**
- * Queued messages listed one per row above the input bar before the remainder
- * collapse into a single "+N more". The block is subtracted from the transcript
- * viewport like every other region above the input, so it has to have a ceiling:
- * four rows, whether two messages are waiting or twenty.
+ * The one hint the queued-input block carries, and the whole of what it says
+ * about itself. Claude Code's wording, verbatim, because the key it names is the
+ * same key: what the captain reads here has to survive him alt-tabbing between
+ * the two terminals all day.
  */
-const QUEUE_SHOWN = 3;
+const QUEUE_HINT = "Press up to edit queued messages";
+
+/** The prompt mark each queued message wears, so the block reads as input the
+ *  captain has already written rather than as anything the co is saying. Ours,
+ *  not Claude Code's `❯` — it is the mark on our own prompt label. */
+const QUEUE_MARK = "› ";
 
 function mouseEnabled(): boolean {
   return process.env.CO_MOUSE !== "off";
@@ -1539,10 +1545,10 @@ export class Tui implements SessionIO {
    * next question() takes the head, so the captain composes at the spinner
    * instead of waiting on it. See enqueue() and releaseQueued().
    *
-   * The queue is HELD (drained by nothing) while a dispatch is armed. That is a
-   * correctness property, not politeness: the armed gate reads the next line as
-   * `confirm` or as a cancellation, so releasing a message into it would either
-   * silently cancel an order or fire one the captain never read.
+   * While a dispatch is armed the queue stays open but narrows: the only line it
+   * will release is a `confirm`, because the armed gate reads anything else as a
+   * cancellation. That is a correctness property, not politeness — see
+   * releaseQueued() for what it costs and why it is worth it.
    */
   private queued: QueuedInput[] = [];
 
@@ -1817,8 +1823,8 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * Rows the queued-input block occupies (0 when nothing is queued): a count
-   * line, up to QUEUE_SHOWN messages, and a "+N more" line when there are more.
+   * Rows the queued-input block occupies (0 when nothing is queued): one row per
+   * listed message, an elision row when more are waiting than fit, and the hint.
    *
    * Counted WITHOUT building the strings, because this runs on every layout
    * question (and so on every streamed repaint), while queueLines() runs once per
@@ -1827,7 +1833,24 @@ export class Tui implements SessionIO {
   private queueRows(): number {
     const n = this.queued.length;
     if (n === 0) return 0;
-    return 1 + Math.min(n, QUEUE_SHOWN) + (n > QUEUE_SHOWN ? 1 : 0);
+    const shown = Math.min(n, this.queueShown());
+    return shown + (n > shown ? 1 : 0) + 1;
+  }
+
+  /**
+   * How many queued messages the block may list. The block is subtracted from
+   * the transcript viewport like every other region above the input, so an
+   * unbounded list would walk the input bar off the bottom of a short terminal —
+   * hence a ceiling of a third of the screen. On any real terminal that is a
+   * dozen or more messages, which is past the point where a queue is a queue.
+   *
+   * What the ceiling may NOT do is report itself as a number: the count is the
+   * one thing this block deliberately no longer shows. Overflow gets a single
+   * `…` row, and it elides the OLDEST — the newest message is the one ↑ recalls,
+   * so it is the one row that must always be on screen.
+   */
+  private queueShown(): number {
+    return Math.max(1, Math.floor(this.rows / 3));
   }
 
   /** Rows the armed-dispatch confirm banner occupies (0 when nothing armed). */
@@ -2191,6 +2214,15 @@ export class Tui implements SessionIO {
   /**
    * The queued-input block, in paint order. Exactly queueRows() rows.
    *
+   * Claude Code's shape, read off its current behaviour on 2026-07-30
+   * (wmedia.es/en/tips/claude-code-queue-messages-while-working, which documents
+   * the `❯` mark, the absence of any count, and the hint's exact wording): every
+   * waiting message on its own row under a prompt mark, in the order they were
+   * typed, then one dim hint naming the key that edits them. No numbering and no
+   * total. A count answers "how many did I type", which the captain can see by
+   * looking; the rows answer "what did I type", which is the question a queue
+   * raises.
+   *
    * Each row is composed as PLAIN text, clipped, and only then styled — the same
    * order renderSeparator uses, and for the same reason: cutting an
    * already-styled string can strand a colour open across the rest of the frame.
@@ -2200,21 +2232,27 @@ export class Tui implements SessionIO {
   private queueLines(): string[] {
     const n = this.queued.length;
     if (n === 0) return [];
-    const held = this.gateArmed();
-    const head = held
-      ? `${n} queued · HELD: a dispatch is armed — answer it yourself`
-      : `${n} queued · Backspace edits the last · Esc Esc clears`;
-    // Held reads as the arm banner's colour, because it is the arm banner's
-    // doing; an ordinary wait is dim, like every other hint above the input.
-    const rows = [this.queueRow("  ", head, held ? c.yellow : c.dim)];
-    const shown = Math.min(n, QUEUE_SHOWN);
-    for (let k = 0; k < shown; k++) {
-      rows.push(
-        this.queueRow(`    ${k + 1}. `, this.queued[k]!.display.replace(/\s+/g, " ").trim(), c.dim),
-      );
+    const shown = Math.min(n, this.queueShown());
+    const rows: string[] = [];
+    // Older-than-the-ceiling messages are elided ABOVE the list, which is where
+    // they are in time: the block still reads top-to-bottom in send order.
+    if (n > shown) rows.push(this.queueRow("  ", "…", c.dim));
+    for (const q of this.queued.slice(n - shown)) {
+      rows.push(this.queueMessageRow(q.display));
     }
-    if (n > shown) rows.push(this.queueRow("    ", `+ ${n - shown} more`, c.dim));
+    rows.push(this.queueRow("  ", QUEUE_HINT, c.dim));
     return rows;
+  }
+
+  /**
+   * One queued message: the prompt mark in the prompt's own colour, the message
+   * itself dim. Two separately-closed styled spans rather than one wrapping
+   * both, so neither colour can be left open by the other's cut.
+   */
+  private queueMessageRow(display: string): string {
+    const lead = "  " + QUEUE_MARK;
+    const text = display.replace(/\s+/g, " ").trim();
+    return c.cyan(lead) + c.dim(clipCell(text, Math.max(1, this.cols - lead.length)));
   }
 
   /**
@@ -2579,25 +2617,40 @@ export class Tui implements SessionIO {
    *
    * The banner IS the gate's presence: session.ts raises it in the one place it
    * arms an order and clears it on both resolutions (fired, cancelled). Deriving
-   * the hold from what is on screen rather than from a second copy of the flag
-   * means the two can't drift apart, and it fails in the safe direction — a
-   * banner up for any reason holds the queue rather than draining into it.
+   * the narrowing from what is on screen rather than from a second copy of the
+   * flag means the two can't drift apart, and it fails in the safe direction — a
+   * banner up for any reason lets nothing but a confirm out of the queue.
    */
   private gateArmed(): boolean {
     return this.confirmBanner !== null;
   }
 
   /**
-   * Take the head of the queue as the answer to a fresh read, echoing it into
-   * the transcript the way a live submit does. Returns null when there is
-   * nothing to release, or when the queue is held by an armed dispatch — in
-   * which case the block above the input says so and the gate waits for a live
-   * keystroke.
+   * Take a queued message as the answer to a fresh read, echoing it into the
+   * transcript the way a live submit does. Returns null when there is nothing
+   * this read may be given.
+   *
+   * Which message that is depends on the gate. Ordinarily it is the head: the
+   * queue is FIFO and every line in it is an ordinary turn.
+   *
+   * With a dispatch armed, the read is not asking for a turn — it is asking the
+   * captain to confirm or to cancel, and a line delivered into it that is not a
+   * confirm CANCELS the order. So the only line the queue may answer an armed
+   * gate with is a confirm verb, and it is taken from wherever it sits rather
+   * than only from the head: a captain who typed a note and then `confirm` while
+   * the co was still arming meant both, and the head is not the one the gate
+   * asked for. Everything else keeps its place and its order and goes out after
+   * the banner clears, which is the only fate available to it — delivering it
+   * here would kill the dispatch, and dropping it would lose a message.
+   *
+   * The queue therefore CANNOT cancel an armed order: the one line it will hand
+   * a gate is one the gate reads as a launch.
    */
   private releaseQueued(): string | null {
     if (this.queued.length === 0) return null;
-    if (this.gateArmed()) return null;
-    const next = this.queued.shift()!;
+    const at = this.gateArmed() ? this.queued.findIndex((q) => isConfirmVerb(q.text)) : 0;
+    if (at === -1) return null;
+    const next = this.queued.splice(at, 1)[0]!;
     this.appendBlock("");
     this.appendBlock(this.echoBlock(next.text));
     this.scrollToBottom();
@@ -2626,20 +2679,29 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * Cancel one queued message: Backspace on an empty line lifts the NEWEST one
-   * back onto the line, caret at the end. Un-queue rather than delete, because
-   * the reason to take a message back is almost always to rephrase it, and a key
-   * that silently ate a paragraph would be the wrong kind of cheap. The display
-   * form goes back (chip intact), so re-sending expands it again.
+   * Take one queued message back: ↑ lifts the NEWEST onto the line, caret at the
+   * end, so it can be rephrased or simply left off the line and dropped. Un-queue
+   * rather than delete, because the reason to take a message back is almost
+   * always to rewrite it, and a key that silently ate a paragraph would be the
+   * wrong kind of cheap. The display form goes back (chip intact), so re-sending
+   * expands it again.
+   *
+   * Returns false when there is nothing queued, which is how ↑ falls through to
+   * input history. That is also the whole of the already-delivered guard
+   * (claude-code #66335, where the race put a message in the edit box AND sent
+   * it): this pops the live queue at the instant the key is pressed, and a
+   * message released to a read has already been spliced out of it, so there is
+   * no window in which ↑ can lift something that is on its way to the model.
    */
-  private unqueueLast(): void {
+  private recallQueued(): boolean {
     const last = this.queued.pop();
-    if (!last) return;
+    if (!last) return false;
     this.buf = last.display;
     this.cursor = this.buf.length;
     this.histIdx = -1;
     this.draft = "";
     this.paint();
+    return true;
   }
 
   /** Clear the whole queue — esc-esc's meaning when there is no line to clear.
@@ -2864,14 +2926,12 @@ export class Tui implements SessionIO {
       }
 
       case "backspace": {
-        if (this.cursor === 0) {
-          // Nothing on the line to delete: the last thing typed is the newest
-          // queued message, so take that back instead. Guarded on an EMPTY line,
-          // not just a caret at 0 — Backspace at the start of a line the captain
-          // is still writing must stay the no-op it has always been.
-          if (this.buf === "") this.unqueueLast();
-          return;
-        }
+        // Nothing before the caret: a no-op, including on an empty line with a
+        // queue behind it. Taking a queued message back used to live here too;
+        // it is ↑ alone now (see recallQueued). One recall key, not two — a
+        // second spelling of it is a second thing to keep true, and Backspace
+        // was the one nobody would guess from the block above the input.
+        if (this.cursor === 0) return;
         // A chip is atomic: if the cursor sits just past (or within) one, remove
         // the whole chip rather than nibbling its closing bracket.
         const chip = this.chipSpanAt(this.cursor);
@@ -3071,8 +3131,16 @@ export class Tui implements SessionIO {
         if (ev) this.applyAction(classify(ev), wasEscPending);
         return consumed;
       }
-      case "A": // Up → previous input row, else previous history
-        if (!this.moveCursorRow(-1)) this.historyPrev();
+      case "A":
+        // Up, in strict precedence: the row above inside a multi-line input
+        // first, THEN the newest queued message, then input history.
+        //
+        // The row comes first because a key that leaves the input the moment a
+        // message has two lines makes a multi-line message uneditable — the
+        // regression claude-code hit twice (#63191, #62922). moveCursorRow only
+        // declines at the top row, so recall and history are reachable exactly
+        // where they should be: the top of what is on the line.
+        if (!this.moveCursorRow(-1) && !this.recallQueued()) this.historyPrev();
         return consumed;
       case "B": // Down → next input row, else next history
         if (!this.moveCursorRow(1)) this.historyNext();
