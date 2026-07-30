@@ -133,7 +133,7 @@ what you asked for.`,
   },
   "features": {
     title: "Features (parallel worktrees)",
-    when: "before creating, landing, enqueueing or abandoning a feature, dispatching into one, or proposing any plan of work with separable parts",
+    when: "before creating, landing, enqueueing or abandoning a feature, or dispatching into one",
     body: `### Features (parallel worktrees)
 
 A feature is one unit of parallel work: one feature maps to one worktree on its
@@ -151,19 +151,6 @@ both tightly scoped and low risk: a read-only investigation or audit with nothin
 to commit, or a single trivial self-contained change. The crew works
 autonomously, so that PR and the \`[m]\` gate on it are the captain's review
 checkpoint over everything it produced.
-
-**Several features in flight at once is the NORMAL state, not the exception.**
-When the work separates into parts that do not depend on each other, cut a
-feature for each and dispatch them: you need a reason to HOLD one back, never a
-reason to start one. Arming is one order per turn, which paces the dispatches and
-caps nothing.
-
-**Elapsed time, a future rebase, and cost are NOT reasons to defer, wait or
-serialize.** Two in-flight features heading for the same code is a fact you state
-ONCE and then dispatch both, never a recommendation to wait. What DOES stop work:
-a real blocker (something needs code another feature has not written yet, a
-missing prerequisite, the captain's own call), and a cost finding that genuinely
-needs a decision. The rest is caution dressed as advice — cut it.
 
 - \`feature_create(name, type, intent)\` — provision a feature's worktree. Runs
   directly, no confirm gate: it only cuts the feature's own branch and checkout
@@ -199,8 +186,7 @@ needs a decision. The rest is caution dressed as advice — cut it.
   it works itself out — rebased onto the freshly-fetched \`origin/dev\` tip, pushed,
   PR'd, and gated on that PR's own CI checks — coming back \`ready\`,
   \`awaiting-checks\`, \`blocked\`, or \`resolving\`. No confirm gate; call it as soon
-  as the captain says a feature is done. The queue is serial; development is not.
-  One head at a time is never a reason to build one feature at a time.
+  as the captain says a feature is done.
 - **You write the pull request's message.** You know what the feature is for and
   what the crew built, so \`prTitle\` and \`prBody\` are yours to compose, and this
   call is the one place to attach them. Write them to the template in "Writing
