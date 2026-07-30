@@ -4,6 +4,11 @@
 pages rot; re-read every rate before acting on anything here. Sources and access
 dates are cited inline.
 
+**Superseded since:** the review inbox and its `file_review` tool were removed on
+2026-07-30 (D-20260729-15). The measurements below are left exactly as they were
+taken and still describe the tree that was measured; R6 is void, and R4's first
+target has partly been done. Both are marked in place.
+
 ## Key findings
 
 1. **The meter overstates the bill by 20%.** `src/cost.ts` derives Bedrock rates as
@@ -600,7 +605,8 @@ halving it is worth ~5.5%. The three fattest code-owned targets, in order:
    PR template that the dispatch protocol already carries in full; `task_table`
    (2,300 B) and `file_review` (2,201 B) likewise re-explain rules stated in their
    protocol sections. The duplication buys nothing the model does not already have
-   two paragraphs earlier in the same prefix.
+   two paragraphs earlier in the same prefix. *(2026-07-30: `file_review` is gone
+   entirely — the tool and its 2,201 B with it. The other two stand.)*
 2. **Dispatch protocol, 15,398 B** — 17% of the prefix, present only when linked.
 3. **`docs/architecture.md`, 19,396 B on `testing`** — 21.5% of the prefix, and
    captain-owned. There is no size discipline on it anywhere in `readSurfacedDocs`.
@@ -636,13 +642,19 @@ architectural conversation. Clearing tool results is low-risk (it keeps what the
 *said* about them); compaction is higher-risk (it replaces what the co said). If only
 one lands, make it context editing.
 
-### R6 — Drop the review record from message history once `file_review` has been called · *saving: est. 2–5% · cost: moderate · risk: moderate* · **structural**
+### R6 — Drop the review record from message history once the review is done · *saving: est. 2–5% · cost: moderate · risk: moderate* · **structural** — ~~VOID (2026-07-30)~~
+
+**Void as written.** It hung on a filing call that no longer exists: the review
+inbox was removed on 2026-07-30, so there is no `.dispatch/inbox.json`, no second
+copy of the record, and no tool call to hang the swap off. The underlying cost is
+real and unaddressed — the record still sits in `state.messages` for the rest of
+the session — but any fix now needs a different trigger. Original text follows.
 
 A review record is already persisted twice — in `.dispatch/inbox.json` and in the
 crew's own transcript — before it is ever read into the conversation. Keeping it in
 `state.messages` afterwards pays for a median 5.2k-token block (p90 8.1k, max 17.6k)
 on every subsequent round of the session. Replacing the record with a one-line
-pointer *after* the `file_review` call lands would recover most of that.
+pointer *after* the filing call lands would recover most of that.
 
 **Do not fix this by truncating the crew report.** `crewtranscript.ts` and
 `reviewrecord.ts` both carry a long, well-argued comment explaining that silent

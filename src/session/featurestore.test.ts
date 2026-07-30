@@ -35,7 +35,7 @@ test("an intent written in one session is read back in the next", async () => {
     assert.equal(first.intent("user-auth"), undefined, "nothing stored yet");
     await first.setIntent("user-auth", "passkey login for the web app");
 
-    // The file lands under .dispatch/, beside the dispatch config and the inbox.
+    // The file lands under .dispatch/, beside the dispatch config.
     assert.ok(fs.existsSync(paths.featureStore), "the store is on disk");
     assert.equal(path.basename(paths.featureStore), "features.json");
 

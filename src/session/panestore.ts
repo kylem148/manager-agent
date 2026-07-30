@@ -25,8 +25,8 @@ import { normalizeTty, pidAlive, type PaneIdentity } from "./paneoccupancy.js";
  * session, and a restarted co would otherwise know nothing about the panes it
  * created five minutes ago — it would take over an anchor that still holds a
  * live agent, and split fresh panes beside idle ones it no longer recognises.
- * So the records sit in `.dispatch/panes.json`, beside the dispatch config, the
- * review inbox and the feature store: the tier that already holds dispatch state
+ * So the records sit in `.dispatch/panes.json`, beside the dispatch config and
+ * the feature store: the tier that already holds dispatch state
  * (never the user's repo).
  *
  * A STALE LEASE MUST NEVER POISON A PANE. A killed session leaves its lease
@@ -274,7 +274,7 @@ export class PaneStore {
   /**
    * Rewrite the whole file. A handful of short rows, so a rewrite beats any merge
    * scheme, and it rides the shared serialized write lane for the same reason the
-   * review inbox and the feature store do.
+   * feature store does.
    *
    * NEVER REJECTS. This is a cache of pane addresses; a write that cannot land
    * costs future reuse (an extra split), never a dispatch.

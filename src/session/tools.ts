@@ -26,14 +26,6 @@ import { searchWeb, fetchUrl } from "../research.js";
 import type { SearchOptions } from "../research.js";
 import type { FeatureManager } from "./features.js";
 import { FEATURE_BRANCH_TYPES } from "./worktrees.js";
-import {
-  isReviewLevel,
-  isReviewVerdict,
-  REVIEW_LEVELS,
-  REVIEW_VERDICTS,
-  type FileReviewInput,
-  type FileReviewResult,
-} from "./reviewinbox.js";
 import { TaskError, TASK_STATUSES, type TaskStore } from "./taskstore.js";
 import { taskDisplayOrder } from "../taskorder.js";
 import {
@@ -263,53 +255,6 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
         type: "object",
         properties: { url: { type: "string" } },
         required: ["url"],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: "file_review",
-      description:
-        "File the structured record of a crew-completion review into the review inbox. Call this EVERY time you review a finished run, once per run, as the review itself — the record is the review, not a copy of it.\n\n" +
-        "The `level` decides how loudly the review lands in the captain's chat, so choose it deliberately:\n" +
-        "- L1 — a `rework` verdict, or a genuine escalation/fork only the captain can resolve. Filing prints NOTHING; after filing, state ONLY the core decision the captain must make, in a line or two. Never dump the body into the chat.\n" +
-        "- L2 — a `fix-commit` verdict, or an `accept` that still carries notes worth having. Filing prints exactly one dim pointer line; say nothing further about the review.\n" +
-        "- L3 — a clean `accept` with nothing to flag. Filing is completely silent; say nothing about it at all.\n\n" +
-        "`headline` is the one-line summary the inbox list shows (aim for well under 80 characters). `body` is the FULL review — what went right, what went wrong, escalations, the verdict — and is never printed to the chat; the captain reads it in the panel (Ctrl-O, Inbox tab), which keeps the last 20 reviews across restarts.",
-      input_schema: {
-        type: "object",
-        properties: {
-          level: {
-            type: "string",
-            enum: [...REVIEW_LEVELS],
-            description:
-              "How loudly this lands: L1 (rework or a real escalation, you then state the core decision), L2 (fix-commit or accept-with-notes, one dim line), L3 (clean accept, silent).",
-          },
-          verdict: {
-            type: "string",
-            enum: [...REVIEW_VERDICTS],
-            description: "The review verdict.",
-          },
-          headline: {
-            type: "string",
-            description:
-              "One line summarising the outcome, shown in the inbox list.",
-          },
-          body: {
-            type: "string",
-            description:
-              "The full review text: what went right, what went wrong, escalations, verdict. Stored, never printed to the chat.",
-          },
-          job_id: {
-            type: "string",
-            description:
-              'Optional. The crew job this reviews (e.g. "job-002"). Defaults to the run you were just handed; use "manual" for a report the captain relayed by hand.',
-          },
-          feature: {
-            type: "string",
-            description: "Optional. The feature the run was scoped to, if any.",
-          },
-        },
-        required: ["level", "verdict", "headline", "body"],
         additionalProperties: false,
       },
     },
@@ -606,13 +551,6 @@ export interface ExecutorContext {
     { armed: true; summary: string } | { armed: false; reason: string }
   >;
   /**
-   * File a structured review into the rolling inbox (file_review tool). The REPL
-   * supplies this; it persists the record and owns the level-gated chat output
-   * (one dim line for L2, nothing for L1/L3 — see reviewinbox.ts). Returns what
-   * the model is told next, which is mostly "and now say nothing more".
-   */
-  onFileReview?: (input: FileReviewInput) => Promise<FileReviewResult>;
-  /**
    * The persisted at-a-glance task table (task_table tool), painted and EDITED
    * by the panel's Home tab. Always wired in a real session — the table needs no
    * repo — so its absence only means a degraded/test executor, where the tool
@@ -834,51 +772,6 @@ export function makeExecutor(ctx: ExecutorContext) {
         case "fetch_url": {
           const res = await fetchUrl(research, String(input.url ?? ""));
           ctx.onNotice?.(`fetched ${res.url}`);
-          return ok(id, res);
-        }
-        case "file_review": {
-          if (!ctx.onFileReview) {
-            return err(id, "The review inbox is unavailable in this session.");
-          }
-          const level = input.level;
-          if (!isReviewLevel(level)) {
-            return err(
-              id,
-              `file_review needs a level of ${REVIEW_LEVELS.join(", ")}.`,
-            );
-          }
-          const verdict = input.verdict;
-          if (!isReviewVerdict(verdict)) {
-            return err(
-              id,
-              `file_review needs a verdict of ${REVIEW_VERDICTS.join(", ")}.`,
-            );
-          }
-          const headline = String(input.headline ?? "").trim();
-          if (!headline)
-            return err(id, "file_review requires a non-empty headline.");
-          const body = String(input.body ?? "").trim();
-          if (!body)
-            return err(
-              id,
-              "file_review requires a non-empty body (the full review).",
-            );
-          const jobId =
-            input.job_id === undefined
-              ? undefined
-              : String(input.job_id).trim() || undefined;
-          const feature =
-            input.feature === undefined
-              ? undefined
-              : String(input.feature).trim() || undefined;
-          const res = await ctx.onFileReview({
-            level,
-            verdict,
-            headline,
-            body,
-            ...(jobId ? { jobId } : {}),
-            ...(feature ? { feature } : {}),
-          });
           return ok(id, res);
         }
         case "task_table": {

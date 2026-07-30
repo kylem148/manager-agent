@@ -19,8 +19,8 @@ import { serializeWrite } from "../memory/writequeue.js";
  *
  * So that prose is persisted here, keyed by slug (the handle that survives — the
  * human name is not recoverable from a branch), as a small JSON object under the
- * instance's `.dispatch/` dir: the same tier the dispatch config, the review
- * inbox and the per-job captures live in, since a feature worktree is dispatch
+ * instance's `.dispatch/` dir: the same tier the dispatch config and the
+ * per-job captures live in, since a feature worktree is dispatch
  * state. Never written into the user's repo, and never into the worktree itself
  * (a file there would show up as an untracked change in the captain's diff).
  *
@@ -233,7 +233,8 @@ export class FeatureStore {
   /**
    * Rewrite the whole file. It is a handful of short lines, so a rewrite is
    * cheaper than any merge scheme would be, and it rides the shared serialized
-   * write lane for the same reason the review inbox does.
+   * write lane, so it can't interleave with the concurrent tool calls of one
+   * model round.
    *
    * NEVER REJECTS. Callers reach this from a create, a merge and a teardown —
    * paths where failing on a cosmetic cache would cost real work — so a write
