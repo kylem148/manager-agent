@@ -112,20 +112,85 @@ test("an empty order is rejected before the gate, and does not consume it", asyn
 });
 
 test("read_protocol is offered on an unlinked instance, because orders still are", () => {
-  // An unlinked co writes orders as plain text for the captain to carry, so
-  // gating the checklist behind the dispatch link would take it away from
-  // exactly the instances with no other way to reach it.
+  // An unlinked co still writes orders as plain text for the captain to carry,
+  // and every instance has memory and docs — so only the sections whose levers
+  // need a repo (features, lanes, pr-message) ride the dispatch link.
   const unlinked = toolDefinitions({});
   const tool = unlinked.find((t) => t.name === "read_protocol");
   assert.ok(tool, "read_protocol must exist unlinked");
   const props = tool.input_schema.properties as Record<string, { enum?: string[] }>;
-  assert.deepEqual(props.section?.enum, ["orders"]);
+  assert.deepEqual(props.section?.enum, ["orders", "memory", "docs"]);
   assert.ok(!unlinked.some((t) => t.name === "dispatch_order"));
 
   const linked = toolDefinitions({ dispatch: true });
   const linkedTool = linked.find((t) => t.name === "read_protocol")!;
   const linkedProps = linkedTool.input_schema.properties as Record<string, { enum?: string[] }>;
-  assert.deepEqual(linkedProps.section?.enum, ["orders", "features", "lanes", "pr-message"]);
+  assert.deepEqual(linkedProps.section?.enum, [
+    "orders",
+    "features",
+    "memory",
+    "lanes",
+    "pr-message",
+    "docs",
+  ]);
+});
+
+test("a re-read returns a pointer, never a second copy of the body", async () => {
+  const fx = await fixture();
+  try {
+    const first = await fx.read("orders");
+    assert.ok(!first.is_error);
+    assert.match(String(first.content), /### Orders protocol/);
+    // The body is already in history and re-sent on every round; a duplicate
+    // would be paid for the same way. The pointer says where to look instead.
+    const second = await fx.read("orders");
+    assert.ok(!second.is_error, "a re-read is not an error");
+    assert.match(String(second.content), /Already in your context/);
+    assert.ok(
+      !String(second.content).includes("### Orders protocol"),
+      "no duplicate body lands in history",
+    );
+    // And the gate stays open: the pointer does not un-read the section.
+    const res = await fx.dispatch("an order written from the copy above");
+    assert.ok(!res.is_error);
+    assert.equal(fx.armed.length, 1);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a refusal-supplied section also re-reads as a pointer", async () => {
+  const fx = await fixture();
+  try {
+    // The gate refusal carried the body into history, which counts as read.
+    await fx.dispatch("first attempt");
+    const read = await fx.read("orders");
+    assert.match(String(read.content), /Already in your context/);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("compaction clears the ledger: reads are real again and the gate re-arms", async () => {
+  const fx = await fixture();
+  try {
+    await fx.read("orders");
+    await fx.dispatch("an order");
+    assert.equal(fx.armed.length, 1);
+    // maybeCompact calls exactly this after replacing the head with a summary:
+    // the window can no longer be assumed to hold the section, so the ledger
+    // resets and both mechanisms come back honest.
+    fx.effects.protocolsRead.clear();
+    const reread = await fx.read("orders");
+    assert.match(String(reread.content), /### Orders protocol/, "the body again, not a pointer");
+    // The gate too: a section outside the window is re-handed on the next act.
+    fx.effects.protocolsRead.clear();
+    const refused = await fx.dispatch("an order written after compaction");
+    assert.ok(refused.is_error);
+    assert.match(String(refused.content), /### Orders protocol/);
+  } finally {
+    await fx.cleanup();
+  }
 });
 
 test("an unknown section is refused without inventing one", async () => {

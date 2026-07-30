@@ -56,12 +56,15 @@ export interface StreamHandlers {
  * Cache breakpoints. Bedrock allows at most 4 per request, and (unlike the
  * first-party API) has no automatic caching, so every breakpoint is placed by
  * hand. Budget:
- *   1. the last tool definition — tools are static for the life of the binary,
- *      so this prefix survives across sessions, not just across turns;
- *   2. the end of the system prompt — stable for a whole session, since
- *      buildSystemPrompt runs once at startup and mid-session memory writes
- *      never rebuild it;
- *   3-4. two rolling anchors in the message history (see pickMessageBreakpoints).
+ *   1. the end of the system prompt — ONE entry covering the tool definitions
+ *      ahead of it AND the prompt text. Both are static for the life of the
+ *      binary (the prompt carries no live state since the 2026-07-30 overhaul;
+ *      per-instance state rides the startup injection in history), so this
+ *      prefix survives across sessions, not just across turns. Tools carry no
+ *      breakpoint of their own: caching them separately from a system prompt
+ *      that never changes without them bought a second entry for nothing.
+ *   2-3. two rolling anchors in the message history (see
+ *      pickMessageBreakpoints). The fourth slot is deliberately unspent.
  *
  * Verified working on the legacy bedrock-runtime path with a Bedrock bearer
  * token on 2026-07-20: a 3.7k-token prefix dropped input_tokens from 3832 to 79
@@ -152,14 +155,6 @@ function withMessageBreakpoints(messages: MessageParam[]): MessageParam[] {
   const marks = pickMessageBreakpoints(messages);
   if (marks.size === 0) return messages;
   return messages.map((m, i) => (marks.has(i) ? markMessage(m) : m));
-}
-
-/** Tool definitions with a breakpoint on the last one, closing the tools prefix. */
-function withToolBreakpoint(tools: Tool[]): Tool[] {
-  if (tools.length === 0) return tools;
-  return tools.map((t, i) =>
-    i === tools.length - 1 ? ({ ...t, cache_control: CACHE_CONTROL } as Tool) : t,
-  );
 }
 
 function fmtMs(ms: number): string {
@@ -390,8 +385,9 @@ export class ModelProvider {
     const base = this.baseParams(args.effort);
     const timing = this.cfg.debugTiming ? handlers?.onTiming : undefined;
     // Built once per turn: neither the tool list nor the system prompt changes
-    // between rounds, and rebuilding them would churn the cached prefix.
-    const cachedTools = withToolBreakpoint(tools);
+    // between rounds, and rebuilding them would churn the cached prefix. The
+    // system breakpoint is the only prefix breakpoint - it covers the tools
+    // serialized ahead of it in the same entry.
     const cachedSystem: Anthropic.TextBlockParam[] = [
       { type: "text", text: system, cache_control: CACHE_CONTROL },
     ];
@@ -407,7 +403,7 @@ export class ModelProvider {
         max_tokens: this.cfg.maxTokens,
         system: cachedSystem,
         messages: withMessageBreakpoints(messages),
-        ...(cachedTools.length ? { tools: cachedTools } : {}),
+        ...(tools.length ? { tools } : {}),
         ...base,
       });
 
@@ -533,7 +529,7 @@ export class ModelProvider {
         max_tokens: CACHE_PROBE_MAX_TOKENS,
         system: [{ type: "text", text: args.system, cache_control: CACHE_CONTROL }],
         messages: withMessageBreakpoints(replay),
-        ...(args.tools.length ? { tools: withToolBreakpoint(args.tools) } : {}),
+        ...(args.tools.length ? { tools: args.tools } : {}),
         ...this.baseParams(),
       });
       const billed = message.usage;

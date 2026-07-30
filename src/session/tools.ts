@@ -1,17 +1,11 @@
 import type { Tool, ToolUseBlock, ToolResult } from "../model.js";
-import {
-  LOG_NAMES,
-  type InstancePaths,
-  type LiveFile,
-  type LogName,
-} from "../paths.js";
+import type { InstancePaths, LiveFile, LogName } from "../paths.js";
 import type { ResearchConfig } from "../config.js";
 import {
   appendLog,
   rewriteLive,
   searchLog,
   readLogRange,
-  readLiveMemory,
 } from "../memory/memory.js";
 import {
   DocError,
@@ -32,24 +26,43 @@ import {
   isProtocolSection,
   protocolBody,
   protocolSectionsFor,
-  PROTOCOL_SECTIONS,
   type ProtocolSection,
 } from "./protocols.js";
 
 /**
- * The co-manager's internal capability surface, exposed to the model as tools.
- * These are NOT surfaced mechanically to the user — the model decides when to
- * call them based on the conversation.
+ * The co-manager's capability surface, exposed to the model as tools.
  *
- * Memory is the co-manager's own, self-managed and invisible. Decisions,
- * progress, research, and live-state updates are recorded on the model's own
- * judgment, as they are reached in conversation. No user confirmation gates a
- * write, and no write is narrated: the executor never asks the user to approve a
- * decision and never reports what it saved. Memory reads and writes stay silent;
- * only external work (web search, fetch) surfaces as activity.
+ * The descriptions here are part of the resident 32K-byte budget (see
+ * prompt.ts): they ride the same single cache breakpoint as the system prompt
+ * and are held to TOOLS_BUDGET_BYTES serialized, enforced by test. Behaviour
+ * lives in the system prompt sections; a description carries mechanics only -
+ * what the tool does, its arguments, and the failure shapes the model must
+ * know to call it correctly. Procedure lives in protocols.ts, on demand.
+ *
+ * Memory is the co's own, self-managed and invisible: no user confirmation
+ * gates a write and no write is narrated. Only external work (web search,
+ * fetch) surfaces as activity.
  */
 
-export const LOG_ENUM: LogName[] = LOG_NAMES;
+export const MEMORY_KINDS = ["decision", "progress", "research"] as const;
+export type MemoryKind = (typeof MEMORY_KINDS)[number];
+
+const KIND_TO_LOG: Record<MemoryKind, LogName> = {
+  decision: "decisions",
+  progress: "progress",
+  research: "research",
+};
+
+export const MEMORY_SEARCH_COMMANDS = ["search_log", "read_log_range"] as const;
+export type MemorySearchCommand = (typeof MEMORY_SEARCH_COMMANDS)[number];
+
+export const MEMORY_REWRITE_FILES = ["projectbrief", "activeContext"] as const;
+export type MemoryRewriteFile = (typeof MEMORY_REWRITE_FILES)[number];
+
+const REWRITE_TO_LIVE: Record<MemoryRewriteFile, LiveFile> = {
+  projectbrief: "projectbrief.md",
+  activeContext: "activeContext.md",
+};
 
 export const DOC_COMMANDS = [
   "create",
@@ -72,185 +85,98 @@ export type TaskCommand = (typeof TASK_COMMANDS)[number];
 
 /**
  * Tool activity the REPL may surface to the user: external work only. Memory
- * reads and writes are the co-manager's private bookkeeping and never announce
- * themselves, so they are deliberately absent here. `dispatch_order` surfaces its
- * own pending-confirm banner through the arm callback, so it is not listed here.
+ * operations never announce themselves. `dispatch_order` surfaces its own
+ * pending-confirm banner through the arm callback.
  */
-export const SURFACED_TOOLS = new Set<string>(["search_web", "fetch_url"]);
+export const SURFACED_TOOLS = new Set<string>(["web_search", "web_fetch"]);
 
 export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
   const tools: Tool[] = [
     {
-      name: "read_live_memory",
+      name: "memory_write",
       description:
-        "Re-read the live-state files (projectbrief, activeContext). They are already provided at session start; call this only to refresh after a rewrite. For documents under docs/, use the doc tool instead.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-    },
-    {
-      name: "search_log",
-      description:
-        "Search one append-only log for a substring (case-insensitive). Returns matching lines with line numbers. Use before read_log_range to locate history without loading the whole log.",
+        "Append one entry to your own memory: a settled `decision` (stable id minted automatically; do not include one), a `progress` note (the narrative of what changed), or a `research` note (question, sources, findings, recommendation, confidence). Silent - never announce it or ask permission.",
       input_schema: {
         type: "object",
         properties: {
-          log: { type: "string", enum: LOG_ENUM },
-          query: { type: "string", description: "Substring to search for." },
+          kind: { type: "string", enum: [...MEMORY_KINDS] },
+          entry: { type: "string" },
         },
-        required: ["log", "query"],
+        required: ["kind", "entry"],
         additionalProperties: false,
       },
     },
     {
-      name: "read_log_range",
+      name: "memory_search",
       description:
-        "Read an inclusive 1-based line range from a log. Use after search_log to pull the surrounding context of a hit.",
+        "Read past history from the append-only logs. `search_log` returns lines matching `query` (case-insensitive substring) with line numbers; `read_log_range` returns the inclusive 1-based range `start`..`end`. Search first, then read the surrounding range for context.",
       input_schema: {
         type: "object",
         properties: {
-          log: { type: "string", enum: LOG_ENUM },
-          start: { type: "integer" },
-          end: { type: "integer" },
+          command: { type: "string", enum: [...MEMORY_SEARCH_COMMANDS] },
+          log: { type: "string", enum: ["decisions", "progress", "research"] },
+          query: { type: "string", description: "search_log only." },
+          start: { type: "integer", description: "read_log_range only." },
+          end: { type: "integer", description: "read_log_range only." },
         },
-        required: ["log", "start", "end"],
+        required: ["command", "log"],
         additionalProperties: false,
       },
     },
     {
-      name: "append_progress",
+      name: "memory_rewrite",
       description:
-        "Append a progress note to progress.md (the narrative of what changed). May be used freely without asking the user.",
-      input_schema: {
-        type: "object",
-        properties: { entry: { type: "string" } },
-        required: ["entry"],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: "append_research",
-      description:
-        "Append a research note to research.md. Should include question, sources, findings, tradeoffs, recommendation, and confidence. May be used freely.",
-      input_schema: {
-        type: "object",
-        properties: { entry: { type: "string" } },
-        required: ["entry"],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: "append_decision",
-      description:
-        "Record a decision to decisions.md as it is reached in conversation, using your own judgment about what is a settled decision worth keeping. A decision id (D-YYYYMMDD-N) is minted automatically. This is silent and needs no user confirmation: do not announce it and do not ask the user to approve the record.",
+        "Replace one live-state file in full: `projectbrief` (what the project is; keep it compact) or `activeContext` (orientation: focus, recent decisions with ids, rolling conversation summary, risks, next actions). Whole-file rewrite - spend it only when orientation has genuinely moved.",
       input_schema: {
         type: "object",
         properties: {
-          entry: {
-            type: "string",
-            description:
-              "The decision, with context and rationale. Do not include the id; it is minted.",
-          },
+          file: { type: "string", enum: [...MEMORY_REWRITE_FILES] },
+          content: { type: "string" },
         },
-        required: ["entry"],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: "rewrite_active_context",
-      description:
-        "Rewrite activeContext.md in full with fresh, compact orientation content. Use when state has changed enough that the live orientation is stale.",
-      input_schema: {
-        type: "object",
-        properties: { content: { type: "string" } },
-        required: ["content"],
+        required: ["file", "content"],
         additionalProperties: false,
       },
     },
     {
       name: "doc",
       description:
-        "Manage the user-facing markdown documents under docs/ (architecture.md, plan.md, and any other doc a workflow calls for). One tool, dispatching on `command`.\n\n" +
-        "Commands:\n" +
-        "- list — every doc in docs/. Takes no other parameter.\n" +
-        "- read — return one doc's full text. Read before editing.\n" +
-        "- create — write a new doc. Fails if it already exists.\n" +
-        "- str_replace — replace `old_str` with `new_str`. `old_str` must match EXACTLY ONCE, whitespace included; if it is ambiguous or absent you get an error rather than a guess, so include enough surrounding context to make it unique. Prefer this for targeted edits: only the diff is generated.\n" +
-        "- overwrite — replace a doc's entire content. Use for full rewrites and restructures, not for small edits.\n" +
-        "- delete — remove an existing doc.\n\n" +
-        "Scope: flat .md files inside THIS instance's docs/ only. It does NOT touch the .memory/ substrate (projectbrief, activeContext, the logs — those have their own tools), .env, or anything outside docs/. No subdirectories.",
+        "Author the captain's markdown under docs/ (plan.md, architecture.md, others on request). Commands: `list`; `read` (before editing); `create` (fails if it exists); `str_replace` (old_str must match exactly once - include context to disambiguate; ambiguity is an error, not a guess); `overwrite` (full rewrite); `delete`. Flat .md files in this instance's docs/ only; never touches .memory/. `read_protocol` (`docs`) says what plan.md and architecture.md each hold.",
       input_schema: {
         type: "object",
         properties: {
           command: { type: "string", enum: [...DOC_COMMANDS] },
           name: {
             type: "string",
-            description:
-              'The doc filename, e.g. "plan.md". Bare markdown filename, no directories. Omit for list.',
+            description: 'Bare filename, e.g. "plan.md". Omit for list.',
           },
-          content: {
-            type: "string",
-            description: "Full document text, for create and overwrite.",
-          },
-          old_str: {
-            type: "string",
-            description:
-              "For str_replace: the exact text to replace. Must appear exactly once.",
-          },
-          new_str: {
-            type: "string",
-            description:
-              'For str_replace: the replacement text. Omit or pass "" to delete the matched text.',
-          },
+          content: { type: "string", description: "For create and overwrite." },
+          old_str: { type: "string", description: "str_replace: exact text to replace." },
+          new_str: { type: "string", description: 'str_replace: replacement ("" deletes).' },
         },
         required: ["command"],
         additionalProperties: false,
       },
     },
     {
-      name: "rewrite_projectbrief",
-      description: "Rewrite projectbrief.md in full. Keep it compact.",
-      input_schema: {
-        type: "object",
-        properties: { content: { type: "string" } },
-        required: ["content"],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: "search_web",
+      name: "web_search",
       description:
-        "Search the web for candidate sources via the configured provider. Returns titles, URLs, and snippets. Prefer primary sources; corroborate before concluding.\n\n" +
-        "Recency is your call, per query, based on intent:\n" +
-        '- Set published_within_days to a recent window (e.g. 30, 90, 365) for queries about up-to-date, current, latest, or "is this still the standard" implementations. Semantic search otherwise surfaces canonical-but-stale results, so clamp the pool when you want what\'s current.\n' +
-        '- OMIT published_within_days for historical, conceptual, or "what have people done over time" prior-art queries, where old canonical sources are exactly what you want.\n' +
-        "- Set fresh_content: true when it matters that the page content is live rather than cached (e.g. a fast-moving doc or changelog). Leave it off otherwise.",
+        "Search the web for candidate sources: titles, URLs, snippets. Set `published_within_days` (e.g. 30, 365) on latest/current queries so canonical-but-stale results are clamped out; omit it for historical or prior-art queries. Set `fresh_content` true when the page must be read live rather than from cache.",
       input_schema: {
         type: "object",
         properties: {
           query: { type: "string" },
           count: { type: "integer", description: "Max results (default 6)." },
-          published_within_days: {
-            type: "integer",
-            description:
-              "Constrain results to content published within the last N days. Set for latest/current queries; omit for historical or prior-art queries.",
-          },
-          fresh_content: {
-            type: "boolean",
-            description:
-              "If true, fetch inline page content live rather than from cache. Use for fast-moving pages.",
-          },
+          published_within_days: { type: "integer" },
+          fresh_content: { type: "boolean" },
         },
         required: ["query"],
         additionalProperties: false,
       },
     },
     {
-      name: "fetch_url",
+      name: "web_fetch",
       description:
-        "Fetch a URL and return its content as clean text/markdown. Use to read a source found via search_web or a link the user gave you.",
+        "Fetch one URL as clean text/markdown. Use it to read a source web_search found or a link the captain gave you.",
       input_schema: {
         type: "object",
         properties: { url: { type: "string" } },
@@ -261,17 +187,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     {
       name: "task_table",
       description:
-        "Read and edit the captain's at-a-glance task table, one row at a time. One tool, dispatching on `command`. The table is persisted and PAINTED by the panel (Ctrl-O, Home tab), and the captain edits it there himself — it is his surface, and you are the second writer on it.\n\n" +
-        "Commands:\n" +
-        "- list — the current table. Takes no other parameter. Call it before editing if you are unsure what is there.\n" +
-        "- add — append `task` as a new row, always `queued`. A task is one short line of text and has no body.\n" +
-        "- status — move the row named by `task` to `building` or `queued`. Work that has actually started is `building`.\n" +
-        "- rename — rewrite the TEXT of the row named by `task` to `new_task`, keeping its status and its place. For a typo or a reworded task; it is not retire-and-add, which would lose both. Fails if `new_task` is empty or would read the same as a different row. Renaming a row to the text it already has is a successful no-op.\n" +
-        "- retire — take the row named by `task` OUT of the table. This is what `done` means here: retiring appends it to a kept `done` list and shrinks the table. There is no third status.\n\n" +
-        "A row is addressed BY ITS EXACT TASK TEXT, never by position — the captain edits the same table between your turns, so a position you read last turn may be a different row now. Text matching no row, or more than one, is an ERROR rather than a guess; `list` first and copy the text.\n\n" +
-        "The table comes back in the order it is DISPLAYED in — every `building` row first, then every `queued` one, each keeping the order it was stored in. That is what the captain's panel paints, so you and he are reading the same table. It is a display order only: it never says which row was added first, and nothing you can call reorders the stored table.\n\n" +
-        "You cannot replace, clear or reorder the table, and no call can touch a row it did not name. That is deliberate: a whole-table write would silently delete rows the captain had just typed.\n\n" +
-        "The DEFAULT IS NOT TO ADD A ROW. A row belongs here only when the captain asks for one, or when the item is plainly a major future workstream. Intermediate and mechanical steps never belong in the table, however real they are. There is no row limit and nothing will stop you, which is exactly why the restraint is YOURS to keep: the table is the captain's notepad and his rows are not your budget to spend. Never assume a row you did not add is stale: if you did not put it there, the captain did.",
+        "Read and edit the captain's task table, one row at a time. Commands: `list`; `add` (new row, always `queued`); `status` (move between `building` and `queued`); `rename` (`task` -> `new_task`, keeping status and place); `retire` (take the row out - this is what done means; no third status). Address a row by its EXACT text as `list` returns it, never by position: the captain edits the table between your turns, and text matching no row or more than one is an error, not a guess. No whole-table write, no clear, no reorder. Rows return `building` first, then `queued`.",
       input_schema: {
         type: "object",
         properties: {
@@ -279,68 +195,49 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
           task: {
             type: "string",
             description:
-              "For add: the new row's text, one short line. For status, rename and retire: the EXACT text of the row to act on, as `list` returns it.",
+              "add: the new row's text (one short line, no body). Others: the exact text of the row to act on.",
           },
           new_task: {
             type: "string",
             description:
-              "For rename only: the row's new text, one short line. It may not be empty, and it may not read the same as a different row on the table.",
+              "rename only: the new text. Not empty, and must not read the same as a different row.",
           },
-          status: {
-            type: "string",
-            enum: [...TASK_STATUSES],
-            description:
-              "For status: `building` if it is being worked right now, `queued` if it is waiting its turn. There is no third value — finishing something is `retire`.",
-          },
+          status: { type: "string", enum: [...TASK_STATUSES] },
         },
         required: ["command"],
         additionalProperties: false,
       },
     },
+    {
+      name: "read_protocol",
+      description:
+        "Put one protocol section in front of you, BEFORE acting on its subject: `orders` before writing ANY order for the crew; `features` before any feature lever; `lanes` before dispatching into a worktree that already holds a live agent; `pr-message` before composing a prTitle/prBody; `memory` for the memory file layout; `docs` for what plan.md and architecture.md hold. These are exact procedures with real failure modes, not summaries you can reconstruct. dispatch_order and feature_enqueue REFUSE a call made without the relevant section in context and hand it over in the refusal - so read first, and only ever write the thing once.",
+      input_schema: {
+        type: "object",
+        properties: {
+          section: { type: "string", enum: protocolSectionsFor(opts) },
+        },
+        required: ["section"],
+        additionalProperties: false,
+      },
+    },
   ];
 
-  // The dispatch + feature tools are only exposed when the instance has been
-  // linked to a repo (co link). dispatch_order ARMS a dispatch — it never runs
-  // anything; the launch happens only after the captain types `confirm` in the
-  // session loop, which is the structural interlock. The feature levers drive
-  // the parallel-worktree flow: create a feature's isolated worktree, target a
-  // dispatch at it, and land it through the Ctrl-O review gate.
-  tools.push({
-    name: "read_protocol",
-    description:
-      "Read one section of the protocol reference. These sections are NOT in your system prompt — they are exact procedures with real failure modes, and they are kept out of every turn's context because most sessions never need them. Call this BEFORE you act, not after: `orders` before writing ANY order for the crew, `features` for creating/landing/enqueueing/abandoning a feature or dispatching into one, `lanes` before dispatching into a worktree that already holds a live crew agent, `pr-message` before you compose the prTitle/prBody for feature_enqueue. Reading a section costs a moment; guessing at one costs the captain a broken landing or a pull request written to the wrong shape. `dispatch_order` and `feature_enqueue` will REFUSE a call made without the relevant section and hand you the whole thing in the error, so you can never act on a guess — but that costs you writing the order or the body twice. Read first and it costs you nothing.",
-    input_schema: {
-      type: "object",
-      properties: {
-        section: {
-          type: "string",
-          enum: protocolSectionsFor(opts),
-          description: "Which protocol section to put in front of you.",
-        },
-      },
-      required: ["section"],
-      additionalProperties: false,
-    },
-  });
-
+  // Dispatch and feature levers exist only when the instance is linked to a
+  // repo (co link). dispatch_order ARMS; the captain's typed `confirm` in the
+  // session loop is the only thing that ever launches a crew agent.
   if (opts.dispatch) {
     tools.push({
       name: "dispatch_order",
       description:
-        "Arm a direct dispatch of an implementation-ready order to the crew (the registered coding agent). This does NOT run anything: it stages the order and shows the captain the exact order text plus the resolved command and target, and waits. The dispatch fires only if the captain then types `confirm`; any other input cancels it. Use this instead of writing plain-text orders when the captain wants the order run directly. Draft the full order (same checklist as a written order: read-docs-first, goal, context, decisions, constraints, acceptance, verification, close-the-report, commit) as the `order` argument. Optionally scope it to a feature with `feature`: the crew then runs inside that feature's isolated worktree (provisioned on first use) instead of the bare main tree. Arm at most one order per turn.\n\n" +
-        "TARGETING A WORKTREE THAT ALREADY HAS A LIVE AGENT is allowed and is LANE-GATED, not refused. The arm banner then names the live agent and offers the captain two verbs: a bare `confirm` grants a READ-ONLY lane (the order is prefixed with a mandate forbidding every write to the tree — no edits, no new files, no `git add`/`commit`/`stash`, no install, no build, no artifact-emitting test run — and the agent's write-capable tools are denied at launch where its CLI supports that), while `confirm write` grants a second WRITING lane, with both agents writing one git index and one build dir. The captain picks; you do not. So write the order for the lane you expect: an audit order asks for findings, and if the work genuinely needs to write, say so and let them choose. A read-only run's result comes back to you as CONTEXT to answer with — no review is filed for it.",
+        "ARM a dispatch of an implementation-ready order to the crew. It runs NOTHING: the captain is shown the order and the resolved command, and the dispatch fires only on their typed `confirm` - anything else cancels it. Pass the complete order text, written to the orders protocol (an order written without it is refused). Scope to a feature's worktree with `feature` (provisioned on first use); omit it for the bare main tree. A worktree already holding a live agent is lane-gated at confirm time: the captain chooses read-only or `confirm write` - see the lanes protocol. Arm at most one order per turn, and never claim the order ran because you armed it.",
       input_schema: {
         type: "object",
         properties: {
-          order: {
-            type: "string",
-            description:
-              "The complete, implementation-ready order text to hand to the coding agent as its prompt.",
-          },
+          order: { type: "string", description: "The complete order, the crew agent's prompt." },
           feature: {
             type: "string",
-            description:
-              "Optional. Scope this dispatch to a feature: the crew runs in that feature's isolated worktree on its own `<type>/<slug>` branch, provisioned on first use. Use the same feature name you created (or will create) with feature_create. Omit to run on the bare main tree.",
+            description: "Optional feature name; the crew runs in its worktree.",
           },
         },
         required: ["order"],
@@ -350,114 +247,49 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "feature_create",
       description:
-        "Provision an isolated worktree for a feature: a fresh `<type>/<slug>` branch (e.g. `feat/user-auth`, `fix/stale-token`) cut from `origin/dev`, with its own checkout, so crew can work it in parallel with other features and never touch the main tree. Runs directly (no confirm gate) — it writes nothing to `dev` or `main`, only creates the feature's own branch and checkout. Requires the repo to have an `origin` remote with a `dev` branch (features integrate by pull request); it reports cleanly if that is missing rather than creating anything. Idempotent: creating an existing feature returns its worktree on the branch it already has. After creating, dispatch orders into it by passing the same name as `dispatch_order`'s `feature`, then land it with feature_land.",
+        "Provision a feature's isolated worktree: a `<type>/<slug>` branch cut from `origin/dev` with its own checkout, so work runs in parallel and never touches the main tree. No confirm gate (it writes nothing to dev or main), idempotent, and it reports cleanly if `origin/dev` is missing. Always pass `intent`: one stored line on what the feature is FOR, shown beside the worktree in the captain's panel.",
       input_schema: {
         type: "object",
         properties: {
-          name: {
-            type: "string",
-            description:
-              'The feature name (a human handle, e.g. "user auth"). Slugged for the branch.',
-          },
+          name: { type: "string", description: 'Human handle, e.g. "user auth"; slugged for the branch.' },
           type: {
             type: "string",
             enum: [...FEATURE_BRANCH_TYPES],
-            description:
-              "Optional Conventional Commits type for the branch prefix, chosen to fit the work (feat for new capability, fix for a bug, refactor, docs, chore, test, perf, build, ci, style). Defaults to feat.",
+            description: "Conventional Commits type for the branch prefix. Default feat.",
           },
-          intent: {
-            type: "string",
-            description:
-              "One line saying what the feature is for. Optional, but give it every time: it is stored with the feature (surviving a restart), echoed back by feature_status/feature_list, and shown as the feature's description beside its branch in the captain's Ctrl-O Home tab — where the branch name says what KIND of work it is and this is the only thing that says what the work actually is.",
-          },
+          intent: { type: "string", description: "One line: what this feature is for." },
         },
         required: ["name"],
-        additionalProperties: false,
-      },
-    });
-    tools.push({
-      name: "feature_land",
-      description:
-        "Land a finished feature into `dev` through a GitHub pull request: fetch, rebase its branch onto the current `origin/dev` tip, push the branch, open (or reuse) its PR into `dev`, read that PR's own GitHub CI checks, and open the Ctrl-O review gate showing the PR and the result. co runs NO build or test of its own — GitHub's checks on the PR are the gate. The gate IS the confirmation — the merge (`gh pr merge --merge`, a merge commit) happens ONLY if the captain presses [m] over a green result; a rebase conflict, a red check, or checks that have not reported yet are shown but not mergeable. A PR with no checks at all is still mergeable but UNGATED (nothing verified it) — say so rather than calling it green. On a merge the feature's worktree is torn down and its branch ref kept. `dev` is never written locally. Needs an interactive terminal (the gate); reports cleanly if there is none, if a crew agent is still working the feature, or if a prerequisite is missing (no gh, not authenticated, no `origin/dev`).",
-      input_schema: {
-        type: "object",
-        properties: {
-          name: {
-            type: "string",
-            description: "The feature to land (name or slug).",
-          },
-        },
-        required: ["name"],
-        additionalProperties: false,
-      },
-    });
-    tools.push({
-      name: "feature_enqueue",
-      description:
-        "Mark a feature done and add it to the serial merge queue, and WRITE ITS PULL REQUEST MESSAGE. This is how a finished feature gets in line to land in `dev`, as a GitHub pull request. There is NO confirm gate on enqueue — call it as soon as the captain says a feature is done. You know what this feature is for and what the crew built, so you are the one who writes its PR: pass `prTitle` and `prBody` describing what the PR accomplishes and why. Omit them only when the mechanical fallback (the commit subject, or `<type>: <feature>`) genuinely says enough. Features LAND one at a time in queue order while development runs in parallel — the queue serializes merges, never the work. Only the head is processed (fetched, rebased onto the current `origin/dev` tip, pushed, PR'd into `dev`, and gated on that PR's own GitHub CI checks — co runs no build or test itself), and only the head can merge. When the enqueued feature becomes the head it is processed immediately, so the result tells you whether the head is `ready` (its checks passed — or its PR reports no checks at all, in which case `ungated` is set and NOTHING verified it: report it as a human-judgment merge, not a green), `awaiting-checks` (CI is still running; this is a WAIT, not a failure — nothing is needed from you, and re-calling feature_enqueue re-reads them), `blocked` (a rebase conflict, a red CI check, or a missing prerequisite such as gh not being installed/authenticated — the result's `blockedKind` says which of the first two; it holds the queue until resolved or removed), `resolving` (a fresh crew agent is fixing it in its worktree), or still `queued`. A `ready` head needs NOTHING from you: its pull request, commits, checks result and a live [m] are already showing in the captain's Ctrl-O queue tab, and they merge that PR with the keystroke whenever they choose (they may edit the PR on GitHub first). Say it is ready, hand over the PR link if you have it, and move on — never call a tool to merge it and never wait for the keypress. On a blocked head you can dispatch a fresh resolver agent with feature_resolve_head, re-call feature_enqueue to retry after a manual fix, or feature_abandon it. Idempotent: enqueuing an already-queued feature keeps its position, and a re-enqueue with no prTitle/prBody keeps the message you already wrote — so you only pass them again to CHANGE the message.",
-      input_schema: {
-        type: "object",
-        properties: {
-          name: {
-            type: "string",
-            description:
-              "The feature to enqueue (name or slug). Must already be created.",
-          },
-          prTitle: {
-            type: "string",
-            description:
-              'The pull request\'s title: one concise imperative line saying what this PR does (e.g. "Add passkey login to the web app"), specific enough to stand alone as the permanent history entry — never "Fix bug", "Update .gitignore", or "Changes per feedback". Write it as a developer would — no bot voice, no attribution, nothing about how the work was produced. Omitted, the title falls back to the branch\'s commit subject.',
-          },
-          prBody: {
-            type: "string",
-            description:
-              'The pull request\'s description. Call `read_protocol` with section "pr-message" and write it to the template there — this tool refuses a body until you have. The template is not restated here on purpose: one copy, read when it is actually needed. Omitted, the description falls back to a one-line mechanical summary.',
-          },
-        },
-        required: ["name"],
-        additionalProperties: false,
-      },
-    });
-    tools.push({
-      name: "feature_merge_head",
-      description:
-        "DO NOT reach for this to merge a ready head — merging is not yours to do. When the queue head is `ready`, the captain's Ctrl-O queue tab is already showing its pull request and checks result with a live [m], and pressing it merges that PR on GitHub, tears down its worktree, advances the queue and processes the next head, none of which involves you. In an interactive session this tool merges NOTHING: it returns the head's current state immediately and tells you the [m] is live. It exists only as a fallback for a session with no panel at all (piped/non-TTY), where there is no key to press and a ready head is merged directly. Use feature_list/feature_status to report queue state instead. Never say a feature landed because you called this, and never wait on the captain's keystroke — you are not in that loop.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-    });
-    tools.push({
-      name: "feature_resolve_head",
-      description:
-        "Dispatch a FRESH crew agent to unblock the current merge-queue HEAD when it is `blocked` by a rebase conflict or a red CI check on its pull request. The agent runs in the FEATURE'S OWN isolated worktree, on its own feature branch (never `dev`): it fetches, rebases onto the current `origin/dev` tip, resolves the conflict, fixes whatever the failing checks reported (the order names them and links their runs), and commits — it does NOT push, open a PR, or merge. Like every dispatch this is CONFIRM-GATED: it ARMS the resolver order (shown to the captain with the target worktree) and fires only when the captain types `confirm`; it launches nothing on its own. While the agent works, the head is `resolving`; when it finishes the head is automatically re-processed (rebase + push + a fresh read of the PR's checks) and becomes `ready` if green or `blocked`/`awaiting-checks` if not. Bounded to a few attempts per head; after the limit the head stays blocked for the captain to resolve by hand or abandon. Use this on a blocked head instead of resolving conflicts yourself.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-    });
-    tools.push({
-      name: "feature_list",
-      description:
-        "List every tracked feature: its branch, worktree path, provision status, which crew agents are live in it and in which lane (`agents` gives each one's job id and role, `writerActive` says whether one of them is a WRITER), its dispatched jobs, and — for enqueued features — its merge-queue position and head state (queued / head-processing / awaiting-checks / ready / blocked / resolving). Also returns the full merge queue in landing order. Use to see what is in flight across the parallel-worktree flow. Only a WRITER blocks enqueuing, landing and abandoning; a worktree with only read-only auditors in it lands normally.",
-      input_schema: {
-        type: "object",
-        properties: {},
         additionalProperties: false,
       },
     });
     tools.push({
       name: "feature_status",
       description:
-        "Show one feature's full picture: branch, worktree path, provision status, whether its worktree has uncommitted changes, which crew agents are live in it and in which lane (`agents` gives each one's job id and role; `writerActive` says whether one of them is a WRITER, which is the only thing that blocks landing), its jobs, and — if it is enqueued — its merge-queue position and head state (queued / head-processing / awaiting-checks / ready / blocked / resolving), including whether a block is a conflict or a red CI check, and whether a ready head is ungated (its PR reports no checks at all). Returns not-found if nothing is tracked under that name or slug.",
+        "With `name`: one feature's full picture - branch, worktree path, dirty state, live agents and their lanes (only a WRITER blocks the levers), jobs, and its merge-queue position and head state (queued / awaiting-checks / ready / blocked / resolving, with the blocked kind and whether a ready head is ungated). Without `name`: every tracked feature plus the merge queue in landing order.",
       input_schema: {
         type: "object",
         properties: {
-          name: {
+          name: { type: "string", description: "Feature name or slug. Omit to list all." },
+        },
+        additionalProperties: false,
+      },
+    });
+    tools.push({
+      name: "feature_enqueue",
+      description:
+        "Mark a feature done and join the serial merge queue; no confirm gate. Only the head is processed: rebased onto fresh `origin/dev`, pushed, PR'd into dev, gated on that PR's own CI checks (co runs no build or test). Returns `ready` (or ready-but-UNGATED when the PR reports no checks: say so, nothing verified it), `awaiting-checks` (a wait, not a failure - re-call to re-read), `blocked` (holds the queue), or `resolving`. You write the PR message: `prTitle` and `prBody` to the pr-message protocol (a body written without it is refused). Idempotent; omitted message fields keep what is stored. A ready head merges by the captain's [m], never by you: report it, give the PR link, move on.",
+      input_schema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Feature name or slug." },
+          prTitle: {
             type: "string",
-            description: "The feature to inspect (name or slug).",
+            description: "One imperative, specific line standing alone in history.",
+          },
+          prBody: {
+            type: "string",
+            description: "The PR description, written to the pr-message protocol's template.",
           },
         },
         required: ["name"],
@@ -465,17 +297,18 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
       },
     });
     tools.push({
+      name: "feature_resolve_head",
+      description:
+        "ARM a fresh crew agent to unblock the merge-queue head when it is blocked by a rebase conflict or a red CI check. The agent runs in the feature's own worktree (never dev), fires only on the captain's typed `confirm`, is bounded to a few attempts, and the head re-processes itself when it finishes. Use this on a blocked head instead of resolving anything yourself.",
+      input_schema: { type: "object", properties: {}, additionalProperties: false },
+    });
+    tools.push({
       name: "feature_abandon",
       description:
-        "Tear down a feature's worktree WITHOUT landing it: remove the checkout and delete its branch only if it is already contained in `origin/dev`. Refuses (reports, never forces) a worktree that still has a live WRITING crew agent in it, and one with uncommitted changes — discarding unsaved work is the captain's call. A read-only auditor in the worktree does not refuse it. Committed-but-unmerged work is preserved: the branch is kept and the reason reported. Use to drop an abandoned or superseded feature.",
+        "Tear down a feature's worktree WITHOUT landing it. Deletes the branch only if it is already contained in `origin/dev`; committed-but-unmerged work keeps its branch. Refuses a worktree with a live WRITING agent or uncommitted changes - it reports, never forces, and discarding unsaved work stays the captain's call.",
       input_schema: {
         type: "object",
-        properties: {
-          name: {
-            type: "string",
-            description: "The feature to abandon (name or slug).",
-          },
-        },
+        properties: { name: { type: "string", description: "Feature name or slug." } },
         required: ["name"],
         additionalProperties: false,
       },
@@ -491,14 +324,10 @@ export interface ToolSideEffects {
   liveRewritten: Set<LiveFile>;
   decisionsRecorded: string[];
   /**
-   * Protocol sections the co has pulled into context this session.
-   *
-   * The point of moving a section out of the system prompt is that most sessions
-   * never pay for it. The risk is that the co then acts without it and nothing
-   * says so — it composes a PR body from memory and the shape is quietly wrong.
-   * An inline trigger is a hope; this is the enforcement, and feature_enqueue
-   * checks it. Session-scoped rather than per-turn on purpose: re-reading before
-   * every call would hand back the saving this exists to make.
+   * Protocol sections pulled into context this session. Session-scoped on
+   * purpose: re-reading before every call would hand back the saving the
+   * on-demand tier exists to make. requireProtocol checks it, and marks it,
+   * because a refusal carries the body into the conversation either way.
    */
   protocolsRead: Set<ProtocolSection>;
 }
@@ -516,16 +345,13 @@ export interface ExecutorContext {
   paths: InstancePaths;
   research: ResearchConfig;
   effects: ToolSideEffects;
-  /** Optional callback so the REPL can surface external work (web search, fetch)
-   *  as activity. Memory operations never call it — they stay silent. */
+  /** Surface external work (web search, fetch) as activity. Memory operations
+   *  never call it - they stay silent. */
   onNotice?: (msg: string) => void;
   /**
-   * Arm a dispatch (dispatch_order tool). The REPL supplies this only when the
-   * instance is linked. It records the order (and optional feature target) for
-   * the confirm interlock and puts the TUI into the pending-confirm state; it
-   * MUST NOT launch anything. Returns a short human-readable confirmation of what
-   * was armed (or an error string if arming is impossible), which becomes the
-   * tool result the model sees.
+   * Arm a dispatch (dispatch_order). Supplied only when linked. Records the
+   * order for the confirm interlock and shows the banner; it MUST NOT launch
+   * anything. Returns a short confirmation (or refusal) for the tool result.
    */
   onArmDispatch?: (
     order: string,
@@ -533,31 +359,17 @@ export interface ExecutorContext {
   ) => Promise<
     { armed: true; summary: string } | { armed: false; reason: string }
   >;
-  /**
-   * The feature levers (feature_create/land/list/status/abandon). Supplied only
-   * when the instance is linked. Absent means the tools report dispatch is
-   * unavailable, exactly like onArmDispatch.
-   */
+  /** The feature levers. Supplied only when linked. */
   features?: FeatureManager;
   /**
-   * Arm a fresh-agent resolver dispatch for the blocked merge-queue head
-   * (feature_resolve_head tool). Like onArmDispatch it ARMS a confirm-gated,
-   * feature-scoped dispatch and launches nothing; the REPL supplies it only when
-   * linked. Returns a short confirmation of what was armed, or a refusal (no
-   * resolvable head, retry bound spent). Marking the head "resolving" happens at
-   * fire time, not here, so a cancelled arm burns no attempt.
+   * Arm a resolver dispatch for the blocked merge-queue head. Confirm-gated
+   * like onArmDispatch; launches nothing. Supplied only when linked.
    */
   onArmResolve?: () => Promise<
     { armed: true; summary: string } | { armed: false; reason: string }
   >;
-  /**
-   * The persisted at-a-glance task table (task_table tool), painted and EDITED
-   * by the panel's Home tab. Always wired in a real session — the table needs no
-   * repo — so its absence only means a degraded/test executor, where the tool
-   * reports the table is unavailable rather than throwing. The same store object
-   * backs the captain's keystrokes, which is what makes the two writers one
-   * table rather than two copies of one.
-   */
+  /** The persisted task table, shared with the captain's panel. Always wired
+   *  in a real session; absent only in degraded/test executors. */
   tasks?: TaskStore;
 }
 
@@ -568,20 +380,14 @@ const FEATURE_UNAVAILABLE =
  * Gate a tool on a protocol section, and SUPPLY the section rather than merely
  * demand it.
  *
- * The obvious gate — "call read_protocol first, then try again" — leaves the co
- * one forgotten tool call away from improvising, and improvising is the failure
+ * The obvious gate - "call read_protocol first, then retry" - leaves the co
+ * one forgotten call away from improvising, and improvising is the failure
  * that does not announce itself: an order that restates the repo, a PR body in
- * the wrong shape. Both read plausibly, both ship, and nobody notices for weeks.
- *
- * So the refusal carries the protocol with it. There is no path to acting
- * without the contract in context, because the only way to be refused is to be
- * handed it. `read_protocol` still earns its place on the good path: reading
- * BEFORE writing a long order avoids generating that order twice.
- *
- * Marking the section read here is correct rather than a shortcut — the body is
- * in this tool result, so it is in the conversation exactly as if the tool had
- * fetched it. Without that, the retry would be refused for the same reason
- * forever.
+ * the wrong shape. Both read plausibly, both ship. So the refusal carries the
+ * protocol with it: there is no path to acting without the contract in
+ * context, because the only way to be refused is to be handed it. Marking the
+ * section read here is correct, not a shortcut - the body lands in the
+ * conversation through this very result, exactly as if read_protocol had.
  */
 function requireProtocol(
   effects: ToolSideEffects,
@@ -594,7 +400,7 @@ function requireProtocol(
   return err(
     id,
     `${lead}\n\nNothing has been staged and nothing has changed. The contract` +
-      ` follows in full — read it, then send this call again with the content` +
+      ` follows in full - read it, then send this call again with the content` +
       ` rewritten to it. Do not simply resend what you had.\n\n` +
       protocolBody(section),
   );
@@ -610,6 +416,8 @@ function err(id: string, msg: string): ToolResult {
   return { tool_use_id: id, content: msg, is_error: true };
 }
 
+const LOG_SET = new Set(["decisions", "progress", "research"]);
+
 /** Build the tool executor bound to a specific instance + config. */
 export function makeExecutor(ctx: ExecutorContext) {
   const { paths, research, effects } = ctx;
@@ -624,69 +432,79 @@ export function makeExecutor(ctx: ExecutorContext) {
           if (!isProtocolSection(section)) {
             return err(
               id,
-              `unknown protocol section. Pick one of: ${PROTOCOL_SECTIONS.join(", ")}.`,
+              `unknown protocol section. Pick one of: ${protocolSectionsFor({
+                dispatch: Boolean(ctx.onArmDispatch),
+              }).join(", ")}.`,
             );
+          }
+          // Once a section is in the live window - read here, or handed over
+          // by a gate refusal - a re-read returns a pointer, not a second
+          // copy: the first copy is already re-sent on every round, and a
+          // duplicate would be paid for the same way. Compaction clears the
+          // ledger (see maybeCompact in session.ts), because a section
+          // summarized out of the window must be re-readable for real.
+          if (effects.protocolsRead.has(section)) {
+            return ok(id, {
+              section,
+              note:
+                "Already in your context: this section entered the conversation" +
+                " earlier this session, as a read_protocol result or inside a" +
+                " refusal that carried it. Use that copy - it has not changed.",
+            });
           }
           effects.protocolsRead.add(section);
           return ok(id, { section, text: protocolBody(section) });
         }
-        case "read_live_memory": {
-          const live = await readLiveMemory(paths);
-          return ok(id, live);
+        case "memory_write": {
+          const kind = String(input.kind ?? "") as MemoryKind;
+          if (!(MEMORY_KINDS as readonly string[]).includes(kind)) {
+            return err(id, `unknown memory kind. Pick one of: ${MEMORY_KINDS.join(", ")}.`);
+          }
+          const log = KIND_TO_LOG[kind];
+          const r = await appendLog(paths, log, String(input.entry ?? ""));
+          effects.logsTouched.add(log);
+          if (kind === "decision" && r.id) effects.decisionsRecorded.push(r.id);
+          return ok(id, { saved: true, ...(r.id ? { id: r.id } : {}), file: r.file });
         }
-        case "search_log": {
-          const hits = await searchLog(
-            paths,
-            input.log as LogName,
-            String(input.query ?? ""),
-          );
-          return ok(id, { hits });
+        case "memory_search": {
+          const command = String(input.command ?? "") as MemorySearchCommand;
+          const log = String(input.log ?? "");
+          if (!LOG_SET.has(log)) {
+            return err(id, `unknown log. Pick one of: decisions, progress, research.`);
+          }
+          switch (command) {
+            case "search_log": {
+              const hits = await searchLog(paths, log as LogName, String(input.query ?? ""));
+              return ok(id, { hits });
+            }
+            case "read_log_range": {
+              const text = await readLogRange(
+                paths,
+                log as LogName,
+                Number(input.start),
+                Number(input.end),
+              );
+              return ok(id, { text });
+            }
+            default:
+              return err(
+                id,
+                `unknown memory_search command. Use one of: ${MEMORY_SEARCH_COMMANDS.join(", ")}.`,
+              );
+          }
         }
-        case "read_log_range": {
-          const text = await readLogRange(
-            paths,
-            input.log as LogName,
-            Number(input.start),
-            Number(input.end),
-          );
-          return ok(id, { text });
-        }
-        case "append_progress": {
-          const r = await appendLog(
-            paths,
-            "progress",
-            String(input.entry ?? ""),
-          );
-          effects.logsTouched.add("progress");
-          return ok(id, { saved: true, file: r.file });
-        }
-        case "append_research": {
-          const r = await appendLog(
-            paths,
-            "research",
-            String(input.entry ?? ""),
-          );
-          effects.logsTouched.add("research");
-          return ok(id, { saved: true, file: r.file });
-        }
-        case "append_decision": {
-          const r = await appendLog(
-            paths,
-            "decisions",
-            String(input.entry ?? ""),
-          );
-          effects.logsTouched.add("decisions");
-          if (r.id) effects.decisionsRecorded.push(r.id);
-          return ok(id, { saved: true, id: r.id, file: r.file });
-        }
-        case "rewrite_active_context": {
-          await rewriteLive(
-            paths,
-            "activeContext.md",
-            String(input.content ?? ""),
-          );
-          effects.liveRewritten.add("activeContext.md");
-          return ok(id, { rewritten: "activeContext.md" });
+        case "memory_rewrite": {
+          const file = String(input.file ?? "") as MemoryRewriteFile;
+          if (!(MEMORY_REWRITE_FILES as readonly string[]).includes(file)) {
+            return err(
+              id,
+              `unknown live file. Pick one of: ${MEMORY_REWRITE_FILES.join(", ")}.`,
+            );
+          }
+          const live = REWRITE_TO_LIVE[file];
+          await rewriteLive(paths, live, String(input.content ?? ""));
+          effects.liveRewritten.add(live);
+          return ok(id, { rewritten: live });
         }
         case "doc": {
           const command = String(input.command ?? "") as DocCommand;
@@ -738,16 +556,7 @@ export function makeExecutor(ctx: ExecutorContext) {
             throw e;
           }
         }
-        case "rewrite_projectbrief": {
-          await rewriteLive(
-            paths,
-            "projectbrief.md",
-            String(input.content ?? ""),
-          );
-          effects.liveRewritten.add("projectbrief.md");
-          return ok(id, { rewritten: "projectbrief.md" });
-        }
-        case "search_web": {
+        case "web_search": {
           const count = Number.isFinite(Number(input.count))
             ? Number(input.count)
             : 6;
@@ -769,7 +578,7 @@ export function makeExecutor(ctx: ExecutorContext) {
           ctx.onNotice?.(`searched the web (${res.provider})`);
           return ok(id, res);
         }
-        case "fetch_url": {
+        case "web_fetch": {
           const res = await fetchUrl(research, String(input.url ?? ""));
           ctx.onNotice?.(`fetched ${res.url}`);
           return ok(id, res);
@@ -779,10 +588,9 @@ export function makeExecutor(ctx: ExecutorContext) {
             return err(id, "The task table is unavailable in this session.");
           const tasks = ctx.tasks;
           const command = String(input.command ?? "") as TaskCommand;
-          // Every `table` this tool hands back — the listing, the echo after a
-          // write, and the one carried by a refusal — goes through the SAME
-          // display order the panel paints, so the co and the captain never
-          // describe the table to each other in two different orders.
+          // Every table handed back - listing, post-write echo, refusal - uses
+          // the SAME display order the panel paints, so the co and the captain
+          // never describe the table to each other in two different orders.
           const table = () => taskDisplayOrder(tasks.list());
           try {
             switch (command) {
@@ -815,8 +623,8 @@ export function makeExecutor(ctx: ExecutorContext) {
             }
           } catch (e) {
             // A refusal is the point of this tool, not an exception: the co is
-            // told exactly which row it named and what the table actually holds,
-            // so its next call can be right rather than a guess.
+            // told exactly which row it named and what the table holds, so its
+            // next call can be right rather than a guess.
             if (e instanceof TaskError) {
               return err(
                 id,
@@ -840,10 +648,8 @@ export function makeExecutor(ctx: ExecutorContext) {
               "Dispatch is not available: this instance is not linked to a repo. Run `co link` first, or write the order as plain text for the captain to copy.",
             );
           }
-          // Before arming, so a refused call leaves nothing staged and the co
-          // cannot report a dispatch that did not happen. The refusal hands the
-          // checklist over rather than pointing at a tool it might not call —
-          // see requireProtocol.
+          // Before arming, so a refused call leaves nothing staged. The
+          // refusal hands the checklist over - see requireProtocol.
           const gate = requireProtocol(
             effects,
             "orders",
@@ -857,8 +663,7 @@ export function makeExecutor(ctx: ExecutorContext) {
               : String(input.feature).trim() || undefined;
           const res = await ctx.onArmDispatch(order, feature);
           if (!res.armed) return err(id, res.reason);
-          // Armed, not run. The model must now stop and let the captain confirm;
-          // it must NOT claim the order ran.
+          // Armed, not run. The model must stop and let the captain confirm.
           return ok(id, {
             armed: true,
             note:
@@ -883,12 +688,18 @@ export function makeExecutor(ctx: ExecutorContext) {
           );
           return ok(id, res);
         }
-        case "feature_land": {
+        case "feature_status": {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
-          const name = String(input.name ?? "").trim();
-          if (!name) return err(id, "feature_land requires a non-empty name.");
-          const res = await ctx.features.land(name);
-          return ok(id, res);
+          const name = input.name === undefined ? "" : String(input.name).trim();
+          if (!name) {
+            return ok(id, {
+              features: ctx.features.list(),
+              queue: ctx.features.queueView(),
+            });
+          }
+          const res = await ctx.features.status(name);
+          if (!res) return ok(id, { found: false, feature: name });
+          return ok(id, { found: true, ...res });
         }
         case "feature_enqueue": {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
@@ -896,19 +707,14 @@ export function makeExecutor(ctx: ExecutorContext) {
           if (!name)
             return err(id, "feature_enqueue requires a non-empty name.");
           // Each half of the PR message is an independent override: an omitted
-          // field leaves whatever this feature already has stored, so a retry
-          // enqueue never wipes a message the co wrote earlier.
+          // field keeps what is stored, so a retry never wipes a message.
           const prTitle =
             input.prTitle === undefined ? undefined : String(input.prTitle);
           const prBody =
             input.prBody === undefined ? undefined : String(input.prBody);
-          // The one hard gate on the on-demand protocol split. The PR template
-          // left the system prompt, so the co can no longer see it by default —
-          // and a body composed from memory instead of the template is exactly
-          // the failure that degrades silently: it reads plausibly, it merges,
-          // and nobody notices the shape is wrong for weeks. The refusal carries
-          // the template with it (see requireProtocol), so the co cannot end up
-          // writing one without the contract in front of it.
+          // The PR body is the durable output of the on-demand split: one
+          // composed from memory reads plausibly, merges, and is quietly the
+          // wrong shape. The refusal carries the template (requireProtocol).
           if (prBody !== undefined) {
             const gate = requireProtocol(
               effects,
@@ -926,17 +732,6 @@ export function makeExecutor(ctx: ExecutorContext) {
             ctx.onNotice?.(`enqueued feature ${name} for landing`);
           return ok(id, res);
         }
-        case "feature_merge_head": {
-          if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
-          // Non-blocking by construction: in an interactive session this reports
-          // state and merges nothing (the panel's [m] owns the merge); with no
-          // panel it merges directly and returns. Either way it never waits on a
-          // human, so the co's turn is never held open (D-20260724-12).
-          const res = await ctx.features.mergeHead();
-          if (res.merged)
-            ctx.onNotice?.(`merged ${res.feature} onto ${res.target}`);
-          return ok(id, res);
-        }
         case "feature_resolve_head": {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
           if (!ctx.onArmResolve) {
@@ -947,30 +742,13 @@ export function makeExecutor(ctx: ExecutorContext) {
           }
           const res = await ctx.onArmResolve();
           if (!res.armed) return err(id, res.reason);
-          // Armed, not run. Same interlock as dispatch_order: the model must stop
-          // and let the captain confirm; it must NOT claim the resolver ran.
+          // Armed, not run. Same interlock as dispatch_order.
           return ok(id, {
             armed: true,
             note:
               "Resolver armed and shown to the captain, awaiting a typed `confirm`. Do NOT say it has run. " +
               res.summary,
           });
-        }
-        case "feature_list": {
-          if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
-          return ok(id, {
-            features: ctx.features.list(),
-            queue: ctx.features.queueView(),
-          });
-        }
-        case "feature_status": {
-          if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);
-          const name = String(input.name ?? "").trim();
-          if (!name)
-            return err(id, "feature_status requires a non-empty name.");
-          const res = await ctx.features.status(name);
-          if (!res) return ok(id, { found: false, feature: name });
-          return ok(id, { found: true, ...res });
         }
         case "feature_abandon": {
           if (!ctx.features) return err(id, FEATURE_UNAVAILABLE);

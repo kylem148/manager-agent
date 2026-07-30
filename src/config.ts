@@ -261,14 +261,16 @@ export interface ModelConfig {
    */
   cacheKeepAliveMax: number;
   /**
-   * Compact the message history once it passes this many estimated tokens.
-   * 0 disables it.
+   * The HARD ceiling on message-history size, in bytes (CO_HISTORY_MAX_BYTES).
+   * Crossing it compacts everything but a recent tail into a summary.
+   * 0 disables it (CO_COMPACT=off).
    *
-   * Set high on purpose. Compaction trades cheap reads for expensive writes (see
-   * compaction.ts), so on a normal session it should never fire — this is a
-   * guard against the session left running all day, not routine housekeeping.
+   * Generous on purpose. Compaction trades cheap reads for expensive writes
+   * (see compaction.ts), so on a normal session it should never fire — this is
+   * the guard that keeps a runaway session from growing until the API refuses
+   * it, not routine housekeeping.
    */
-  compactAtTokens: number;
+  historyMaxBytes: number;
   /** Intact exchanges kept verbatim when compacting. Everything older becomes a
    *  summary. */
   compactKeepTurns: number;
@@ -429,10 +431,10 @@ export function loadConfig(): Config {
           ? 0
           : parseIntOr("CO_CACHE_KEEPALIVE_MS", 45 * 60 * 1000),
       cacheKeepAliveMax: parseIntOr("CO_CACHE_KEEPALIVE_MAX", 3),
-      compactAtTokens:
+      historyMaxBytes:
         (env("CO_COMPACT") ?? "").toLowerCase() === "off"
           ? 0
-          : parseIntOr("CO_COMPACT_AT_TOKENS", 60_000),
+          : parseIntOr("CO_HISTORY_MAX_BYTES", 200_000),
       compactKeepTurns: parseIntOr("CO_COMPACT_KEEP_TURNS", 6),
     },
     research: {
