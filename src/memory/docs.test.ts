@@ -16,7 +16,7 @@ import {
   strReplaceDoc,
 } from "./docs.js";
 import { makeExecutor, newSideEffects, toolDefinitions } from "../session/tools.js";
-import { buildSystemPrompt } from "../session/prompt.js";
+import { buildStartupInjection } from "../session/prompt.js";
 import { onWrite } from "./writequeue.js";
 import { rewriteLive, appendLog } from "./memory.js";
 import type { ResearchConfig } from "../config.js";
@@ -277,20 +277,22 @@ test("cold start surfaces architecture.md and plan.md when they exist", async ()
 
     const empty = await readSurfacedDocs(paths);
     assert.deepEqual(empty, [], "nothing to surface on a fresh instance");
-    const fresh = await buildSystemPrompt(paths, research);
+    const fresh = await buildStartupInjection(paths, research);
     assert.ok(!fresh.includes("docs/architecture.md"), "no phantom architecture.md");
 
     await createDoc(paths, "architecture.md", "# Arch\n\nthe hull and the rigging\n");
     await createDoc(paths, "plan.md", "# Plan\n\nthe course we are steering\n");
     await createDoc(paths, "scratch.md", "not surfaced at cold start\n");
 
-    const prompt = await buildSystemPrompt(paths, research);
-    assert.match(prompt, /### docs[/\\]architecture\.md/);
-    assert.match(prompt, /the hull and the rigging/);
-    assert.match(prompt, /### docs[/\\]plan\.md/);
-    assert.match(prompt, /the course we are steering/);
-    assert.ok(!prompt.includes("not surfaced at cold start"), "only the two privileged docs");
-    assert.match(prompt, /activeContext\.md/, "the substrate live state is still there");
+    // The privileged read lands in the startup injection (layer 3), not the
+    // static system prompt: docs are state, and state rides history.
+    const briefing = await buildStartupInjection(paths, research);
+    assert.match(briefing, /## docs[/\\]architecture\.md/);
+    assert.match(briefing, /the hull and the rigging/);
+    assert.match(briefing, /## docs[/\\]plan\.md/);
+    assert.match(briefing, /the course we are steering/);
+    assert.ok(!briefing.includes("not surfaced at cold start"), "only the two privileged docs");
+    assert.match(briefing, /activeContext\.md/, "the substrate live state is still there");
   } finally {
     await cleanup();
   }

@@ -13,6 +13,7 @@ import {
   type TaskRow,
 } from "./taskstore.js";
 import { makeExecutor, newSideEffects, toolDefinitions, TASK_COMMANDS } from "./tools.js";
+import { buildSystemPrompt } from "./prompt.js";
 import type { ResearchConfig } from "../config.js";
 
 /**
@@ -568,13 +569,14 @@ test("the tool's add is never refused on a row count, and promises no ceiling", 
   assert.equal(store.size, 7);
   assert.ok(!JSON.stringify(store.list()).includes("TABLE_FULL"));
 
-  // And the description the model actually reads carries the discipline without
-  // a number, so it cannot plan around a limit that no longer exists.
+  // The restraint lives in the system prompt's task-table section now (the
+  // tool description carries mechanics only), and neither surface may promise
+  // a numeric ceiling the store no longer enforces.
   const tool = toolDefinitions({ dispatch: false }).find((t) => t.name === "task_table");
   assert.ok(tool);
-  assert.match(tool.description, /DEFAULT IS NOT TO ADD A ROW/, "the restraint is still stated");
-  assert.match(tool.description, /There is no row limit/, "and stated as restraint, not as a wall");
   assert.doesNotMatch(tool.description, /\d+ rows maximum|maximum of \d+ rows/, "no count is promised");
+  const prompt = buildSystemPrompt({});
+  assert.match(prompt, /The default is NOT to add a row/, "the restraint is stated where behaviour lives");
 });
 
 test("the tool renames one named row, and refuses in the shape the co can read", async () => {

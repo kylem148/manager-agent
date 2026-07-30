@@ -2,25 +2,26 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   applyCompaction,
-  estimateTokens,
+  historyBytes,
   findCompactionCut,
   planCompaction,
 } from "./compaction.js";
 import type { MessageParam } from "../model.js";
 
 /**
- * Mid-session history compaction.
+ * The hard history ceiling.
  *
  * Two classes of thing have to hold, and they fail very differently.
  *
- * The API constraints fail LOUDLY: a history that starts with an assistant turn,
- * or a `tool_result` whose `tool_use` was dropped on the other side of the cut,
- * is a 400 that costs the captain their turn. Those are pinned hard.
+ * The API constraints fail LOUDLY: a history that starts with an assistant
+ * turn, or a `tool_result` whose `tool_use` was dropped on the other side of
+ * the cut, is a 400 that costs the captain their turn. Those are pinned hard.
  *
- * The economics fail QUIETLY: compacting rewrites the retained tail, and a cached
- * read is a twentieth the price of a write, so a compaction that releases little
- * costs more than it saves and nothing anywhere reports that. Hence the trigger
- * and minimum-release tests.
+ * The ceiling itself has to be HARD: over the cap, a plan comes back whenever
+ * any safe cut exists at all, shrinking the kept tail if the default keep is
+ * itself over the cap - the alternative is a session that grows until the API
+ * refuses it. And it has to SETTLE: a compacted history must not immediately
+ * re-trigger, or every turn pays for another rewrite.
  */
 
 function user(text: string): MessageParam {
@@ -34,7 +35,7 @@ function assistant(text: string): MessageParam {
 /** An assistant turn asking for a tool, and the user turn answering it. */
 function toolExchange(id: string): MessageParam[] {
   return [
-    { role: "assistant", content: [{ type: "tool_use", id, name: "search_log", input: {} }] },
+    { role: "assistant", content: [{ type: "tool_use", id, name: "memory_search", input: {} }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "found" }] },
   ];
 }
@@ -50,13 +51,12 @@ function history(n: number, pad = 10): MessageParam[] {
 
 // --- sizing -------------------------------------------------------------------
 
-test("token estimates cover both string and block content", () => {
-  assert.equal(estimateTokens([]), 0);
-  const plain = estimateTokens([user("x".repeat(380))]);
-  assert.ok(plain > 90 && plain < 110, `expected ~100, got ${plain}`);
+test("byte sizing covers both string and block content", () => {
+  assert.equal(historyBytes([]), 0);
+  assert.equal(historyBytes([user("x".repeat(380))]), 380);
   // Block content is measured through its wire form, because that is what is
   // actually sent and billed.
-  assert.ok(estimateTokens(toolExchange("t1")) > 0);
+  assert.ok(historyBytes(toolExchange("t1")) > 0);
 });
 
 // --- where to cut -------------------------------------------------------------
@@ -94,7 +94,7 @@ test("keeping more turns than exist releases nothing rather than cutting badly",
 });
 
 test("a cut that would drop nothing is refused", () => {
-  // Cutting at index 0 rewrites the entire history to release zero tokens: the
+  // Cutting at index 0 rewrites the entire history to release zero bytes: the
   // worst of both sides of the trade.
   assert.equal(findCompactionCut([user("only"), assistant("reply")], 1), null);
 });
@@ -128,46 +128,73 @@ test("the summary tells the co where the dropped detail went", () => {
   assert.match(String(out[0]!.content), /memory logs/);
 });
 
+test("orientation rides the compaction message, after the summary", () => {
+  // The startup injection is history and history is what gets cut, so this is
+  // the one place orientation could leave the window - and a later whole-file
+  // rewrite of activeContext.md written without the old content in view sheds
+  // standing facts permanently. The re-injection closes that, hardcoded.
+  const orientation = "## .memory/activeContext.md\n\nfocus: the overhaul";
+  const out = applyCompaction(history(6), 6, "the summary", orientation);
+  const head = String(out[0]!.content);
+  assert.match(head, /focus: the overhaul/);
+  assert.match(head, /re-read from disk/);
+  assert.ok(
+    head.indexOf("the summary") < head.indexOf("focus: the overhaul"),
+    "summary first, orientation after it",
+  );
+  // The tail is untouched either way, and omitting orientation changes nothing.
+  assert.deepEqual(out.slice(1), history(6).slice(6));
+  assert.ok(!String(applyCompaction(history(6), 6, "s")[0]!.content).includes("re-read from disk"));
+});
+
 // --- when to do it at all -----------------------------------------------------
 
 test("a session under the ceiling is left alone", () => {
   const msgs = history(4, 100);
-  assert.equal(
-    planCompaction(msgs, { triggerTokens: 60_000, keepTurns: 6, minReleaseTokens: 15_000 }),
-    null,
-  );
+  assert.equal(planCompaction(msgs, { maxBytes: 200_000, keepTurns: 6 }), null);
 });
 
-test("a compaction that would release too little is refused", () => {
-  // Over the trigger, with a safe cut available, but the cut only frees a sliver.
-  // Firing here pays to rewrite the whole retained tail for almost nothing.
-  const msgs = [user("x".repeat(400_000)), assistant("a"), user("b"), assistant("c"), user("d")];
-  const plan = planCompaction(msgs, {
-    triggerTokens: 1_000,
-    keepTurns: 1,
-    minReleaseTokens: 15_000,
-  });
-  assert.ok(plan, "this one should fire — the head is enormous");
-  assert.ok(plan!.before - plan!.after >= 15_000);
+test("over the ceiling, the cap is hard: any safe cut produces a plan", () => {
+  // A small overshoot with a small release still fires — there is no minimum
+  // release to hide behind. Hard means hard.
+  const msgs = history(10, 2_000);
+  const plan = planCompaction(msgs, { maxBytes: 30_000, keepTurns: 6 });
+  assert.ok(plan, "over the cap with safe cuts available must produce a plan");
+  assert.ok(plan!.after <= 30_000, "the retained tail is back under the cap");
+});
 
-  const stingy = planCompaction(history(40, 10), {
-    triggerTokens: 10,
-    keepTurns: 6,
-    minReleaseTokens: 15_000,
-  });
-  assert.equal(stingy, null, "small histories must not trigger a rewrite");
+test("a giant kept tail shrinks the keep until the tail fits", () => {
+  // Six turns of enormous tool results: keeping six would leave the history
+  // over the cap and re-trigger forever. The planner keeps fewer instead.
+  const msgs = history(12, 20_000);
+  const plan = planCompaction(msgs, { maxBytes: 50_000, keepTurns: 6 });
+  assert.ok(plan);
+  assert.ok(plan!.after <= 50_000, `tail is ${plan!.after}, still over the 50k cap`);
+});
+
+test("when even one kept turn is over the cap, the best safe cut still applies", () => {
+  // One enormous final exchange: nothing can get under the cap safely, so the
+  // plan drops everything else - the most that can go without a malformed
+  // request - rather than doing nothing and growing forever.
+  const msgs = [...history(3, 10), user("x".repeat(300_000)), assistant("a")];
+  const plan = planCompaction(msgs, { maxBytes: 100_000, keepTurns: 6 });
+  assert.ok(plan, "a best-effort plan is still returned");
+  assert.equal(plan!.cut, 6, "everything before the giant exchange is dropped");
+});
+
+test("a history with no legal cut is left alone rather than malformed", () => {
+  // A single giant exchange has no second cut point: compacting it would drop
+  // nothing or cut mid-exchange. Null is the only correct answer.
+  const msgs = [user("x".repeat(300_000)), assistant("reply")];
+  assert.equal(planCompaction(msgs, { maxBytes: 100_000, keepTurns: 6 }), null);
 });
 
 test("a plan reports the sizes it is trading between", () => {
   const msgs = history(30, 2_000);
-  const plan = planCompaction(msgs, {
-    triggerTokens: 1_000,
-    keepTurns: 4,
-    minReleaseTokens: 1_000,
-  });
+  const plan = planCompaction(msgs, { maxBytes: 40_000, keepTurns: 4 });
   assert.ok(plan);
   assert.ok(plan!.after < plan!.before);
-  assert.equal(plan!.after, estimateTokens(msgs.slice(plan!.cut)));
+  assert.equal(plan!.after, historyBytes(msgs.slice(plan!.cut)));
   // Round-trip the plan through the transform it describes: the retained tail
   // must be exactly what was measured, or the reported saving is fiction.
   const out = applyCompaction(msgs, plan!.cut, "s");
@@ -175,20 +202,12 @@ test("a plan reports the sizes it is trading between", () => {
 });
 
 test("compacting twice in a row is a no-op the second time", () => {
-  // The guard has to settle. If a compacted history still reads as over the
-  // ceiling, every subsequent turn would pay for another rewrite.
+  // The ceiling has to settle. If a compacted history still read as over the
+  // cap, every subsequent turn would pay for another rewrite.
   const msgs = history(30, 2_000);
-  const first = planCompaction(msgs, {
-    triggerTokens: 20_000,
-    keepTurns: 4,
-    minReleaseTokens: 1_000,
-  });
+  const first = planCompaction(msgs, { maxBytes: 40_000, keepTurns: 4 });
   assert.ok(first);
   const compacted = applyCompaction(msgs, first!.cut, "a short summary");
-  const second = planCompaction(compacted, {
-    triggerTokens: 20_000,
-    keepTurns: 4,
-    minReleaseTokens: 1_000,
-  });
+  const second = planCompaction(compacted, { maxBytes: 40_000, keepTurns: 4 });
   assert.equal(second, null);
 });

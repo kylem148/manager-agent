@@ -1,50 +1,40 @@
 import type { MessageParam, ContentBlockParam } from "../model.js";
 
 /**
- * Mid-session history compaction.
+ * Layer 2: the history ceiling.
  *
- * The conversation grows every turn and the whole of it is re-sent on every
- * round of every turn, so cost per turn climbs for the life of a session. This
- * puts a ceiling on that.
+ * The conversation is re-sent on every round of every turn, so cost per turn
+ * climbs for the life of a session. This puts a HARD ceiling on it, denominated
+ * in bytes (the same unit every other layer budgets in - see prompt.ts): when
+ * history crosses the cap, everything but a recent tail of intact exchanges is
+ * replaced by a model-written summary.
  *
- * The ceiling is deliberately GENEROUS, and that is the whole design. Trimming
- * trades cheap reads for expensive writes: a cached read is billed at 0.1x base
- * input and a 1-hour write at 2x, so dropping history has to save twenty read
- * tokens for every write token it costs before it breaks even. Every compaction
- * rewrites the retained context, so compacting often is a reliable way to spend
- * MORE than doing nothing. Measured against this app's own ledger, a session of
- * ~17 turns is better off never compacting at all; the crossover sits around 24.
+ * The ceiling is generous on purpose. Trimming trades cheap reads for
+ * expensive writes: a cached read bills at 0.1x base input and a 1-hour write
+ * at 2x, and every compaction rewrites the retained context, so compacting
+ * often reliably spends MORE than doing nothing. A normal working session
+ * should never reach the cap; what the cap buys is that the runaway session
+ * trims in a controlled way instead of growing until the API refuses it.
  *
- * So this is a guard against the runaway session, not a routine tidy-up. It
- * should fire rarely or never on a normal working session, and the defaults are
- * picked to make that true.
+ * Hysteresis is structural rather than tuned: the retained tail is a handful
+ * of turns, a small fraction of the cap, so one compaction buys a long run of
+ * cache-clean growth before the ceiling can engage again.
  *
  * Nothing here loses information the co can't get back: the transcript is
- * written every turn, and decisions/progress/research are append-only and
- * searchable. Compaction moves detail out of the live window, not off the disk.
+ * written every turn, and the memory logs are append-only and searchable.
+ * Compaction moves detail out of the live window, not off the disk.
  */
 
-/**
- * Bytes per token, for deciding WHEN to compact.
- *
- * An estimate on purpose. The Bedrock runtime path exposes no token counter
- * (the SDK omits countTokens), and the only exact figure arrives in the usage
- * block after a request has already been billed. 3.8 is measured against this
- * app's own prefix — markdown and JSON tokenize denser than the ~4 rule of
- * thumb, and Opus 4.7+ uses a tokenizer producing ~30% more tokens for the same
- * text. Being off by a fifth moves the trigger point, which is a threshold with
- * a wide safe band; it cannot make the result wrong.
- */
-const BYTES_PER_TOKEN = 3.8;
-
-/** Rough token count of a message array. See BYTES_PER_TOKEN. */
-export function estimateTokens(messages: MessageParam[]): number {
+/** Bytes of a message array as the wire would carry it, near enough. */
+export function historyBytes(messages: MessageParam[]): number {
   let bytes = 0;
   for (const m of messages) {
     bytes +=
-      typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length;
+      typeof m.content === "string"
+        ? Buffer.byteLength(m.content, "utf8")
+        : Buffer.byteLength(JSON.stringify(m.content), "utf8");
   }
-  return Math.round(bytes / BYTES_PER_TOKEN);
+  return bytes;
 }
 
 /**
@@ -52,7 +42,7 @@ export function estimateTokens(messages: MessageParam[]): number {
  *
  * Two hard API constraints, and getting either wrong is a 400 rather than a
  * degradation. The first message must be user-role. And a `tool_result` must
- * still be preceded by the `tool_use` that asked for it — so a user message
+ * still be preceded by the `tool_use` that asked for it - so a user message
  * carrying tool results is NOT a legal cut point, because the assistant turn
  * holding its `tool_use` blocks would be left behind on the other side.
  */
@@ -90,25 +80,40 @@ export function findCompactionCut(
 /**
  * Replace everything before `cut` with a summary, keeping the tail verbatim.
  *
- * The summary goes in as a user message. Two consecutive user messages are legal
- * — the API folds them into one turn — so this needs no filler assistant turn to
- * separate it from the retained tail, and adding one would put words in the co's
- * mouth that it never said.
+ * The summary goes in as a user message. Two consecutive user messages are
+ * legal - the API folds them into one turn - so this needs no filler assistant
+ * turn, and adding one would put words in the co's mouth it never said.
+ *
+ * `orientation` restores an invariant the old architecture had by accident:
+ * live state used to sit in the system prompt and could never leave the
+ * window, so a whole-file rewrite always had the old content in view. Now
+ * orientation enters as history (the startup injection), and this cut is the
+ * one place it can vanish - after which a later rewrite of activeContext.md
+ * would be written from a window missing standing facts, shedding them
+ * permanently with nothing failing. So the compaction message re-carries the
+ * current files verbatim, hardcoded, the same mechanism-over-judgment move as
+ * the protocol gate. A few KB, once, in a session that just freed far more.
  */
 export function applyCompaction(
   messages: MessageParam[],
   cut: number,
   summary: string,
+  orientation?: string,
 ): MessageParam[] {
   return [
     {
       role: "user",
       content:
-        "[Earlier conversation, compacted to keep this session's context" +
-        " affordable. This is your own summary of what came before; the full" +
-        " exchange is in the session transcript and the memory logs if you need" +
-        " detail from it.]\n\n" +
-        summary,
+        "[Earlier conversation, compacted to keep this session under its" +
+        " context ceiling. This is your own summary of what came before; the" +
+        " full exchange is in the session transcript and the memory logs if" +
+        " you need detail from it.]\n\n" +
+        summary +
+        (orientation
+          ? "\n\n[Your live orientation, re-read from disk at this compaction" +
+            " so it stays in front of you whatever the summary kept:]\n\n" +
+            orientation
+          : ""),
     },
     ...messages.slice(cut),
   ];
@@ -118,30 +123,36 @@ export function applyCompaction(
 export interface CompactionPlan {
   /** Index the retained tail starts at. */
   cut: number;
-  /** Estimated tokens before compacting. */
+  /** History bytes before compacting. */
   before: number;
-  /** Estimated tokens the retained tail alone accounts for. */
+  /** Bytes the retained tail alone accounts for. */
   after: number;
 }
 
 /**
- * Decide whether to compact, and where.
+ * Decide whether to compact, and where. The ceiling is HARD: over the cap,
+ * this returns a plan whenever any safe cut exists at all.
  *
- * Returns null unless compacting would actually pay: over the threshold, a safe
- * cut point exists, AND the cut releases enough to be worth the rewrite it
- * costs. That last check is the one that matters — a compaction that drops a few
- * thousand tokens still rewrites the whole retained tail, so firing on a small
- * win is how this feature would end up costing more than it saves.
+ * It first tries to keep `keepTurns` intact exchanges. If the tail those
+ * turns make is itself still over the cap (a run of enormous tool results),
+ * it keeps fewer, down to the final exchange alone - the most that can be
+ * dropped safely. Null only below the cap, or when no legal cut exists (the
+ * history is effectively one giant exchange, which nothing can split without
+ * a malformed request).
  */
 export function planCompaction(
   messages: MessageParam[],
-  opts: { triggerTokens: number; keepTurns: number; minReleaseTokens: number },
+  opts: { maxBytes: number; keepTurns: number },
 ): CompactionPlan | null {
-  const before = estimateTokens(messages);
-  if (before < opts.triggerTokens) return null;
-  const cut = findCompactionCut(messages, opts.keepTurns);
-  if (cut === null) return null;
-  const after = estimateTokens(messages.slice(cut));
-  if (before - after < opts.minReleaseTokens) return null;
-  return { cut, before, after };
+  const before = historyBytes(messages);
+  if (before <= opts.maxBytes) return null;
+  let best: CompactionPlan | null = null;
+  for (let keep = Math.max(0, opts.keepTurns); keep >= 0; keep--) {
+    const cut = findCompactionCut(messages, keep);
+    if (cut === null) continue;
+    const after = historyBytes(messages.slice(cut));
+    best = { cut, before, after };
+    if (after <= opts.maxBytes) break;
+  }
+  return best;
 }

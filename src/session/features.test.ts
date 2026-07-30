@@ -1414,13 +1414,13 @@ test("the feature_enqueue TOOL declares the message and threads it to the pull r
   assert.equal(props.prTitle?.type, "string");
   assert.equal(props.prBody?.type, "string");
   assert.deepEqual(def.input_schema.required, ["name"], "both halves are optional");
-  assert.match(props.prTitle?.description ?? "", /concise imperative line/);
+  assert.match(props.prTitle?.description ?? "", /imperative, specific line/);
   // The template itself lives in protocols.ts now: one copy, read when needed.
   // The schema's job is to send the co there, and to say the gate exists.
-  assert.match(props.prBody?.description ?? "", /read_protocol/);
-  assert.match(props.prBody?.description ?? "", /refuses a body until you have/);
-  assert.match(def.description, /pass `prTitle` and `prBody`/, "the description tells co to write it");
-  assert.match(def.description, /keeps the message you already wrote/, "and that omitting preserves it");
+  assert.match(props.prBody?.description ?? "", /pr-message protocol/);
+  assert.match(def.description, /a body written without it is refused/);
+  assert.match(def.description, /`prTitle` and `prBody`/, "the description tells co to write it");
+  assert.match(def.description, /omitted message fields keep what is stored/, "omitting preserves it");
 
   const fx = await makeFixture();
   try {

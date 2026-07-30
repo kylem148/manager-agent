@@ -92,20 +92,27 @@ test("the system prompt is sent as a block carrying a cache breakpoint", async (
   ]);
 });
 
-test("only the last tool definition closes the tools prefix", async () => {
+test("tools carry no breakpoint of their own; the system entry covers them", async () => {
   const provider = new ModelProvider({ ...CFG });
   const sent = stubClient(provider, [endTurn]);
 
   await provider.runTurn(turn([{ role: "user", content: "hi" }]));
 
+  // One prefix entry, at the end of the system prompt, spans tools + system.
+  // A breakpoint reappearing on a tool would silently split the prefix into
+  // two entries and pay a second write for nothing.
   const tools = sent[0]!.tools as Array<Record<string, unknown>>;
   assert.equal(tools.length, 2);
-  assert.equal(tools[0]!.cache_control, undefined);
-  // The one-hour TTL is load-bearing, not incidental: under the five-minute
-  // default every pause longer than a thought expires this entry and the next
-  // turn re-writes the whole prefix. Asserted here so a silent revert to a bare
-  // `ephemeral` fails a test rather than quietly tripling the bill.
-  assert.deepEqual(tools[1]!.cache_control, { type: "ephemeral", ttl: "1h" });
+  for (const t of tools) assert.equal(t.cache_control, undefined);
+  // The one-hour TTL on the system entry is load-bearing, not incidental:
+  // under the five-minute default every pause longer than a thought expires
+  // the entry and the next turn re-writes the whole prefix. Asserted so a
+  // silent revert to a bare `ephemeral` fails a test rather than quietly
+  // tripling the bill.
+  assert.deepEqual((sent[0]!.system as any[])[0].cache_control, {
+    type: "ephemeral",
+    ttl: "1h",
+  });
 });
 
 test("a request never exceeds Bedrock's four cache breakpoints", async () => {
@@ -231,12 +238,14 @@ test("a cache probe replays the prefix a real turn would send", async () => {
 
   assert.equal(sent.length, 1);
   const p = sent[0]!;
-  // Same system block with its breakpoint, same tools prefix — otherwise the two
-  // biggest cached tiers are missed.
+  // Same system block with its breakpoint, same unmarked tools ahead of it —
+  // any drift writes a fresh entry instead of touching the one being kept warm.
   assert.deepEqual(p.system, [
     { type: "text", text: "system prompt", cache_control: { type: "ephemeral", ttl: "1h" } },
   ]);
-  assert.ok((p.tools as any[])[1].cache_control, "the tools prefix must still be closed");
+  for (const t of p.tools as any[]) {
+    assert.equal(t.cache_control, undefined, "tools stay unmarked, exactly like a real round");
+  }
   assert.ok(countBreakpoints(p) <= 4, "a probe is still bound by Bedrock's ceiling");
 });
 

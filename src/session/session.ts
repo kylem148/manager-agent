@@ -2,10 +2,10 @@ import * as readline from "node:readline";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { effortLevelsFor, parseEffort, type Config, type Effort } from "../config.js";
-import type { InstancePaths } from "../paths.js";
+import type { InstancePaths, LiveFile } from "../paths.js";
 import { CACHE_TTL, ModelProvider, type MessageParam } from "../model.js";
 import { CostLedger, formatCostReport } from "../cost.js";
-import { buildSystemPrompt } from "./prompt.js";
+import { buildSystemPrompt, buildStartupInjection } from "./prompt.js";
 import {
   toolDefinitions,
   makeExecutor,
@@ -328,12 +328,14 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // greeting, which is a real billed turn) and is otherwise silent all session.
   const costs = await CostLedger.load(paths);
 
-  const system = await buildSystemPrompt(paths, cfg.research, {
+  // The resident prompt is static (identity + behaviour + tools); everything
+  // per-instance rides the startup injection below, as the first message of
+  // history, where it ages and scrolls like the state it is.
+  const system = buildSystemPrompt({ dispatch: Boolean(dispatch) });
+  const briefing = await buildStartupInjection(paths, cfg.research, {
     excludeTranscript: transcript.file,
-    // Read ONCE, here, into the live-state block. The captain edits the table
-    // all session from the panel, but this prompt is the cache prefix: a block
-    // that re-read the store per turn would change bytes underneath it and cost
-    // the whole cache. The co reads the current table with `task_table list`.
+    // The table is read ONCE, here. The captain edits it all session from the
+    // panel; the co reads the current table with `task_table list`.
     tasks: taskStore.list(),
     dispatch: dispatch
       ? {
@@ -424,7 +426,10 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     paths,
     model,
     system,
-    messages: [],
+    // Layer 3: the session briefing opens the history. It is a plain user
+    // message - internal scaffolding, never logged as a "you" turn - and the
+    // rolling anchors cache it incrementally like everything after it.
+    messages: [{ role: "user", content: briefing }],
     effects,
     io,
     transcript,
@@ -474,7 +479,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
 
     // The feature levers drive the parallel-worktree flow over the registry.
     // The landing gate needs the interactive overlay (openLandingReview), which
-    // only the Tui provides; on PlainIO (piped/non-TTY) feature_land reports it
+    // only the Tui provides; on PlainIO (piped/non-TTY) the engine reports it
     // needs an interactive session rather than crashing.
     state.features = new FeatureManager({
       registry: state.registry,
@@ -692,13 +697,6 @@ function printClosingSummary(state: SessionState): void {
   line(c.dim(`  memory: ${state.paths.root}`));
 }
 
-/**
- * Tokens a compaction must release to be worth the rewrite it costs. Below this
- * it fires, pays to rewrite the whole retained tail, and saves almost nothing —
- * which is how a cost feature turns into a cost.
- */
-const COMPACT_MIN_RELEASE_TOKENS = 15_000;
-
 const COMPACT_REQUEST =
   "Session compaction (bookkeeping, not a question from the captain). This" +
   " conversation has grown long enough to be worth compressing. Write a summary" +
@@ -739,9 +737,9 @@ async function runOpeningGreeting(state: SessionState): Promise<void> {
     role: "user",
     content:
       "SESSION START (spoken by you, the co-manager, unprompted). You have just" +
-      " come aboard and read the system prompt above, which holds your live state" +
-      " AND a verbatim tail of our last conversation. Greet the captain and report" +
-      " where we left off. Open with an acknowledgement in character — e.g." +
+      " come aboard and read your session briefing above, which holds your live" +
+      " state AND a verbatim tail of our last conversation. Greet the captain and" +
+      " report where we left off. Open with an acknowledgement in character — e.g." +
       ' "Aye, ready to work, captain." — then, in 2-4 sentences, summarise the' +
       " current focus, anything in flight, and the most useful next step. Draw on" +
       " your live state first; where it is thin or stale, lean on the recent" +
@@ -913,27 +911,24 @@ async function drive(
 }
 
 /**
- * Put a ceiling on the message history, once, when a session runs long.
+ * The hard history ceiling, engaged when a session runs long.
  *
- * Everything about the shape of this is driven by one price ratio: a cached read
- * is billed at 0.1x base input and a 1-hour write at 2x, so compacting has to
- * save twenty read tokens for every write token it costs. Since every compaction
- * rewrites the retained tail, firing eagerly is a reliable way to spend more than
- * doing nothing — on this app's measured sessions the break-even sits around 24
- * turns. Hence a high trigger, a minimum release, and the expectation that a
- * normal session never reaches it.
+ * The cap is generous because compaction is expensive: a cached read bills at
+ * 0.1x base input and a 1-hour write at 2x, and every compaction rewrites the
+ * retained tail, so a normal session should never reach it. What HARD buys is
+ * the other end: a runaway session trims in a controlled way instead of
+ * growing until the API refuses the request mid-conversation.
  *
  * Nothing is lost that the co cannot get back. The transcript is written every
- * turn and the logs are append-only and searchable, so this moves detail out of
- * the live window, not off the disk.
+ * turn and the logs are append-only and searchable, so this moves detail out
+ * of the live window, not off the disk.
  */
 async function maybeCompact(state: SessionState): Promise<void> {
-  const trigger = state.cfg.model.compactAtTokens;
-  if (trigger <= 0) return;
+  const maxBytes = state.cfg.model.historyMaxBytes;
+  if (maxBytes <= 0) return;
   const plan = planCompaction(state.messages, {
-    triggerTokens: trigger,
+    maxBytes,
     keepTurns: state.cfg.model.compactKeepTurns,
-    minReleaseTokens: COMPACT_MIN_RELEASE_TOKENS,
   });
   if (!plan) return;
 
@@ -953,7 +948,26 @@ async function maybeCompact(state: SessionState): Promise<void> {
     return;
   }
 
-  state.messages = applyCompaction(state.messages.slice(0, before), plan.cut, summary);
+  // Orientation rides the compaction message so it can never be summarized
+  // out of the window (see applyCompaction). Best-effort: a read failure
+  // costs the re-injection, never the compaction itself.
+  let orientation: string | undefined;
+  try {
+    const live = await readLiveMemory(state.paths);
+    orientation = (Object.keys(live) as LiveFile[])
+      .map((f) => `## .memory/${f}\n\n${live[f].trim() || "(empty)"}`)
+      .join("\n\n");
+  } catch {
+    orientation = undefined;
+  }
+  state.messages = applyCompaction(state.messages.slice(0, before), plan.cut, summary, orientation);
+
+  // The compacted head may have carried protocol sections, so the live window
+  // can no longer be assumed to hold them. Resetting the ledger keeps its
+  // meaning crisp - "this section is verbatim in the window" - and restores
+  // both mechanisms: the next re-read returns the real body, and the next
+  // gated act is re-handed the contract. Worst case is one redundant copy.
+  state.effects.protocolsRead.clear();
 
   // Said out loud, unlike every other piece of the co's bookkeeping. Memory
   // writes are invisible because they change nothing the captain can observe;
@@ -961,7 +975,7 @@ async function maybeCompact(state: SessionState): Promise<void> {
   // stops remembering something you both said an hour ago is a bug report
   // waiting to happen. One dim line, once.
   const freed = plan.before - plan.after;
-  const note = `compacted earlier conversation (~${freed.toLocaleString("en-US")} tokens)`;
+  const note = `compacted earlier conversation (~${Math.round(freed / 1024).toLocaleString("en-US")} KB)`;
   state.io.appendBlock(c.dim(`  · ${note}`));
   // Written to the transcript as well as the screen, unlike the screen-only
   // notices elsewhere. A compaction is the one piece of bookkeeping whose effect
@@ -1496,7 +1510,7 @@ async function drainReviews(state: SessionState): Promise<void> {
         resolveNote =
           `\n\nThis dispatch was a merge-queue RESOLVER for '${job.feature}'. After it finished the ` +
           `head was re-processed: ${headLine}. Tell the captain whether the head is ready to merge ` +
-          `(feature_merge_head), still blocked (they can resolve again with feature_resolve_head until ` +
+          `(the captain's [m] in the panel), still blocked (they can resolve again with feature_resolve_head until ` +
           `the attempt limit, or fix by hand / abandon), and factor that into your verdict.`;
         state.io.appendBlock(c.dim(`  · resolver finished for '${job.feature}': ${headLine}`));
       } catch (e) {
@@ -1684,7 +1698,7 @@ async function handleCommand(state: SessionState, raw: string): Promise<CommandR
       // step — recording is silent and self-managed.
       state.messages.push({
         role: "user",
-        content: `Record this as a decision now with append_decision. Use the rationale already in our conversation; if some context is thin, record it anyway and note the open questions inline in the entry. Then refresh activeContext.md to reference the new decision id. Keep your spoken reply natural and brief, and do not narrate the memory write. Decision: ${arg}`,
+        content: `Record this as a decision now with memory_write (kind: decision). Use the rationale already in our conversation; if some context is thin, record it anyway and note the open questions inline in the entry. Then rewrite activeContext (memory_rewrite) to reference the new decision id. Keep your spoken reply natural and brief, and do not narrate the memory write. Decision: ${arg}`,
       });
       await drive(state);
       return "ok";
@@ -1791,7 +1805,7 @@ async function syncActiveContext(state: SessionState, force: boolean, quiet = fa
     role: "user",
     content:
       "Session sync: update .memory/activeContext.md so the next cold start orients" +
-      " correctly. Use rewrite_active_context. Reflect the current focus, decisions" +
+      " correctly. Use memory_rewrite (file: activeContext). Reflect the current focus, decisions" +
       " in flight, recent confirmed decisions (compressed, with ids), open questions," +
       " known risks, and next likely actions. Crucially, update the \"Recent" +
       " conversation\" section to summarise what we actually discussed this session -" +
