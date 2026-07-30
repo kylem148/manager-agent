@@ -71,8 +71,8 @@ text, never into a memory file.
 **Write it short, and trust the crew.** The agent reading this is capable and it
 can read the repo; you cannot. Every line you spend describing what it could
 discover in one \`grep\` is a line that buys nothing and costs on both sides — you
-generate it, then it reads it. Aim for well under a page. A short order that
-names the outcome and the constraints beats a long one that tries to pre-empt
+generate it, then it reads it. **Hard limit: 40 lines and 350 words per order.**
+State the outcome and the constraints, and let the coding agent choose the
 implementation.
 
 - **Do NOT restate the repo.** No file inventories, no descriptions of existing
@@ -124,13 +124,12 @@ three things and NOTHING else:
    the output, and not a claim that it passed.
 3. The approaches it tried and abandoned, with the reason each was dropped.
 
-**Tell the crew to keep that report tight: a few lines per item, no narration of
-the work, no restating the order back, no summary of files it touched beyond the
-diffstat.** This matters more than it looks. Nothing truncates that report — it
-reaches you whole by design, because half a report is worse than none — so its
-length is decided entirely by what you asked for. A crew told to "report what you
-did" writes an essay you then carry in context for the rest of the session; a
-crew told to close with three tight items writes three tight items.`,
+**Hard limit: 50 lines for the whole report.** Diffstat as-is; verification
+trimmed to its summary lines, with any failure text verbatim; abandoned
+approaches one line each. Tell the crew to end the report by stating its own
+line count. Nothing truncates that report — it reaches you whole by design,
+because half a report is worse than none — so its length is decided entirely by
+what you asked for.`,
   },
   "features": {
     title: "Features (parallel worktrees)",

@@ -245,8 +245,8 @@ test("every order makes the crew close its report with the material the PR needs
     // design, so its length is decided entirely by what the order asked for — a
     // crew told to "report what you did" writes an essay the co then carries in
     // context for the rest of the session.
-    assert.match(prompt, /keep that report tight/);
-    assert.match(prompt, /no narration of\s+the work/);
+    assert.match(prompt, /Hard limit: 50 lines for the whole report/);
+    assert.match(prompt, /end the report by stating its own\s+line count/);
   } finally {
     await cleanup();
   }

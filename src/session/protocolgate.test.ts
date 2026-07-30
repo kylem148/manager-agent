@@ -56,7 +56,7 @@ test("a first dispatch is refused, and the refusal carries the protocol", async 
     // Not a pointer to a tool the co might forget to call — the contract itself.
     assert.match(String(res.content), /### Orders protocol/);
     assert.match(String(res.content), /Do NOT restate the repo/);
-    assert.match(String(res.content), /keep that report tight/);
+    assert.match(String(res.content), /Hard limit: 50 lines for the whole report/);
     // And it must be unambiguous that the order did not go anywhere, or the co
     // will tell the captain it dispatched.
     assert.match(String(res.content), /Nothing has been staged/);
