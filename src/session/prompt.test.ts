@@ -553,21 +553,20 @@ test("the two lanes are in the protocol: which verb grants which, and who is enf
   }
 });
 
-test("an audit run files no review, and only a writer blocks the levers", async () => {
+test("an audit run gets no verdict, and only a writer blocks the levers", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
     const prompt = await reachable(paths);
-    // The routing rule. The co files a review for EVERY completion by standing
-    // instruction, so the exception has to be explicit or an audit lands in the
-    // inbox with an accept/rework verdict for work that was never done.
+    // The routing rule. The co reviews EVERY completion by standing instruction,
+    // so the exception has to be explicit or an audit picks up an accept/rework
+    // verdict for work that was never done.
     assert.match(prompt, /\*\*A read-only run's result is NOT a review\.\*\*/);
-    assert.match(prompt, /Do NOT call \\?`file_review\\?` for it/);
-    assert.match(prompt, /do not give\s+it a verdict/);
+    assert.match(prompt, /Do NOT give it a verdict, and do not treat it\s+as work delivered/);
     assert.match(prompt, /Answer\s+the captain with what it found/);
     // The review protocol's own completion bullet has to agree with it.
     assert.match(
       prompt,
-      /that comes back as\s+context to answer with, and you file no review for it/,
+      /that comes back as\s+context to answer with, and you give it no verdict/,
       "stated where the co reads about completions, not only in the lanes section",
     );
     // The role-aware guard, and the consequence the co would otherwise misread.
@@ -691,9 +690,11 @@ test("the guardrails stay permanent, because they bind every turn", async () => 
     assert.match(prompt, /never write over a\s+row you did not name/i);
     assert.match(prompt, /You never inspect, edit, or run the user's source code/);
     assert.match(prompt, /gated by the captain's typed\s+confirm/);
-    // The review level gate decides how much of a review reaches the chat, on
-    // every completion, with no lookup in between.
-    assert.match(prompt, /Never paste the review body into the chat/);
+    // Silence-by-default on a completed run binds on every completion, with no
+    // lookup in between: a review the co speaks before checking a protocol is a
+    // review the captain has already had to read.
+    assert.match(prompt, /Silence is the default and it is total/);
+    assert.match(prompt, /say nothing at all, and let the run pass/);
   } finally {
     await cleanup();
   }

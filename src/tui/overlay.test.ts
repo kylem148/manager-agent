@@ -8,12 +8,10 @@ import {
   osc52,
   packRow,
   pad,
-  renderInboxItem,
   renderMarkdownDoc,
   type DocSource,
   type FeaturePanelEntry,
   type FeaturePanelSource,
-  type InboxPanelEntry,
   type InStream,
   type LandingReview,
   type OutStream,
@@ -128,7 +126,6 @@ function harness(
   cols = 40,
   rows = 12,
   queue?: QueuePanelSource,
-  inbox?: { list(): InboxPanelEntry[] },
   features?: FeaturePanelSource,
   tasks?: TaskPanelSource,
 ): Harness {
@@ -159,7 +156,6 @@ function harness(
     inp,
     docs,
     ...(queue ? { queue } : {}),
-    ...(inbox ? { inbox } : {}),
     ...(features ? { features } : {}),
     ...(tasks ? { tasks } : {}),
   });
@@ -596,28 +592,18 @@ test("on a narrow terminal the copy hint survives and the scroll indicator still
   h.stop();
 });
 
-test("y stays scoped to a doc: it copies nothing from a filed review body", async () => {
-  const entry: InboxPanelEntry = {
-    level: "L1",
-    verdict: "rework",
-    headline: "auth middleware never ran",
-    body: "Went wrong: the middleware is registered after the route.",
-    timestamp: "2026-07-24T11:05:00.000Z",
-    jobId: "job-003",
-  };
-  const h = harness(undefined, 72, 16, undefined, { list: () => [entry] });
+test("y stays scoped to a doc: it copies nothing from the queue tab", async () => {
+  const h = harness(undefined, 72, 16, fakeQueue(READY_VIEW, READY_DETAIL));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
-  h.send("a"); // drill into the filed review
-  await settle();
-  assert.match(h.lastFramePlain(), /inbox · L1 rework/, "in a filed review body");
+  assert.match(h.lastFramePlain(), /queue/, "on the queue tab");
 
   const before = h.writes().length;
   h.send("y");
   await settle();
   assert.equal(clipboardPayload(h.writes().slice(before)), null, "no clipboard write");
-  // And the inbox body's own footer is untouched by the doc view's new key.
+  // And the queue tab's own footer is untouched by the doc view's key.
   assert.ok(!h.lastFramePlain().includes("y copy"), "the hint is the doc view's alone");
   h.stop();
 });
@@ -863,29 +849,25 @@ test("the wheel still scrolls the panel, and a drag never fires the queue's [m]"
   h.stop();
 });
 
-test("a drag selects on the inbox tab too, not just on a doc", async () => {
-  const entry: InboxPanelEntry = {
-    level: "L1",
-    verdict: "rework",
-    headline: "auth middleware never ran",
-    body: "zulu\nyankee\n",
-    timestamp: "2026-07-24T11:05:00.000Z",
-    jobId: "job-003",
-  };
-  const h = harness(undefined, 72, 14, undefined, { list: () => [entry] });
+test("a drag selects on the queue tab too, not just on a doc", async () => {
+  const h = harness(undefined, 72, 20, fakeQueue(READY_VIEW, READY_DETAIL));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
-  h.send("a"); // drill into the filed review
-  await settle();
-  const row = docRowOf(h, "zulu");
+  // The PR link is the thing a captain actually drags off this tab.
+  const row = docRowOf(h, "https://github.com/acme/repo/pull/42");
+  const frame = h.lastFrame();
+  const painted = stripAnsi(
+    new RegExp(`\\x1b\\[${row};1H\\x1b\\[2K([^\\x1b]*)`).exec(frame)![1]!,
+  );
+  const at = painted.indexOf("https://");
 
   const before = h.writes().length;
-  h.send(mousePress(1, row));
-  h.send(mouseDrag(4, row));
-  h.send(mouseRelease(4, row));
+  h.send(mousePress(at + 1, row));
+  h.send(mouseDrag(at + 8, row));
+  h.send(mouseRelease(at + 8, row));
   await settle();
-  assert.equal(clipboardPayload(h.writes().slice(before)), "zulu", "the body surface selects too");
+  assert.equal(clipboardPayload(h.writes().slice(before)), "https://", "the queue body selects too");
   h.stop();
 });
 
@@ -2051,287 +2033,13 @@ test("no doc is labelled `i` or with a digit, so no panel key can shadow a selec
   h.stop();
 });
 
-// --- the inbox tab -------------------------------------------------------------
-//
-// The rolling record of filed crew reviews (D-20260724-8). It is a READ surface:
-// a list of what the co filed, newest first, each drilling into its full body.
-// Nothing here can merge, reject, or act on anything — that's the queue tab's
-// job, and keeping the two key spaces apart is why they're separate tabs.
-
-/** An inbox source whose snapshot the test swaps between paints, to prove the
- *  panel reads it fresh (no cached list) — the same contract as fakeQueue. */
-function fakeInbox(initial: InboxPanelEntry[]): {
-  list(): InboxPanelEntry[];
-  set(v: InboxPanelEntry[]): void;
-} {
-  let cur = initial;
-  return { list: () => cur, set: (v) => (cur = v) };
-}
-
-const REVIEWS: InboxPanelEntry[] = [
-  {
-    level: "L1",
-    verdict: "rework",
-    headline: "auth middleware never ran",
-    body: "Went wrong: the middleware is registered after the route.\n\nVerdict: rework.",
-    timestamp: "2026-07-24T11:05:00.000Z",
-    jobId: "job-003",
-    feature: "auth",
-  },
-  {
-    level: "L2",
-    verdict: "fix-commit",
-    headline: "shipped, migration untested",
-    body: "Went right: endpoint ships.\n\nVerdict: fix-commit.",
-    timestamp: "2026-07-24T10:40:00.000Z",
-    jobId: "job-002",
-  },
-  {
-    level: "L3",
-    verdict: "accept",
-    headline: "rename landed clean",
-    body: "All criteria met.\n\nVerdict: accept.",
-    timestamp: "2026-07-24T09:12:00.000Z",
-    jobId: "job-001",
-  },
-];
-
-test("the inbox tab lists filed reviews newest-first with level, verdict and headline", async () => {
-  const h = harness(undefined, 72, 16, undefined, fakeInbox(REVIEWS));
-  h.tui.question();
-  h.send(CTRL_O);
-  await settle();
-  const frame = h.lastFramePlain();
-  assert.match(frame, /inbox/, "the header names the inbox tab");
-  assert.match(frame, /a\)\s*\[L1\]\s*rework\s+auth middleware never ran/, "newest is first, label 1");
-  assert.match(frame, /b\)\s*\[L2\]\s*fix-commit\s+shipped, migration untested/);
-  assert.match(frame, /c\)\s*\[L3\]\s*accept\s+rename landed clean/);
-  // A list row is a summary: the body stays out of it until you open one.
-  assert.ok(!frame.includes("middleware is registered"), "bodies aren't in the list");
-  h.stop();
-});
-
-/** The panel's rows as PAINTED, split out of the frame by the cursor moves that
- *  place them. lastFramePlain() abuts the rows, which hides a row's indent. */
-function paintedRows(h: Harness): string[] {
-  return h.lastFrame().split(/\x1b\[\d+;1H/).slice(1).map(stripAnsi);
-}
-
-test("every inbox row keeps its two-space indent when the headline runs past the edge", async () => {
-  // Each painted row goes through clip(), which truncates by word-wrapping, and
-  // a wrap point drops a leading space run (wrap.ts). An entry built wider than
-  // the screen therefore came back flush against the left edge while its shorter
-  // neighbours stayed indented, so the list's left margin went ragged entry by
-  // entry. The rows are laid out to the width now, so none of them reach clip().
-  const long: InboxPanelEntry[] = REVIEWS.map((r, i) => ({
-    ...r,
-    headline: `entry ${i + 1} with a headline far past the right-hand edge of this panel`,
-  }));
-  const h = harness(undefined, 60, 14, undefined, fakeInbox([...long, ...REVIEWS]));
-  h.tui.question();
-  h.send(CTRL_O);
-  await settle();
-  const rows = paintedRows(h).filter((r) => /\w\) \[L\d\]/.test(r));
-  assert.equal(rows.length, 6, "a row per entry, long and short alike");
-  for (const r of rows) {
-    assert.match(r, /^ {2}\S/, `indented by exactly two: ${JSON.stringify(r)}`);
-    assert.ok(r.length <= 60, `laid out inside the width: ${r.length} in ${JSON.stringify(r)}`);
-  }
-  h.stop();
-});
-
-test("a drilled-in review keeps its header indent when the headline wraps", () => {
-  const entry: InboxPanelEntry = {
-    ...REVIEWS[0]!,
-    headline: "a headline long enough that it has to wrap onto a second visual row here",
-  };
-  const rows = renderInboxItem(entry, 40).map(stripAnsi);
-  assert.equal(rows[0], "", "the entry opens with one blank line and no more");
-  const header = rows.slice(1, rows.indexOf("", 1));
-  assert.ok(header.length > 2, "the headline and metadata both wrapped");
-  for (const r of header) {
-    assert.match(r, /^ {2}\S/, `header row indented by exactly two: ${JSON.stringify(r)}`);
-  }
-});
-
-test("selecting a review drills into its full body and pages; Backspace returns to the list", async () => {
-  const long = Array.from({ length: 60 }, (_, i) => `body line ${i + 1}`).join("\n");
-  const entries: InboxPanelEntry[] = [
-    { ...REVIEWS[0]!, body: long },
-    ...REVIEWS.slice(1),
-  ];
-  const h = harness(undefined, 72, 16, undefined, fakeInbox(entries));
-  h.tui.question();
-  h.send(CTRL_O);
-  await settle();
-  h.send("a");
-  await settle();
-  const opened = h.lastFramePlain();
-  assert.match(opened, /inbox · L1 rework/, "the header names the open review");
-  assert.match(opened, /auth middleware never ran/, "the headline leads the body view");
-  assert.match(opened, /job-003/, "the metadata line names the job");
-  // Painted rows abut in the frame, so the first two lines prove the top.
-  assert.match(opened, /body line 1body line 2/);
-  assert.ok(!opened.includes("body line 60"), "a long body starts at the top");
-
-  h.send(" "); // page down, the same less-style paging docs and diffs use
-  assert.ok(!h.lastFramePlain().includes("body line 1body line 2"), "paged past the start");
-  h.send("G");
-  assert.match(h.lastFramePlain(), /body line 60/, "G jumps to the end");
-
-  h.send("\x7f"); // Backspace
-  assert.match(h.lastFramePlain(), /b\)\s*\[L2\]/, "back on the inbox list");
-  h.send(ESC);
-  h.stop();
-});
-
-test("an empty inbox says so rather than showing a blank tab", async () => {
-  const h = harness(undefined, 60, 12, undefined, fakeInbox([]));
-  h.tui.question();
-  h.send(CTRL_O);
-  await settle();
-  assert.match(h.lastFramePlain(), /No reviews filed yet/);
-  h.send("a"); // a stray selector on an empty list is a no-op, not a crash
-  await settle();
-  h.send(ESC);
-  h.stop();
-});
-
-test("the inbox reads its source fresh: a review filed while the panel is open shows up", async () => {
-  const src = fakeInbox([REVIEWS[2]!]);
-  const h = harness(undefined, 72, 16, undefined, src);
-  h.tui.question();
-  h.send(CTRL_O);
-  await settle();
-  assert.match(h.lastFramePlain(), /a\)\s*\[L3\]/);
-  // The co files a new one mid-session; the next paint picks it up. Transcript
-  // output coalesces its frame (~60fps), so wait for it rather than the tick.
-  src.set([REVIEWS[0]!, REVIEWS[2]!]);
-  h.tui.appendBlock("something happened");
-  await frame();
-  assert.match(h.lastFramePlain(), /a\)\s*\[L1\]\s*rework/, "the new review is now first");
-  h.stop();
-});
-
-test("Tab cycles queue → docs → inbox and back, and each tab keeps its own keys", async () => {
-  const docs = fakeDocs({ "plan.md": "# Plan\n" });
-  const q = fakeQueue({
-    size: 1,
-    head: null,
-    entries: [{ feature: "headfeat", position: 1, isHead: true, status: "queued" }],
-  });
-  const h = harness(docs, 72, 16, q, fakeInbox(REVIEWS));
-  h.tui.question();
-  h.send(CTRL_O);
-  await settle();
-  assert.match(h.lastFramePlain(), /headfeat/, "opens on the queue tab, as before");
-  h.send("\t");
-  await settle();
-  assert.match(h.lastFramePlain(), /a\)\s*plan\.md/, "Tab reaches docs");
-  h.send("\t");
-  await settle();
-  assert.match(h.lastFramePlain(), /a\)\s*\[L1\]\s*rework/, "Tab reaches the inbox");
-  h.send("\t");
-  await settle();
-  assert.match(h.lastFramePlain(), /headfeat/, "and wraps back to the queue");
-
-  // Sub-view → its own tab: open a review, Tab pops back to the inbox list.
-  h.send("\t");
-  h.send("\t");
-  await settle();
-  h.send("b");
-  await settle();
-  assert.match(h.lastFramePlain(), /inbox · L2 fix-commit/);
-  h.send("\t");
-  assert.match(h.lastFramePlain(), /c\)\s*\[L3\]/, "Tab from an open review returns to the list");
-  h.stop();
-});
-
-test("with only an inbox wired, Ctrl-O opens it and keystrokes never reach the prompt", async () => {
-  const h = harness(undefined, 72, 16, undefined, fakeInbox(REVIEWS));
-  const answer = h.tui.question();
-  h.send(CTRL_O);
-  await settle();
-  assert.match(h.lastFramePlain(), /rename landed clean/);
-  h.send("hello"); // would otherwise land in the input buffer
-  await settle();
-  h.send(ESC);
-  h.send("real\r");
-  assert.equal(await answer, "real");
-  h.stop();
-});
-
-// --- the panel keybinds meet the inbox tab -----------------------------------
-//
-// `i`/Ctrl-O (D-20260724-9) and the inbox tab (D-20260724-8) were built against
-// a two-tab panel and a queue/docs panel respectively; these pin the behaviour
-// where they meet. `i` is safe as the inbox's tab key for the same reason it is
-// safe as the docs': it isn't in OVERLAY_LABELS, so it can't shadow a row.
-
-test("`i` cycles the third tab too, and pops back out of an open review", async () => {
-  const docs = fakeDocs({ "plan.md": "# Plan\n" });
-  const h = harness(docs, 72, 16, fakeQueue(emptyQueue), fakeInbox(REVIEWS));
-  h.tui.question();
-  h.send(CTRL_O);
-  await settle();
-  assert.match(h.lastFramePlain(), /merge queue is empty/, "opens on the queue tab");
-
-  h.send("i"); // queue -> docs
-  await settle();
-  assert.match(h.lastFramePlain(), /a\)\s*plan\.md/, "`i` reached docs");
-
-  h.send("i"); // docs -> inbox, the tab that didn't exist when `i` was bound
-  await settle();
-  assert.match(h.lastFramePlain(), /a\)\s*\[L1\]\s*rework/, "`i` reached the inbox");
-
-  h.send("i"); // inbox -> queue, all three cycled
-  await settle();
-  assert.match(h.lastFramePlain(), /merge queue is empty/, "`i` wrapped back round");
-
-  // From a filed review's body `i` pops back to the list, exactly as it does
-  // from an open doc — the sub-view returns to its own tab, not the next one.
-  h.send("i");
-  h.send("i");
-  await settle();
-  h.send("b");
-  await settle();
-  assert.match(h.lastFramePlain(), /inbox · L2 fix-commit/, "in the review body");
-  h.send("i");
-  await settle();
-  assert.match(h.lastFramePlain(), /c\)\s*\[L3\]/, "`i` returned to the inbox list");
-  h.stop();
-});
-
-test("no filed review is labelled `i` or with a digit, so no panel key shadows a row", async () => {
-  // The inbox caps at 20, which runs well past where `i` sits — exactly where a
-  // dead label would show up — and the whole list is inside the 25-label
-  // alphabet, so dropping the digits costs the inbox nothing.
-  const many: InboxPanelEntry[] = Array.from({ length: 20 }, (_, n) => ({
-    ...REVIEWS[2]!,
-    headline: `review ${String(n + 1).padStart(2, "0")}`,
-    jobId: `job-${String(n + 1).padStart(3, "0")}`,
-  }));
-  const h = harness(undefined, 72, 30, undefined, fakeInbox(many));
-  h.tui.question();
-  h.send(CTRL_O);
-  await settle();
-  const frame = h.lastFramePlain();
-  assert.match(frame, /a\)\s*\[L3\]\s*accept\s+review 01/, "the first row is `a`, not `1`");
-  assert.match(frame, /h\)\s*\[L3\]\s*accept\s+review 08/, "letters run up to h");
-  assert.match(frame, /j\)\s*\[L3\]\s*accept\s+review 09/, "and skip `i` for j");
-  assert.match(frame, /u\)\s*\[L3\]\s*accept\s+review 20/, "and the last of the 20 still has one");
-  assert.ok(!/\bi\)/.test(frame), "no `i)` label exists to be shadowed");
-  assert.ok(!/\b[1-9]\)/.test(frame), "and no digit label either");
-  h.stop();
-});
-
-test("Ctrl-O closes the panel from the inbox tab and from an open review", async () => {
-  const h = harness(undefined, 72, 16, undefined, fakeInbox(REVIEWS));
+test("Ctrl-O closes the panel from the docs tab and from an open doc", async () => {
+  const h = harness(fakeDocs({ "plan.md": "# Plan\n\nthe body\n" }), 72, 16);
   const answer = h.tui.question();
 
   h.send(CTRL_O);
   await settle();
-  assert.match(h.lastFramePlain(), /a\)\s*\[L1\]\s*rework/, "on the inbox tab");
+  assert.match(h.lastFramePlain(), /a\)\s*plan\.md/, "on the docs tab");
   h.send(CTRL_O); // the list takes its own escape exit: the panel closes
   await settle();
   assert.match(h.lastFramePlain(), /you > /, "closed from the list");
@@ -2340,7 +2048,7 @@ test("Ctrl-O closes the panel from the inbox tab and from an open review", async
   await settle();
   h.send("a");
   await settle();
-  assert.match(h.lastFramePlain(), /inbox · L1 rework/, "drilled into a review");
+  assert.match(h.lastFramePlain(), /docs · plan\.md/, "drilled into a doc");
   h.send(CTRL_O); // and from the body, which Backspace would only pop back from
   await settle();
   assert.match(h.lastFramePlain(), /you > /, "closed from the body");
@@ -2349,7 +2057,6 @@ test("Ctrl-O closes the panel from the inbox tab and from an open review", async
   assert.equal(await answer, "typed", "no toggle leaked a keystroke into the buffer");
   h.stop();
 });
-
 
 // --- the Home tab (the task table over every tracked worktree) ----------------
 //
@@ -2475,7 +2182,7 @@ const TASKS: TaskPanelRow[] = [
 ];
 
 test("Home shows the task table above the worktree list", async () => {
-  const h = harness(undefined, 90, 24, undefined, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  const h = harness(undefined, 90, 24, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2503,7 +2210,7 @@ test("Home shows the task table above the worktree list", async () => {
 
 test("Home is the tab Ctrl-O opens on, ahead of the queue", async () => {
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(fakeDocs({ "plan.md": "# Plan\n" }), 90, 24, q, fakeInbox(REVIEWS), fakeFeatures(FEATURES), fakeTasks(TASKS));
+  const h = harness(fakeDocs({ "plan.md": "# Plan\n" }), 90, 24, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2514,7 +2221,7 @@ test("Home is the tab Ctrl-O opens on, ahead of the queue", async () => {
 
 test("Home merges nothing: [m] there never reaches the ready head one tab away", async () => {
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(undefined, 90, 24, q, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  const h = harness(undefined, 90, 24, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2532,7 +2239,7 @@ test("Home merges nothing: [m] there never reaches the ready head one tab away",
 });
 
 test("an empty task table says so rather than showing a blank block", async () => {
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), fakeTasks([]));
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), fakeTasks([]));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2543,7 +2250,7 @@ test("an empty task table says so rather than showing a blank block", async () =
 
 test("with no feature source, Home is still the task table and says why the list is empty", async () => {
   // An unlinked instance: no repo, no worktrees, but the table is the co's own.
-  const h = harness(undefined, 80, 20, undefined, undefined, undefined, fakeTasks(TASKS));
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2555,7 +2262,7 @@ test("with no feature source, Home is still the task table and says why the list
 
 test("the task table reads its source fresh: a table rewritten mid-session shows up", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2572,7 +2279,7 @@ test("the task table reads its source fresh: a table rewritten mid-session shows
 });
 
 test("the task table is a spaced status-first list, with no Type column", async () => {
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), fakeTasks(TASKS));
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2597,7 +2304,7 @@ test("the task table is a spaced status-first list, with no Type column", async 
 });
 
 test("a feature with no intent renders a placeholder, never a blank tail", async () => {
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([
     { feature: "nameless", branch: "co/feat-nameless", status: "idle", busy: false },
   ]), fakeTasks([]));
   h.tui.question();
@@ -2628,7 +2335,7 @@ function painted(h: Harness): string {
 }
 
 test("a description too long for its row wraps, and every word of it is on screen", async () => {
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([
     { feature: "resolver", branch: "co/feat-resolver", intent: LONG_INTENT, status: "blocked", busy: false },
   ]), fakeTasks([]));
   h.tui.question();
@@ -2647,7 +2354,7 @@ test("a description too long for its row wraps, and every word of it is on scree
 });
 
 test("a resize re-wraps the descriptions, with nothing stale and nothing clipped", async () => {
-  const h = harness(undefined, 120, 24, undefined, undefined, fakeFeatures([
+  const h = harness(undefined, 120, 24, undefined, fakeFeatures([
     { feature: "resolver", branch: "co/feat-resolver", intent: LONG_INTENT, status: "idle", busy: false },
   ]), fakeTasks(TASKS));
   h.tui.question();
@@ -2674,7 +2381,7 @@ test("a resize re-wraps the descriptions, with nothing stale and nothing clipped
 
 test("a long branch name is wrapped with the row, never ellipsized out of it", async () => {
   const branch = "co/feat-ctrl-o-home-tab-readability-pass";
-  const h = harness(undefined, 64, 20, undefined, undefined, fakeFeatures([
+  const h = harness(undefined, 64, 20, undefined, fakeFeatures([
     { feature: "home-cleanup", branch, intent: "make the panel readable", status: "idle", busy: false },
   ]), fakeTasks([]));
   h.tui.question();
@@ -2686,7 +2393,7 @@ test("a long branch name is wrapped with the row, never ellipsized out of it", a
 });
 
 test("an empty worktree list says so rather than showing a blank block", async () => {
-  const h = harness(undefined, 72, 12, undefined, undefined, fakeFeatures([]), fakeTasks([]));
+  const h = harness(undefined, 72, 12, undefined, fakeFeatures([]), fakeTasks([]));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2698,7 +2405,7 @@ test("an empty worktree list says so rather than showing a blank block", async (
 });
 
 test("the state word tracks reality: dirty, clean, crew, queue position, block", async () => {
-  const h = harness(undefined, 90, 24, undefined, undefined, fakeFeatures([
+  const h = harness(undefined, 90, 24, undefined, fakeFeatures([
     {
       feature: "wip-dirty",
       branch: "feat/wip-dirty",
@@ -2767,7 +2474,7 @@ test("the state word tracks reality: dirty, clean, crew, queue position, block",
 
 test("opening Home asks the source to re-read the dirty flags, and repaints when it lands", async () => {
   const features = fakeFeatures(FEATURES);
-  const h = harness(undefined, 80, 20, undefined, undefined, features, fakeTasks([]));
+  const h = harness(undefined, 80, 20, undefined, features, fakeTasks([]));
   h.tui.question();
   assert.equal(features.refreshes, 0, "nothing is read before the panel opens");
   h.send(CTRL_O);
@@ -2789,7 +2496,7 @@ test("Home pages a long list; nothing is silently clipped", async () => {
     status: "idle" as const,
     busy: false,
   }));
-  const h = harness(undefined, 80, 14, undefined, undefined, fakeFeatures(many), fakeTasks(TASKS));
+  const h = harness(undefined, 80, 14, undefined, fakeFeatures(many), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2823,7 +2530,7 @@ const MANY_TASKS: TaskPanelRow[] = Array.from({ length: 24 }, (_, n) => ({
 }));
 
 test("a table taller than the pane paints its viewport and nothing else", async () => {
-  const h = harness(undefined, 80, 14, undefined, undefined, fakeFeatures(FEATURES), fakeTasks(MANY_TASKS));
+  const h = harness(undefined, 80, 14, undefined, fakeFeatures(FEATURES), fakeTasks(MANY_TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2849,7 +2556,7 @@ test("a table taller than the pane paints its viewport and nothing else", async 
 });
 
 test("the heading counts the rows once the block outgrows the pane, and not before", async () => {
-  const short = harness(undefined, 80, 24, undefined, undefined, fakeFeatures([]), fakeTasks(TASKS));
+  const short = harness(undefined, 80, 24, undefined, fakeFeatures([]), fakeTasks(TASKS));
   short.tui.question();
   short.send(CTRL_O);
   await settle();
@@ -2857,7 +2564,7 @@ test("the heading counts the rows once the block outgrows the pane, and not befo
   assert.ok(!/Tasks \(\d+\)/.test(short.lastFramePlain()), "no count on a table that fits");
   short.stop();
 
-  const tall = harness(undefined, 80, 14, undefined, undefined, fakeFeatures([]), fakeTasks(MANY_TASKS));
+  const tall = harness(undefined, 80, 14, undefined, fakeFeatures([]), fakeTasks(MANY_TASKS));
   tall.tui.question();
   tall.send(CTRL_O);
   await settle();
@@ -2867,7 +2574,7 @@ test("the heading counts the rows once the block outgrows the pane, and not befo
 
 test("every row of a long table is selectable, painted when selected, and editable", async () => {
   const tasks = fakeTasks(MANY_TASKS);
-  const h = harness(undefined, 80, 14, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 14, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2893,7 +2600,7 @@ test("`a` puts a sixth row on a five-row table: the panel has no cap of its own"
     status: "queued" as const,
   }));
   const tasks = fakeTasks(five);
-  const h = harness(undefined, 80, 24, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 24, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2910,7 +2617,7 @@ test("`a` puts a sixth row on a five-row table: the panel has no cap of its own"
 
 test("Home reads its feature source fresh: a feature created while the panel is open shows up", async () => {
   const src = fakeFeatures([FEATURES[2]!]);
-  const h = harness(undefined, 80, 20, undefined, undefined, src, fakeTasks([]));
+  const h = harness(undefined, 80, 20, undefined, src, fakeTasks([]));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2923,7 +2630,7 @@ test("Home reads its feature source fresh: a feature created while the panel is 
 });
 
 test("with only a task source wired, Ctrl-O opens Home and keystrokes never reach the prompt", async () => {
-  const h = harness(undefined, 80, 20, undefined, undefined, undefined, fakeTasks(TASKS));
+  const h = harness(undefined, 80, 20, undefined, undefined, fakeTasks(TASKS));
   const answer = h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2937,7 +2644,7 @@ test("with only a task source wired, Ctrl-O opens Home and keystrokes never reac
 });
 
 test("Ctrl-O closes the panel from Home", async () => {
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
   const answer = h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -2986,7 +2693,7 @@ function selectedRow(h: Harness): string {
 
 test("Home opens with nothing selected, and x/s do nothing until something is", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3006,7 +2713,7 @@ test("Home opens with nothing selected, and x/s do nothing until something is", 
 
 test("arrows and j/k move the selection; Esc clears it and leaves the tab inert", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3039,7 +2746,7 @@ test("arrows and j/k move the selection; Esc clears it and leaves the tab inert"
 
 test("`x` retires the highlighted row and drops the selection with it", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3062,7 +2769,7 @@ test("`x` retires the highlighted row and drops the selection with it", async ()
 
 test("`s` toggles the highlighted row between building and queued", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3083,7 +2790,7 @@ test("`s` toggles the highlighted row between building and queued", async () => 
 
 test("`a` adds only what is submitted: Enter stores it, Esc stores nothing", async () => {
   const tasks = fakeTasks([]);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3114,7 +2821,7 @@ test("`a` adds only what is submitted: Enter stores it, Esc stores nothing", asy
 test("the add field owns the keyboard: digits are text, not a jump to tab 2", async () => {
   const tasks = fakeTasks([]);
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(undefined, 90, 20, q, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 90, 20, q, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3132,7 +2839,7 @@ test("the add field owns the keyboard: digits are text, not a jump to tab 2", as
 
 test("a refused add keeps the field open with the text, and says why", async () => {
   const tasks = fakeTasks([]);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3150,7 +2857,7 @@ test("a refused add keeps the field open with the text, and says why", async () 
 
 test("a selection whose row the co retired mid-session simply stops being one", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3186,7 +2893,7 @@ const CTRL_S = "\x13";
 
 test("`e` opens the field prefilled with the selected row, and Ctrl-S commits it", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3219,7 +2926,7 @@ test("`e` opens the field prefilled with the selected row, and Ctrl-S commits it
 
 test("Enter commits the rename too, since the field is one line", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3235,7 +2942,7 @@ test("Enter commits the rename too, since the field is one line", async () => {
 
 test("Esc leaves the row exactly as it was, selection included", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3256,7 +2963,7 @@ test("Esc leaves the row exactly as it was, selection included", async () => {
 
 test("`e` with nothing selected does nothing at all, exactly like `x`", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures(FEATURES), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3278,7 +2985,7 @@ test("`e` with nothing selected does nothing at all, exactly like `x`", async ()
 
 test("an unchanged rename is not written at all, and keeps the selection", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3294,7 +3001,7 @@ test("an unchanged rename is not written at all, and keeps the selection", async
 
 test("emptying the field cancels rather than erasing the row's text", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3310,7 +3017,7 @@ test("emptying the field cancels rather than erasing the row's text", async () =
 
 test("a refused rename keeps the field open with the text, and leaves the selection put", async () => {
   const tasks = fakeTasks(TASKS);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3333,7 +3040,7 @@ test("a refused rename keeps the field open with the text, and leaves the select
 test("the rename field owns the keyboard: `x` is text, not a retire", async () => {
   const tasks = fakeTasks(TASKS);
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(undefined, 90, 20, q, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 90, 20, q, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3352,7 +3059,7 @@ test("the rename field owns the keyboard: `x` is text, not a retire", async () =
 
 test("a source with no write hooks paints the table and says the keys aren't available", async () => {
   const tasks = fakeTasks(TASKS, { readOnly: true });
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3386,7 +3093,7 @@ const UNSORTED: TaskPanelRow[] = [
 
 test("the tab paints building rows above queued ones, whatever order they were stored in", async () => {
   const tasks = fakeTasks(UNSORTED);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3404,7 +3111,7 @@ test("the tab paints building rows above queued ones, whatever order they were s
 });
 
 test("j/k walk the painted order, not the stored one", async () => {
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), fakeTasks(UNSORTED));
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), fakeTasks(UNSORTED));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3419,7 +3126,7 @@ test("j/k walk the painted order, not the stored one", async () => {
 
 test("`s` re-sorts the row on the next paint, and the highlight follows it", async () => {
   const tasks = fakeTasks(UNSORTED);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3451,7 +3158,7 @@ test("`s` re-sorts the row on the next paint, and the highlight follows it", asy
 
 test("retiring a row disturbs the order of nothing else", async () => {
   const tasks = fakeTasks(UNSORTED);
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), tasks);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3467,7 +3174,7 @@ test("retiring a row disturbs the order of nothing else", async () => {
 });
 
 test("the rename field paints in the row's own place, under the row's own status", async () => {
-  const h = harness(undefined, 80, 20, undefined, undefined, fakeFeatures([]), fakeTasks(UNSORTED));
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), fakeTasks(UNSORTED));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3484,7 +3191,7 @@ test("the rename field paints in the row's own place, under the row's own status
 });
 
 test("Home's footer names the keys, because nothing else can", async () => {
-  const h = harness(undefined, 90, 20, undefined, undefined, fakeFeatures([]), fakeTasks(TASKS));
+  const h = harness(undefined, 90, 20, undefined, fakeFeatures([]), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3549,22 +3256,22 @@ function tabsOf(h: Harness): string[] {
 test("every tab is named in a bar at the top, on every tab, with the active one distinct", async () => {
   const docs = fakeDocs({ "plan.md": "# Plan\n" });
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(docs, 90, 24, q, fakeInbox(REVIEWS), fakeFeatures(FEATURES), fakeTasks(TASKS));
+  const h = harness(docs, 90, 24, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
 
   // Every tab, numbered, in bar order, on the tab the panel opened on.
-  assert.deepEqual(tabsOf(h), ["1 home", "2 queue", "3 docs", "4 inbox"]);
+  assert.deepEqual(tabsOf(h), ["1 home", "2 queue", "3 docs"]);
   assert.ok(bar(h).includes("[1 home]"), "and the active one is marked");
 
   // The bar is on EVERY tab, and the mark moves with the view.
-  for (const [key, active] of [["2", "2 queue"], ["3", "3 docs"], ["4", "4 inbox"]] as const) {
+  for (const [key, active] of [["2", "2 queue"], ["3", "3 docs"]] as const) {
     h.send(key);
     await settle();
     assert.deepEqual(
       tabsOf(h),
-      ["1 home", "2 queue", "3 docs", "4 inbox"],
+      ["1 home", "2 queue", "3 docs"],
       `${active}: every tab still listed`,
     );
     assert.ok(bar(h).includes(`[${active}]`), `${active}: is marked active`);
@@ -3574,7 +3281,7 @@ test("every tab is named in a bar at the top, on every tab, with the active one 
 
 test("the bar follows into a sub-view and names what is open", async () => {
   const docs = fakeDocs({ "plan.md": "# Plan\n" });
-  const h = harness(docs, 90, 24, undefined, fakeInbox(REVIEWS), undefined, fakeTasks(TASKS));
+  const h = harness(docs, 90, 24, undefined, undefined, fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3585,25 +3292,24 @@ test("the bar follows into a sub-view and names what is open", async () => {
   assert.ok(bar(h).includes("[2 docs · plan.md]"), "the open doc rides in its own tab's segment");
   assert.match(bar(h), /1 home/, "and the other tabs are still listed");
 
-  h.send("3"); // straight out of the doc to the inbox
+  h.send("1"); // straight out of the doc to home
   await settle();
-  h.send("a");
-  await settle();
-  assert.ok(bar(h).includes("[3 inbox · L1 rework]"), "a filed review names itself the same way");
+  assert.ok(bar(h).includes("[1 home]"), "the mark moved with the jump");
+  assert.ok(!bar(h).includes("plan.md"), "and the doc's detail left with its tab");
   h.stop();
 });
 
 test("1-9 jump straight to a tab, from any view, and a digit past the end does nothing", async () => {
   const docs = fakeDocs({ "plan.md": "# Plan\n" });
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(docs, 90, 24, q, fakeInbox(REVIEWS), fakeFeatures(FEATURES), fakeTasks(TASKS));
+  const h = harness(docs, 90, 24, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
 
-  h.send("4");
+  h.send("3");
   await settle();
-  assert.match(h.lastFramePlain(), /a\)\s*\[L1\]\s*rework/, "4 lands on the inbox");
+  assert.match(h.lastFramePlain(), /a\)\s*plan\.md/, "3 lands on docs");
   h.send("2");
   await settle();
   assert.match(h.lastFramePlain(), /head-a/, "2 lands on the queue");
@@ -3630,7 +3336,7 @@ test("1-9 jump straight to a tab, from any view, and a digit past the end does n
 
 test("the numbers index the bar as it actually is, so a pending review is reachable by digit", async () => {
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(undefined, 90, 24, q, undefined, undefined, fakeTasks(TASKS));
+  const h = harness(undefined, 90, 24, q, undefined, fakeTasks(TASKS));
   h.tui.question();
   const review = fakeReview(GREEN);
   const p = h.tui.openLandingReview(review);
@@ -3653,7 +3359,7 @@ test("the numbers index the bar as it actually is, so a pending review is reacha
 test("Tab and `i` still cycle in bar order, home first", async () => {
   const docs = fakeDocs({ "plan.md": "# Plan\n" });
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(docs, 90, 24, q, fakeInbox(REVIEWS), fakeFeatures(FEATURES), fakeTasks(TASKS));
+  const h = harness(docs, 90, 24, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3664,9 +3370,6 @@ test("Tab and `i` still cycle in bar order, home first", async () => {
   h.send("\t");
   await settle();
   assert.match(h.lastFramePlain(), /a\)\s*plan\.md/, "Tab reaches docs");
-  h.send("\t");
-  await settle();
-  assert.match(h.lastFramePlain(), /a\)\s*\[L1\]\s*rework/, "Tab reaches the inbox");
   h.send("\t");
   await settle();
   assert.match(h.lastFramePlain(), /ctrl-o overhaul/, "and wraps back to home");
@@ -3685,7 +3388,7 @@ test("Tab and `i` still cycle in bar order, home first", async () => {
 });
 
 test("with one tab the bar still names it, and Tab is a no-op", async () => {
-  const h = harness(undefined, 60, 16, undefined, undefined, undefined, fakeTasks(TASKS));
+  const h = harness(undefined, 60, 16, undefined, undefined, fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3699,7 +3402,7 @@ test("with one tab the bar still names it, and Tab is a no-op", async () => {
 test("on a narrow terminal the tabs survive; the sub-view detail is what gives way", async () => {
   const docs = fakeDocs({ "a-rather-long-document-name.md": "# Long\n" });
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(docs, 34, 16, q, fakeInbox(REVIEWS), fakeFeatures(FEATURES), fakeTasks(TASKS));
+  const h = harness(docs, 34, 16, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3709,7 +3412,7 @@ test("on a narrow terminal the tabs survive; the sub-view detail is what gives w
   await settle();
   const line = bar(h);
   assert.match(line, /1 home/, "every tab is still named");
-  assert.match(line, /4 inbox/, "including the last one");
+  assert.match(line, /3 docs/, "including the last one");
   assert.ok(!line.includes("a-rather-long-document-name"), "the detail dropped instead of a tab");
   // And the doc itself is still open underneath.
   assert.match(h.lastFramePlain(), /Long/);
@@ -3719,13 +3422,13 @@ test("on a narrow terminal the tabs survive; the sub-view detail is what gives w
 test("on a terminal too narrow even for the labels, the numbers still stand", async () => {
   const docs = fakeDocs({ "plan.md": "# Plan\n" });
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(docs, 22, 12, q, fakeInbox(REVIEWS), fakeFeatures(FEATURES), fakeTasks(TASKS));
+  const h = harness(docs, 22, 12, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
   // A tab is never dropped: a tab you cannot see is a tab you don't know exists.
   assert.deepEqual(tabsOf(h).length, 0, "the labels are gone at this width");
-  assert.match(bar(h), /\[1\]\s*2\s+3\s+4/, "but all four tabs are still numbered");
+  assert.match(bar(h), /\[1\]\s*2\s+3/, "but all three tabs are still numbered");
   assert.ok(bar(h).includes("[1]"), "and the active one is still marked");
   // The numbers still work at that width, which is the point of keeping them.
   h.send("2");

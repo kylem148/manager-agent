@@ -71,16 +71,12 @@ export interface InstancePaths {
   dispatch: string;
   /** The per-instance dispatch config file (co link). */
   dispatchConfig: string;
-  /** The rolling review inbox: the last N crew-completion reviews, newest first.
-   *  Lives beside the dispatch config because a review is the tail end of a
-   *  dispatch; never written into the user's repo. */
-  reviewInbox: string;
   /** Per-feature prose co authored and git cannot recover: the feature's intent
    *  (its one-line description) and the PR title/body co wrote when it enqueued
    *  the feature. Keyed by slug, read at startup so both survive a restart and a
    *  re-processed head still opens its pull request with the message co wrote.
-   *  Lives beside the dispatch config for the same reason the inbox does — feature
-   *  worktrees are dispatch state — and is never written into the user's repo. */
+   *  Lives beside the dispatch config — feature worktrees are dispatch state —
+   *  and is never written into the user's repo. */
   featureStore: string;
   /** The crew panes co owns: each pane's Ghostty id plus the tty and shell pid a
    *  job taught it, and co's dispatch lease on it. Ghostty can only be asked
@@ -133,7 +129,6 @@ export function instancePaths(home: string, name: string): InstancePaths {
     sessions,
     dispatch,
     dispatchConfig: path.join(dispatch, "config.json"),
-    reviewInbox: path.join(dispatch, "inbox.json"),
     featureStore: path.join(dispatch, "features.json"),
     paneStore: path.join(dispatch, "panes.json"),
     taskTable: path.join(dispatch, "tasks.json"),

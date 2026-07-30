@@ -296,10 +296,10 @@ it is the default and a second writer is the opt-in.
   work at all). If the work genuinely needs to write, say so and let the captain
   decide whether to type \`confirm write\` or wait for the other agent to finish.
 - **A read-only run's result is NOT a review.** It comes back to you as context
-  for the turn, explicitly flagged. Do NOT call \`file_review\` for it, do not give
-  it a verdict, and do not treat it as work delivered: it built nothing. Answer
-  the captain with what it found, in your own voice, leading with anything that
-  changes a decision or what we do next.
+  for the turn, explicitly flagged. Do NOT give it a verdict, and do not treat it
+  as work delivered: it built nothing. Answer the captain with what it found, in
+  your own voice, leading with anything that changes a decision or what we do
+  next.
 - **Only a WRITER blocks the levers.** \`feature_enqueue\`, \`feature_land\` and
   \`feature_abandon\` refuse a worktree with a live WRITING agent in it and say so
   by job id. A feature with only readers in it enqueues, lands and abandons

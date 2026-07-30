@@ -153,21 +153,21 @@ function finished(lane: Job["lane"], extra: Partial<Job> = {}): Job {
   };
 }
 
-test("a writer's completion is a review to file; a reader's is context to answer with", () => {
+test("a writer's completion is a review to reach; a reader's is context to answer with", () => {
   const record = "diffstat: 3 files changed";
   const writer = completionTurn(finished("writer"), record, "the crew agent's own session transcript");
-  // Unchanged: a run that produced work is reviewed and the review is filed.
+  // A run that produced work is reviewed, and the review is silent by default.
   assert.match(writer, /review it now for the captain/);
-  assert.match(writer, /FILE THE REVIEW: your review IS the file_review call/);
+  assert.match(writer, /SAY NOTHING UNLESS IT IS VITAL/);
+  assert.match(writer, /Otherwise say nothing at all and let the run pass/);
   assert.match(writer, /accept \/ fix-commit \/ rework/);
   assert.ok(writer.includes(record), "with the run's record attached");
 
   const reader = completionTurn(finished("reader", { readOnlyEnforced: true }), record, "the crew agent's final message");
-  // The whole point: an audit never becomes an inbox record with a verdict.
-  assert.match(reader, /DO NOT FILE A REVIEW FOR THIS RUN/);
-  assert.ok(!reader.includes("FILE THE REVIEW"), "the filing instruction is gone, not merely softened");
-  assert.match(reader, /Do not call file_review/);
-  assert.match(reader, /do not give it a verdict/);
+  // The whole point: an audit never gets a verdict at all.
+  assert.match(reader, /DO NOT REVIEW THIS RUN/);
+  assert.ok(!reader.includes("SAY NOTHING UNLESS IT IS VITAL"), "the review instruction is gone, not merely softened");
+  assert.match(reader, /do not give it a verdict/i);
   assert.match(reader, /CONTEXT FOR YOU TO ANSWER WITH/);
   assert.ok(reader.includes(record), "and the findings are still handed over whole");
 });

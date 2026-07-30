@@ -14,12 +14,6 @@ import {
   type ToolSideEffects,
 } from "./tools.js";
 import {
-  fileReviewInto,
-  ReviewInbox,
-  type FileReviewInput,
-  type FileReviewResult,
-} from "./reviewinbox.js";
-import {
   detectStaleActiveContext,
   readLiveMemory,
   archiveLog,
@@ -156,17 +150,10 @@ interface SessionState {
   /** The cache keep-alive, or null when disabled. Owned here so every turn can
    *  reset its clock and the exit path can stop it. */
   keepAlive: KeepAlive | null;
-  /** The rolling record of filed crew reviews (the Ctrl-O Inbox tab). Loaded at
-   *  session start, so it carries the previous sessions' reviews. */
-  inbox: ReviewInbox;
   /** The co's at-a-glance task table (the Ctrl-O Home tab). Loaded at session
    *  start, so the panel shows the last table the co wrote before it says a word
    *  this session. */
   tasks: TaskStore;
-  /** The job whose review turn is running right now, or null. Lets file_review
-   *  default its jobId/feature to the run the co was just handed, so the co only
-   *  has to name them when it files a review for something else. */
-  reviewingJob: Job | null;
   /** The token/cost meter. Fed after every turn, shown only by /cost. */
   costs: CostLedger;
 }
@@ -323,11 +310,6 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // co-manager writes plain-text orders exactly as before.
   const dispatch = await readDispatchConfig(paths);
 
-  // The rolling review inbox is instance state, not dispatch state, so it loads
-  // whether or not this instance is linked: reviews survive a re-link, and a
-  // report the captain relayed by hand is filed the same way a dispatched one is.
-  const inbox = await ReviewInbox.load(paths);
-
   // The durable half of a feature record: the one-line intents the co authored at
   // create time, and the PR title/body it authored at enqueue. Everything else
   // about a feature is rebuilt from git by the boot reconcile below; that prose is
@@ -373,10 +355,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
         promptLabel: PROMPT_LABEL,
         header,
         docs: docSource(paths),
-        // The Inbox tab reads the in-memory store fresh at paint time, so a
-        // review filed mid-session shows without any subscription.
-        inbox: { list: () => inbox.list() },
-        // The Home tab's task table, on the same rule: read fresh at paint time,
+        // The Home tab's task table: read fresh at paint time,
         // so a row either writer added shows on the next paint. Wired whether or
         // not the instance is linked, so Ctrl-O always has a Home.
         //
@@ -458,9 +437,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     armed: null,
     reviewQueue: [],
     queueNotices: [],
-    inbox,
     tasks: taskStore,
-    reviewingJob: null,
     costs,
   };
 
@@ -827,11 +804,8 @@ async function drive(
       : {}),
     ...(state.features ? { features: state.features } : {}),
     ...(state.dispatch && state.features ? { onArmResolve: () => armResolve(state) } : {}),
-    // Filing a review persists the record and owns the level-gated chat output.
-    // Always wired: a review is filed whether the run was dispatched or relayed.
-    onFileReview: (input) => fileReview(state, input),
-    // The task table the Home tab paints. Always wired for the same reason the
-    // inbox is: it is the co's own state and outlives any link to a repo.
+    // The task table the Home tab paints. Always wired: it is the co's own state
+    // and outlives any link to a repo.
     tasks: state.tasks,
   });
 
@@ -989,25 +963,6 @@ async function maybeCompact(state: SessionState): Promise<void> {
   state.io.appendBlock(
     c.dim(`  · compacted earlier conversation (~${freed.toLocaleString("en-US")} tokens)`),
   );
-}
-
-// --- the review inbox --------------------------------------------------------
-
-/**
- * File a structured review (the file_review tool). The rules live in
- * reviewinbox.ts — persist the record, then emit only what its level allows (one
- * dim pointer line at L2, nothing at L1/L3, and the body never) — so this is just
- * the wiring: which inbox, which run is under review, where a line goes.
- */
-async function fileReview(state: SessionState, input: FileReviewInput): Promise<FileReviewResult> {
-  const { result } = await fileReviewInto({
-    inbox: state.inbox,
-    input,
-    job: state.reviewingJob,
-    now: new Date().toISOString(),
-    emit: (line) => state.io.appendBlock(line),
-  });
-  return result;
 }
 
 // --- dispatch (arm → confirm → launch → review) ------------------------------
@@ -1549,23 +1504,9 @@ async function drainReviews(state: SessionState): Promise<void> {
     state.userTurns++;
     state.messages.push({ role: "user", content: completionTurn(job, record, source, resolveNote) });
 
-    // A READ-ONLY run is not work delivered, so it never enters the review path
-    // (D-20260729-6). It also must not be NAMED as the run under review: that
-    // is what file_review defaults its jobId to, and an audit is precisely the
-    // run no review may be filed for.
-    if (job.lane === "reader") {
-      await drive(state);
-      continue;
-    }
-
-    // Name the run under review so file_review can default its jobId/feature to
-    // it; cleared on the way out so a later filing can't be misattributed.
-    state.reviewingJob = job;
-    try {
-      await drive(state);
-    } finally {
-      state.reviewingJob = null;
-    }
+    // Both lanes drive the same way; which turn they were handed is the only
+    // difference, and completionTurn has already decided that (D-20260729-6).
+    await drive(state);
   }
 }
 
@@ -1575,10 +1516,10 @@ async function drainReviews(state: SessionState): Promise<void> {
  *
  * Two destinations, and which one a run takes is its LANE and nothing else:
  *
- *  - a WRITER built something, so it is reviewed and the review is filed;
+ *  - a WRITER built something, so it is reviewed and given a verdict;
  *  - a READER was forbidden to change anything, so there is nothing to accept or
- *    rework and nothing belongs in the inbox — it comes back as context the co
- *    answers the captain with (D-20260729-6).
+ *    rework — it comes back as context the co answers the captain with
+ *    (D-20260729-6).
  */
 export function completionTurn(job: Job, record: string, source: string, resolveNote = ""): string {
   return job.lane === "reader"
@@ -1587,7 +1528,7 @@ export function completionTurn(job: Job, record: string, source: string, resolve
 }
 
 /** The review turn: a crew run that produced work, handed over to be reviewed
- *  and filed per the report-review protocol. */
+ *  per the report-review protocol. */
 function reviewTurn(job: Job, record: string, source: string, resolveNote: string): string {
   return (
     "SYSTEM: A crew dispatch you launched has finished; review it now for the captain. This is" +
@@ -1599,12 +1540,10 @@ function reviewTurn(job: Job, record: string, source: string, resolveNote: strin
     " anything; you already have the record. Separate verified from claimed. If the record is" +
     " only a completion marker with no content, say plainly that the run left no reviewable" +
     " record and what the exit code implies.\n\n" +
-    "FILE THE REVIEW: your review IS the file_review call. Decide the verdict, map it to a level" +
-    " (rework or a genuine escalation/fork → L1; fix-commit or accept-with-notes → L2; a clean" +
-    " accept → L3), and call file_review with {level, verdict, headline, body} — the body is the" +
-    " full three-part review. Then, in the chat: on L1 state ONLY the core decision the captain" +
-    " has to make; on L2 and L3 say nothing further. The captain reads the full review in the" +
-    " panel (Ctrl-O, Inbox tab), so never paste the body into the chat.\n\n" +
+    "SAY NOTHING UNLESS IT IS VITAL: reach the verdict, then speak only if it is `rework`, a" +
+    " genuine escalation, or a fork only the captain can resolve — and then state that decision" +
+    " alone, in a line or two. Otherwise say nothing at all and let the run pass: no summary, no" +
+    " headline, no line reporting that you reviewed it. He asks when he wants the detail.\n\n" +
     `Job: ${job.id} (${job.label})\nStatus: ${job.status}` +
     (job.exitCode !== undefined ? ` (exit ${job.exitCode})` : "") +
     `\n\n--- record of the run ---\n${record}` +
@@ -1620,10 +1559,9 @@ function firstLineOf(order: string): string {
 /**
  * The turn a finished READ-ONLY run produces. Deliberately not the review turn:
  * an audit is a question the captain asked, answered by an agent that was
- * forbidden to change anything, so there is no delivery to accept, no verdict to
- * reach, and nothing to file (D-20260729-6). Filing one would also put a
- * headline and an accept/rework in the inbox for a run that built nothing, which
- * is exactly the noise the inbox exists to prevent.
+ * forbidden to change anything, so there is no delivery to accept and no verdict
+ * to reach (D-20260729-6). Reviewing one would put an accept/rework on a run that
+ * built nothing.
  */
 function auditTurn(job: Job, record: string, source: string): string {
   return (
@@ -1637,8 +1575,8 @@ function auditTurn(job: Job, record: string, source: string): string {
       : " (advisory only for this agent — nothing mechanically blocked it, so if the record shows it" +
         " wrote anything, say so plainly: that is a real problem worth raising)." +
         " It was supposed to produce no diff and change nothing.") +
-    "\n\nDO NOT FILE A REVIEW FOR THIS RUN. Do not call file_review, do not give it a verdict" +
-    " (accept / fix-commit / rework), and do not treat it as work delivered. Its findings are" +
+    "\n\nDO NOT REVIEW THIS RUN. Do not give it a verdict (accept / fix-commit / rework), and do" +
+    " not treat it as work delivered. Its findings are" +
     " CONTEXT FOR YOU TO ANSWER WITH: read the report below, and reply to the captain with what it" +
     " found and what you make of it, in your own voice and at your usual length. Say plainly where" +
     " the audit is uncertain or where it only looked at part of the picture, and separate what it" +
@@ -1964,11 +1902,7 @@ function bannerText(name: string, cfg: Config, tui: boolean, linked: boolean): s
   if (tui) {
     lines.push(
       c.dim("scroll: wheel or PgUp/PgDn · ↑/↓ recalls your input · hold Option/Shift to select text"),
-      c.dim(
-        linked
-          ? "Ctrl-O opens the panel (merge queue + docs + review inbox)"
-          : "Ctrl-O opens the panel (docs + review inbox)",
-      ),
+      c.dim(linked ? "Ctrl-O opens the panel (merge queue + docs)" : "Ctrl-O opens the panel (docs)"),
     );
   }
   return lines.join("\n");

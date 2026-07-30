@@ -221,7 +221,7 @@ export class TaskStore {
   /**
    * Read the table from disk. A missing file is an empty table (the common first
    * run); a corrupt or unreadable one is ALSO an empty table rather than a failed
-   * session start — the same rule the feature store and the review inbox follow.
+   * session start — the same rule the feature store follows.
    */
   static async load(paths: InstancePaths): Promise<TaskStore> {
     const file = paths.taskTable;

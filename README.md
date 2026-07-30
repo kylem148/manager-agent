@@ -341,8 +341,8 @@ The session is a scrollable terminal UI, not a plain read-out:
 - **Copying out of the Ctrl-O panel** works two ways, because there are two
   questions. **Drag** to select part of what you're looking at: the cells
   highlight and the text is on your clipboard the moment you let go — on any
-  tab, so a PR link on the queue, a paragraph of a doc and a chunk of a filed
-  review all come out the same way. **`y`** on an open doc takes the whole
+  tab, so a PR link on the queue and a paragraph of a doc both come out the
+  same way. **`y`** on an open doc takes the whole
   thing, as **raw markdown** rather than the painted rows, which is what you
   actually want back from a cheat-sheet the co-manager wrote: the source, not a
   width-wrapped screenshot of it. Both go through OSC 52, so both work over SSH.
@@ -416,7 +416,6 @@ flat over time — small rewritten orientation files plus large append-only logs
         └── .dispatch/          runtime state (the crew half only after `co link`)
             ├── config.json        repo path, named agent commands, caps, pane layout, anchor
             ├── panes.json         the crew panes co owns: tty + shell pid + its lease on each
-            ├── inbox.json         the last 20 crew reviews, newest first (Ctrl-O → Inbox)
             ├── features.json      per-feature intent + PR message, keyed by slug
             ├── tasks.json         the at-a-glance task table (Ctrl-O → Home)
             └── captures/          per-job captured output the co reviews from
@@ -541,8 +540,8 @@ flag the lane is **advisory**, and the banner says so rather than claiming an
 enforcement that isn't there.
 
 What comes back is different too. A read-only run built nothing, so it is not
-reviewed and nothing is filed in the inbox: its findings are handed to the
-co-manager as context, and it answers you with what the audit found. Only a
+reviewed and gets no verdict: its findings are handed to the co-manager as
+context, and it answers you with what the audit found. Only a
 **writer** blocks the levers, as well — a feature with an auditor still reading
 it enqueues, lands and abandons normally, while a live writer refuses all three
 by name.
@@ -612,34 +611,26 @@ review on its own — you never paste anything back, and every job reports
 independently (a later job finishing while an earlier one still runs delivers
 its own review). The session stays fully interactive the whole time, including
 with several jobs running at once; a failed or timed-out job never takes the
-session down. A read-only audit run is the one exception, and files no review at
+session down. A read-only audit run is the one exception, and is not reviewed at
 all (see "Two agents in one worktree" above).
 
-### Reviews are filed, not shouted
+### Reviews are silent unless they are vital
 
-A review is a **record**, not a wall of chat. The co-manager writes each one into
-a rolling inbox (the last 20, newest first, kept under the instance's
-`.dispatch/inbox.json` and so surviving a restart), and reads it back in the
-Ctrl-O panel's **Inbox** tab: one row per review with its level, verdict, and
-headline, and one keypress to read the whole thing.
+The review always happens: the co-manager checks the run against the acceptance
+criteria it set, separates what was verified from what was merely claimed, and
+reaches a verdict. What it does with that is the part you notice, and almost
+always the answer is nothing.
 
-What reaches the conversation depends on the review's **level**, which the
-co-manager assigns from its own verdict:
-
-| level | when                                            | what you see in the chat                        |
-| ----- | ----------------------------------------------- | ----------------------------------------------- |
-| L1    | `rework`, or a real escalation only you can call | just the core decision it needs from you         |
-| L2    | `fix-commit`, or an `accept` with notes          | one grey line: headline + where to read the rest |
-| L3    | a clean `accept`                                 | nothing at all                                   |
-
-The full review body is never printed to the chat at any level — it lives in the
-inbox. So a clean chore costs you no attention, a mixed result costs you one
-line, and only a run that genuinely needs a decision interrupts you, with the
-decision and nothing else.
+It speaks only when the result is vital — a `rework`, a real escalation, or a
+fork only you can resolve — and then it says that decision and nothing else, in
+a line or two. Every other outcome passes in silence: no summary, no headline,
+no "reviewed" line, nowhere to go and read it. A clean chore costs you no
+attention at all, and only a run that genuinely needs you interrupts you, with
+the decision and nothing else. Ask and you get the detail.
 
 A **read-only audit** never enters this at all: there is no diff to accept or
-rework, so it gets no verdict, no level and no inbox row. The co-manager simply
-answers you with what the audit found.
+rework, so it gets no verdict. The co-manager simply answers you with what the
+audit found.
 
 ### The Ctrl-O panel: tabs and keys
 
@@ -648,25 +639,24 @@ tab it has is listed in a bar across the top, on every tab, with the one you're
 on marked:
 
 ```
-[1 home] 2 queue  3 docs  4 inbox
+[1 home] 2 queue  3 docs
 ```
 
 Move between them three ways: `Tab` (or `i`) cycles, and the **number beside a
 tab jumps straight to it** from anywhere in the panel, including out of an open
-doc. A fifth tab appears while a `feature_land` review is pending, and takes the
-next number. Because the digits belong to the bar, the doc and inbox lists label
-their rows `a)`, `b)`, `c)` rather than `1)`, `2)`, `3)`.
+doc. A fourth tab appears while a `feature_land` review is pending, and takes the
+next number. Because the digits belong to the bar, the doc list labels its rows
+`a)`, `b)`, `c)` rather than `1)`, `2)`, `3)`.
 
 | tab   | what it is                                                        | its keys                              |
 | ----- | ----------------------------------------------------------------- | ------------------------------------- |
 | home  | the task table (yours to edit), then every tracked worktree       | `a` add, `e` edit, `x` retire, `s` status |
 | queue | the merge queue and the head's pull request                       | `m` merge, `e` edit the PR message    |
 | docs  | everything in `docs/`, opened through the transcript's renderer   | `a`-`z` open, `y` copies an open doc  |
-| inbox | the last 20 filed crew reviews                                    | `a`-`z` open                          |
 
 Everywhere: `space`/`b` page, `j`/`k` line, `d`/`u` half, `g`/`G` ends,
-`Backspace` steps back out of a doc or a review, `Esc` (or `Ctrl-O`, or `q`)
-closes. A left-drag selects and copies on release, on every tab.
+`Backspace` steps back out of a doc, `Esc` (or `Ctrl-O`, or `q`) closes. A
+left-drag selects and copies on release, on every tab.
 
 ### Home: what we're doing, and what's in flight
 
@@ -1242,7 +1232,7 @@ src/
   cli/       auth.ts doctor.ts modelsdoctor.ts link.ts cost.ts
   tui/       tui.ts editor.ts markdown.ts wrap.ts keys.ts banner.ts
              commands.ts visuals.ts
-  session/   session.ts prompt.ts tools.ts reviewinbox.ts
+  session/   session.ts prompt.ts tools.ts
              crewpanes.ts paneoccupancy.ts panestore.ts
              dispatchconfig.ts transport.ts registry.ts
              worktrees.ts forge.ts checks.ts landing.ts landinggate.ts
@@ -1284,20 +1274,16 @@ order: identity + constraints, operating notes, navigator voice, the protocol
 reference sections (memory / documents / research / orders / dispatch when linked
 / report review), then live state and the recent-conversation tail (logs
 excluded). `tools.ts` is the internal tool surface exposed to the model plus the
-executor that binds tools to memory + research; it holds the decision gate, the
-arm-only `dispatch_order` tool, and the `file_review` tool.
+executor that binds tools to memory + research; it holds the decision gate and
+the arm-only `dispatch_order` tool.
 
-`reviewinbox.ts` is the review record and its volume knob. A crew review used to
-be nothing but the co talking, so it neither survived the session nor varied in
-loudness with how much it mattered. Now `file_review` writes a structured record
-(job, feature, verdict, level, headline, body) into a capped rolling list — the
-last 20, newest first, persisted as JSON under the instance's `.dispatch/` and
-loaded at session start, so the inbox is populated before the panel is ever
-opened. Writes ride the shared memory write queue, so a whole-file rewrite can't
-interleave with the other tool calls of one model round. The same module owns the
-chat gate as one pure function: L2 returns exactly one dim pointer line, L1 and
-L3 return none (L1's signal is the co's own next sentence — the decision the
-captain has to make), and the body reaches the chat at no level.
+A completed run's review lives entirely in the prompt now. There used to be a
+tool that filed each review as a structured record, plus a store to keep the last
+twenty and a fourth panel tab to read them back — a durable surface for something
+nobody opened, at the cost of a tool call per completion and permanent prompt
+bytes. The reviewing itself never depended on any of it, so the storage went and
+the discipline stayed: the co reviews every run and speaks only when the verdict
+is vital.
 
 The dispatch layer is six focused modules. `crewpanes.ts` is the pure pane-
 placement planner (reuse a proven-idle pane first, else alternating splits of the
@@ -1540,7 +1526,7 @@ than reporting clean.
 everything else about a feature from its worktree, but not the prose the co
 wrote about it — the intent saying what it is FOR, and the PR title and body it
 composed when it marked the feature done — so both are persisted per slug in
-`.dispatch/features.json` — beside the dispatch config and the review inbox,
+`.dispatch/features.json` — beside the dispatch config,
 never inside the repo or the worktree — and read back at session start, which is
 what lets a recovered worktree still show its description and a re-processed head
 still open its pull request with the message the co wrote. Every field is an
@@ -1573,9 +1559,9 @@ file is an empty table, never a failed start.
 
 **`src/tui/`** — the full-screen terminal UI: transcript buffer + scrolling,
 the multi-line line editor, markdown → ANSI rendering, ANSI-aware wrapping,
-and the Ctrl-O panel. The panel has four home tabs — home (the task table over
-the worktree overview), the merge queue, the doc viewer, and the review inbox —
-listed in a persistent bar across the top and reached by Tab, `i`, or the digit
+and the Ctrl-O panel. The panel has three home tabs — home (the task table over
+the worktree overview), the merge queue, and the doc viewer — listed in a
+persistent bar across the top and reached by Tab, `i`, or the digit
 the bar shows beside each. Each reads a small injected source, so the Tui never
 reaches into git, the filesystem, or the session layer itself; `panelFrame()` is
 the one switch behind the paint, the bar and the drag-copy alike, so no view can
@@ -1593,9 +1579,8 @@ Ctrl-S and never merging anything. The home tab merges nothing
 and edits nothing on ONE key — its task keys need a submitted line or a picked
 row first — which is what lets the panel open on it: the tab a keystroke lands on
 by default can never be the thing that merged something. A pending `feature_land` review
-gets a fifth tab of its own for as long as it is pending, so the two merges never
-share a key. A doc and a filed review drill into the same paged body view. The
-panel body is one selection surface: a left-drag highlights and copies out of any
+gets a fourth tab of its own for as long as it is pending, so the two merges never
+share a key. The panel body is one selection surface: a left-drag highlights and copies out of any
 view over OSC 52 (the same escape the transcript's own drag-selection uses), and
 an open doc additionally binds `y` to copy its raw markdown whole.
 `keys.ts` is the pure decode table that maps both legacy control bytes and

@@ -444,7 +444,7 @@ export class FeatureManager {
    * overview of everything in flight, not just what is queued to land. Pure
    * in-memory derivation (registry records + jobs + the queue snapshot + the
    * stored intent), so the panel can call it fresh on every paint the way it
-   * already does for the queue and the inbox.
+   * already does for the queue.
    *
    * Ordered the way the captain reads it: whatever is closest to landing first
    * (the merge queue, in its own landing order), then everything still being
