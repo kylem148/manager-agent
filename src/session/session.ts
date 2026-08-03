@@ -1,7 +1,18 @@
 import * as readline from "node:readline";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { effortLevelsFor, parseEffort, type Config, type Effort } from "../config.js";
+import {
+  DEFAULT_MODEL_ID,
+  MODEL_ID_KEY,
+  effortLevelsFor,
+  isPlausibleModelId,
+  parseEffort,
+  persistInstanceModel,
+  resolveModelOrigin,
+  type Config,
+  type Effort,
+  type ModelOrigin,
+} from "../config.js";
 import type { InstancePaths, LiveFile } from "../paths.js";
 import { CACHE_TTL, ModelProvider, type MessageParam } from "../model.js";
 import { CostLedger, formatCostReport } from "../cost.js";
@@ -1723,6 +1734,133 @@ export function parseConfirm(raw: string): { isConfirm: boolean; write?: boolean
   };
 }
 
+/**
+ * Everything `/model` needs, injected — so the command's decisions (does an
+ * exported variable outrank this, does an unreachable id change anything, is the
+ * choice actually stored) are provable without a Bedrock account or a session.
+ */
+export interface ModelSwitch {
+  /** The model in force this instant: what a turn sent right now would use. */
+  current: string;
+  /** Where a session opened right now would get its model, read fresh off disk. */
+  origin: ModelOrigin;
+  /** Ask the API whether it will answer to this id. Never throws. */
+  probe: (modelId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Store the choice for this instance; resolves to the file written. */
+  persist: (modelId: string) => Promise<string>;
+  /** Switch the live provider. Returns a note if the switch moved anything else. */
+  commit: (modelId: string) => string | null;
+}
+
+/**
+ * `/model` — report the model in force and where it came from; `/model <id>`
+ * switches this co-manager to a different Bedrock model and remembers it.
+ *
+ * Three rules, in this order, and each of them is a thing that would otherwise
+ * bite silently:
+ *
+ *  1. An EXPORTED `BEDROCK_MODEL_ID` wins and the command refuses. It already
+ *     outranks the stored value at load, so a `/model` that beat it for one
+ *     session and lost at the next restart would give "which model is this
+ *     co-manager on" two different answers depending on when you asked — which
+ *     is the exact confusion this command exists to end. Refusing says so and
+ *     names the way out.
+ *  2. The API is asked BEFORE anything is committed. A bad or unentitled id
+ *     otherwise sets cleanly and kills the next turn instead, with the error
+ *     arriving detached from the command that caused it. A failed probe leaves
+ *     the previous model in force and nothing on disk.
+ *  3. The write is reported, including when it fails. A switch that could not be
+ *     stored is still applied — it is what the captain asked for — but it is
+ *     announced as this-session-only rather than being left to look permanent.
+ *
+ * Ids are taken verbatim. There is no alias table and no friendly-name registry:
+ * either would be stale the day a new model ships, and would then reject an id
+ * that works.
+ */
+export async function runModelCommand(arg: string, deps: ModelSwitch): Promise<string[]> {
+  const { current, origin } = deps;
+  const wanted = arg.trim();
+
+  if (!wanted) return describeModel(current, origin);
+
+  if (!isPlausibleModelId(wanted)) {
+    return [
+      c.yellow(`usage: /model <bedrock model id>`),
+      c.dim(`  a bare id, e.g. ${DEFAULT_MODEL_ID}`),
+    ];
+  }
+
+  if (origin.source === "env") {
+    return [
+      c.yellow(`${MODEL_ID_KEY} is set in your environment (${origin.modelId}).`),
+      c.dim("  an exported variable outranks a stored choice, so nothing was changed."),
+      c.dim(`  unset ${MODEL_ID_KEY} to set a model per co-manager.`),
+    ];
+  }
+
+  // Already the model in force: skip the probe (it is answering turns already)
+  // and just pin it, so a changed default or a changed shared .env cannot move
+  // this instance later.
+  if (wanted === current) {
+    const out = [c.dim(`model: ${current} — already in force`)];
+    out.push(...(await store(deps, wanted)));
+    return out;
+  }
+
+  const verdict = await deps.probe(wanted);
+  if (!verdict.ok) {
+    return [
+      c.yellow(`${wanted} did not answer — staying on ${current}.`),
+      c.dim(`  ${verdict.error}`),
+    ];
+  }
+
+  const stored = await store(deps, wanted);
+  const note = deps.commit(wanted);
+  const out = [c.dim(`model: ${current} → ${wanted} (from the next turn)`)];
+  if (note) out.push(c.yellow(`  ${note}`));
+  return [...out, ...stored];
+}
+
+/** Persist the choice and say what happened, including when it didn't. */
+async function store(deps: ModelSwitch, modelId: string): Promise<string[]> {
+  try {
+    return [c.dim(`  stored for this co-manager in ${await deps.persist(modelId)}`)];
+  } catch (e) {
+    return [
+      c.yellow(`  this session only — the choice could not be stored: ${(e as Error).message}`),
+    ];
+  }
+}
+
+/** The bare `/model` report: what is in force, and what put it there. */
+function describeModel(current: string, origin: ModelOrigin): string[] {
+  const out = [c.dim(`model:  ${current}`), c.dim(`source: ${sourceLabel(origin)}`)];
+  for (const s of origin.shadowed) {
+    out.push(c.dim(`        shadowing ${s.modelId} in ${s.where}`));
+  }
+  // Only reachable when the two have been pulled apart — a store that failed, or
+  // a file edited by hand mid-session. Saying it plainly beats a report that is
+  // quietly about a different model than the next turn will use.
+  if (origin.modelId !== current) {
+    out.push(c.yellow(`        this session is on ${current}; a restart would use ${origin.modelId}`));
+  }
+  out.push(c.dim("switch it with /model <bedrock model id>"));
+  return out;
+}
+
+function sourceLabel(origin: ModelOrigin): string {
+  switch (origin.source) {
+    case "env":
+      return `${origin.where} — an exported variable outranks anything stored`;
+    case "instance":
+      return `this co-manager — ${origin.where}`;
+    default:
+      // A shared .env, or the built-in default: `where` already says which.
+      return origin.where;
+  }
+}
+
 type CommandResult = "ok" | "exit";
 
 async function handleCommand(state: SessionState, raw: string): Promise<CommandResult> {
@@ -1838,6 +1976,33 @@ async function handleCommand(state: SessionState, raw: string): Promise<CommandR
       }
       state.model.setEffort(next);
       io.appendBlock(c.dim(`effort: ${current} → ${next} (this session)`));
+      return "ok";
+    }
+
+    case "model": {
+      // Unlike /effort, this one is DURABLE: the captain runs one co-manager per
+      // project and wants each on its own model without editing files. So the
+      // choice is written to the instance's own .env — per-instance, under
+      // CO_HOME, never in a repo and never a global default other instances would
+      // inherit. resolveModelOrigin is read fresh here rather than off the loaded
+      // config, so the report reflects a write this session just made.
+      const lines = await runModelCommand(arg, {
+        current: state.model.modelId,
+        origin: resolveModelOrigin({
+          instanceRoot: state.paths.root,
+          home: state.cfg.home,
+        }),
+        probe: (id) => state.model.probeModel(id),
+        persist: (id) => persistInstanceModel(state.paths.root, id),
+        commit: (id) => {
+          const before = state.model.effort;
+          const lowered = state.model.setModel(id);
+          return lowered
+            ? `effort ${before} → ${lowered}: ${id} does not accept ${before}`
+            : null;
+        },
+      });
+      for (const l of lines) io.appendBlock(l);
       return "ok";
     }
 

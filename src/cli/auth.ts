@@ -4,6 +4,7 @@ import path from "node:path";
 import * as readline from "node:readline";
 import type { Config } from "../config.js";
 import { DEFAULT_MODEL_ID, redactSecret } from "../config.js";
+import { readEnvFile, readEnvText, upsertEnv } from "../envfile.js";
 import { c, line } from "../ui.js";
 
 /**
@@ -40,7 +41,7 @@ export async function runAuthBedrock(cfg: Config): Promise<number> {
   }
 
   // Upsert the token (overwrite), and add region/model only if missing.
-  const existing = readEnvFileSafe(envPath);
+  const existing = readEnvFile(envPath);
   const updates: Record<string, string> = { AWS_BEARER_TOKEN_BEDROCK: token };
   const defaultsAdded: string[] = [];
   if (!(("AWS_REGION" in existing) && existing.AWS_REGION)) {
@@ -52,7 +53,7 @@ export async function runAuthBedrock(cfg: Config): Promise<number> {
     defaultsAdded.push(`BEDROCK_MODEL_ID=${DEFAULT_MODEL}`);
   }
 
-  const merged = upsertEnv(readRawSafe(envPath), updates);
+  const merged = upsertEnv(readEnvText(envPath), updates);
   await writeEnvSecure(envPath, merged);
 
   line();
@@ -103,67 +104,11 @@ function promptSecret(prompt: string): Promise<string> {
   });
 }
 
-// --- .env read / merge / write -------------------------------------------------
-
-function readRawSafe(file: string): string {
-  try {
-    return fs.readFileSync(file, "utf8");
-  } catch {
-    return "";
-  }
-}
-
-/** Parse KEY=VALUE lines into a map (best-effort; comments/blank lines ignored). */
-function readEnvFileSafe(file: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const raw of readRawSafe(file).split("\n")) {
-    const lineTrim = raw.trim();
-    if (!lineTrim || lineTrim.startsWith("#")) continue;
-    const eq = lineTrim.indexOf("=");
-    if (eq <= 0) continue;
-    const key = lineTrim.slice(0, eq).trim();
-    const val = lineTrim.slice(eq + 1).trim();
-    out[key] = val;
-  }
-  return out;
-}
-
-/**
- * Return the env-file text with the given keys upserted: existing uncommented
- * assignments are replaced in place (preserving surrounding lines/comments);
- * new keys are appended. Values are written raw (tokens are single-line).
- */
-function upsertEnv(content: string, updates: Record<string, string>): string {
-  const lines = content.length ? content.split("\n") : [];
-  const remaining = new Set(Object.keys(updates));
-
-  const rewritten = lines.map((ln) => {
-    const trimmed = ln.trim();
-    if (!trimmed || trimmed.startsWith("#")) return ln;
-    const eq = trimmed.indexOf("=");
-    if (eq <= 0) return ln;
-    const key = trimmed.slice(0, eq).trim();
-    if (remaining.has(key)) {
-      remaining.delete(key);
-      return `${key}=${updates[key]}`;
-    }
-    return ln;
-  });
-
-  const additions: string[] = [];
-  for (const key of Object.keys(updates)) {
-    if (remaining.has(key)) additions.push(`${key}=${updates[key]}`);
-  }
-
-  let body = rewritten.join("\n");
-  if (additions.length) {
-    if (body.length && !body.endsWith("\n")) body += "\n";
-    body += additions.join("\n") + "\n";
-  } else if (body.length && !body.endsWith("\n")) {
-    body += "\n";
-  }
-  return body;
-}
+// --- .env write ----------------------------------------------------------------
+//
+// Reading, parsing and upserting live in src/envfile.ts, shared with the
+// per-instance model write (/model). The 0600 write stays here: it is a
+// property of the file holding the TOKEN, not of env files generally.
 
 /** Write the env file with 0600 perms (best-effort on platforms that support it). */
 async function writeEnvSecure(file: string, content: string): Promise<void> {
