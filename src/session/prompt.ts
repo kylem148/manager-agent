@@ -441,7 +441,8 @@ function taskTableBlock(rows: TaskRow[]): string {
       : shown.map((r) => `${r.status.padEnd(8)}  ${r.task}`).join("\n");
   return (
     "## Task table (the captain's, painted on Ctrl-O Home)\n\n" +
-    "_As it stood when this session opened, `building` rows first. They edit it" +
+    "_As it stood when this session opened, `building` rows first, then" +
+    " `testing` (built, awaiting their check), then `queued`. They edit it" +
     " there themselves; call `task_table list` for the current one._\n\n" +
     body
   );

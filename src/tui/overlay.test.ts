@@ -2681,7 +2681,7 @@ function taskRows(h: Harness): string[] {
   const out: string[] = [];
   for (let i = head + 1; i < rows.length; i++) {
     if (rows[i]!.trim() === "Worktrees") break;
-    if (/\b(building|queued|new)\b/.test(rows[i]!)) out.push(rows[i]!);
+    if (/\b(building|testing|queued|new)\b/.test(rows[i]!)) out.push(rows[i]!);
   }
   return out;
 }
@@ -2767,7 +2767,7 @@ test("`x` retires the highlighted row and drops the selection with it", async ()
   h.stop();
 });
 
-test("`s` toggles the highlighted row between building and queued", async () => {
+test("`s` cycles the highlighted row queued -> building -> testing -> queued", async () => {
   const tasks = fakeTasks(TASKS);
   const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), tasks);
   h.tui.question();
@@ -2776,15 +2776,28 @@ test("`s` toggles the highlighted row between building and queued", async () => 
   h.send("j"); // ctrl-o overhaul, which is building
   await settle();
 
+  // One key for three statuses, running the way the work does. From `building`
+  // the next press is `testing` — the row is built and waiting on the captain.
   h.send("s");
   await settle();
-  assert.deepEqual(tasks.writes, ["status:ctrl-o overhaul:queued"]);
-  assert.equal(tasks.list()[0]!.status, "queued");
-  assert.match(selectedRow(h), /queued\s+ctrl-o overhaul/, "the row is repainted, still selected");
+  assert.deepEqual(tasks.writes, ["status:ctrl-o overhaul:testing"]);
+  assert.equal(tasks.list()[0]!.status, "testing");
+  assert.match(selectedRow(h), /testing\s+ctrl-o overhaul/, "the row is repainted, still selected");
 
+  // Round the cycle: `testing` wraps to `queued`, which is the way back for a
+  // row that failed its test. Nothing here reaches `done` — `x` is that key.
   h.send("s");
   await settle();
-  assert.equal(tasks.list()[0]!.status, "building", "and it toggles back");
+  assert.equal(tasks.list()[0]!.status, "queued");
+  h.send("s");
+  await settle();
+  assert.equal(tasks.list()[0]!.status, "building", "and it comes all the way round");
+  assert.deepEqual(tasks.writes, [
+    "status:ctrl-o overhaul:testing",
+    "status:ctrl-o overhaul:queued",
+    "status:ctrl-o overhaul:building",
+  ]);
+  assert.equal(tasks.list().length, 3, "and no press ever took a row off the table");
   h.stop();
 });
 

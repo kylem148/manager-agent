@@ -13,6 +13,7 @@ import {
   type TaskRow,
 } from "./taskstore.js";
 import { makeExecutor, newSideEffects, toolDefinitions, TASK_COMMANDS } from "./tools.js";
+import { taskDisplayOrder } from "../taskorder.js";
 import { buildSystemPrompt } from "./prompt.js";
 import type { ResearchConfig } from "../config.js";
 
@@ -156,19 +157,54 @@ test("adding the text of a row already on the table is refused, not duplicated",
   assert.deepEqual(store.list(), ROWS);
 });
 
-test("status takes the two words and nothing else", async () => {
+test("status takes the three words and nothing else", async () => {
   const store = TaskStore.ephemeral(ROWS);
   await store.setStatus("ctrl-o overhaul", "queued");
   assert.equal(store.list()[0]!.status, "queued");
   await store.setStatus("ctrl-o overhaul", "building");
   assert.equal(store.list()[0]!.status, "building");
+  // The third one is a status like the others: it is set directly, from any of
+  // them, and it is not a step the store makes a row walk to.
+  await store.setStatus("ctrl-o overhaul", "testing");
+  assert.equal(store.list()[0]!.status, "testing");
+  await store.setStatus("ctrl-o overhaul", "building");
+  assert.equal(store.list()[0]!.status, "building", "and there is a way back out of it");
 
   // Strict on the way in, unlike the read path: a write that silently became
-  // `queued` is a write the caller believes landed.
-  for (const bad of ["done", "ready-to-arm", "", 3, undefined]) {
+  // `queued` is a write the caller believes landed. `done` and `tested` are the
+  // two most tempting near-misses, and neither is a status.
+  for (const bad of ["done", "tested", "ready-to-arm", "", 3, undefined]) {
     assert.equal((await refusal(() => store.setStatus("ctrl-o overhaul", bad))).code, "BAD_STATUS");
   }
   assert.equal(store.list()[0]!.status, "building", "and the row is as it was");
+});
+
+/**
+ * A row parked in `testing` is still a row on the table: it survives a restart,
+ * it renames in place like any other, and retiring it is what done still means.
+ * The whole point of the status is that nothing retires on the strength of the
+ * crew's word — so the path OUT of the table has to be unchanged.
+ */
+test("a testing row round-trips through the file, renames in place, and retires", async () => {
+  const { paths, cleanup } = await tmpPaths();
+  try {
+    const store = await TaskStore.load(paths);
+    await store.add("yellow status");
+    await store.setStatus("yellow status", "testing");
+
+    const reopened = await TaskStore.load(paths);
+    assert.deepEqual(reopened.list(), [{ task: "yellow status", status: "testing" }], "read back as it was written");
+
+    const renamed = await reopened.rename("yellow status", "the yellow status");
+    assert.deepEqual(renamed, { task: "the yellow status", status: "testing" }, "rename keeps the status");
+
+    const retired = await reopened.retire("the yellow status");
+    assert.equal(retired.task, "the yellow status");
+    assert.deepEqual(reopened.list(), [], "retire still lifts it clean out");
+    assert.equal((await TaskStore.load(paths)).done()[0]!.task, "the yellow status", "and into done");
+  } finally {
+    await cleanup();
+  }
 });
 
 /**
@@ -271,8 +307,8 @@ test("retire lifts a row out of the table and keeps it, timestamped, in done", a
     assert.deepEqual(store.list(), [{ task: "bedrock retry backoff", status: "queued" }]);
     assert.deepEqual(store.done(), [{ task: "ctrl-o overhaul", retiredAt: at }]);
 
-    // Done is an ACTION, not a third status: nothing retired is still in the
-    // table, and nothing retired is lost either.
+    // Done is an ACTION, not a status of its own — `testing` did not change
+    // that: nothing retired is still in the table, and nothing retired is lost.
     const reloaded = await TaskStore.load(paths);
     assert.deepEqual(reloaded.list(), [{ task: "bedrock retry backoff", status: "queued" }]);
     assert.deepEqual(reloaded.done(), [{ task: "ctrl-o overhaul", retiredAt: at }]);
@@ -377,12 +413,13 @@ test("a file holding the wrong shape entirely is an empty table too", async () =
   }
 });
 
-test("rows are coerced: junk is dropped, cells are one line, status is one of two", () => {
+test("rows are coerced: junk is dropped, cells are one line, status is one of three", () => {
   assert.deepEqual(
     coerceTasks([
       { task: "  spaced  out  ", status: " Building " },
       { task: "multi\nline\ndescription", status: "queued" },
       { task: "no status at all" },
+      { task: "under test", status: " Testing " },
       { task: "" }, // nothing to show
       { status: "queued" }, // no task text at all
       "a bare string",
@@ -392,6 +429,9 @@ test("rows are coerced: junk is dropped, cells are one line, status is one of tw
       { task: "spaced out", status: "building" },
       { task: "multi line description", status: "queued" },
       { task: "no status at all", status: "queued" },
+      // Read the same way `building` is: trimmed and case-folded, so a row the
+      // panel wrote and a row typed into the file by hand land identically.
+      { task: "under test", status: "testing" },
     ],
   );
 });
@@ -425,7 +465,7 @@ test("a store written under the old shape loads: bare array, type ignored, statu
     ]);
     assert.deepEqual(store.done(), [], "a file with no done list has retired nothing");
     for (const row of store.list()) {
-      assert.ok(TASK_STATUSES.includes(row.status), `${row.status} is one of the two`);
+      assert.ok(TASK_STATUSES.includes(row.status), `${row.status} is one of the three`);
       assert.ok(!("type" in row), "and nothing carries the old field forward");
     }
 
@@ -435,6 +475,49 @@ test("a store written under the old shape loads: bare array, type ignored, statu
     const onDisk = JSON.parse(await fsp.readFile(paths.taskTable, "utf8")) as Record<string, unknown>;
     assert.ok(!JSON.stringify(onDisk).includes("\"type\""), "the stored rows are the new shape");
     assert.ok(Array.isArray(onDisk.tasks) && Array.isArray(onDisk.done), "and the file has both lists");
+  } finally {
+    await cleanup();
+  }
+});
+
+/**
+ * The compatibility case for the third status: a file written by the version
+ * that had only two. Every real instance has one of these on disk, so this is
+ * the normal first read after the change, not an edge case — and the rows in it
+ * must come back byte-identical, not "close enough". A `testing` bucket added in
+ * the MIDDLE of the display order is the thing that could have moved them.
+ */
+test("a two-status file written before `testing` existed loads unchanged", async () => {
+  const { paths, cleanup } = await tmpPaths();
+  try {
+    await fsp.mkdir(path.dirname(paths.taskTable), { recursive: true });
+    const before = {
+      tasks: [
+        { task: "bedrock retry backoff", status: "queued" },
+        { task: "ctrl-o overhaul", status: "building" },
+        { task: "pricing table refresh", status: "queued" },
+      ],
+      done: [{ task: "prompt overhaul", retiredAt: "2026-07-30T00:00:00.000Z" }],
+    };
+    await fsp.writeFile(paths.taskTable, JSON.stringify(before, null, 2) + "\n", "utf8");
+
+    const store = await TaskStore.load(paths);
+    assert.deepEqual(store.list(), before.tasks, "every row exactly as it was stored");
+    assert.deepEqual(store.done(), before.done, "and the done list with it");
+    // The painted view of that same table is what it always was, too.
+    assert.deepEqual(
+      taskDisplayOrder(store.list()).map((r) => r.task),
+      ["ctrl-o overhaul", "bedrock retry backoff", "pricing table refresh"],
+    );
+
+    // And the new status is available to it immediately: no migration step, no
+    // rewrite, nothing the captain has to do to the file first.
+    await store.setStatus("ctrl-o overhaul", "testing");
+    assert.deepEqual((await TaskStore.load(paths)).list(), [
+      { task: "bedrock retry backoff", status: "queued" },
+      { task: "ctrl-o overhaul", status: "testing" },
+      { task: "pricing table refresh", status: "queued" },
+    ]);
   } finally {
     await cleanup();
   }
@@ -486,7 +569,13 @@ test("the task_table tool is declared, linked or not, and dispatches on a comman
     assert.deepEqual(tool.input_schema.required, ["command"]);
     const props = tool.input_schema.properties as Record<string, { enum?: string[] }>;
     assert.deepEqual(props.command?.enum, ["add", "status", "rename", "retire", "list"]);
-    assert.deepEqual(props.status?.enum, ["building", "queued"], "and the status enum is the gate");
+    // All three, in display order. The enum is the gate: a status the TUI can
+    // put on a row and the tool's schema cannot name is a row the co fails on.
+    assert.deepEqual(
+      props.status?.enum,
+      ["building", "testing", "queued"],
+      "and the status enum is the gate",
+    );
     assert.ok("new_task" in props, "rename needs a second text, and it is declared");
     assert.ok(!("tasks" in props), "the whole-table array is gone from the contract");
   }
@@ -667,4 +756,52 @@ test("a status outside the enum is refused by the tool, never coerced into the t
   assert.equal(res.is_error, true);
   assert.match(res.content, /BAD_STATUS/);
   assert.equal(store.list()[0]!.status, "building", "the row did not move");
+});
+
+/**
+ * The co's side of the third status, which is the half that fails LOUDLY if it
+ * is missed: the captain can put a row into `testing` from the panel, and the
+ * next thing the co does with that table is read it. A tool that knew two
+ * statuses would refuse the write and mis-sort the read on a row it did not make.
+ */
+test("the tool sets, lists and sorts `testing` like any other status", async () => {
+  const store = TaskStore.ephemeral([
+    { task: "waiting", status: "queued" },
+    { task: "checking", status: "testing" }, // as if the captain parked it there
+    { task: "working", status: "building" },
+  ]);
+  const tableOf = (content: string): TaskRow[] =>
+    (JSON.parse(content) as { table: TaskRow[] }).table ?? [];
+
+  const listed = await callTool(store, { command: "list" });
+  assert.ok(!listed.is_error, listed.content);
+  assert.deepEqual(
+    tableOf(listed.content),
+    [
+      { task: "working", status: "building" },
+      { task: "checking", status: "testing" },
+      { task: "waiting", status: "queued" },
+    ],
+    "read back in display order, with the captain's row intact",
+  );
+
+  // And the co can write the status itself — the schema enum is the only gate,
+  // and it now names this one.
+  const moved = await callTool(store, { command: "status", task: "waiting", status: "testing" });
+  assert.ok(!moved.is_error, moved.content);
+  assert.match(moved.content, /"status": ?"testing"/);
+  // Into the testing group, and STORED order decides inside it: "waiting" sits
+  // at index 0 of the store, so it lands above the row that was already testing
+  // rather than being appended behind it. The same rule the building group has.
+  assert.deepEqual(
+    tableOf(moved.content).map((r) => `${r.status}:${r.task}`),
+    ["building:working", "testing:waiting", "testing:checking"],
+    "and it lands in the testing group, keeping stored order inside it",
+  );
+
+  // Retire is untouched by any of it: done is still an action off the table.
+  const retired = await callTool(store, { command: "retire", task: "checking" });
+  assert.ok(!retired.is_error, retired.content);
+  assert.equal(store.done()[0]!.task, "checking");
+  assert.deepEqual(store.list().map((r) => r.task), ["waiting", "working"]);
 });
