@@ -526,6 +526,12 @@ You can type it early, at the spinner, before the order is even armed: a queued
 co is working" above). It is still your keystroke and still the same interlock —
 only the waiting is gone.
 
+Either way the co-manager learns how it went, in one line into its own history:
+the order fired and which agent is running it, or the order was cancelled — and a
+cancellation is placed ahead of the message that cancelled it, so the co reads
+"you were cancelled" and then what you actually said, on the one turn it has to
+answer both. It used to have neither, and guessed.
+
 ### Two agents in one worktree: the read-only lane
 
 A feature worktree can hold more than one agent, and the confirm verb decides
@@ -973,7 +979,11 @@ queue advances, and the next feature rebases onto the `dev` you just moved and
 has its own PR checked against it, so its `[m]` lights up when it goes green.
 Nothing is armed, nothing expires, and the co-manager is not involved in any of
 it: it never opens the merge, never waits on your keypress, and its agent loop is
-free the whole time. The PR is a normal PR while it waits — retitle it, rewrite
+free the whole time. It is *told*, though, which is a different thing: one line
+into its own history saying which feature and which PR merged, or that the merge
+failed, so it stops reporting a landed feature as still in flight. That line
+costs no model call, wakes nothing, and prints nothing — it is simply sitting
+there the next time the co speaks. The PR is a normal PR while it waits — retitle it, rewrite
 the description (on GitHub, or with `e` without leaving the panel), comment on
 it, review the diff on GitHub. Re-processing only
 rewrites the fenced evidence block co owns; your edits stay.
