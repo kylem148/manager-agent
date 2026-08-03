@@ -23,6 +23,7 @@ import {
   type TaskPanelRow,
   type TaskPanelSource,
 } from "./tui.js";
+import { OCEAN_TICK_MS } from "./ocean.js";
 import { stripAnsi, visibleWidth } from "./wrap.js";
 
 /** A checks summary for the panel, counted from the runs so a test only states
@@ -128,6 +129,10 @@ function harness(
   queue?: QueuePanelSource,
   features?: FeaturePanelSource,
   tasks?: TaskPanelSource,
+  /** Whether self-started scenery may move. Off by default, as it is for any
+   *  Tui built without an opinion — so every test but the tide's own sees the
+   *  still water this panel has always painted. */
+  scenery?: () => boolean,
 ): Harness {
   let listener: ((d: string) => void) | null = null;
   const writes: string[] = [];
@@ -158,6 +163,7 @@ function harness(
     ...(queue ? { queue } : {}),
     ...(features ? { features } : {}),
     ...(tasks ? { tasks } : {}),
+    ...(scenery ? { scenery } : {}),
   });
   tui.start();
   return {
@@ -3231,6 +3237,321 @@ test("Home's footer names the keys, because nothing else can", async () => {
   assert.match(renaming, /Enter rename the task/);
   assert.match(renaming, /Esc cancel/);
   h.stop();
+});
+
+// --- the ocean at the foot of Home -------------------------------------------
+//
+// A waterline over a sea floor, with the greeting's own ship on it, pinned to
+// the bottom of the tab. It is decoration and nothing else, so these tests are
+// all the same assertion from different angles: the content is never the thing
+// that gives way. The arithmetic is proved in ocean.test.ts; these are the real
+// painted frames, because "no row was lost" is a claim about the screen.
+
+/** The Home body rows of the last frame, without the bar or the footer. */
+function bodyRows(h: Harness): string[] {
+  return screenRows(h).slice(1, -1);
+}
+
+test("a tall Home floats the greeting's ship on a waterline at the bottom", async () => {
+  const h = harness(undefined, 90, 34, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const rows = bodyRows(h);
+
+  assert.match(rows.at(-2) ?? "", /~~~\^~~~\^/, "the waterline is the second-from-last row");
+  assert.match(rows.at(-1) ?? "", /\./, "and the sea floor is the last one");
+  assert.ok(rows.join("\n").includes("|>>=x"), "the ship's pennant, so it really is the galleon");
+  assert.ok(rows.join("\n").includes(")_____)_____)_____)"), "hull and all");
+
+  // The content is still all there, and still above the water.
+  const frame = h.lastFramePlain();
+  assert.match(frame, /building\s+ctrl-o overhaul/);
+  assert.match(frame, /search\s+\[crew running\]/);
+  const lastContent = rows.findIndex((r) => /full-text search/.test(r));
+  const water = rows.findIndex((r) => /~~~\^/.test(r));
+  assert.ok(lastContent > 0 && lastContent < water, "the list sits above the sea, not in it");
+  h.stop();
+});
+
+test("as the rows run out the ship goes first, and the waterline stays", async () => {
+  const h = harness(undefined, 90, 20, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const rows = bodyRows(h);
+
+  assert.ok(!rows.join("\n").includes("|>>=x"), "no ship on a short pane");
+  assert.ok(!rows.join("\n").includes(")_)"), "and no piece of one either");
+  assert.match(rows.at(-2) ?? "", /~~~\^~~~\^/, "the water is what's left");
+
+  // Every row of both blocks is still painted.
+  const frame = h.lastFramePlain();
+  for (const t of TASKS) assert.ok(frame.includes(t.task), `task still painted: ${t.task}`);
+  for (const f of FEATURES) assert.ok(frame.includes(f.branch), `worktree still painted: ${f.branch}`);
+  h.stop();
+});
+
+test("under more pressure the waterline goes too, and the content is untouched", async () => {
+  const h = harness(undefined, 90, 16, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+
+  assert.ok(!frame.includes("~~~^"), "no water");
+  assert.ok(!frame.includes("|>>=x"), "no ship");
+  for (const t of TASKS) assert.ok(frame.includes(t.task), `task still painted: ${t.task}`);
+  for (const f of FEATURES) assert.ok(frame.includes(f.branch), `worktree still painted: ${f.branch}`);
+  h.stop();
+});
+
+test("content never scrolls, clips or loses a row to the scene, at any height", async () => {
+  const h = harness(undefined, 90, 34, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+
+  // Walk down through every height where the scene changes shape, and past it.
+  for (let rows = 34; rows >= 8; rows--) {
+    h.resize(90, rows);
+    await frame();
+    const painted = h.lastFramePlain();
+    const body = bodyRows(h).join("\n");
+    const decorated = body.includes("~~~^");
+    const footer = screenRows(h).at(-1) ?? "";
+    if (decorated) {
+      // Room to spare means room for everything: nothing is below the fold, so
+      // the art cannot have invented a scroll position or a "more below" count.
+      assert.ok(!/more below/.test(footer), `rows=${rows}: decoration must not push content off screen`);
+      for (const t of TASKS) assert.ok(painted.includes(t.task), `rows=${rows}: ${t.task} survives`);
+      for (const f of FEATURES) assert.ok(painted.includes(f.branch), `rows=${rows}: ${f.branch} survives`);
+    }
+    assert.equal(screenRows(h).length, rows, `rows=${rows}: the frame is still exactly the screen`);
+  }
+  h.stop();
+});
+
+test("a table that fills the pane gets the whole pane; the scene simply isn't drawn", async () => {
+  const h = harness(undefined, 90, 20, undefined, fakeFeatures(FEATURES), fakeTasks(MANY_TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const painted = h.lastFramePlain();
+
+  assert.ok(!painted.includes("~~~^"), "content wanted the rows, so there is no water");
+  assert.match(painted, /task number 01/, "and the table has them");
+  assert.match(screenRows(h).at(-1) ?? "", /more below/, "with the footer counting the rest, as always");
+
+  // And paging still reaches the tail: the art is not sitting on the end of it.
+  h.send("G");
+  await settle();
+  assert.match(h.lastFramePlain(), /task number 24/, "G still reaches the last row");
+  assert.ok(!h.lastFramePlain().includes("~~~^"), "still no water down there");
+  h.stop();
+});
+
+test("at a narrow width the ship is absent rather than clipped mid-hull", async () => {
+  const h = harness(undefined, 34, 34, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const rows = bodyRows(h);
+
+  assert.match(rows.at(-2) ?? "", /~~~\^/, "the water fits any width");
+  assert.ok(!rows.join("\n").includes(")_)"), "the ship does not, so it is not there at all");
+  for (const r of screenRows(h)) {
+    assert.ok(visibleWidth(r) <= 34, `row overflows the width: ${JSON.stringify(r)}`);
+  }
+
+  // Widen it and the ship sails in, whole.
+  h.resize(90, 34);
+  await frame();
+  assert.ok(bodyRows(h).join("\n").includes("|>>=x"), "a wider terminal gets the ship back");
+  h.stop();
+});
+
+test("the scene is on Home alone: the other tabs are unchanged", async () => {
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(fakeDocs({ "plan.md": "# Plan\n" }), 90, 34, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.ok(h.lastFramePlain().includes("~~~^"), "Home has it");
+
+  h.send("2");
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("~~~^"), "the queue tab does not");
+  h.send("3");
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("~~~^"), "nor does the docs tab");
+  h.send("1");
+  await settle();
+  assert.ok(h.lastFramePlain().includes("~~~^"), "and it is still there on the way back");
+  h.stop();
+});
+
+// --- the tide ----------------------------------------------------------------
+//
+// The sea moves, and a moving thing on a screen is a timer somewhere. So these
+// tests are almost all about the timer's DEATH rather than its life: the one
+// live frame is easy, and a repaint loop left running behind a closed panel is
+// the failure that costs a captain his battery and never shows itself.
+//
+// A live tide has exactly one observable effect — it repaints — so counting the
+// frames written to the terminal is both how we prove it is running and how we
+// prove it is not. Nothing here reads a private field: a timer that writes no
+// frames is, from the terminal's side, not a timer at all.
+
+/** Home, wide and tall enough for the whole scene, with scenery allowed. */
+function tidal(cols = 90, rows = 34): Harness {
+  return harness(undefined, cols, rows, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS), () => true);
+}
+
+/** Comfortably longer than a frame, so a live tide has certainly painted. */
+const tick = (): Promise<void> => new Promise((r) => setTimeout(r, OCEAN_TICK_MS + 120));
+
+/** Frames written to the terminal so far. */
+function paints(h: Harness): number {
+  return h.writes().length;
+}
+
+/** Nothing repaints the screen for longer than a frame would take. */
+async function quiet(h: Harness, why: string): Promise<void> {
+  const before = paints(h);
+  await tick();
+  assert.equal(paints(h), before, why);
+}
+
+test("with scenery allowed the water moves, and nothing above it does", async () => {
+  const h = tidal();
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const before = bodyRows(h);
+  await tick();
+  const after = bodyRows(h);
+
+  const water = before.findIndex((r) => /~~~\^/.test(r));
+  assert.ok(water > 0, "there is a waterline to move");
+  assert.notEqual(after[water], before[water], "and a frame later the swell has rolled on");
+  assert.equal(after.length, before.length, "the scene is still exactly as tall");
+
+  // The content is not scenery: every row of it is byte-identical, and the
+  // footer still has nothing below the fold to count.
+  const lastContent = before.findIndex((r) => /full-text search/.test(r));
+  assert.ok(lastContent > 0 && lastContent < water, "the table sits above the sea");
+  assert.deepEqual(
+    after.slice(0, lastContent + 1),
+    before.slice(0, lastContent + 1),
+    "the table did not move a column",
+  );
+  assert.doesNotMatch(screenRows(h).at(-1) ?? "", /more below/, "and cost nothing");
+  h.stop();
+});
+
+test("a Tui told nothing about scenery paints still water forever", async () => {
+  // The default, and the one every other test in this file runs under: no
+  // opinion means no motion, so a frame a second later is the same frame.
+  const h = harness(undefined, 90, 34, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.ok(h.lastFramePlain().includes("~~~^"), "the sea is drawn");
+  const before = bodyRows(h);
+  await quiet(h, "nothing may tick when scenery was never allowed");
+  assert.deepEqual(bodyRows(h), before, "and the water is where it was");
+  h.stop();
+});
+
+test("the tide stops dead when the panel closes", async () => {
+  const h = tidal();
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const opened = paints(h);
+  await tick();
+  assert.ok(paints(h) > opened, "it really is ticking while Home is on screen");
+
+  h.send(CTRL_O); // and the panel goes away
+  await settle();
+  await quiet(h, "a closed panel must not leave a repaint loop behind it");
+  h.stop();
+});
+
+test("leaving Home stops the tide; coming back picks it up again", async () => {
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(undefined, 90, 34, q, fakeFeatures(FEATURES), fakeTasks(TASKS), () => true);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("2"); // the queue tab: no sea on it
+  await settle();
+  await quiet(h, "a tab with no scene must not be ticking");
+
+  h.send("1");
+  await settle();
+  const back = paints(h);
+  await tick();
+  assert.ok(paints(h) > back, "Home starts it again on arrival");
+  h.stop();
+});
+
+test("a pane with no room for a scene starts no timer at all", async () => {
+  const h = tidal(90, 16);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("~~~^"), "the content wanted every row");
+  await quiet(h, "nothing is drawn down there, so nothing may tick");
+  h.stop();
+});
+
+test("a resize that takes the sea away stops the tide, and one that gives it back restarts it", async () => {
+  const h = tidal();
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.resize(90, 16);
+  await frame();
+  assert.ok(!h.lastFramePlain().includes("~~~^"), "no scene at this height");
+  await quiet(h, "and no tick either");
+
+  h.resize(90, 34);
+  await frame();
+  const back = paints(h);
+  await tick();
+  assert.ok(paints(h) > back, "the sea is back, and the tide with it");
+  h.stop();
+});
+
+test("model tokens stop the tide, and it resumes when the turn ends", async () => {
+  const h = tidal();
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  // The panel stays up while the model streams into the transcript underneath,
+  // so this is the one case where the two could compete for the frame.
+  h.tui.appendStream("co  › half an answer", { markdown: true });
+  await frame();
+  await quiet(h, "scenery never repaints against arriving tokens");
+
+  h.tui.flushStream();
+  h.tui.appendBlock("");
+  await frame();
+  const resumed = paints(h);
+  await tick();
+  assert.ok(paints(h) > resumed, "and the tab picks the tide up on its next paint");
+  h.stop();
+});
+
+test("teardown leaves nothing running, panel and tide and all", async () => {
+  const h = tidal();
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.stop();
+  await quiet(h, "a stopped Tui writes to a screen it has already given back");
 });
 
 // --- the tab bar and the number keys -----------------------------------------

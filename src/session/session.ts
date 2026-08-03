@@ -357,6 +357,12 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     ? new Tui({
         promptLabel: PROMPT_LABEL,
         header,
+        // Whether the sea at the foot of the Home tab may move. The Tui starts
+        // that one itself (there is no caller to hand it a spec), so the
+        // CO_VISUALS decision has to reach it as a predicate instead — resolved
+        // per call for the same reason visualsFor is, and hard-coded plainIO
+        // false because this branch IS the Tui.
+        scenery: () => currentVisuals({ plainIO: false }).animate,
         docs: docSource(paths),
         // The Home tab's task table: read fresh at paint time,
         // so a row either writer added shows on the next paint. Wired whether or

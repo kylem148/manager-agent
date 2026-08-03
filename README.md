@@ -759,6 +759,30 @@ with the task keys gated behind a submitted line or a picked row, is what lets
 this be the tab the panel opens on. Landing is the queue tab's keystroke, and
 creating, enqueuing and abandoning are the co-manager's levers.
 
+**And at the bottom, an ocean.** In whatever room the two blocks leave unused, a
+waterline over the sea floor with the same galleon the session-start greeting
+draws sitting on it. It says nothing and tracks nothing; it is there because
+opening the panel should feel like something. Which is exactly why it is the
+first thing to go: it is drawn out of the leftovers and hands them back in a
+fixed order as the content grows, the ship first and the water second, until on
+a short pane there is no scene at all. No row of the table or the worktree list
+is ever clipped, scrolled or pushed off screen to keep it. Narrow works the same
+way: below the width the hull needs, the ship is absent rather than cut in half,
+and the waterline, being a tile, fits anything. The colour goes through the same
+handling as everything else here, so `NO_COLOR` and a non-colour terminal get
+plain ASCII.
+
+And it moves — slowly. The swell rolls a column about every two thirds of a
+second and the galleon rocks a column with it, on the same `CO_VISUALS` gate and
+the same timer as the dispatch flourish and the exit ship, so anything that says
+this terminal should not animate (`CO_VISUALS=minimal` or `off`, `NO_COLOR`, a
+reduced-motion signal, a pipe, `TERM=dumb`, a narrow screen) leaves the water
+still. It moves sideways only: the scene's height never changes with the frame,
+so the tide cannot cost a row any more than the scene can. The timer lives
+exactly as long as the sea is on screen — leave the tab, close the panel, shrink
+the pane until the content wants the rows, or let the co start streaming an
+answer, and it is gone until the sea comes back.
+
 ### Landing work: one keystroke, `[m]`
 
 Finished features land in `dev` as **GitHub pull requests**, through a strictly
