@@ -192,6 +192,51 @@ Bedrock API key that lacks Mantle entitlement 404s there, so the app stays on
 the runtime path (matching Claude Code's own `CLAUDE_CODE_USE_BEDROCK=1`
 setup). Run `co doctor --ping` to confirm it's reachable from your account.
 
+### A model per co-manager: `/model`
+
+You run one co-manager per project, and projects don't all want the same model.
+`/model` is that choice, made from inside the session and remembered:
+
+```
+/model                                    # what am I on, and what put me there
+/model us.anthropic.claude-sonnet-5       # switch this co-manager, and keep it
+```
+
+Bare, it reports the model in force and its **source** — an exported
+`BEDROCK_MODEL_ID`, this co-manager's own `.env`, a shared `.env`, or the
+built-in default — plus anything that source is covering up, which is the whole
+answer to "why is this instance not on the model I set".
+
+With an id, it switches. The id is taken **verbatim**: there is no alias table
+and no friendly-name registry, because either would be stale the day a new model
+ships and would then reject an id that works. What happens, in order:
+
+- **Bedrock is asked first.** A bad or unentitled id would otherwise set cleanly
+  and kill the *next* turn, with the error arriving detached from the command
+  that caused it. The probe is one tiny call carrying the same thinking and
+  effort parameters a real turn will, so a model that takes the id but rejects
+  the params is caught here too. A refusal prints Bedrock's own words, leaves the
+  previous model in force, and writes nothing.
+- **The choice is stored per instance**, as `BEDROCK_MODEL_ID` in that
+  co-manager's own `.env` under `CO_HOME` — never in your repo, never in the home
+  `.env` every other instance would inherit. The file is edited in place, so your
+  other keys and comments survive. No other co-manager moves.
+- **It takes effect from the next turn** and the conversation is kept; a model
+  change is not a new conversation. Effort is re-clamped against the new model's
+  ladder if it has to be (xhigh arrived with Opus 4.7), and says so rather than
+  dropping quietly.
+
+An **exported `BEDROCK_MODEL_ID` outranks the stored choice** — it always has, at
+load — so `/model <id>` refuses while one is set, names it, and changes nothing.
+Winning for one session and losing at the next restart would give "which model is
+this co-manager on" two different answers depending on when you asked, which is
+the confusion this command exists to end. Unset the variable and set it again.
+
+`/cost` follows the switch without being told: the ledger is keyed by the model
+in force when each turn was metered, so a switch splits the buckets and each is
+priced on its own. A model with no rate on file counts its tokens and reports the
+cost as unknown rather than billing it at the rate of the model it replaced.
+
 ### Research layer (all optional)
 
 Research is a first-class capability with a pluggable design:
@@ -256,6 +301,7 @@ Slash-commands are optional overrides:
 | `/sync`            | refresh `activeContext.md` from recent activity           |
 | `/archive <log>`   | move a log's history into `archive/`                      |
 | `/effort [level]`  | show or set thinking effort for this session              |
+| `/model [id]`      | show the model and where it came from, or set it for this co-manager |
 | `/cost`            | tokens, dollars and time spent — session, today, all time  |
 | `/help`            | list commands                                             |
 | `/exit`            | leave (auto-saves: refreshes `activeContext.md` if stale)  |
@@ -1283,7 +1329,7 @@ they want, so a cold start only loads what it uses.
 ```
 src/
   index.ts config.ts paths.ts ui.ts model.ts research.ts cost.ts
-             taskorder.ts confirmverb.ts
+             taskorder.ts confirmverb.ts envfile.ts
   cli/       auth.ts doctor.ts modelsdoctor.ts link.ts cost.ts
   tui/       tui.ts editor.ts markdown.ts wrap.ts keys.ts banner.ts
              commands.ts visuals.ts
@@ -1301,16 +1347,31 @@ Tests live next to the code they cover (`src/tui/keys.test.ts`, etc.).
 
 - **`src/index.ts`** — CLI dispatch and the `dist/index.js` bin entry.
 - **`src/config.ts`** — env/`.env` loading; Bedrock + research config. No
-  hardcoded secrets.
+  hardcoded secrets. It also owns the model-choice ladder in both directions:
+  `resolveModelOrigin` walks the same precedence `loadConfig` +
+  `applyInstanceOverrides` do (exported variable, then the instance's own `.env`,
+  then the shared ones, then the default) and reports which rung won and what it
+  is covering; `persistInstanceModel` writes the instance rung. Both live beside
+  the loader deliberately — a `/model` that reported a different answer than the
+  next turn used would be worse than no report at all.
 - **`src/paths.ts`** — the two-tier folder layout and instance path resolution.
 - **`src/ui.ts`** — colour and line-output primitives used by everything.
 - **`src/model.ts`** — `AnthropicBedrock` wrapper: streaming turns, the tool-use
-  loop, thinking/effort config. Bedrock is the only backend (V1).
+  loop, thinking/effort config. Bedrock is the only backend (V1). `setModel` and
+  `probeModel` are `/model`'s two halves: the id is a per-request field, so a
+  switch rebuilds no client and drops no history, and the probe is the only
+  honest validation there is — a model id cannot be checked offline against a
+  registry that would not be stale by the next release.
 - **`src/research.ts`** — `SearchProvider` (Brave/Tavily/SearXNG) and `Fetcher`
   (Jina/HTTP) behind small interfaces; everything optional.
 - **`src/cost.ts`** — the spend meter: Bedrock rate table, four-class pricing,
   the durable per-instance ledger, and the `/cost` report. Silent by design;
   `model.ts` feeds it and nothing else reads it.
+- **`src/envfile.ts`** — reading and rewriting `KEY=VALUE` files in place, at the
+  root because two layers write one: `co auth bedrock` (the token, in the home
+  `.env`) and `/model` (the model id, in an instance's own). It edits rather than
+  reserializes — a `.env` is a file people edit by hand, and rewriting it from a
+  parsed map silently deletes their comments and ordering.
 - **`src/confirmverb.ts`** — one function, `isConfirmVerb`, and it is at the root
   because two layers ask it. `session.ts` parses a confirm for what it grants
   (which agent, which lane); the TUI only needs to know whether a line IS one, to

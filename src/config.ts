@@ -1,7 +1,9 @@
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import { config as loadDotenv, parse as parseDotenv } from "dotenv";
+import { readEnvFile, readEnvText, upsertEnv } from "./envfile.js";
 
 /**
  * Loads .env from the current working directory and from the co-manager home,
@@ -220,6 +222,13 @@ export function paneWaitSec(): number {
  */
 export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-5";
 
+/**
+ * The one env key that names the Bedrock model, wherever it is read or written:
+ * the environment, a `.env`, an instance's own `.env`, and `/model`. Named once
+ * so the command that writes it and the loader that reads it cannot drift.
+ */
+export const MODEL_ID_KEY = "BEDROCK_MODEL_ID";
+
 export interface ModelConfig {
   region: string;
   /**
@@ -315,7 +324,7 @@ function parseIntOr(name: string, fallback: number): number {
  * environment still wins so a one-off `BEDROCK_MODEL_ID=… co testing` overrides
  * the file, which is what you want when checking something quickly.
  */
-const INSTANCE_KEYS = ["BEDROCK_MODEL_ID", "CO_EFFORT", "CO_THINKING", "CO_MAX_TOKENS"] as const;
+const INSTANCE_KEYS = [MODEL_ID_KEY, "CO_EFFORT", "CO_THINKING", "CO_MAX_TOKENS"] as const;
 
 /**
  * Apply an instance's own `.env` on top of the resolved config.
@@ -373,6 +382,142 @@ export function applyInstanceOverrides(
   if (effort) model.effort = clampEffort(effort, model.modelId);
 
   return { ...cfg, model };
+}
+
+// --- which model is in force, and why -----------------------------------------
+
+/** Where the model id in force came from, strongest first. */
+export type ModelSource = "env" | "instance" | "dotenv" | "default";
+
+/** One rung of the ladder: an id and a human-readable account of where it is. */
+export interface ModelCandidate {
+  modelId: string;
+  /** Human-readable "where", e.g. a path or "the environment". */
+  where: string;
+}
+
+export interface ModelOrigin extends ModelCandidate {
+  source: ModelSource;
+  /**
+   * Lower-precedence values this one is hiding, strongest first. A stored
+   * per-instance choice that an exported variable is overriding shows up here,
+   * which is the case `/model` exists to make visible instead of puzzling.
+   */
+  shadowed: ModelCandidate[];
+}
+
+/**
+ * Resolve which model a session opened right now would use, and where that
+ * value comes from.
+ *
+ * This walks the SAME ladder the loader does — real environment, then the
+ * instance's own `.env`, then the `.env` files loadEnvFiles reads (cwd before
+ * home), then the built-in default — and it has to keep walking it in lockstep
+ * with loadConfig + applyInstanceOverrides, because a `/model` that reported a
+ * different answer than the next turn actually used would be worse than no
+ * report at all.
+ *
+ * Everything is read fresh off disk rather than off the loaded Config: this is
+ * asked after `/model` has just rewritten a file, and it must see that write.
+ * `realEnv` is the pre-dotenv snapshot for the same reason applyInstanceOverrides
+ * takes one — by now process.env cannot tell an exported variable from a line in
+ * a `.env`.
+ */
+export function resolveModelOrigin(opts: {
+  instanceRoot: string;
+  home?: string;
+  cwd?: string;
+  /** Injected only by tests; production always uses the module snapshot. */
+  realEnv?: ReadonlySet<string>;
+  /** Injected only by tests. */
+  env?: NodeJS.ProcessEnv;
+}): ModelOrigin {
+  const realEnv = opts.realEnv ?? REAL_ENV;
+  const processEnv = opts.env ?? process.env;
+  const home = opts.home ?? coHome();
+  const cwd = opts.cwd ?? process.cwd();
+
+  const fromFile = (file: string, where: string): ModelCandidate | null => {
+    const v = readEnvFile(file)[MODEL_ID_KEY]?.trim();
+    return v ? { modelId: v, where } : null;
+  };
+
+  const exported = realEnv.has(MODEL_ID_KEY) ? processEnv[MODEL_ID_KEY]?.trim() : undefined;
+  const instanceEnv = path.join(opts.instanceRoot, ".env");
+  const homeEnv = path.join(home, ".env");
+  const cwdEnv = path.join(cwd, ".env");
+
+  const ladder: { source: ModelSource; candidate: ModelCandidate | null }[] = [
+    {
+      source: "env",
+      candidate: exported
+        ? { modelId: exported, where: `${MODEL_ID_KEY} in the environment` }
+        : null,
+    },
+    { source: "instance", candidate: fromFile(instanceEnv, instanceEnv) },
+    // cwd before home, matching loadEnvFiles: dotenv does not overwrite a key it
+    // has already set, so whichever file is read first wins.
+    { source: "dotenv", candidate: cwdEnv === homeEnv ? null : fromFile(cwdEnv, cwdEnv) },
+    { source: "dotenv", candidate: fromFile(homeEnv, homeEnv) },
+  ];
+
+  const present = ladder.filter((r) => r.candidate !== null);
+  const winner = present[0];
+  if (!winner?.candidate) {
+    return {
+      modelId: DEFAULT_MODEL_ID,
+      source: "default",
+      where: "the built-in default",
+      shadowed: [],
+    };
+  }
+  return {
+    ...winner.candidate,
+    source: winner.source,
+    shadowed: present.slice(1).map((r) => r.candidate!),
+  };
+}
+
+/**
+ * A model id this app is willing to write into an env file and send verbatim.
+ *
+ * Deliberately a shape check and nothing more: there is no alias table and no
+ * registry of known ids, because either would go stale the day a new model
+ * ships and would then reject an id that works. What this rejects is what
+ * cannot survive a `KEY=VALUE` line or would make one ambiguous — whitespace,
+ * quotes, `#`, `=`. Whether the id EXISTS is Bedrock's answer to give, and
+ * /model asks it before committing.
+ */
+export function isPlausibleModelId(raw: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(raw);
+}
+
+/**
+ * Store a model id as this instance's own choice, in the instance `.env` the
+ * loader already reads (see applyInstanceOverrides).
+ *
+ * Per-instance because that is the whole ask: one co-manager per project, each
+ * on the model that project wants. It goes in the instance's own folder under
+ * CO_HOME — never in the captain's repo, and never in the home `.env`, which
+ * every other instance would inherit.
+ *
+ * The file is edited in place rather than rewritten from a parsed map, so the
+ * captain's other keys, comments and ordering survive a `/model`. Created 0600
+ * because a `.env` is where secrets end up; an existing file's mode is left
+ * exactly as the captain set it.
+ *
+ * Returns the path written, for the receipt. Throws on a failed write — a
+ * silent failure here would promise a persistence that isn't there.
+ */
+export async function persistInstanceModel(
+  instanceRoot: string,
+  modelId: string,
+): Promise<string> {
+  const file = path.join(instanceRoot, ".env");
+  const next = upsertEnv(readEnvText(file), { [MODEL_ID_KEY]: modelId });
+  await fsp.mkdir(instanceRoot, { recursive: true });
+  await fsp.writeFile(file, next, { encoding: "utf8", mode: 0o600 });
+  return file;
 }
 
 export function loadConfig(): Config {

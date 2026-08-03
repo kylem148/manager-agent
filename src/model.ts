@@ -1,5 +1,6 @@
 import { AnthropicBedrock } from "@anthropic-ai/bedrock-sdk";
 import type Anthropic from "@anthropic-ai/sdk";
+import { clampEffort } from "./config.js";
 import type { Effort, ModelConfig } from "./config.js";
 import { emptyUsage, type TokenUsage } from "./cost.js";
 
@@ -172,6 +173,33 @@ function fmtMs(ms: number): string {
 const CACHE_PROBE_MAX_TOKENS = 64;
 
 /**
+ * Output cap on the model-availability probe /model sends before switching.
+ * The reply is discarded — only whether the call was accepted matters — so this
+ * is as small as a legal request allows. Adaptive thinking will usually hit it
+ * rather than finish, which is fine and expected.
+ *
+ * Not metered. It is neither a turn nor a keep-alive, and at this cap it is a
+ * few tokens against a ledger that reports in cents; minting a third counter to
+ * account for it would cost more clarity in `/cost` than it could ever add.
+ */
+const MODEL_PROBE_MAX_TOKENS = 16;
+
+/**
+ * What the API actually said, for a failure the captain has to act on.
+ *
+ * The SDK's APIError already carries the status and the service's own body text
+ * in `message` ("404 {"message":"The provided model identifier is invalid."}"),
+ * so the job here is to NOT improve on it. A rewritten error is a guess about a
+ * failure we did not diagnose, and the whole value of this string is that it
+ * came from Bedrock rather than from us.
+ */
+export function apiErrorText(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  const text = raw.trim();
+  return text || String(e);
+}
+
+/**
  * The history truncated to end on the last user-role message, or null if there
  * isn't one.
  *
@@ -326,6 +354,68 @@ export class ModelProvider {
    */
   setEffort(effort: Effort): void {
     this.cfg.effort = effort;
+  }
+
+  /**
+   * Point every later turn at a different Bedrock model (/model).
+   *
+   * Same shape as setEffort and for the same reason: the request params are
+   * rebuilt per turn, so this takes effect from the NEXT turn and an in-flight
+   * one is untouched. The message history is deliberately kept — a model change
+   * is not a new conversation. The client is not rebuilt either: the model id is
+   * a per-request field, and region and credentials have not changed.
+   *
+   * Effort is re-clamped against the new model's ladder, because the levels are
+   * not the same on every model (xhigh arrived with Opus 4.7) and an unsupported
+   * one is a 400 on every subsequent turn rather than a soft degrade. Returns the
+   * effort it had to lower to, or null if nothing moved — the caller says so out
+   * loud, since a silent drop in effort is exactly the kind of thing a captain
+   * discovers three turns later.
+   *
+   * What this does NOT do is check that the model answers. Call probeModel first
+   * (as /model does): committing an unreachable id here would break the next turn
+   * instead of the command that set it.
+   */
+  setModel(modelId: string): Effort | null {
+    this.cfg.modelId = modelId;
+    const effort = this.cfg.effort;
+    if (!effort) return null;
+    const clamped = clampEffort(effort, modelId);
+    if (clamped === effort) return null;
+    this.cfg.effort = clamped;
+    return clamped;
+  }
+
+  /**
+   * Ask Bedrock whether it will answer to `modelId`, without committing to it.
+   *
+   * A model id is not checkable offline — there is no registry to consult that
+   * would not be stale the day a new model ships — so the only honest validation
+   * is the API's own answer, and the only place to hear it is before the switch.
+   * Without this, a typo'd or unentitled id sets fine and then kills the next
+   * turn, at which point the error arrives detached from the thing that caused it.
+   *
+   * The probe sends the same thinking and effort params a real turn would,
+   * effort clamped for the CANDIDATE model — a model that accepts the id but
+   * rejects the params fails every turn just as thoroughly, and that is a 400 on
+   * output_config, not on the model id. Tools and the system prompt are left off:
+   * they are the same bytes on any model, and this call is deliberately tiny.
+   *
+   * Never throws: the error is the return value, verbatim from the SDK, because
+   * surfacing what the API actually said is the entire point.
+   */
+  async probeModel(modelId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    try {
+      await this.client.messages.create({
+        model: modelId,
+        max_tokens: MODEL_PROBE_MAX_TOKENS,
+        messages: [{ role: "user", content: "Reply with the single word: ok" }],
+        ...this.baseParams(this.cfg.effort ? clampEffort(this.cfg.effort, modelId) : undefined),
+      });
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: apiErrorText(e) };
+    }
   }
 
   /**

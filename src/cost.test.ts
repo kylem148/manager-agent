@@ -339,6 +339,41 @@ test("an un-priced model reports tokens and says the cost is unknown", async () 
   assert.match(text, /claude-mystery-1/);
 });
 
+test("switching models keeps two buckets; the new one never inherits the old rate", async () => {
+  // What /model must not be able to do: move spend onto a rate that belongs to a
+  // different model. The ledger is keyed by the id in force when the turn was
+  // metered, so a switch splits the buckets and each is priced on its own — and
+  // a model with no rate on file reports its tokens with the cost left unknown
+  // rather than quietly billed at the model it replaced.
+  const ledger = CostLedger.ephemeral({ since: "2026-07-27T09:00:00.000Z" });
+  await ledger.record(
+    "us.anthropic.claude-opus-5",
+    usage({ output: 10_000 }),
+    { now: at("2026-07-27", 10) },
+  );
+  await ledger.record(
+    "us.anthropic.claude-brandnew-9",
+    usage({ output: 10_000 }),
+    { now: at("2026-07-27", 11) },
+  );
+
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-brandnew-9", // the model now in force
+      cacheTtl: "1h",
+      now: at("2026-07-27", 12),
+    }),
+  );
+
+  assert.match(text, /20,000 out/, "both models' tokens are counted");
+  // Opus 5's 10k output at the geo-scoped rate is $0.275, and that is ALL the
+  // report claims: the second 10k is not priced at it.
+  assert.match(text, /\$0\.2750\+/, "priced where it can be, marked incomplete where it can't");
+  assert.match(text, /claude-brandnew-9 — no bedrock rate on file/);
+  assert.doesNotMatch(text, /\$0\.5500/, "the new model is never billed at the old model's rate");
+});
+
 test("a session with no turns yet reports zeroes without blowing up", () => {
   const text = plain(
     formatCostReport({

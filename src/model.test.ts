@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { ModelConfig } from "./config.js";
-import { ModelProvider, type MessageParam, type Tool } from "./model.js";
+import { apiErrorText, ModelProvider, type MessageParam, type Tool } from "./model.js";
 
 /**
  * Tests for prompt-cache breakpoint placement and the parallel tool round.
@@ -342,4 +342,80 @@ test("a probe is not folded into the turn meter", async () => {
   const drained = provider.drainUsage();
   assert.equal(drained.rounds, 0);
   assert.equal(drained.usage.cacheRead, 0);
+});
+
+// --- switching models (/model) -------------------------------------------------
+
+test("a switch takes effect on the next turn and keeps the history", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  const sent = stubClient(provider, [endTurn]);
+  const history: MessageParam[] = [
+    { role: "user", content: "first" },
+    { role: "assistant", content: "reply" },
+    { role: "user", content: "second" },
+  ];
+
+  provider.setModel("us.anthropic.claude-sonnet-5");
+  assert.equal(provider.modelId, "us.anthropic.claude-sonnet-5", "and the session's own view of it");
+
+  const out = await provider.runTurn({
+    system: "s",
+    messages: history,
+    tools: [],
+    executor: async () => ({ tool_use_id: "x", content: "" }),
+  });
+  assert.equal((sent[0] as any).model, "us.anthropic.claude-sonnet-5");
+  // A model change is not a new conversation: everything said so far is re-sent.
+  assert.deepEqual(out.messages.slice(0, 3), history);
+});
+
+test("a switch re-clamps effort against the new model's ladder", () => {
+  // xhigh arrived with Opus 4.7 and is a flat 400 on the 4.6 generation, so an
+  // unclamped switch would break every subsequent turn rather than degrade.
+  const provider = new ModelProvider({ ...CFG, effort: "xhigh" });
+  assert.equal(provider.setModel("us.anthropic.claude-sonnet-4-6"), "high", "degrades, never rounds up");
+  assert.equal(provider.effort, "high");
+  // And back up the ladder it stays where it was put — a model that accepts the
+  // level has nothing to say about it.
+  assert.equal(provider.setModel("us.anthropic.claude-opus-5"), null);
+  assert.equal(provider.effort, "high");
+});
+
+test("a probe asks about the candidate model, in the shape a real turn will use", async () => {
+  const provider = new ModelProvider({ ...CFG, effort: "xhigh" });
+  const sent = stubCreate(provider, { content: [], stop_reason: "max_tokens", usage: {} });
+
+  const verdict = await provider.probeModel("us.anthropic.claude-sonnet-4-6");
+  assert.deepEqual(verdict, { ok: true });
+
+  const p = sent[0]! as any;
+  assert.equal(p.model, "us.anthropic.claude-sonnet-4-6", "the candidate, not the model in force");
+  // Effort clamped for the CANDIDATE: a model that takes the id but rejects the
+  // params fails every turn just as thoroughly, and that is the failure this
+  // probe exists to catch before the switch rather than after it.
+  assert.equal(p.output_config.effort, "high");
+  assert.ok(p.thinking, "thinking rides along too");
+  assert.equal(provider.modelId, CFG.modelId, "a probe commits to nothing");
+});
+
+test("a refused id comes back with the API's own words, and changes nothing", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  stubCreate(provider, () => {
+    throw new Error('404 {"message":"The provided model identifier is invalid."}');
+  });
+
+  const verdict = await provider.probeModel("us.anthropic.claude-nope");
+  assert.deepEqual(verdict, {
+    ok: false,
+    error: '404 {"message":"The provided model identifier is invalid."}',
+  });
+  // Not a throw: the caller has to be able to report this and carry on.
+  assert.equal(provider.modelId, CFG.modelId);
+  assert.equal(provider.drainUsage().rounds, 0, "and a probe is not a turn");
+});
+
+test("a non-Error failure still yields something readable", () => {
+  assert.equal(apiErrorText(new Error("  boom  ")), "boom");
+  assert.equal(apiErrorText("socket hang up"), "socket hang up");
+  assert.equal(apiErrorText(new Error("")), "Error");
 });
