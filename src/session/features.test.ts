@@ -739,20 +739,20 @@ test("feature status derivation: provisioning wins, then the queue, then a live 
   assert.equal(featureActivity("ready", undefined, false), "idle");
 });
 
-test("reconcileFeatures surfaces a branch-without-worktree anomaly for unmerged work, destroying nothing", async () => {
+test("reconcileFeatures says NOTHING about an unmerged branch whose worktree is gone: abandon leaves exactly that", async () => {
   const fx = await makeFixture();
   try {
     const rec = await provisionWorktree(fx.opts, "orphan");
     await commitIn(rec.worktreePath, "w.txt", "unmerged\n", "job: unmerged work");
-    // Remove just the worktree, leaving the branch with unmerged commits.
+    // Remove just the worktree, leaving the branch with unmerged commits — the
+    // state `feature_abandon` deliberately produces, since it keeps a branch
+    // holding commits not in origin/dev rather than force-deleting it.
     run(fx.repo, ["worktree", "remove", "--force", rec.worktreePath]);
 
     const report = await reconcileFeatures(fx.opts);
     assert.equal(report.records.length, 0);
-    assert.equal(report.anomalies.length, 1);
-    assert.equal(report.anomalies[0]!.kind, "branch-without-worktree");
-    assert.match(report.anomalies[0]!.detail, /unmerged work/);
-    // The branch is untouched — surfaced, not destroyed.
+    assert.deepEqual(report.anomalies, [], "a branch co abandoned on purpose is not an anomaly");
+    // The branch is untouched — kept, and not reported either.
     assert.ok(branchExists(fx.repo, rec.branch));
   } finally {
     await fx.cleanup();
@@ -801,9 +801,8 @@ test("reconcileFeatures rebuilds a record AND surfaces an anomaly side by side",
   const fx = await makeFixture();
   try {
     const live = await provisionWorktree(fx.opts, "alive");
-    const gone = await provisionWorktree(fx.opts, "gone");
-    await commitIn(gone.worktreePath, "g.txt", "x\n", "job: work");
-    run(fx.repo, ["worktree", "remove", "--force", gone.worktreePath]);
+    const stray = path.join(fx.base, "not-a-worktree");
+    await fsp.mkdir(stray, { recursive: true });
 
     const report = await reconcileFeatures(fx.opts);
     assert.deepEqual(
@@ -812,7 +811,7 @@ test("reconcileFeatures rebuilds a record AND surfaces an anomaly side by side",
       "the live worktree rebuilds a record",
     );
     assert.equal(report.anomalies.length, 1);
-    assert.equal(report.anomalies[0]!.kind, "branch-without-worktree");
+    assert.equal(report.anomalies[0]!.kind, "stray-directory");
     assert.ok(fs.existsSync(live.worktreePath));
   } finally {
     await fx.cleanup();

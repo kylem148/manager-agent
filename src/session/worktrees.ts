@@ -975,22 +975,19 @@ function safeFeatureSlug(name: string): string {
 }
 
 /** What a boot reconcile could not cleanly account for. Every anomaly is
- *  SURFACED for a human/the co to resolve; reconcileFeatures never acts on one. */
+ *  SURFACED for a human/the co to resolve; reconcileFeatures never acts on one.
+ *
+ *  A BRANCH is never one of these, whatever state it is in. A branch co cut with
+ *  no worktree is the resting state of a feature that ended: landed (the PR
+ *  merged, the worktree torn down, the ref kept by policy — D-20260724-13) or
+ *  abandoned (`feature_abandon` keeps a branch holding commits not in
+ *  `origin/dev`, by design). Both are states co produces on purpose, so both are
+ *  reported as nothing at all rather than as something wrong. */
 export type FeatureAnomalyKind =
-  /** A branch co cut, with no worktree, that is NOT merged into `origin/dev`:
-   *  it holds unmerged work but its checkout is gone (a crashed run, a manually-
-   *  removed worktree). Re-provision or investigate before the work is lost.
-   *
-   *  Its counterpart — a branch with no worktree that IS contained in
-   *  `origin/dev` — is NOT an anomaly any more (D-20260724-13). That is exactly
-   *  what a landed feature looks like: the PR merged, the worktree was torn down,
-   *  the branch ref was kept on purpose. Reporting it would mean flagging every
-   *  feature ever landed on every boot. */
-  | "branch-without-worktree"
   /** A directory under the managed base that git does not list as a worktree:
    *  an orphaned checkout (registration lost) or something foreign. Never ours
    *  to delete blindly, so it is reported for a human to judge. */
-  | "stray-directory";
+  "stray-directory";
 
 export interface FeatureAnomaly {
   kind: FeatureAnomalyKind;
@@ -1005,8 +1002,8 @@ export interface FeatureReconcileReport {
    *  original human name is not recoverable from a directory, so `feature` is
    *  set to the slug). Ready to seed the in-memory registry. */
   records: FeatureRecord[];
-  /** Everything that could not be turned into a clean record. Surfaced, never
-   *  destroyed. */
+  /** Every directory under the managed base that could not be turned into a
+   *  clean record. Surfaced, never destroyed. */
   anomalies: FeatureAnomaly[];
 }
 
@@ -1029,11 +1026,9 @@ export interface FeatureReconcileReport {
  *    is what makes a feature survive a restart without co ever having to guess
  *    an ownership prefix — and what keeps a `co/feat-*` feature from an older
  *    build manageable under exactly the same rules.
- *  - A branch co cut with no worktree is an anomaly ONLY when it is not
- *    contained in `origin/dev` (`branch-without-worktree`: unmerged work whose
- *    checkout is gone). A branch that IS contained is a landed feature whose ref
- *    was kept by policy — the normal state, reported as nothing at all. A branch
- *    co did NOT cut is not co's business and is never reported at all.
+ *  - A branch with no worktree is not looked at. Landed or abandoned, a bare
+ *    branch ref is what co itself leaves behind on purpose, so there is nothing
+ *    to reconcile and nothing to say about one.
  *  - A directory under the managed base that git doesn't list as a worktree is a
  *    `stray-directory` anomaly (an orphaned checkout or something foreign).
  */
@@ -1048,16 +1043,9 @@ export async function reconcileFeatures(opts: WorktreeOptions): Promise<FeatureR
   await git(r.repoPath, ["worktree", "prune"]);
 
   const worktrees = await listWorktrees(r.repoPath);
-  const devExists = await refExists(r.repoPath, r.devRef);
 
   // Pass 1: the worktrees co owns → a ready record each.
   const registeredPaths = new Set(worktrees.map((w) => realpathOr(w.path)));
-  const attached = new Set(
-    worktrees
-      .map((w) => w.branch)
-      .filter((b): b is string => Boolean(b?.startsWith("refs/heads/")))
-      .map((b) => b.slice("refs/heads/".length)),
-  );
   for (const entry of await listFeatureWorktrees(opts)) {
     if (!fs.existsSync(entry.path)) continue; // pruned above; defensive
     records.push({
@@ -1069,23 +1057,7 @@ export async function reconcileFeatures(opts: WorktreeOptions): Promise<FeatureR
     });
   }
 
-  // Pass 2: branches co cut that have no worktree.
-  for (const { branch } of await listOwnedFeatureBranches(opts)) {
-    if (attached.has(branch)) continue;
-    // Contained in origin/dev = landed, worktree torn down, ref kept by policy.
-    // That is the resting state of every feature co has ever landed; silence.
-    if (devExists && (await isMergedInto(r.repoPath, branch, r.devRef))) continue;
-    anomalies.push({
-      kind: "branch-without-worktree",
-      ref: branch,
-      detail: devExists
-        ? `branch '${branch}' has commits not in '${r.devRef}' but its worktree is gone — ` +
-          `unmerged work whose checkout was lost. Re-provision or investigate before dropping it.`
-        : `branch '${branch}' exists with no worktree and there is no '${r.devRef}' to compare against.`,
-    });
-  }
-
-  // Pass 3: directories under the managed base git doesn't list as worktrees.
+  // Pass 2: directories under the managed base git doesn't list as worktrees.
   if (fs.existsSync(r.baseDir)) {
     for (const name of await fsp.readdir(r.baseDir)) {
       const dir = path.join(r.baseDir, name);

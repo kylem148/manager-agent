@@ -944,7 +944,7 @@ export class FeatureManager {
   /**
    * Boot reconcile: rebuild feature records from the on-disk worktrees and seed
    * the registry, so a feature survives a session restart. Non-destructive —
-   * anomalies (a branch holding unmerged work with no worktree, a stray dir) are
+   * anomalies (a stray dir under the managed base) are
    * returned for surfacing, never acted on. Records already tracked are
    * overwritten by the fresh on-disk truth.
    *

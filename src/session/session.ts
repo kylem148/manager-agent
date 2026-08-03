@@ -537,8 +537,10 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
 
   // Boot reconcile: rebuild feature records from the on-disk worktrees so a
   // feature (1 feature → 1 worktree → 1 branch) survives a restart. Read-only
-  // over feature state — it rebuilds records and SURFACES anomalies (a branch
-  // with unmerged work but no worktree, a stray dir), destroying nothing.
+  // over feature state — it rebuilds records and surfaces the one thing it
+  // cannot account for (a stray dir under the managed base), destroying nothing.
+  // A bare branch ref is never reported: landed or abandoned, that is a state co
+  // leaves behind on purpose, so it would fire every session and mean nothing.
   // Best-effort: a repo that has never seen the flow, or a git hiccup, must not
   // block the session opening. Skipped outright when the repo path is already
   // known bad, so the one honest message above is not followed by its symptom.
