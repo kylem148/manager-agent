@@ -44,6 +44,7 @@ import { c, colorEnabled } from "../ui.js";
 import { taskDisplayOrder } from "../taskorder.js";
 import { isConfirmVerb } from "../confirmverb.js";
 import { classifyToken, completeCommand } from "./commands.js";
+import { oceanRows } from "./ocean.js";
 import { MarkdownRenderer, renderTable, type Rendered } from "./markdown.js";
 import {
   classify,
@@ -5797,9 +5798,18 @@ export class Tui implements SessionIO {
    * ellipsis removed the overflow while leaving the information unreadable —
    * which was the complaint. So text that outgrows its room wraps instead, and a
    * long row costs a line or two rather than its meaning.
+   *
+   * Under all of it, in whatever room the content did not use, an ocean. It is
+   * the one purely decorative thing in the panel, so it is drawn LAST and out of
+   * the leftovers: oceanRows() is handed the rows the content did not take and
+   * can only ever return that many, which is what makes the art unable to cost a
+   * row of content. As the content grows the ship goes first, then the water,
+   * then there is simply no scene. The list never gives up a line for it.
    */
   private homeTabRows(): string[] {
-    return [...this.taskTableRows(), "", ...this.worktreeRows()];
+    const content = [...this.taskTableRows(), "", ...this.worktreeRows()];
+    const spare = this.overlayViewport() - content.length;
+    return [...content, ...oceanRows(this.cols, spare)];
   }
 
   /**

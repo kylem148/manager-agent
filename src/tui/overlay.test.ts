@@ -3233,6 +3233,158 @@ test("Home's footer names the keys, because nothing else can", async () => {
   h.stop();
 });
 
+// --- the ocean at the foot of Home -------------------------------------------
+//
+// A waterline over a sea floor, with the greeting's own ship on it, pinned to
+// the bottom of the tab. It is decoration and nothing else, so these tests are
+// all the same assertion from different angles: the content is never the thing
+// that gives way. The arithmetic is proved in ocean.test.ts; these are the real
+// painted frames, because "no row was lost" is a claim about the screen.
+
+/** The Home body rows of the last frame, without the bar or the footer. */
+function bodyRows(h: Harness): string[] {
+  return screenRows(h).slice(1, -1);
+}
+
+test("a tall Home floats the greeting's ship on a waterline at the bottom", async () => {
+  const h = harness(undefined, 90, 34, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const rows = bodyRows(h);
+
+  assert.match(rows.at(-2) ?? "", /~~~\^~~~\^/, "the waterline is the second-from-last row");
+  assert.match(rows.at(-1) ?? "", /\./, "and the sea floor is the last one");
+  assert.ok(rows.join("\n").includes("|>>=x"), "the ship's pennant, so it really is the galleon");
+  assert.ok(rows.join("\n").includes(")_____)_____)_____)"), "hull and all");
+
+  // The content is still all there, and still above the water.
+  const frame = h.lastFramePlain();
+  assert.match(frame, /building\s+ctrl-o overhaul/);
+  assert.match(frame, /search\s+\[crew running\]/);
+  const lastContent = rows.findIndex((r) => /full-text search/.test(r));
+  const water = rows.findIndex((r) => /~~~\^/.test(r));
+  assert.ok(lastContent > 0 && lastContent < water, "the list sits above the sea, not in it");
+  h.stop();
+});
+
+test("as the rows run out the ship goes first, and the waterline stays", async () => {
+  const h = harness(undefined, 90, 20, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const rows = bodyRows(h);
+
+  assert.ok(!rows.join("\n").includes("|>>=x"), "no ship on a short pane");
+  assert.ok(!rows.join("\n").includes(")_)"), "and no piece of one either");
+  assert.match(rows.at(-2) ?? "", /~~~\^~~~\^/, "the water is what's left");
+
+  // Every row of both blocks is still painted.
+  const frame = h.lastFramePlain();
+  for (const t of TASKS) assert.ok(frame.includes(t.task), `task still painted: ${t.task}`);
+  for (const f of FEATURES) assert.ok(frame.includes(f.branch), `worktree still painted: ${f.branch}`);
+  h.stop();
+});
+
+test("under more pressure the waterline goes too, and the content is untouched", async () => {
+  const h = harness(undefined, 90, 16, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const frame = h.lastFramePlain();
+
+  assert.ok(!frame.includes("~~~^"), "no water");
+  assert.ok(!frame.includes("|>>=x"), "no ship");
+  for (const t of TASKS) assert.ok(frame.includes(t.task), `task still painted: ${t.task}`);
+  for (const f of FEATURES) assert.ok(frame.includes(f.branch), `worktree still painted: ${f.branch}`);
+  h.stop();
+});
+
+test("content never scrolls, clips or loses a row to the scene, at any height", async () => {
+  const h = harness(undefined, 90, 34, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+
+  // Walk down through every height where the scene changes shape, and past it.
+  for (let rows = 34; rows >= 8; rows--) {
+    h.resize(90, rows);
+    await frame();
+    const painted = h.lastFramePlain();
+    const body = bodyRows(h).join("\n");
+    const decorated = body.includes("~~~^");
+    const footer = screenRows(h).at(-1) ?? "";
+    if (decorated) {
+      // Room to spare means room for everything: nothing is below the fold, so
+      // the art cannot have invented a scroll position or a "more below" count.
+      assert.ok(!/more below/.test(footer), `rows=${rows}: decoration must not push content off screen`);
+      for (const t of TASKS) assert.ok(painted.includes(t.task), `rows=${rows}: ${t.task} survives`);
+      for (const f of FEATURES) assert.ok(painted.includes(f.branch), `rows=${rows}: ${f.branch} survives`);
+    }
+    assert.equal(screenRows(h).length, rows, `rows=${rows}: the frame is still exactly the screen`);
+  }
+  h.stop();
+});
+
+test("a table that fills the pane gets the whole pane; the scene simply isn't drawn", async () => {
+  const h = harness(undefined, 90, 20, undefined, fakeFeatures(FEATURES), fakeTasks(MANY_TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const painted = h.lastFramePlain();
+
+  assert.ok(!painted.includes("~~~^"), "content wanted the rows, so there is no water");
+  assert.match(painted, /task number 01/, "and the table has them");
+  assert.match(screenRows(h).at(-1) ?? "", /more below/, "with the footer counting the rest, as always");
+
+  // And paging still reaches the tail: the art is not sitting on the end of it.
+  h.send("G");
+  await settle();
+  assert.match(h.lastFramePlain(), /task number 24/, "G still reaches the last row");
+  assert.ok(!h.lastFramePlain().includes("~~~^"), "still no water down there");
+  h.stop();
+});
+
+test("at a narrow width the ship is absent rather than clipped mid-hull", async () => {
+  const h = harness(undefined, 34, 34, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  const rows = bodyRows(h);
+
+  assert.match(rows.at(-2) ?? "", /~~~\^/, "the water fits any width");
+  assert.ok(!rows.join("\n").includes(")_)"), "the ship does not, so it is not there at all");
+  for (const r of screenRows(h)) {
+    assert.ok(visibleWidth(r) <= 34, `row overflows the width: ${JSON.stringify(r)}`);
+  }
+
+  // Widen it and the ship sails in, whole.
+  h.resize(90, 34);
+  await frame();
+  assert.ok(bodyRows(h).join("\n").includes("|>>=x"), "a wider terminal gets the ship back");
+  h.stop();
+});
+
+test("the scene is on Home alone: the other tabs are unchanged", async () => {
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(fakeDocs({ "plan.md": "# Plan\n" }), 90, 34, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.ok(h.lastFramePlain().includes("~~~^"), "Home has it");
+
+  h.send("2");
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("~~~^"), "the queue tab does not");
+  h.send("3");
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("~~~^"), "nor does the docs tab");
+  h.send("1");
+  await settle();
+  assert.ok(h.lastFramePlain().includes("~~~^"), "and it is still there on the way back");
+  h.stop();
+});
+
 // --- the tab bar and the number keys -----------------------------------------
 //
 // The panel's discovery surface. Before it, the tabs existed and nothing said

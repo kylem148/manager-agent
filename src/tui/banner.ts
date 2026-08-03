@@ -23,32 +23,13 @@
 
 import { visibleWidth } from "./wrap.js";
 import { c } from "../ui.js";
+import { GALLEON, GALLEON_WIDTH, galleonRow, seaLine } from "./galleon.js";
 
 /** Frame chrome per row: "│ " on the left + " │" on the right = 4 columns. */
 const CHROME = 4;
 
 /** Minimum blank columns kept outside the box (at least one each side). */
 const OUTER_MARGIN = 2;
-
-/**
- * The ship, authored as a raw block so the backslashes of the stern read
- * literally. Internal spacing is significant: every line shares the same left
- * origin, and the whole block is centered as a unit (never per-line, which
- * would shear the hull). String.raw keeps `\`, `\\`, `\\\` exactly as typed.
- */
-const SHIP = String.raw`
-            |>>=x
-            |
-      |     |     |
-     )_)   )_)   )_)
-    )___) )___) )___)\
-   )_____)_____)_____)\\
- ___|_____|_____|_______\\\__
- \    o    o    o    o     /
-  \~-~-~-~-~-~-~-~-~-~-~-~-/
-`
-  .split("\n")
-  .filter((l) => l.length > 0);
 
 export interface BannerInfo {
   name: string;
@@ -70,7 +51,7 @@ export function pirateBanner(info: BannerInfo): string | null {
   // minimum interior the content actually needs; the frame then grows past that
   // to fill the terminal. Color is applied after sizing (visibleWidth ignores
   // SGR, so order wouldn't matter, but plain sizing keeps the math obvious).
-  const shipWidth = Math.max(...SHIP.map((l) => l.length));
+  const shipWidth = GALLEON_WIDTH;
   const title = "Aye, Captain.";
   const subtitle = "your navigator stands ready at the helm";
   const nameLine = `co-manager  ·  ${info.name}`;
@@ -103,14 +84,9 @@ export function pirateBanner(info: BannerInfo): string | null {
   rows.push(center(c.bold(c.yellow(title)), contentWidth));
   rows.push(center(c.dim(subtitle), contentWidth));
   rows.push(pad("", contentWidth));
-  const shipRows = centerBlock(SHIP, shipWidth, contentWidth);
+  const shipRows = centerBlock(GALLEON, shipWidth, contentWidth);
   shipRows.forEach((line, i) => {
-    // Flag pennant at the masthead flies red (Jolly Roger); the lowest hull row
-    // is the crest of the sea, so it takes the water's blue. Everything between
-    // — masts, hull, decks — is the warm timber yellow of the galleon.
-    if (i === 0) rows.push(c.red(line));
-    else if (i === shipRows.length - 1) rows.push(c.blue(line));
-    else rows.push(c.yellow(line));
+    rows.push(galleonRow(line, i, shipRows.length));
   });
   rows.push(seaRow(contentWidth, shipWidth));
   rows.push(pad("", contentWidth));
@@ -205,15 +181,4 @@ function seaRow(width: number, shipWidth: number): string {
   }
   out += c.blue(swell.slice(cursor));
   return out;
-}
-
-/**
- * A stylized waterline that fills the content width. A repeating `~~~^` gives a
- * gentle swell without any wide glyphs, so alignment stays exact.
- */
-function seaLine(width: number): string {
-  const unit = "~~~^";
-  let out = "";
-  while (out.length < width) out += unit;
-  return out.slice(0, width);
 }
