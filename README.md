@@ -494,7 +494,9 @@ flat over time — small rewritten orientation files plus large append-only logs
   overwrite / delete / list), which can only address flat `.md` files inside that
   instance's `docs/` — never the `.memory/` substrate, `.env`, or anything else.
   `architecture.md` and `plan.md` are ordinary documents that happen to get a
-  privileged read at cold start.
+  privileged read at cold start. You write to the same documents from the Ctrl-O
+  docs tab with `e` (see "Docs" below), through the same sandbox and the same
+  serialized write lane.
 - **Archiving** (`/archive <log>`) snapshots a log into `.memory/archive/<log>/`
   verbatim and resets the live log to its header, keeping history recoverable but
   off the default read path.
@@ -722,7 +724,7 @@ next number. Because the digits belong to the bar, the doc list labels its rows
 | ----- | ----------------------------------------------------------------- | ------------------------------------- |
 | home  | the task table (yours to edit), then every tracked worktree       | `a` add, `e` edit, `x` retire, `s` status |
 | queue | the merge queue and the head's pull request                       | `m` merge, `e` edit the PR message    |
-| docs  | everything in `docs/`, opened through the transcript's renderer   | `a`-`z` open, `y` copies an open doc  |
+| docs  | everything in `docs/`, opened through the transcript's renderer   | `a`-`z` open, `y` copies an open doc, `e` edits it |
 
 Everywhere: `space`/`b` page, `j`/`k` line, `d`/`u` half, `g`/`G` ends,
 `Backspace` steps back out of a doc, `Esc` (or `Ctrl-O`, or `q`) closes. A
@@ -837,6 +839,45 @@ exactly as long as the sea is on screen — leave the tab, close the panel, shri
 the pane until the content wants the rows, or let the co start streaming an
 answer, and it is gone until the sea comes back.
 
+### Docs: read them here, and edit them here with `e`
+
+The docs tab lists everything in `docs/` — `a)`, `b)`, `c)` — and a letter opens
+one, rendered through the same markdown renderer the transcript uses. `y` takes
+the whole thing away as raw markdown.
+
+**`e` edits it in place.** These documents are yours: the co drafts them, but the
+architecture and the plan are the captain's, and changing a line of one should
+not mean leaving the session. So `e` on an open doc puts it in **the same editor
+`e` opens on a pull request message** on the queue tab — the same box, the same
+keys, the same **Ctrl-S** to save and the same **Esc** to walk away (twice, once
+you've typed something). There is nothing separate to learn, and no second
+editor to drift. The buffer is the file's raw markdown, not the painted rows, so
+what you edit is what is on disk.
+
+The rules around the save are the ones that decide whether it is safe to put a
+file behind a keystroke:
+
+- **Nothing is destroyed in either direction.** If the co rewrote that doc while
+  the editor was open, the save is refused and says so, with your text still in
+  the box — it never overwrites the file blind, and it never throws away what you
+  typed (`Ctrl-Y` copies the buffer out). The check happens inside the same
+  serialized write lane every other doc write runs through, so it cannot race one.
+- **Discarding writes nothing at all.** The file is byte-identical afterwards.
+- **Only `docs/`.** The editor can only ever name a document the panel listed,
+  and that list is the co's own sandboxed doc tool — the `.memory/` substrate is
+  no more reachable from the editor than it is from the list.
+- **An empty buffer is refused.** `Ctrl-X` is one key away from `Ctrl-S`, and
+  deleting a document is a thing you should ask for by name.
+- Creating a new doc from the panel is not a thing yet: `e` rewrites what exists.
+
+After a save the tab repaints from **the file**, not from your buffer, and the co
+is handed one line saying that document changed — not the document. It reads
+`architecture.md` and `plan.md` at startup and would otherwise go on quoting the
+version it was given; the line tells it the copy is stale, and it re-reads the
+file with its own doc tool the next time the subject comes up. It costs no turn,
+no reply and no context beyond the line: you are editing your own document, and
+the co has nothing to say about it.
+
 ### Landing work: one keystroke, `[m]`
 
 Finished features land in `dev` as **GitHub pull requests**, through a strictly
@@ -946,7 +987,7 @@ is ignored until it settles.
 | **Ctrl-Y** | copy the selection to the clipboard, or the whole buffer when nothing is selected | selection / buffer |
 | **left-drag** | select text; on release it is copied to the clipboard | selection |
 | **click** | move the caret there; a click outside the box drops the selection | character |
-| **Ctrl-S** | save the title and description to GitHub | buffer |
+| **Ctrl-S** | save: the title and description to GitHub, or the document to its file | buffer |
 | **Esc** (and **Ctrl-O**) | cancel; on a changed buffer the first press warns, the second discards | buffer |
 
 Ctrl-A is Home and not select-all, in both editors. It is the oldest binding the
@@ -1382,7 +1423,11 @@ Tests live next to the code they cover (`src/tui/keys.test.ts`, etc.).
 read/rewrite, append-only logs with decision-id minting, log search / range
 read, archive, and mtime staleness detection. `docs.ts` is the user-facing `docs/`
 tier: the six doc operations, the name/realpath sandbox that keeps them inside
-`docs/`, and the cold-start read of `architecture.md` / `plan.md`. `templates.ts`
+`docs/`, and the cold-start read of `architecture.md` / `plan.md`. It also holds
+the panel editor's write, `overwriteDocIfUnchanged`, which is an ordinary
+overwrite with the text the editor opened on carried back and compared first —
+inside the lane, not around it, because a check outside the lane races the writes
+already queued in it. `templates.ts`
 is the seed content for a fresh instance. `writequeue.ts` is the single lane every
 mutating memory/doc operation runs through, so the concurrent tool calls in one
 model round can't interleave a read-modify-write (duplicate decision ids, a lost
@@ -1704,11 +1749,20 @@ by default can never be the thing that merged something. A pending `feature_land
 gets a fourth tab of its own for as long as it is pending, so the two merges never
 share a key. The panel body is one selection surface: a left-drag highlights and copies out of any
 view over OSC 52 (the same escape the transcript's own drag-selection uses), and
-an open doc additionally binds `y` to copy its raw markdown whole.
+an open doc additionally binds `y` to copy its raw markdown whole and `e` to edit
+it — the SAME popup, entered with a different target and a different save, not a
+second editor. The popup carries the view it opened over and restores it on the
+way out, which is what lets one box sit on the queue tab and on a document
+without either knowing about the other; the target is read in exactly three
+places (what the borders say, what Ctrl-S calls, what a discard names). A doc's
+save carries the text the buffer opened on back to `overwriteDocIfUnchanged`, so
+a concurrent write by the co is reported rather than clobbered, and leaves one
+line in the model's history naming the file — never its contents, and never a
+turn.
 `keys.ts` is the pure decode table that maps both legacy control bytes and
 enhanced-protocol CSI-u sequences onto one set of bindings. `editor.ts` is the
-buffer model under both text editors on the screen — the input bar and the PR
-message popup: the word wrap, the cursor↔(row, col) mapping that keeps a caret
+buffer model under both text editors on the screen — the input bar and the
+popup: the word wrap, the cursor↔(row, col) mapping that keeps a caret
 where it visually appears on a wrapped line, the viewport-follows-cursor rule,
 the editing verbs, and the `git commit`-shaped title/body split. Two editors on
 one screen must not disagree about where a line breaks or what Ctrl-U does, so
