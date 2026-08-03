@@ -27,17 +27,18 @@ import { serializeWrite } from "../memory/writequeue.js";
  * the wrong row. Text that matches no row, or more than one, is an error rather
  * than a guess — the same posture the doc tool's `str_replace` takes.
  *
- * Retirement is an ACTION and not a third status: `retire` lifts a row out of
- * the table and appends it to the `done` list, timestamped, so finishing
- * something shrinks the table instead of growing a column of `done` rows nobody
- * scans past.
+ * Retirement is an ACTION and not a status: `retire` lifts a row out of the
+ * table and appends it to the `done` list, timestamped, so finishing something
+ * shrinks the table instead of growing a column of `done` rows nobody scans
+ * past. `testing` does not change that — it is the stage a row sits in while the
+ * captain checks work that has landed, and retiring is still what done means.
  *
  * The order kept here is INSERTION order, and nothing below reorders it: `add`
  * appends, `rename` rewrites a row's text in place, `retire` leaves the rest
- * where they were, and a status toggle moves no row at all. The order the table
- * is PAINTED in — `building` rows first — is a separate thing entirely and lives
- * in ../taskorder.ts, so that a status toggle can change what the captain sees
- * without rewriting the file underneath him.
+ * where they were, and a status change moves no row at all. The order the table
+ * is PAINTED in — `building`, then `testing`, then `queued` — is a separate
+ * thing entirely and lives in ../taskorder.ts, so that a status change can alter
+ * what the captain sees without rewriting the file underneath him.
  *
  * Like the feature store it is a CACHE of a conversation, not a source of truth
  * about anything: a missing, corrupt or unwritable file is an empty table and
@@ -47,17 +48,28 @@ import { serializeWrite } from "../memory/writequeue.js";
  */
 
 /**
- * The whole status vocabulary: something is being built, or it is waiting its
- * turn. Two words and no more.
+ * The whole status vocabulary: something is being built, it is being tested, or
+ * it is waiting its turn. Three words and no more.
  *
  * A free-form status looked harmless and was not. It let the table drift into a
  * tracker — `ready-to-arm`, `scoping`, `recommended`, `backlog` all appeared in
  * real stores — and a column of eight different words is a column you read
  * instead of scan, which is the opposite of what an at-a-glance block is for.
- * The tool's schema now offers only these two, and anything else that reaches
- * the store (an older file, a model that ignored the enum) coerces to `queued`.
+ * The tool's schema offers only these three, and anything else that reaches the
+ * store (an older file, a model that ignored the enum) coerces to `queued`.
+ *
+ * `testing` is the captain's own addition and it is a STAGE, not a second way of
+ * saying done: work has landed but they have not tested it yet, so the row parks
+ * here instead of being retired on the strength of the crew's word. Retiring
+ * still means done, and `testing` is what sits in front of it — which is exactly
+ * why it is a status and not another action. A row can go back to `building` from
+ * it, and a row that never needed a test goes straight out as it always did.
+ *
+ * Declared in DISPLAY order — building, testing, queued — because this array is
+ * also what the tool's enum and its refusal message are built from, and one
+ * order everywhere is one less thing to keep in sync.
  */
-export const TASK_STATUSES = ["building", "queued"] as const;
+export const TASK_STATUSES = ["building", "testing", "queued"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 /** One row of the table: what it is, and whether it is being built or waiting.
@@ -129,16 +141,22 @@ function cell(raw: unknown): string | undefined {
 }
 
 /**
- * The status of a row, narrowed to the two the table has. `building` is the only
- * word that means anything specific; EVERYTHING else — a missing status, a
- * word from the old free-form vocabulary, junk — is `queued`.
+ * The status of a row, narrowed to the three the table has. `building` and
+ * `testing` are the only words that mean anything specific; EVERYTHING else — a
+ * missing status, a word from the old free-form vocabulary, junk — is `queued`.
  *
  * That is a coercion and not a validation on purpose: a store written under the
- * old shape is read, not rejected, and the panel is never handed a third word it
- * has no column for. The WRITE path is strict (see setStatus); this is the read.
+ * old shape is read, not rejected, and the panel is never handed a word it has
+ * no column for. Adding `testing` to the vocabulary cannot disturb a file
+ * written before it existed, either: such a file holds only `building` and
+ * `queued`, and both still read as themselves. The WRITE path is strict (see
+ * setStatus); this is the read.
  */
 function status(raw: unknown): TaskStatus {
-  return cell(raw)?.toLowerCase() === "building" ? "building" : "queued";
+  const word = cell(raw)?.toLowerCase();
+  if (word === "building") return "building";
+  if (word === "testing") return "testing";
+  return "queued";
 }
 
 export function isTaskStatus(v: unknown): v is TaskStatus {
@@ -281,15 +299,15 @@ export class TaskStore {
   }
 
   /**
-   * Move one row between the two statuses. Strict, unlike the read path: a third
-   * word is refused rather than coerced, because a write that quietly became
-   * `queued` is a write the caller believes landed.
+   * Move one row between the statuses. Strict, unlike the read path: a word
+   * outside the vocabulary is refused rather than coerced, because a write that
+   * quietly became `queued` is a write the caller believes landed.
    */
   async setStatus(task: unknown, next: unknown): Promise<TaskRow> {
     if (!isTaskStatus(next)) {
       throw new TaskError(
         "BAD_STATUS",
-        `Status must be one of: ${TASK_STATUSES.join(", ")}. There is no third value.`,
+        `Status must be one of: ${TASK_STATUSES.join(", ")}. There is no other value.`,
       );
     }
     const row = this.rows[this.indexOf(task)]!;

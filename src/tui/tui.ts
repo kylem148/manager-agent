@@ -258,9 +258,9 @@ export function fieldWindow(
 }
 
 /** The Home tab's task list: the status word in a fixed left column (sized to
- *  the longer of the two the contract allows), then a gap, then the name. Fixed
- *  rather than content-sized because a column that moves is a column you have to
- *  read instead of scan. */
+ *  the longest the contract allows, still `building` now that `testing` has
+ *  joined it), then a gap, then the name. Fixed rather than content-sized
+ *  because a column that moves is a column you have to read instead of scan. */
 const TASK_STATUS_W = "building".length;
 const TASK_STATUS_GAP = "   ";
 
@@ -656,11 +656,21 @@ export interface FeaturePanelSource {
  *  the low-level Tui never depends on the session layer. */
 export interface TaskPanelRow {
   task: string;
-  /** Exactly two values, because the table is a "you are here" and not a
-   *  tracker: something is being built, or it is waiting its turn. The store
-   *  coerces anything else to `queued`, so the painter only ever sees these. */
-  status: "building" | "queued";
+  /** Exactly three values, because the table is a "you are here" and not a
+   *  tracker: something is being built, it is built and waiting on the captain
+   *  to test it, or it is waiting its turn. The store coerces anything else to
+   *  `queued`, so the painter only ever sees these. */
+  status: "building" | "testing" | "queued";
 }
+
+/** What `s` moves a row to, one press at a time: the cycle the work runs in.
+ *  Total over the three statuses, so the key can never compute a status the
+ *  store would refuse — see toggleSelectedTask for why it is a cycle at all. */
+const NEXT_TASK_STATUS: Record<TaskPanelRow["status"], TaskPanelRow["status"]> = {
+  queued: "building",
+  building: "testing",
+  testing: "queued",
+};
 
 /** Whether a task write landed, and what to say when it did not. A refusal is a
  *  normal outcome here (a full table, a row that moved between the paint and the
@@ -4046,9 +4056,22 @@ export class Tui implements SessionIO {
     this.runTaskWrite(source.retire(row.task));
   }
 
-  /** `s`: toggle the highlighted row between building and queued. A no-op with
-   *  nothing highlighted, like `x`. The selection stays, because the toggle is
-   *  reversible and the captain may want the other way. */
+  /**
+   * `s`: advance the highlighted row to the next status. A no-op with nothing
+   * highlighted, like `x`. The selection stays, because the captain is often
+   * pressing it more than once and the row moves under them as it re-sorts.
+   *
+   * ONE KEY, CYCLING, rather than a key per status. `s` was a two-way toggle
+   * while there were two statuses, and the third had to reach it the same way —
+   * a new key for `testing` would have made the one status the captain reaches
+   * for most the odd one out, and Home's letters are nearly spent besides.
+   *
+   * The cycle runs the way the work does — queued -> building -> testing ->
+   * queued — so pressing `s` means "this moved on", which is the thing actually
+   * being recorded. Wrapping back to `queued` from `testing` is the way back for
+   * a row that failed its test; a row that PASSED leaves by `x`, because
+   * retiring is still what done means and no amount of pressing `s` reaches it.
+   */
   private toggleSelectedTask(): void {
     const row = this.selectedTask();
     if (!row) return;
@@ -4057,7 +4080,7 @@ export class Tui implements SessionIO {
       this.taskNotice("changing a task's status isn't available in this session.");
       return;
     }
-    this.runTaskWrite(source.setStatus(row.task, row.status === "building" ? "queued" : "building"));
+    this.runTaskWrite(source.setStatus(row.task, NEXT_TASK_STATUS[row.status]));
   }
 
   /** Repaint at once (the store has already moved in memory), then print
@@ -5790,10 +5813,11 @@ export class Tui implements SessionIO {
    * and it was buried on the right behind two content-sized columns before. The
    * old `Type` column is gone: it never changed what the captain did next.
    *
-   * `building` rows are painted first (D-20260729-5), through the same shared
-   * helper the tool and the live-state block call, so the row actually being
-   * worked cannot sit below two rows waiting their turn. The STORE is untouched
-   * by that: it keeps insertion order, and this is a view of it.
+   * Rows are painted `building`, then `testing`, then `queued` (D-20260729-5),
+   * through the same shared helper the tool and the live-state block call, so
+   * the row actually being worked cannot sit below two rows waiting their turn,
+   * and the rows waiting on the captain's own test sit where they will be seen.
+   * The STORE is untouched by that: it keeps insertion order, this is a view.
    *
    * Building the rows is also where the selection is RECONCILED with the table:
    * a selected row the co retired mid-session is simply no longer selected. The
@@ -5898,10 +5922,15 @@ export class Tui implements SessionIO {
   }
 
   /** A task's status, coloured by the panel's existing convention rather than a
-   *  new one: the worktree chips already paint a live crew cyan and a thing
-   *  waiting its turn dim, and these two words mean the same two things. */
+   *  new one: the worktree chips already paint a live crew cyan, a thing needing
+   *  the captain's eye yellow, and a thing waiting its turn dim, and these three
+   *  words mean the same three things. The colours come from the shared `c`
+   *  helper, so NO_COLOR and a non-TTY strip them here exactly as everywhere
+   *  else and the column keeps its width either way. */
   private taskStatusLabel(status: TaskPanelRow["status"]): string {
-    return status === "building" ? c.cyan("building") : c.dim("queued");
+    if (status === "building") return c.cyan("building");
+    if (status === "testing") return c.yellow("testing");
+    return c.dim("queued");
   }
 
   /** A line of explanation under a Home heading, wrapped rather than clipped. */

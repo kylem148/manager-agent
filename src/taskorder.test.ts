@@ -69,18 +69,67 @@ test("it is deterministic: the same rows give the same order, every time", () =>
   }
 });
 
-test("anything that is not exactly `building` is queued, matching the store's read", () => {
+test("anything that is not exactly `building` or `testing` is queued, matching the store's read", () => {
   // A hand-edited file can hold a word from the old free-form vocabulary. The
   // store coerces it to `queued` on read; this must bucket it the same way
   // rather than dropping it out of the painted table entirely.
   const odd = [
     { task: "junk", status: "ready-to-arm" as unknown as "queued" },
     { task: "real", status: "building" as const },
+    { task: "checking", status: "testing" as const },
   ];
   assert.deepEqual(
     taskDisplayOrder(odd).map((r) => r.task),
-    ["real", "junk"],
+    ["real", "checking", "junk"],
     "nothing vanishes, whatever the word says",
+  );
+});
+
+// --- the third status ---------------------------------------------------------
+//
+// `testing` is a STAGE, not a second way of saying done: work has landed and the
+// captain has not checked it yet. It paints between the two that were already
+// here, which is the order the work runs in read downward.
+
+const THREE = [
+  { task: "waiting", status: "queued" as const },
+  { task: "checking", status: "testing" as const },
+  { task: "working", status: "building" as const },
+];
+
+test("the three groups paint building, then testing, then queued", () => {
+  assert.deepEqual(
+    taskDisplayOrder(THREE).map((r) => r.task),
+    ["working", "checking", "waiting"],
+  );
+});
+
+test("stored order still holds INSIDE the testing group, like the other two", () => {
+  const many = [
+    { task: "t-z", status: "testing" as const },
+    { task: "q", status: "queued" as const },
+    { task: "t-a", status: "testing" as const },
+    { task: "b", status: "building" as const },
+    { task: "t-m", status: "testing" as const },
+  ];
+  assert.deepEqual(
+    taskDisplayOrder(many).map((r) => r.task),
+    ["b", "t-z", "t-a", "t-m", "q"],
+    "a stable partition over three buckets, not a sort",
+  );
+});
+
+test("a table of nothing but testing rows is handed back exactly as it came", () => {
+  const testing = THREE.filter((r) => r.status === "testing");
+  assert.deepEqual(taskDisplayOrder(testing), testing);
+});
+
+test("a table written before `testing` existed orders exactly as it always did", () => {
+  // The regression that matters most: adding a bucket in the middle must not
+  // move a row in a table that has no rows in it.
+  assert.deepEqual(
+    taskDisplayOrder(ROWS).map((r) => r.task),
+    ["two", "four", "one", "three"],
   );
 });
 
