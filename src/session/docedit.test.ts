@@ -179,7 +179,14 @@ test("end to end: Ctrl-O, open a doc, edit it, Ctrl-S — the file on disk chang
     await openEditorOn(h, "plan.md");
     h.send("NEW "); // types at the head of the buffer
     h.send("\x13"); // Ctrl-S
-    await waitFor(() => !h.frame().includes("┌"), "the popup to close on a landed save");
+    // A landed save settles in TWO steps, not one: the popup closes, and only
+    // once the doc has been re-read from disk does the receipt land. A refresh
+    // whose content moved retires the notice line, so the receipt has to follow
+    // the read rather than precede it (see the save handler in tui.ts). Waiting
+    // on the popup alone gets the earlier of the two and races that read, which
+    // on a disk slower than this process is a frame with no receipt on it yet.
+    // So settle on the receipt: it is the last thing a save does.
+    await waitFor(() => h.frame().includes("saved docs/plan.md"), "the save receipt on the tab");
 
     assert.equal(
       await readFile(paths.docFile("plan.md"), "utf8"),
