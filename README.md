@@ -760,8 +760,10 @@ this be the tab the panel opens on. Landing is the queue tab's keystroke, and
 creating, enqueuing and abandoning are the co-manager's levers.
 
 **And at the bottom, an ocean.** In whatever room the two blocks leave unused, a
-waterline over the sea floor with the same galleon the session-start greeting
-draws sitting on it. It says nothing and tracks nothing; it is there because
+waterline with the same galleon the session-start greeting draws sitting on it,
+and nothing underneath it — the waterline is the last row of the panel, and the
+sea below it is left to the imagination rather than drawn as texture. It says
+nothing and tracks nothing; it is there because
 opening the panel should feel like something. Which is exactly why it is the
 first thing to go: it is drawn out of the leftovers and hands them back in a
 fixed order as the content grows, the ship first and the water second, until on

@@ -1,6 +1,12 @@
 /**
- * The ocean scene at the foot of the Ctrl-O home tab: a waterline over the sea
- * floor, with the galleon from the session-start greeting riding on it.
+ * The ocean scene at the foot of the Ctrl-O home tab: a waterline with the
+ * galleon from the session-start greeting riding on it, and nothing under it.
+ *
+ * Nothing is drawn below the waterline, and that is the point rather than an
+ * omission. The scene used to carry a tiled sea floor on the row beneath, and on
+ * a real terminal it read as speckle — a row of stray punctuation under the
+ * water rather than ground beneath it. So the row is gone, not blanked: the
+ * scene is one row shorter and the content keeps that row.
  *
  * This is decoration, and it is the only thing in the panel that is. Everything
  * else on Home answers a question; this answers none, and exists because opening
@@ -14,8 +20,8 @@
  * So the scene is drawn out of the room the real content did not use, and gives
  * that room back in a fixed order as the content grows:
  *
- *   plenty of room  →  ship + waterline + sea floor
- *   less room       →  waterline + sea floor  (the ship goes first)
+ *   plenty of room  →  ship + waterline
+ *   less room       →  waterline alone  (the ship goes first)
  *   less again      →  nothing at all
  *
  * Width works the same way: below a minimum the ship is absent rather than
@@ -44,8 +50,10 @@ const SEA_LEFT = 2;
  *  reason, and this is the bottom of the screen, where a wrap costs a line. */
 const SEA_RIGHT = 1;
 
-/** The sea itself: the waterline, and the floor under it. */
-const SEA_ROWS = 2;
+/** The sea itself: the waterline, and nothing else. Nothing is drawn below it,
+ *  so this is 1 rather than a 2 with a blank in it — the row the floor used to
+ *  take is the content's now, at every size. */
+const SEA_ROWS = 1;
 
 /** Blank rows kept between the last row of real content and the top of the
  *  scene, so the art never reads as part of the list above it. */
@@ -58,19 +66,6 @@ const MIN_SEA_COLS = 8;
  *  with this to spare, so it is never wedged against the edge and never clipped
  *  mid-hull. At narrower widths there is simply no ship. */
 const SHIP_CLEARANCE = 2;
-
-/**
- * The sea floor: scattered sand and pebbles, tiled. Deliberately a fixed
- * repeating unit rather than anything sampled: a randomised floor would redraw
- * differently on every repaint, and the scene has to be reproducible from its
- * frame number alone.
- *
- * The floor does NOT drift with the water. It is the ground, and it is also the
- * bottom row of the panel: two rows sliding together would read as the screen
- * scrolling rather than as a sea. Water over still ground is what makes the
- * motion a current.
- */
-const FLOOR_UNIT = "  .  ,   . :  o   ,  .";
 
 /**
  * Milliseconds a frame is held. Forty times a repaint's budget and seven times
@@ -124,10 +119,7 @@ export function oceanScene(cols: number, spare: number, frame = 0): string[] {
   if (spare < OCEAN_SEA_MIN_ROWS) return [];
 
   const indent = " ".repeat(SEA_LEFT);
-  const sea = [
-    indent + c.blue(seaLine(seaWidth, frame)),
-    indent + c.dim(floorLine(seaWidth)),
-  ];
+  const sea = [indent + c.blue(seaLine(seaWidth, frame))];
 
   // The ship is the first thing to yield, on either axis: it needs its own rows
   // AND its own columns, and failing either leaves the water drawn without it.
@@ -147,7 +139,7 @@ export function oceanScene(cols: number, spare: number, frame = 0): string[] {
 
 /**
  * The scene padded to sit at the BOTTOM of the space it was given: `spare` rows
- * in total, blank until the art starts, so the sea floor lands on the viewport's
+ * in total, blank until the art starts, so the waterline lands on the viewport's
  * last row. Returns nothing at all when there is no room for a scene, which is
  * the case the caller appends to its content unchanged.
  *
@@ -167,11 +159,4 @@ export function oceanRows(cols: number, spare: number, frame = 0): string[] {
 function sway(frame: number): number {
   const n = SHIP_SWAY.length;
   return SHIP_SWAY[((frame % n) + n) % n]!;
-}
-
-/** The sea floor, tiled to `width` columns. */
-function floorLine(width: number): string {
-  let out = "";
-  while (out.length < width) out += FLOOR_UNIT;
-  return out.slice(0, width).replace(/\s+$/, "");
 }
