@@ -494,13 +494,15 @@ test("a branch co cut is still known as co's once its worktree is gone; a lookal
     const owned = (await listOwnedFeatureBranches(opts)).map((o) => o.branch).sort();
     assert.deepEqual(owned, ["co/feat-old-one", "feat/orphan"], "the marker and the legacy prefix, nothing else");
 
-    // The boot rebuild reports the unmerged work and says nothing about the decoy.
+    // The boot rebuild says nothing about ANY of them — not the decoy, and not
+    // co's own bare branch either, even holding a commit that never landed. A
+    // branch with no worktree is what an abandoned or landed feature leaves
+    // behind by design, so there is nothing there to report.
     commitOnBranch(repo, "feat/orphan");
     const report = await reconcileFeatures(opts);
-    assert.deepEqual(
-      report.anomalies.filter((a) => a.kind === "branch-without-worktree").map((a) => a.ref),
-      ["feat/orphan"],
-    );
+    assert.deepEqual(report.records, []);
+    assert.deepEqual(report.anomalies, []);
+    assert.ok(branchExists(repo, "feat/orphan"), "co's branch is kept, just not reported");
     assert.ok(branchExists(repo, "feat/decoy"), "and the captain's branch is left entirely alone");
   } finally {
     await cleanup();

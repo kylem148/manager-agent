@@ -1564,11 +1564,12 @@ attempts, after which the head stays blocked for you.
 clean worktree down but refuses one with uncommitted changes and never
 force-deletes an unmerged branch. At session start a non-destructive reconcile
 (`reconcileFeatures`) rebuilds feature records from the on-disk worktrees so a
-feature survives a restart, and surfaces anomalies (a branch holding unmerged
-work whose worktree is gone, a stray directory) for the co to relay rather than
-acting on them — a branch already contained in `origin/dev` with no worktree is
-not an anomaly at all, it is what every landed feature leaves behind now that
-refs are kept. The co's reach stops at the PR into `dev`: it never touches
+feature survives a restart, and surfaces the one thing it cannot account for (a
+stray directory under the managed base) for the co to relay rather than acting on
+it. A branch with no worktree is never reported, in any state: that is what a
+feature that ended leaves behind on purpose, whether it landed (the PR merged,
+the ref kept) or was abandoned (`feature_abandon` keeps a branch holding commits
+not in `origin/dev`). The co's reach stops at the PR into `dev`: it never touches
 `main` and there is no promote path.
 
 `overview()` is the same module's read side for the Home tab's worktree list:
