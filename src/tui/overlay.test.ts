@@ -3241,8 +3241,8 @@ test("Home's footer names the keys, because nothing else can", async () => {
 
 // --- the ocean at the foot of Home -------------------------------------------
 //
-// A waterline over a sea floor, with the greeting's own ship on it, pinned to
-// the bottom of the tab. It is decoration and nothing else, so these tests are
+// A waterline with the greeting's own ship on it and nothing below it, pinned
+// to the bottom of the tab. It is decoration and nothing else, so these tests are
 // all the same assertion from different angles: the content is never the thing
 // that gives way. The arithmetic is proved in ocean.test.ts; these are the real
 // painted frames, because "no row was lost" is a claim about the screen.
@@ -3259,8 +3259,7 @@ test("a tall Home floats the greeting's ship on a waterline at the bottom", asyn
   await settle();
   const rows = bodyRows(h);
 
-  assert.match(rows.at(-2) ?? "", /~~~\^~~~\^/, "the waterline is the second-from-last row");
-  assert.match(rows.at(-1) ?? "", /\./, "and the sea floor is the last one");
+  assert.match(rows.at(-1) ?? "", /~~~\^~~~\^/, "the waterline is the last row of the body");
   assert.ok(rows.join("\n").includes("|>>=x"), "the ship's pennant, so it really is the galleon");
   assert.ok(rows.join("\n").includes(")_____)_____)_____)"), "hull and all");
 
@@ -3283,7 +3282,7 @@ test("as the rows run out the ship goes first, and the waterline stays", async (
 
   assert.ok(!rows.join("\n").includes("|>>=x"), "no ship on a short pane");
   assert.ok(!rows.join("\n").includes(")_)"), "and no piece of one either");
-  assert.match(rows.at(-2) ?? "", /~~~\^~~~\^/, "the water is what's left");
+  assert.match(rows.at(-1) ?? "", /~~~\^~~~\^/, "the water is what's left");
 
   // Every row of both blocks is still painted.
   const frame = h.lastFramePlain();
@@ -3293,7 +3292,9 @@ test("as the rows run out the ship goes first, and the waterline stays", async (
 });
 
 test("under more pressure the waterline goes too, and the content is untouched", async () => {
-  const h = harness(undefined, 90, 16, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  // One row lower than it used to be: with nothing drawn below the water the
+  // whole scene is a row shorter, so it survives a row longer on the way down.
+  const h = harness(undefined, 90, 15, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3358,7 +3359,7 @@ test("at a narrow width the ship is absent rather than clipped mid-hull", async 
   await settle();
   const rows = bodyRows(h);
 
-  assert.match(rows.at(-2) ?? "", /~~~\^/, "the water fits any width");
+  assert.match(rows.at(-1) ?? "", /~~~\^/, "the water fits any width");
   assert.ok(!rows.join("\n").includes(")_)"), "the ship does not, so it is not there at all");
   for (const r of screenRows(h)) {
     assert.ok(visibleWidth(r) <= 34, `row overflows the width: ${JSON.stringify(r)}`);
@@ -3498,7 +3499,7 @@ test("leaving Home stops the tide; coming back picks it up again", async () => {
 });
 
 test("a pane with no room for a scene starts no timer at all", async () => {
-  const h = tidal(90, 16);
+  const h = tidal(90, 15);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
@@ -3512,7 +3513,7 @@ test("a resize that takes the sea away stops the tide, and one that gives it bac
   h.tui.question();
   h.send(CTRL_O);
   await settle();
-  h.resize(90, 16);
+  h.resize(90, 15);
   await frame();
   assert.ok(!h.lastFramePlain().includes("~~~^"), "no scene at this height");
   await quiet(h, "and no tick either");
