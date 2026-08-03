@@ -26,7 +26,8 @@ export type DocErrorCode =
   | "DOC_NOT_A_FILE"
   | "PATH_ESCAPE"
   | "NO_MATCH"
-  | "MULTIPLE_MATCHES";
+  | "MULTIPLE_MATCHES"
+  | "DOC_CHANGED";
 
 export class DocError extends Error {
   constructor(
@@ -220,6 +221,44 @@ export async function overwriteDoc(
     await fsp.writeFile(file, body, "utf8");
     notifyWrite({ kind: "doc", name });
     return { name, bytes: Buffer.byteLength(body), created: !existed };
+  });
+}
+
+/**
+ * Replace a doc's whole content, but only if it still holds `baseline`.
+ *
+ * The write behind the Ctrl-O panel's doc editor. The captain opens a doc,
+ * types into a buffer for as long as they like, and saves — and in that window
+ * the co-manager's own doc tool can have rewritten the same file underneath
+ * them. A plain overwrite would eat that silently, so the text the editor
+ * OPENED on is carried back here and checked against what is on disk now.
+ *
+ * The read and the compare happen INSIDE the write lane (see writequeue.ts),
+ * not around it: a check outside the lane is a race with any write already
+ * queued, which is precisely the case it exists to catch.
+ *
+ * A doc that has been deleted since reads as "" and therefore mismatches, so a
+ * save can never quietly resurrect a document the co removed either.
+ */
+export async function overwriteDocIfUnchanged(
+  paths: InstancePaths,
+  name: string,
+  content: string,
+  baseline: string,
+): Promise<{ name: string; bytes: number }> {
+  return serializeWrite(async () => {
+    const file = await resolveDocPath(paths, name);
+    const current = (await readIfExists(file)) ?? "";
+    if (current !== baseline) {
+      throw new DocError(
+        "DOC_CHANGED",
+        `"${name}" changed on disk while it was open. Nothing was written.`,
+      );
+    }
+    const body = content.endsWith("\n") ? content : content + "\n";
+    await fsp.writeFile(file, body, "utf8");
+    notifyWrite({ kind: "doc", name });
+    return { name, bytes: Buffer.byteLength(body) };
   });
 }
 

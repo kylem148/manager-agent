@@ -34,7 +34,7 @@ import {
   appendTranscript,
   type TranscriptHandle,
 } from "../memory/memory.js";
-import { listDocs, readDoc } from "../memory/docs.js";
+import { DocError, listDocs, overwriteDocIfUnchanged, readDoc } from "../memory/docs.js";
 import { onWrite } from "../memory/writequeue.js";
 import { c, line, write } from "../ui.js";
 import { isConfirmVerb } from "../confirmverb.js";
@@ -45,6 +45,7 @@ import {
   type AnimationHandle,
   type AnimationSpec,
   type SessionIO,
+  type DocSaveResult,
   type DocSource,
   type PrMessageSaveResult,
   type QueueMergeResult,
@@ -89,7 +90,9 @@ import {
   noteDispatchCancelled,
   noteDispatchFired,
   noteDispatchLaunchFailed,
+  noteDocEdited,
   noteMergeOutcome,
+  type HistoryNoteSink,
 } from "./historynotes.js";
 
 /**
@@ -155,11 +158,12 @@ interface SessionState {
   /**
    * The other half of the same queue: one-line records of events the co must
    * have SEEN but must not be woken for — an armed dispatch resolving (fired or
-   * cancelled) and the captain's [m]. Same single path into the model's history
-   * as queueNotices, a user-role `SYSTEM:` message; the difference is that these
-   * are flushed into the history ahead of the next turn rather than drained by
-   * driving one, so nothing here costs a model call or a word on screen. See
-   * historynotes.ts for why they are buffered rather than pushed in place.
+   * cancelled), the captain's [m], and a doc he edited himself in the panel.
+   * Same single path into the model's history as queueNotices, a user-role
+   * `SYSTEM:` message; the difference is that these are flushed into the history
+   * ahead of the next turn rather than drained by driving one, so nothing here
+   * costs a model call or a word on screen. See historynotes.ts for why they are
+   * buffered rather than pushed in place.
    */
   historyNotes: string[];
   /**
@@ -250,12 +254,61 @@ const BUSY_CHORES = [
  * write, and only the doc tier emits there, so the hidden substrate stays
  * invisible to this feature.
  */
-function docSource(paths: InstancePaths): DocSource {
+export function docSource(
+  paths: InstancePaths,
+  write: DocSource["write"],
+): DocSource {
   return {
     list: () => listDocs(paths),
     read: (name) => readDoc(paths, name),
     subscribe: (listener) => onWrite((e) => listener(e.name)),
+    ...(write ? { write } : {}),
   };
+}
+
+/** What panelWriteDoc needs, and nothing more: where the docs are, the note
+ *  buffer the line goes into, and one line for the session's own record.
+ *  `messages` is the history that buffer eventually flushes into, carried here
+ *  so a test can assert the save pushed nothing into it on the spot. */
+export interface DocEditContext extends HistoryNoteSink {
+  paths: InstancePaths;
+  messages: MessageParam[];
+  note(line: string): void;
+}
+
+/**
+ * The panel's `e` → Ctrl-S on a doc: write the captain's buffer to the file.
+ *
+ * The twin of panelEditPrMessage, and deliberately shaped like it: it runs
+ * outside the agent loop, it never throws into the Tui, and a failure comes back
+ * as a result the popup prints over the captain's still-intact buffer. Two
+ * things differ, and both come from the file being the co's own working memory
+ * rather than GitHub's copy of a message:
+ *
+ *  - it goes through overwriteDocIfUnchanged, so a doc the co rewrote while the
+ *    popup was open is reported instead of overwritten, and the write itself
+ *    shares the one serialized lane every other doc write uses;
+ *  - it leaves ONE line in the model's history naming the file, buffered through
+ *    the same path an armed dispatch and the captain's [m] use, so the co learns
+ *    the copy it was handed at startup is stale without a turn being driven to
+ *    tell it. See noteDocEdited for what that line says and why it stops there.
+ */
+export async function panelWriteDoc(
+  ctx: DocEditContext,
+  edit: { name: string; content: string; baseline: string },
+): Promise<DocSaveResult> {
+  try {
+    const res = await overwriteDocIfUnchanged(ctx.paths, edit.name, edit.content, edit.baseline);
+    noteDocEdited(ctx, res.name);
+    ctx.note(`  · wrote docs/${res.name} (${res.bytes} bytes)`);
+    return { saved: true, summary: `saved docs/${res.name}` };
+  } catch (e) {
+    const changed = e instanceof DocError && e.code === "DOC_CHANGED";
+    const error =
+      (e instanceof DocError ? e.message : `${edit.name} could not be written: ${(e as Error).message}`) +
+      (changed ? " Copy your text out with Ctrl-Y, then reopen the doc." : "");
+    return { saved: false, summary: error, error };
+  }
 }
 
 /**
@@ -392,7 +445,23 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
         // per call for the same reason visualsFor is, and hard-coded plainIO
         // false because this branch IS the Tui.
         scenery: () => currentVisuals({ plainIO: false }).animate,
-        docs: docSource(paths),
+        // `e` on an open doc edits it in the same popup the queue tab's `e`
+        // opens on a PR message, and Ctrl-S lands here. Wired unconditionally —
+        // the docs are the co's own memory and need no link to a repo — and
+        // sandboxed by construction: the name can only ever be one `list`
+        // already vetted, so `.memory/` is as unreachable through the write as
+        // it is through the read.
+        docs: docSource(paths, (edit) =>
+          panelWriteDoc(
+            {
+              paths,
+              messages: state.messages,
+              historyNotes: state.historyNotes,
+              note: (l) => state.io.appendBlock(c.dim(l)),
+            },
+            edit,
+          ),
+        ),
         // The Home tab's task table: read fresh at paint time,
         // so a row either writer added shows on the next paint. Wired whether or
         // not the instance is linked, so Ctrl-O always has a Home.

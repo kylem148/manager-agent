@@ -12,8 +12,8 @@ import type { MergeHeadResult } from "./mergequeue.js";
  * history immediately ahead of whatever the next turn turns out to be, and
  * nothing is woken to read them.
  *
- * Which matters because two of the co's own levers resolve entirely outside its
- * loop, and it was left guessing at both:
+ * Which matters because several things the co depends on happen entirely outside
+ * its loop, and it was left guessing at every one of them:
  *
  *  - an ARMED dispatch is resolved by the captain's next keystroke, in the input
  *    loop, with no tool result to report it. The co armed an order and then never
@@ -21,15 +21,18 @@ import type { MergeHeadResult } from "./mergequeue.js";
  *  - the captain's [m] merges the queue head from the panel with the co nowhere
  *    in the loop (that is the whole design), so a feature could land on dev while
  *    the co went on reporting it as in flight.
+ *  - the captain edits a doc in the panel himself. The co is handed
+ *    architecture.md and plan.md at startup and holds them for the rest of the
+ *    session, so a file rewritten underneath it is a copy it would go on quoting.
  *
  * Ordering is the reason these are buffered rather than pushed where they happen.
  * A cancellation has to sit BEFORE the captain's line in the history — the co
  * must read "you were cancelled" and then what they typed instead, on the one
- * turn it has to react to both. And [m] can be pressed at any moment, including
- * mid-turn, where appending straight to state.messages would land a user message
- * between an assistant's tool_use and its tool_result and cost the captain the
- * turn. Buffering solves both: the flush happens at a turn boundary, ahead of the
- * message that turn is about.
+ * turn it has to react to both. And [m] — or a Ctrl-S in the doc editor — can
+ * land at any moment, including mid-turn, where appending straight to
+ * state.messages would put a user message between an assistant's tool_use and its
+ * tool_result and cost the captain the turn. Buffering solves both: the flush
+ * happens at a turn boundary, ahead of the message that turn is about.
  *
  * Every note is one line, and every line names its subject and its outcome —
  * either half alone is useless. Nothing is recorded when nothing happened.
@@ -121,6 +124,23 @@ export function noteMergeOutcome(
   sink.historyNotes.push(
     `SYSTEM: The captain pressed [m] in the panel: the merge of ${feature}${pr} FAILED —` +
       ` ${res.error ?? res.summary}. Nothing was merged and it still holds the queue.`,
+  );
+}
+
+/**
+ * The captain saved a doc from the panel's editor (`e` then Ctrl-S).
+ *
+ * Says that the document MOVED and nothing else — no contents, no turn, no
+ * reply. The co has a doc tool and can re-read the file the next time the subject
+ * actually comes up, whereas re-injecting the text would put a whole document in
+ * the context for a turn that may never mention it. Recorded only for a write
+ * that landed: a refusal (the doc changed under the editor, an invalid name)
+ * moved nothing, so there is nothing for the co to have seen.
+ */
+export function noteDocEdited(sink: HistoryNoteSink, name: string): void {
+  sink.historyNotes.push(
+    `SYSTEM: The captain edited docs/${name} himself just now. Your copy of it is stale —` +
+      ` re-read it with the doc tool before relying on it. Say nothing about this.`,
   );
 }
 

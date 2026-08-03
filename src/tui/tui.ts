@@ -408,6 +408,34 @@ export interface DocSource {
   read(name: string): Promise<string>;
   /** Subscribe to doc-write events; returns an unsubscribe function. */
   subscribe(listener: (name: string) => void): () => void;
+  /**
+   * Write an edited doc back — the `e` editor's Ctrl-S, and the ONLY way this
+   * panel ever writes a file. Optional, exactly like the queue's
+   * `editPrMessage`: a source without it is read-only, and `e` on an open doc is
+   * refused with a stated reason rather than opening a popup that could not
+   * save. Same sandbox as `read`, so this can no more name a `.memory/` file
+   * than the list it came from could.
+   *
+   * `baseline` is the exact text the editor OPENED on. The implementation
+   * compares it against what is on disk at write time and refuses when they
+   * differ, so an edit the co-manager made while the popup was open is reported
+   * rather than overwritten.
+   */
+  write?(edit: { name: string; content: string; baseline: string }): Promise<DocSaveResult>;
+}
+
+/**
+ * What a panel-driven doc save did. Deliberately the same shape as
+ * PrMessageSaveResult: the popup that reports it is the same popup, so the two
+ * save paths hand back the same three things — did it land, one line for the
+ * panel, and (when it didn't) the reason to print over the intact buffer.
+ */
+export interface DocSaveResult {
+  saved: boolean;
+  /** One line for the panel to carry after the popup closes. */
+  summary: string;
+  /** Present when nothing was written: why. The popup stays open over it. */
+  error?: string;
 }
 
 /**
@@ -1326,11 +1354,20 @@ type PanelView =
    *  Its rows/scroll live on `pendingReview` (mutated in place), so this carries
    *  no state of its own. */
   | { kind: "review" }
-  /** The head PR's message, open in a popup editor over the queue tab (`e`).
-   *  Like `review` it carries no state of its own — the buffer lives on
-   *  `PanelState.prEdit` and is mutated in place, so a resize (which re-lays
-   *  every row) can never swap the text under the captain's caret. */
-  | { kind: "prEdit" };
+  /** The text editor, open over whichever view called it up (`e`): the head PR's
+   *  message over the queue tab, or an open doc over itself. Like `review` it
+   *  carries no state of its own — the buffer lives on `PanelState.popup` and is
+   *  mutated in place, so a resize (which re-lays every row) can never swap the
+   *  text under the captain's caret. */
+  | { kind: "popup" };
+
+/**
+ * The panel's home tabs: the kinds that appear in the bar and that a digit jumps
+ * to. `doc` and `popup` are SUB-VIEWS — they belong to a tab (docs, and whatever
+ * they opened over) rather than being one — so they are not in this union, and
+ * nothing that reasons about tabs has to carry a case for them.
+ */
+type PanelTab = "home" | "queue" | "docs" | "review";
 
 interface PanelState {
   view: PanelView;
@@ -1392,9 +1429,9 @@ interface PanelState {
    *  the anchor for mapping a mouse (x, y) back to an absolute body row. */
   lastStart: number;
   /** The open PR message editor, or null. Non-null exactly while the view is
-   *  `prEdit`; kept on the panel rather than in the view so the buffer survives
+   *  `popup`; kept on the panel rather than in the view so the buffer survives
    *  a resize and a repaint by identity. */
-  prEdit: PrEditState | null;
+  popup: PopupState | null;
 }
 
 /**
@@ -1435,27 +1472,59 @@ interface TaskFieldState {
 }
 
 /**
- * The PR message editor's live state (D-20260727-15): one buffer in `git commit`
- * shape (line 1 the title, a blank line, then the description), the popup's own
- * scroll, and whatever it currently has to say back to the captain.
+ * What the popup editor is writing to. The buffer, the keys, the paint and the
+ * whole save interlock are one mechanism (see PopupState); this is the only
+ * thing that differs between the two things it edits, and it is what the save
+ * dispatches on.
  *
- * It edits the PROSE ONLY. co's fenced evidence block is split off before the
- * buffer is filled and spliced back on by the save path, so the captain never
- * sees those markers and cannot delete the block by editing around it.
+ * `pr` is one buffer in `git commit` shape (line 1 the title, a blank line, then
+ * the description) holding the PROSE ONLY: co's fenced evidence block is split
+ * off before the buffer is filled and spliced back on by the save path, so the
+ * captain never sees those markers and cannot delete the block by editing around
+ * them.
+ *
+ * `doc` is a whole markdown file, verbatim — no split, no fence, nothing hidden.
+ * It can only ever name a doc the sandboxed DocSource already listed, which is
+ * what keeps the `.memory/` substrate as unreachable from this editor as it is
+ * from the list the name came from.
  */
-interface PrEditState {
-  editor: TextEditor;
+type PopupTarget =
   /** The pull request being edited — pinned, so a save can name it and a head
    *  that changed underneath is visible rather than silently retargeted. */
-  prNumber: number;
-  feature: string;
+  | { kind: "pr"; prNumber: number; feature: string }
+  /** The doc being edited, plus the exact text the buffer opened on. The
+   *  baseline rides back to the write so a save can refuse rather than clobber a
+   *  file the co rewrote while the popup was up. */
+  | { kind: "doc"; name: string; baseline: string };
+
+/**
+ * The popup editor's live state (D-20260727-15): the buffer, its own scroll, and
+ * whatever it currently has to say back to the captain.
+ *
+ * ONE editor serves the PR message and a doc. The buffer model, every binding,
+ * the paste path, the drag-selection, the box and the save interlock are shared
+ * whole — `target` is the entire difference, and it is read in exactly three
+ * places (what the borders say, what Ctrl-S calls, and what a discard names). A
+ * second editing surface would be a second set of bindings to keep in step, and
+ * the captain would have to learn which one he was in.
+ */
+interface PopupState {
+  editor: TextEditor;
+  target: PopupTarget;
+  /**
+   * The view the popup opened OVER, restored when it closes and painted
+   * underneath it while it is up (the PR message keeps its head in sight; a doc
+   * keeps the document). Held here rather than left on `panel.view` because the
+   * view slot is what routes the keyboard, and the popup has to own that.
+   */
+  under: PanelView;
   /** Top visual row of the popup's viewport. Kept in step with the caret by
    *  scrollToCursor on every paint. */
   scroll: number;
-  /** "saving": `gh pr edit` is in flight; every key is ignored until it settles,
+  /** "saving": the write is in flight; every key is ignored until it settles,
    *  the same fire-once interlock the queue merge uses. */
   status: "editing" | "saving";
-  /** A refusal or a gh failure, shown inside the popup with the buffer intact. */
+  /** A refusal or a write failure, shown inside the popup with the buffer intact. */
   error: string | null;
   /** True once Esc has been pressed on a dirty buffer: the next Esc discards. */
   escPending: boolean;
@@ -1475,6 +1544,13 @@ interface PrEditState {
   /** A copy receipt or a clear confirmation, shown on the popup's message line
    *  until the next key. Same idea as the panel's copyNotice, scoped to the box. */
   notice: string | null;
+}
+
+/** What the popup's top border says it is editing. */
+function popupLabel(target: PopupTarget): string {
+  return target.kind === "pr"
+    ? `edit PR #${target.prNumber} · ${target.feature}`
+    : `edit docs/${target.name}`;
 }
 
 /**
@@ -3501,7 +3577,7 @@ export class Tui implements SessionIO {
       selection: null,
       selecting: false,
       lastStart: 0,
-      prEdit: null,
+      popup: null,
     };
     if (this.docs) {
       this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
@@ -3610,8 +3686,8 @@ export class Tui implements SessionIO {
    *  tab's [m] is the panel-native queue merge, and two different merges must
    *  never share one key (D-20260724-12). Tab cycles these; `1`..`3` (and `4`
    *  when a review is pending) index straight into this list. */
-  private panelTabs(): PanelView["kind"][] {
-    const tabs: PanelView["kind"][] = [];
+  private panelTabs(): PanelTab[] {
+    const tabs: PanelTab[] = [];
     if (this.tasks || this.features) tabs.push("home");
     if (this.queue) tabs.push("queue");
     if (this.docs) tabs.push("docs");
@@ -3620,27 +3696,20 @@ export class Tui implements SessionIO {
   }
 
   /** The one-word label each tab wears in the bar. */
-  private static readonly TAB_LABELS: Record<PanelView["kind"], string> = {
+  private static readonly TAB_LABELS: Record<PanelTab, string> = {
     home: "home",
     queue: "queue",
     docs: "docs",
     review: "review",
-    doc: "docs",
-    prEdit: "queue",
   };
 
-  /** A home tab's view state. Sub-views (doc) are never home tabs, so anything
-   *  unrecognised falls back to the first tab that exists. */
-  private homeView(kind: PanelView["kind"]): PanelView {
+  /** A home tab's view state. */
+  private homeView(kind: PanelTab): PanelView {
     switch (kind) {
       case "home": return { kind: "home" };
       case "queue": return { kind: "queue" };
       case "docs": return { kind: "docs" };
       case "review": return { kind: "review" };
-      // Sub-views (doc, prEdit) are never home tabs. Fall back to whatever tab is
-      // FIRST rather than to a fixed one — a panel may have no queue at all.
-      // panelTabs only ever yields home tabs, so this recurses once.
-      default: return this.homeView(this.panelTabs()[0] ?? "queue");
     }
   }
 
@@ -3653,7 +3722,10 @@ export class Tui implements SessionIO {
     if (v.kind === "doc") { this.panel.view = { kind: "docs" }; this.paint(); return; }
     const tabs = this.panelTabs();
     if (tabs.length < 2) return;
-    const cur = tabs.indexOf(v.kind);
+    // A sub-view isn't in the bar and reads as -1, which starts the cycle at the
+    // first tab. (The popup never reaches here: it owns the keyboard, Tab
+    // included.)
+    const cur = tabs.indexOf(v.kind as PanelTab);
     this.gotoTab(tabs[(cur + 1) % tabs.length]!);
   }
 
@@ -3676,7 +3748,7 @@ export class Tui implements SessionIO {
   /** Land on a home tab: switch the view, run whatever that tab needs on arrival,
    *  and repaint. The single path Tab, `i` and the number keys all take, so no
    *  route onto a tab can skip its arrival work. */
-  private gotoTab(kind: PanelView["kind"]): void {
+  private gotoTab(kind: PanelTab): void {
     if (!this.panel) return;
     this.panel.view = this.homeView(kind);
     if (kind === "review" && this.pendingReview) {
@@ -3744,7 +3816,18 @@ export class Tui implements SessionIO {
     // A resize re-wraps every row, so a selection made at the old width points
     // at text that has moved. Drop it rather than highlight the wrong cells.
     this.clearPanelSelection();
-    const v = this.panel.view;
+    const panel = this.panel;
+    // A doc sitting UNDER the popup is still painted, so it is re-laid too; the
+    // buffer above it needs nothing (its selection is buffer offsets, and its
+    // rows are laid out fresh on every paint).
+    const under = panel.popup?.under;
+    if (panel.view.kind === "popup" && under?.kind === "doc") {
+      const rows = renderMarkdownDoc(under.content, this.cols);
+      const scroll = Math.min(under.scroll, Math.max(0, rows.length - this.overlayViewport()));
+      panel.popup!.under = { ...under, rows, scroll };
+      return;
+    }
+    const v = panel.view;
     if (v.kind === "doc") {
       const rows = renderMarkdownDoc(v.content, this.cols);
       const scroll = Math.min(v.scroll, Math.max(0, rows.length - this.overlayViewport()));
@@ -3814,7 +3897,7 @@ export class Tui implements SessionIO {
     // panel's (where it pages up), so it is routed before any panel translation
     // rather than through dispatchOverlay. It handles its own bracketed paste,
     // into its buffer.
-    if (this.panel?.view.kind === "prEdit") return this.consumePrEdit(data, i);
+    if (this.panel?.view.kind === "popup") return this.consumePopup(data, i);
 
     // The Home tab's add-a-task field takes it whole for the same reason, and
     // one more: the panel's digits jump tabs and its letters page, so a task
@@ -4360,7 +4443,7 @@ export class Tui implements SessionIO {
   }
 
   /** Parse one key/sequence while the add field owns the keyboard. The same
-   *  shapes consumePrEdit handles, decoded by the same table, minus everything a
+   *  shapes consumePopup handles, decoded by the same table, minus everything a
    *  one-line field has no use for. */
   private consumeTaskField(data: string, i: number): number {
     const state = this.panel?.taskField;
@@ -4511,11 +4594,14 @@ export class Tui implements SessionIO {
       this.overlayScrollInput(input);
       return;
     }
-    // `y` yanks the whole doc, checked before the paging surface so the copy can
-    // never be shadowed by a scroll key. It is the ONLY action on this view, and
-    // it lives here rather than in overlayScrollInput so the filed-review body -
-    // which shares that paging surface - keeps the key space it already had.
+    // `y` yanks the whole doc and `e` opens it in the editor. Both are checked
+    // before the paging surface so an action can never be shadowed by a scroll
+    // key, and both live here rather than in overlayScrollInput so the filed
+    // review body — which shares that paging surface — keeps the key space it
+    // already had. `e` is the same letter, the same popup and the same Ctrl-S as
+    // the queue tab's edit of a PR message, deliberately.
     if (input.ch === "y") { this.copyDoc(); return; }
+    if (input.ch === "e") { this.openDocEditor(); return; }
     if (input.ch === "q") { this.closePanel(); return; }
     this.overlayScrollInput(input);
   }
@@ -4964,7 +5050,7 @@ export class Tui implements SessionIO {
    * its own minimum); the ceilings stop a full-screen terminal from producing a
    * 200-column line length nobody can read a sentence across.
    */
-  private prEditBox(): { left: number; top: number; width: number; textRows: number } {
+  private popupBox(): { left: number; top: number; width: number; textRows: number } {
     const width = Math.max(
       1,
       Math.min(this.cols - 2, Math.max(32, Math.min(120, Math.floor(this.cols * 0.9)))),
@@ -4980,8 +5066,8 @@ export class Tui implements SessionIO {
   }
 
   /** Columns of buffer text inside the box (border + one space on each side). */
-  private prEditWidth(): number {
-    return Math.max(1, this.prEditBox().width - 4);
+  private popupWidth(): number {
+    return Math.max(1, this.popupBox().width - 4);
   }
 
   /**
@@ -5013,10 +5099,59 @@ export class Tui implements SessionIO {
     // source. A source that doesn't split falls back to the raw body, exactly as
     // the painted message does.
     const prose = (pr.prose ?? pr.body).trim();
-    panel.prEdit = {
-      editor: new TextEditor(joinMessage(pr.title, prose)),
-      prNumber: pr.number,
-      feature: detail.feature,
+    this.openPopup(
+      { kind: "pr", prNumber: pr.number, feature: detail.feature },
+      joinMessage(pr.title, prose),
+      { kind: "queue" },
+    );
+    this.queueEditNotice = null;
+    this.paint();
+  }
+
+  /**
+   * `e` on an open doc: edit the document in the SAME popup, with the same keys.
+   *
+   * The buffer is the file's raw markdown — what `y` copies, not the painted
+   * rows — because that is what will be written back. The text it opened on is
+   * pinned as the baseline so the save can tell an edit the co made underneath
+   * from one it is safe to overwrite.
+   *
+   * Refused, with the reason on screen, when the doc surface cannot write (no
+   * `write` on the source) or when the view has no readable document under it —
+   * the same rule as the queue's `e`, which never opens a popup that could not
+   * save. `.memory/` never reaches this: the only name it can ever be handed is
+   * one the sandboxed DocSource listed.
+   */
+  private openDocEditor(): void {
+    const panel = this.panel;
+    if (!panel) return;
+    const refuse = (text: string): void => {
+      panel.copyNotice = text;
+      this.paint();
+    };
+    const view = panel.view;
+    if (view.kind !== "doc") return;
+    if (!this.docs?.write) {
+      refuse("editing docs isn't available in this session.");
+      return;
+    }
+    if (view.error !== null) {
+      refuse(`${view.name} could not be read, so there is nothing to edit.`);
+      return;
+    }
+    this.openPopup({ kind: "doc", name: view.name, baseline: view.content }, view.content, view);
+    this.paint();
+  }
+
+  /** Put the popup up over `under` with `text` in the buffer. The one place the
+   *  editor is entered, so neither target can drift into its own opening rules. */
+  private openPopup(target: PopupTarget, text: string, under: PanelView): void {
+    const panel = this.panel;
+    if (!panel) return;
+    panel.popup = {
+      editor: new TextEditor(text),
+      target,
+      under,
       scroll: 0,
       status: "editing",
       error: null,
@@ -5026,42 +5161,49 @@ export class Tui implements SessionIO {
       dragging: false,
       notice: null,
     };
-    panel.view = { kind: "prEdit" };
-    this.queueEditNotice = null;
+    panel.view = { kind: "popup" };
     this.clearPanelSelection();
-    this.paint();
   }
 
-  /** Leave the editor for the queue tab underneath, optionally leaving a line
-   *  behind on it. Never called while a save is in flight. */
-  private closePrEditor(notice?: { text: string; ok: boolean }): void {
+  /** Leave the editor for the view underneath, optionally leaving a line behind
+   *  on it. Never called while a save is in flight. */
+  private closePopupEditor(notice?: { text: string; ok: boolean }): void {
     const panel = this.panel;
     if (!panel) return;
     // A save can land mid-paste (the popup closes on success while the terminal
     // is still feeding us the payload). Hand the paste over to the tab's own
     // swallower rather than let its remaining bytes arrive as panel keys.
-    if (panel.prEdit?.pasting) this.overlayPasting = true;
-    panel.prEdit = null;
-    if (panel.view.kind === "prEdit") panel.view = { kind: "queue" };
-    if (notice) this.queueEditNotice = notice;
+    const state = panel.popup;
+    if (state?.pasting) this.overlayPasting = true;
+    const forDoc = state?.target.kind === "doc";
+    panel.popup = null;
+    if (panel.view.kind === "popup") panel.view = state?.under ?? { kind: "queue" };
+    // The line goes where the view it is about can show it: the queue tab has a
+    // banner of its own, and a doc has the footer's notice line — which is the
+    // same line a copy receipt lands on, and lives exactly as long.
+    if (notice) {
+      if (forDoc) panel.copyNotice = notice.text;
+      else this.queueEditNotice = notice;
+    }
     this.paint();
   }
 
   /** Esc: cancel. A clean buffer leaves at once; a dirty one warns first and
    *  discards on the second consecutive Esc, so a whole rewritten description is
-   *  never one stray keypress from gone. */
-  private escapePrEditor(wasEscPending: boolean): void {
-    const state = this.panel?.prEdit;
+   *  never one stray keypress from gone. Nothing is written on either path, so a
+   *  discarded doc edit leaves the file exactly as it was. */
+  private escapePopupEditor(wasEscPending: boolean): void {
+    const state = this.panel?.popup;
     if (!state) return;
     if (state.editor.dirty && !wasEscPending) {
       state.escPending = true;
       this.paint();
       return;
     }
-    this.closePrEditor(
-      state.editor.dirty
-        ? { text: `discarded the unsaved edit to PR #${state.prNumber}`, ok: false }
-        : undefined,
+    const what =
+      state.target.kind === "pr" ? `PR #${state.target.prNumber}` : state.target.name;
+    this.closePopupEditor(
+      state.editor.dirty ? { text: `discarded the unsaved edit to ${what}`, ok: false } : undefined,
     );
   }
 
@@ -5070,8 +5212,8 @@ export class Tui implements SessionIO {
    * prompt's consume(): the same escape/CSI shapes, decoded by the same table,
    * so every binding behaves identically in both editors.
    */
-  private consumePrEdit(data: string, i: number): number {
-    const state = this.panel?.prEdit;
+  private consumePopup(data: string, i: number): number {
+    const state = this.panel?.popup;
     if (!state) return 1;
     const saving = state.status === "saving";
     const ch = data[i]!;
@@ -5081,7 +5223,7 @@ export class Tui implements SessionIO {
     // the whole reason a multi-line description can be pasted at all: without it
     // the embedded newlines arrive as Enter presses and the CSI sequences in a
     // pasted diff arrive as arrow keys.
-    if (state.pasting) return this.consumePrEditPaste(state, data, i);
+    if (state.pasting) return this.consumePopupPaste(state, data, i);
 
     // The start of one. Checked before the generic CSI dispatch because the
     // marker itself begins with ESC [.
@@ -5097,15 +5239,15 @@ export class Tui implements SessionIO {
     // Alt+Enter as an ESC prefix, checked before the generic ESC dispatch for
     // the same reason the prompt checks it: otherwise it reads as a lone Escape.
     if (ch === ESC && (data[i + 1] === "\r" || data[i + 1] === "\n")) {
-      if (!saving) this.prEditAction({ kind: "newline" });
+      if (!saving) this.popupAction({ kind: "newline" });
       return 2;
     }
-    if (ch === ESC && data[i + 1] === "[") return this.consumePrEditCsi(data, i);
+    if (ch === ESC && data[i + 1] === "[") return this.consumePopupCsi(data, i);
     if (ch === ESC) {
-      if (!saving) this.prEditAction({ kind: "escape" });
+      if (!saving) this.popupAction({ kind: "escape" });
       return 1;
     }
-    if (!saving) this.prEditAction(classifyByte(ch));
+    if (!saving) this.popupAction(classifyByte(ch));
     return 1;
   }
 
@@ -5117,7 +5259,7 @@ export class Tui implements SessionIO {
    * The whole payload lands as ONE insert, so a 40-line body costs one repaint
    * and one undo-able edit rather than 2,000 keystrokes' worth of both.
    */
-  private consumePrEditPaste(state: PrEditState, data: string, i: number): number {
+  private consumePopupPaste(state: PopupState, data: string, i: number): number {
     const end = data.indexOf(PASTE_END, i);
     if (end === -1) {
       state.pasteBuf += data.slice(i);
@@ -5147,11 +5289,11 @@ export class Tui implements SessionIO {
    *  handoff is this one branch: the panel's own drag handler is unreachable
    *  from here, and it resumes the moment the popup closes and the panel's input
    *  path takes CSI again. */
-  private consumePrEditCsi(data: string, i: number): number {
+  private consumePopupCsi(data: string, i: number): number {
     if (data[i + 2] === "<") {
       const end = this.findMouseEnd(data, i + 3);
       if (end === -1) return data.length - i;
-      this.handlePrEditMouse(data.slice(i + 3, end), data[end] === "M");
+      this.handlePopupMouse(data.slice(i + 3, end), data[end] === "M");
       return end - i + 1;
     }
     let j = i + 2;
@@ -5161,33 +5303,33 @@ export class Tui implements SessionIO {
     const params = data.slice(i + 2, j);
     const consumed = j - i + 1;
 
-    const state = this.panel?.prEdit;
+    const state = this.panel?.popup;
     if (!state || state.status === "saving") return consumed;
 
     switch (final) {
       case "u": {
         const ev = parseCsiU(params);
-        if (ev) this.prEditAction(classify(ev));
+        if (ev) this.popupAction(classify(ev));
         return consumed;
       }
-      case "A": this.prEditMoveRow(-1); return consumed;
-      case "B": this.prEditMoveRow(1); return consumed;
-      case "C": this.prEditEdit(() => state.editor.right()); return consumed;
-      case "D": this.prEditEdit(() => state.editor.left()); return consumed;
-      case "H": this.prEditAction({ kind: "home" }); return consumed;
-      case "F": this.prEditAction({ kind: "end" }); return consumed;
+      case "A": this.popupMoveRow(-1); return consumed;
+      case "B": this.popupMoveRow(1); return consumed;
+      case "C": this.popupEdit(() => state.editor.right()); return consumed;
+      case "D": this.popupEdit(() => state.editor.left()); return consumed;
+      case "H": this.popupAction({ kind: "home" }); return consumed;
+      case "F": this.popupAction({ kind: "end" }); return consumed;
       case "~": {
         const other = parseModifyOtherKeys(params);
         if (other) {
-          this.prEditAction(classify(other));
+          this.popupAction(classify(other));
           return consumed;
         }
         const n = Number.parseInt(params, 10);
-        if (n === 3) this.prEditEdit(() => state.editor.deleteForward());
-        else if (n === 5) this.prEditPage(-1);
-        else if (n === 6) this.prEditPage(1);
-        else if (n === 1 || n === 7) this.prEditAction({ kind: "home" });
-        else if (n === 4 || n === 8) this.prEditAction({ kind: "end" });
+        if (n === 3) this.popupEdit(() => state.editor.deleteForward());
+        else if (n === 5) this.popupPage(-1);
+        else if (n === 6) this.popupPage(1);
+        else if (n === 1 || n === 7) this.popupAction({ kind: "home" });
+        else if (n === 4 || n === 8) this.popupAction({ kind: "end" });
         return consumed;
       }
       default:
@@ -5202,8 +5344,8 @@ export class Tui implements SessionIO {
    * commit), and Ctrl-O leaves through this view's own exit rather than closing
    * the panel out from under an unsaved buffer.
    */
-  private prEditAction(action: Action): void {
-    const state = this.panel?.prEdit;
+  private popupAction(action: Action): void {
+    const state = this.panel?.popup;
     if (!state || state.status === "saving") return;
     const editor = state.editor;
     // Only another Escape consumes the discard arming; every other key disarms.
@@ -5263,11 +5405,11 @@ export class Tui implements SessionIO {
         break;
       }
       case "save":
-        this.savePrMessage();
+        this.savePopup();
         return;
       case "escape":
       case "open-docs":
-        this.escapePrEditor(wasEscPending);
+        this.escapePopupEditor(wasEscPending);
         return;
       // Tab, Ctrl-C and Ctrl-D have nothing to do in this buffer, and must not
       // fall through to the panel's meanings for them (switch tab, quit).
@@ -5282,7 +5424,7 @@ export class Tui implements SessionIO {
 
   // --- selecting text inside the popup -----------------------------------------
   //
-  // The popup owns the mouse for as long as it is open (consumePrEditCsi routes
+  // The popup owns the mouse for as long as it is open (consumePopupCsi routes
   // every report here, and the panel's own drag handler is not reachable from
   // that path). A left-drag selects TEXT, not painted cells: the endpoints are
   // buffer offsets, so the selection survives a re-wrap, and therefore a resize,
@@ -5294,8 +5436,8 @@ export class Tui implements SessionIO {
    * An SGR mouse report while the popup is open. Same wire format and bit layout
    * as handleMouse: low two bits the button, 32 motion, 64 the wheel.
    */
-  private handlePrEditMouse(body: string, press: boolean): void {
-    const state = this.panel?.prEdit;
+  private handlePopupMouse(body: string, press: boolean): void {
+    const state = this.panel?.popup;
     if (!state || state.status === "saving") return;
     const parts = body.split(";");
     const b = Number.parseInt(parts[0] ?? "", 10);
@@ -5305,28 +5447,28 @@ export class Tui implements SessionIO {
 
     // The wheel scrolls by MOVING THE CARET, the way PgUp/PgDn already do here.
     // The popup's scroll is derived from the caret on every paint (see
-    // prEditFrame), so this keeps one invariant (the caret is always on screen
+    // popupFrame), so this keeps one invariant (the caret is always on screen
     // and the hardware cursor is always where the text cursor is) instead of
     // introducing a second, free-floating scroll that a keystroke would snap back.
-    if (b === 64) { this.prEditScroll(-1, 3); return; }
-    if (b === 65) { this.prEditScroll(1, 3); return; }
+    if (b === 64) { this.popupScroll(-1, 3); return; }
+    if (b === 65) { this.popupScroll(1, 3); return; }
 
     const button = b & 0b11;
     const motion = (b & 32) !== 0;
     if (button !== 0) return;
 
-    if (!motion && press) this.beginPrEditSelection(x, y);
-    else if (motion && press) this.extendPrEditSelection(x, y);
-    else if (!press) this.endPrEditSelection();
+    if (!motion && press) this.beginPopupSelection(x, y);
+    else if (motion && press) this.extendPopupSelection(x, y);
+    else if (!press) this.endPopupSelection();
   }
 
   /** Scroll by moving the caret `steps` visual rows, and repaint. */
-  private prEditScroll(delta: 1 | -1, steps: number): void {
-    const state = this.panel?.prEdit;
+  private popupScroll(delta: 1 | -1, steps: number): void {
+    const state = this.panel?.popup;
     if (!state || state.status === "saving") return;
     state.escPending = false;
     state.notice = null;
-    const width = this.prEditWidth();
+    const width = this.popupWidth();
     for (let n = 0; n < steps; n++) {
       if (!state.editor.moveRow(delta, width)) break;
     }
@@ -5342,12 +5484,12 @@ export class Tui implements SessionIO {
    * one (the caret follows the drag, and the viewport follows the caret), so a
    * selection can run past a screenful in either direction.
    */
-  private prEditCellAt(
-    state: PrEditState,
+  private popupCellAt(
+    state: PopupState,
     x: number,
     y: number,
   ): { row: number; col: number; inside: boolean } {
-    const box = this.prEditBox();
+    const box = this.popupBox();
     const firstRow = box.top + 1; // row 0 of the box is the top border
     const firstCol = box.left + 2; // "│" + one space
     const inner = Math.max(1, box.width - 4);
@@ -5364,10 +5506,10 @@ export class Tui implements SessionIO {
   /** Left press: anchor a selection at that character, and put the caret there.
    *  A press outside the box's text area only dismisses a standing selection,
    *  because a stray click on the queue underneath must not start one. */
-  private beginPrEditSelection(x: number, y: number): void {
-    const state = this.panel?.prEdit;
+  private beginPopupSelection(x: number, y: number): void {
+    const state = this.panel?.popup;
     if (!state || state.status === "saving") return;
-    const cell = this.prEditCellAt(state, x, y);
+    const cell = this.popupCellAt(state, x, y);
     state.notice = null;
     state.escPending = false;
     if (!cell.inside) {
@@ -5377,23 +5519,23 @@ export class Tui implements SessionIO {
       return;
     }
     state.dragging = true;
-    state.editor.anchorAt(state.editor.offsetAt(cell.row, cell.col, this.prEditWidth()));
+    state.editor.anchorAt(state.editor.offsetAt(cell.row, cell.col, this.popupWidth()));
     this.paint();
   }
 
-  private extendPrEditSelection(x: number, y: number): void {
-    const state = this.panel?.prEdit;
+  private extendPopupSelection(x: number, y: number): void {
+    const state = this.panel?.popup;
     if (!state || !state.dragging || state.status === "saving") return;
-    const cell = this.prEditCellAt(state, x, y);
-    state.editor.extendTo(state.editor.offsetAt(cell.row, cell.col, this.prEditWidth()));
+    const cell = this.popupCellAt(state, x, y);
+    state.editor.extendTo(state.editor.offsetAt(cell.row, cell.col, this.popupWidth()));
     this.paint();
   }
 
   /** Left release: a drag that selected something copies it, the same way a drag
    *  over the panel body does. A bare click selected nothing and copies nothing:
    *  it just moved the caret, which is what a click in a text box is for. */
-  private endPrEditSelection(): void {
-    const state = this.panel?.prEdit;
+  private endPopupSelection(): void {
+    const state = this.panel?.popup;
     if (!state || !state.dragging) return;
     state.dragging = false;
     const text = state.editor.selectedText();
@@ -5407,8 +5549,8 @@ export class Tui implements SessionIO {
   }
 
   /** Run a buffer mutation and repaint. The scroll follows on the next paint. */
-  private prEditEdit(fn: () => void): void {
-    const state = this.panel?.prEdit;
+  private popupEdit(fn: () => void): void {
+    const state = this.panel?.popup;
     if (!state || state.status === "saving") return;
     state.escPending = false;
     state.notice = null;
@@ -5418,17 +5560,28 @@ export class Tui implements SessionIO {
 
   /** Up/Down: one visual row, clamped at both ends. There is no history here to
    *  fall through to, since this buffer is the only thing the keys address. */
-  private prEditMoveRow(delta: 1 | -1): void {
-    this.prEditScroll(delta, 1);
+  private popupMoveRow(delta: 1 | -1): void {
+    this.popupScroll(delta, 1);
   }
 
   /** PgUp/PgDn: a viewport of rows at a time, by the same clamped row move. */
-  private prEditPage(delta: 1 | -1): void {
-    this.prEditScroll(delta, this.prEditBox().textRows);
+  private popupPage(delta: 1 | -1): void {
+    this.popupScroll(delta, this.popupBox().textRows);
   }
 
   /**
-   * Ctrl-S: write the buffer to the pull request.
+   * Ctrl-S: write the buffer to wherever it came from. The one save key, routed
+   * on the target, so both writes get the same interlock and the same reporting.
+   */
+  private savePopup(): void {
+    const state = this.panel?.popup;
+    if (!state || state.status === "saving") return;
+    if (state.target.kind === "pr") this.savePrMessage(state, state.target);
+    else this.saveDoc(state, state.target);
+  }
+
+  /**
+   * Ctrl-S over a PR message: write the buffer to the pull request.
    *
    * Fire-once while in flight, like the queue merge. An empty title is refused
    * HERE, before anything is sent, with the buffer left exactly as it is — gh
@@ -5438,9 +5591,7 @@ export class Tui implements SessionIO {
    * silently dropped. Only a save that actually landed closes the popup, and
    * what the tab paints afterwards is what the source read back from GitHub.
    */
-  private savePrMessage(): void {
-    const state = this.panel?.prEdit;
-    if (!state || state.status === "saving") return;
+  private savePrMessage(state: PopupState, target: { prNumber: number }): void {
     const source = this.queue;
     const save = source?.editPrMessage;
     if (!source || !save) {
@@ -5454,23 +5605,90 @@ export class Tui implements SessionIO {
       this.paint();
       return;
     }
+    this.runPopupSave(state, () => save.call(source, { title, body, prNumber: target.prNumber }));
+  }
+
+  /**
+   * Ctrl-S over a doc: write the buffer to the file.
+   *
+   * The whole buffer is the document — there is no title line here and no fence
+   * to splice — so the only thing refused before it is sent is an empty one. A
+   * doc emptied and saved would be indistinguishable from a doc the captain
+   * meant to keep, and Ctrl-X (which is how a buffer gets emptied by accident)
+   * is one keystroke away from Ctrl-S; deleting a document is the co's `doc`
+   * tool's job, deliberately and by name.
+   *
+   * The baseline pinned at open goes back with the text, so a file the co
+   * rewrote while the popup was up comes back as a refusal over the captain's
+   * intact buffer instead of being overwritten (see overwriteDocIfUnchanged).
+   */
+  private saveDoc(state: PopupState, target: { name: string; baseline: string }): void {
+    const source = this.docs;
+    const write = source?.write;
+    if (!source || !write) {
+      state.error = "editing docs isn't available in this session.";
+      this.paint();
+      return;
+    }
+    const content = state.editor.text;
+    if (content.trim() === "") {
+      state.error = `the buffer is empty — ${target.name} was left alone. Ask the co to delete a doc.`;
+      this.paint();
+      return;
+    }
+    this.runPopupSave(state, () =>
+      write.call(source, { name: target.name, content, baseline: target.baseline }),
+    );
+  }
+
+  /**
+   * Hold the popup locked while a save is in flight and settle it: a landed
+   * write closes over a receipt, and anything else — a refusal, a rejection —
+   * leaves the box open over the captain's text with the reason in it.
+   *
+   * Shared by both targets deliberately: the fire-once interlock and "a failed
+   * save never loses the buffer" are the properties that make the editor safe to
+   * put a file behind, and they must not be two implementations.
+   */
+  private runPopupSave(
+    state: PopupState,
+    send: () => Promise<{ saved: boolean; summary: string; error?: string }>,
+  ): void {
     state.status = "saving";
     state.error = null;
     state.escPending = false;
     this.paint();
-    void save.call(source, { title, body, prNumber: state.prNumber }).then(
+    void send().then(
       (res) => {
-        if (this.panel?.prEdit !== state) return; // closed or replaced since
+        if (this.panel?.popup !== state) return; // closed or replaced since
         state.status = "editing";
         if (res.saved) {
-          this.closePrEditor({ text: res.summary, ok: true });
+          if (state.target.kind !== "doc") {
+            this.closePopupEditor({ text: res.summary, ok: true });
+            return;
+          }
+          // Repaint the document from DISK rather than from the buffer, the same
+          // way the queue tab repaints from what GitHub read back. The write
+          // queue's signal can't do it: it fires while the popup still owns the
+          // view, so onDocWrite has no open doc to refresh.
+          //
+          // The receipt is set AFTER that lands, because a refresh whose content
+          // moved retires the notice line — it exists to stop a receipt vouching
+          // for text that has since changed, and this is the one write where the
+          // change and the receipt are the same event.
+          this.closePopupEditor();
+          void this.refreshDoc().then(() => {
+            if (!this.panel) return;
+            this.panel.copyNotice = res.summary;
+            this.paint();
+          });
           return;
         }
         state.error = res.error ?? res.summary;
         this.paint();
       },
       (e: unknown) => {
-        if (this.panel?.prEdit !== state) return;
+        if (this.panel?.popup !== state) return;
         state.status = "editing";
         state.error = e instanceof Error ? e.message : String(e);
         this.paint();
@@ -5486,8 +5704,8 @@ export class Tui implements SessionIO {
    * the key handlers, so every path that moves the caret — typing, arrows, a
    * kill, a resize that re-wraps everything — keeps it on screen for free.
    */
-  private prEditFrame(state: PrEditState): { rows: string[]; cursorRow: number; cursorCol: number } {
-    const { width, textRows } = this.prEditBox();
+  private popupFrame(state: PopupState): { rows: string[]; cursorRow: number; cursorCol: number } {
+    const { width, textRows } = this.popupBox();
     const inner = Math.max(1, width - 4);
     const layout = state.editor.layout(inner);
     state.scroll = scrollToCursor(state.scroll, layout.cursorRow, textRows, layout.segs.length);
@@ -5501,25 +5719,27 @@ export class Tui implements SessionIO {
       const fill = Math.max(0, width - visibleWidth(lead) - 2);
       return c.dim(open + lead + "─".repeat(fill) + close);
     };
-    // The title line is the first BUFFER line, however many visual rows it takes.
+    // The title line is the first BUFFER line, however many visual rows it takes
+    // — a PR message thing only. A doc's first line is ordinary markdown, and the
+    // renderer under the box, not the box, is what makes a heading look like one.
+    const isPr = state.target.kind === "pr";
     const titleEnd = state.editor.text.indexOf("\n");
     const sel = state.editor.selection;
-    const rows: string[] = [
-      border(`edit PR #${state.prNumber} · ${state.feature}`, "┌", "┐"),
-    ];
+    const rows: string[] = [border(popupLabel(state.target), "┌", "┐")];
     for (let r = 0; r < textRows; r++) {
       const idx = state.scroll + r;
       const seg = layout.segs[idx];
       const start = layout.starts[idx];
-      const isTitle = seg !== undefined && start !== undefined && (titleEnd === -1 || start < titleEnd);
+      const isTitle =
+        isPr && seg !== undefined && start !== undefined && (titleEnd === -1 || start < titleEnd);
       let text = seg === undefined ? "" : isTitle ? c.bold(seg) : seg;
       if (sel && seg !== undefined && start !== undefined) {
         text = this.highlightSelectedRow(text, seg, start, layout.starts[idx + 1], sel);
       }
       rows.push(c.dim("│") + " " + pad(text, inner) + " " + c.dim("│"));
     }
-    rows.push(c.dim("│") + " " + pad(this.prEditMessage(state, inner), inner) + " " + c.dim("│"));
-    rows.push(border(this.prEditKeys(state, width), "└", "┘"));
+    rows.push(c.dim("│") + " " + pad(this.popupMessage(state, inner), inner) + " " + c.dim("│"));
+    rows.push(border(this.popupKeys(state, width), "└", "┘"));
     return { rows, cursorRow: layout.cursorRow - state.scroll, cursorCol: layout.cursorCol };
   }
 
@@ -5556,7 +5776,7 @@ export class Tui implements SessionIO {
    * verbs go before them, and the drag hint goes first, because the gesture is
    * self-revealing where a key is not.
    */
-  private prEditKeys(state: PrEditState, width: number): string {
+  private popupKeys(state: PopupState, width: number): string {
     if (state.status === "saving") return "saving…";
     const room = Math.max(0, width - 6);
     const tiers = [
@@ -5569,8 +5789,12 @@ export class Tui implements SessionIO {
   }
 
   /** The popup's one message line: what it needs to say, most urgent first. */
-  private prEditMessage(state: PrEditState, width: number): string {
-    if (state.status === "saving") return c.cyan(this.clip(`writing PR #${state.prNumber}…`, width));
+  private popupMessage(state: PopupState, width: number): string {
+    const target = state.target;
+    if (state.status === "saving") {
+      const what = target.kind === "pr" ? `PR #${target.prNumber}` : target.name;
+      return c.cyan(this.clip(`writing ${what}…`, width));
+    }
     if (state.escPending) {
       return c.yellow(this.clip("unsaved changes — Esc again to discard them", width));
     }
@@ -5585,8 +5809,18 @@ export class Tui implements SessionIO {
       const n = countLines(state.editor.selectedText());
       return c.dim(this.clip(`${n} line${n === 1 ? "" : "s"} selected · Ctrl-Y copies · typing replaces`, width));
     }
-    if (state.editor.dirty) return c.dim(this.clip("edited · Ctrl-S writes it to GitHub", width));
-    return c.dim(this.clip("line 1 is the title · Enter inserts a newline", width));
+    if (state.editor.dirty) {
+      const where = target.kind === "pr" ? "GitHub" : `docs/${target.name}`;
+      return c.dim(this.clip(`edited · Ctrl-S writes it to ${where}`, width));
+    }
+    return c.dim(
+      this.clip(
+        target.kind === "pr"
+          ? "line 1 is the title · Enter inserts a newline"
+          : "the whole file · Enter inserts a newline",
+        width,
+      ),
+    );
   }
 
   /** Paint the full-screen panel: tab bar, content viewport, footer. */
@@ -5602,7 +5836,7 @@ export class Tui implements SessionIO {
    * because queueBody() clamps that scroll to the freshly-built row count.
    */
   private panelFrame(): {
-    tab: PanelView["kind"];
+    tab: PanelTab;
     suffix: string;
     body: string[];
     start: number;
@@ -5610,6 +5844,26 @@ export class Tui implements SessionIO {
     const panel = this.panel;
     if (!panel) return { tab: "home", suffix: "", body: [], start: 0 };
     const v = panel.view;
+    if (v.kind !== "popup") return this.viewFrame(v);
+    // The editor is a POPUP over the view that called it up, not a view of its
+    // own: that view stays painted underneath (paintPanel overlays the box), so
+    // the captain never loses sight of the head — or the document — he is
+    // writing about. The bar names what is being edited in its place.
+    const state = panel.popup;
+    const base = this.viewFrame(state?.under ?? { kind: "queue" });
+    return state ? { ...base, suffix: popupLabel(state.target) } : base;
+  }
+
+  /** One view as a frame. Split out of panelFrame so the popup can ask for the
+   *  frame of the view it is sitting on top of. */
+  private viewFrame(v: PanelView): {
+    tab: PanelTab;
+    suffix: string;
+    body: string[];
+    start: number;
+  } {
+    const panel = this.panel;
+    if (!panel) return { tab: "home", suffix: "", body: [], start: 0 };
     if (v.kind === "home") {
       const body = this.homeTabRows();
       // A feature landing (or being abandoned) shortens the list; never strand
@@ -5618,16 +5872,12 @@ export class Tui implements SessionIO {
       if (panel.homeScroll > max) panel.homeScroll = max;
       return { tab: "home", suffix: "", body, start: panel.homeScroll };
     }
-    if (v.kind === "queue" || v.kind === "prEdit") {
-      // The message editor is a POPUP over this tab, not a view of its own: the
-      // queue stays painted underneath it (paintPanel overlays the box), so the
-      // captain never loses sight of the head they are writing about.
-      const body = this.queueBody();
-      const suffix = panel.prEdit ? `edit PR #${panel.prEdit.prNumber}` : "";
-      return { tab: "queue", suffix, body, start: panel.queueScroll };
+    if (v.kind === "queue") {
+      return { tab: "queue", suffix: "", body: this.queueBody(), start: panel.queueScroll };
     }
     if (v.kind === "docs") return { tab: "docs", suffix: "", body: this.docsTabRows(panel), start: 0 };
     if (v.kind === "doc") return { tab: "docs", suffix: v.name, body: v.rows, start: v.scroll };
+    if (v.kind === "popup") return { tab: "queue", suffix: "", body: [], start: 0 };
     const pr = this.pendingReview;
     return {
       tab: "review",
@@ -5657,10 +5907,10 @@ export class Tui implements SessionIO {
     // are laid over the middle of the body, so the head it is about stays
     // visible around it. It is also the one panel view with a real text cursor,
     // so the caret is placed and shown instead of hidden.
-    const edit = panel.view.kind === "prEdit" ? panel.prEdit : null;
+    const edit = panel.view.kind === "popup" ? panel.popup : null;
     if (edit) {
-      const box = this.prEditBox();
-      const { rows: boxRows, cursorRow, cursorCol } = this.prEditFrame(edit);
+      const box = this.popupBox();
+      const { rows: boxRows, cursorRow, cursorCol } = this.popupFrame(edit);
       for (let r = 0; r < boxRows.length; r++) {
         frame.push(term.moveTo(box.top + r, box.left) + this.clip(boxRows[r]!, w));
       }
@@ -5694,7 +5944,7 @@ export class Tui implements SessionIO {
    * A tab is never dropped from the list, because a tab you cannot see is a tab
    * you do not know exists — which is the whole reason the bar is here.
    */
-  private overlayHeader(active: PanelView["kind"], suffix = ""): string {
+  private overlayHeader(active: PanelTab, suffix = ""): string {
     const w = this.cols;
     const tabs = this.panelTabs();
     const activeTab = Tui.TAB_LABELS[active];
@@ -6229,15 +6479,22 @@ export class Tui implements SessionIO {
       const terse = notice.replace("if nothing pastes, allow", "allow");
       left = ` ${c.cyan(2 + visibleWidth(notice) <= w ? notice : terse)} `;
       right = "";
-    } else if (v?.kind === "prEdit") {
+    } else if (v?.kind === "popup") {
       // The popup carries its own keys on its bottom border; the footer names
-      // what is being written, so the two never disagree about which PR it is.
-      const edit = this.panel?.prEdit;
+      // what is being written, so the two never disagree about which PR — or
+      // which file — it is.
+      const edit = this.panel?.popup;
+      const what =
+        edit === null || edit === undefined
+          ? ""
+          : edit.target.kind === "pr"
+            ? `PR #${edit.target.prNumber}`
+            : edit.target.name;
       left = edit
         ? " " +
           (edit.status === "saving"
-            ? c.cyan(`writing PR #${edit.prNumber}…`)
-            : c.cyan("Ctrl-S") + c.dim(` save PR #${edit.prNumber} · `) + c.cyan("Esc") + c.dim(" cancel")) +
+            ? c.cyan(`writing ${what}…`)
+            : c.cyan("Ctrl-S") + c.dim(` save ${what} · `) + c.cyan("Esc") + c.dim(" cancel")) +
           " "
         : " ";
     } else if (v?.kind === "review") {
@@ -6283,19 +6540,24 @@ export class Tui implements SessionIO {
     } else if (v?.kind === "docs") {
       left = ` a-z open · ${tabHint}Esc close `;
     } else if (v?.kind === "doc") {
-      // `y` is the only ACTION key on a doc, so it leads and is coloured the way
-      // the queue tab leads with its [m]. The run shortens to fit beside the
-      // position indicator rather than letting clip() eat its end: a hint that
-      // is always truncated away is a hint nobody discovers. The drag hint is
-      // first out, because the gesture is self-revealing where a key is not -
-      // you drag, the highlight appears, the receipt names what it took.
-      const room = w - 2 - visibleWidth(right); // the leading space + the `y`
+      // The ACTION keys on a doc lead and are coloured the way the queue tab
+      // leads with its [m]: `y` takes it away, `e` rewrites it. The run shortens
+      // to fit beside the position indicator rather than letting clip() eat its
+      // end: a hint that is always truncated away is a hint nobody discovers.
+      // The drag hint is first out, because the gesture is self-revealing where a
+      // key is not - you drag, the highlight appears, the receipt names what it
+      // took. `e` is advertised on the same rule the queue tab advertises its
+      // own: only where it would actually fire.
+      const editable = this.docs?.write !== undefined && v.error === null;
+      const lead = " " + c.cyan("y") + " copy" + (editable ? " · " + c.cyan("e") + " edit" : "");
+      const room = w - 2 - visibleWidth(right) - visibleWidth(lead);
       const tiers = [
-        " copy · drag select · space/b page · j/k line · g/G ends · Backspace back · Esc close ",
-        " copy · space/b page · j/k line · g/G ends · Backspace back · Esc close ",
-        " copy · space/b page · Backspace back · Esc close ",
+        " · drag select · space/b page · j/k line · g/G ends · Backspace back · Esc close ",
+        " · space/b page · j/k line · g/G ends · Backspace back · Esc close ",
+        " · space/b page · Backspace back · Esc close ",
+        " · Esc close ",
       ];
-      left = " " + c.cyan("y") + (tiers.find((t) => t.length <= room) ?? tiers[tiers.length - 1]!);
+      left = lead + (tiers.find((t) => t.length <= room) ?? tiers[tiers.length - 1]!);
     } else {
       // No view (the panel is closed): the shared paging surface, nothing of its own
       left = " space/b page · j/k line · g/G ends · Backspace back · Esc close ";

@@ -11,6 +11,7 @@ import {
   deleteDoc,
   listDocs,
   overwriteDoc,
+  overwriteDocIfUnchanged,
   readDoc,
   readSurfacedDocs,
   strReplaceDoc,
@@ -131,6 +132,61 @@ test("overwrite creates when the doc does not exist yet", async () => {
   }
 });
 
+test("a checked overwrite writes only while the file still holds what was read", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    await createDoc(paths, "plan.md", "one\n");
+    const opened = await readDoc(paths, "plan.md");
+
+    const ok = await overwriteDocIfUnchanged(paths, "plan.md", "one\ntwo\n", opened);
+    assert.equal(ok.name, "plan.md");
+    assert.equal(await readDoc(paths, "plan.md"), "one\ntwo\n");
+
+    // The co rewrote it while the editor was open: the stale baseline is
+    // refused, and the co's version is still on disk afterwards.
+    await overwriteDoc(paths, "plan.md", "the co's rewrite\n");
+    const e = await expectDocError(
+      () => overwriteDocIfUnchanged(paths, "plan.md", "the captain's rewrite\n", opened),
+      "DOC_CHANGED",
+    );
+    assert.match(e.message, /changed on disk/);
+    assert.equal(await readDoc(paths, "plan.md"), "the co's rewrite\n");
+
+    // Deleted out from under the editor is the same answer: a save must not
+    // silently resurrect a document the co removed.
+    await deleteDoc(paths, "plan.md");
+    await expectDocError(
+      () => overwriteDocIfUnchanged(paths, "plan.md", "back from the dead\n", "the co's rewrite\n"),
+      "DOC_CHANGED",
+    );
+    await expectDocError(() => readDoc(paths, "plan.md"), "DOC_NOT_FOUND");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a checked overwrite announces itself on the write queue", async () => {
+  const { paths, cleanup } = await makeInstance();
+  const seen: string[] = [];
+  const off = onWrite((e) => seen.push(`${e.kind}:${e.name}`));
+  try {
+    await createDoc(paths, "plan.md", "one\n");
+    seen.length = 0;
+    await overwriteDocIfUnchanged(paths, "plan.md", "two\n", "one\n");
+    assert.deepEqual(seen, ["doc:plan.md"], "the viewer refreshes off exactly one signal");
+
+    seen.length = 0;
+    await expectDocError(
+      () => overwriteDocIfUnchanged(paths, "plan.md", "three\n", "stale\n"),
+      "DOC_CHANGED",
+    );
+    assert.deepEqual(seen, [], "a refused write signals nothing");
+  } finally {
+    off();
+    await cleanup();
+  }
+});
+
 test("the sandbox rejects every way out of docs/", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
@@ -156,6 +212,12 @@ test("the sandbox rejects every way out of docs/", async () => {
       await expectDocError(() => overwriteDoc(paths, name, "x"), "INVALID_DOC_NAME");
       await expectDocError(() => deleteDoc(paths, name), "INVALID_DOC_NAME");
       await expectDocError(() => strReplaceDoc(paths, name, "a", "b"), "INVALID_DOC_NAME");
+      // The panel's editor writes through here, so it is held to the same
+      // sandbox as every other writer — `.memory/` included.
+      await expectDocError(
+        () => overwriteDocIfUnchanged(paths, name, "x", ""),
+        "INVALID_DOC_NAME",
+      );
     }
 
     // The substrate is untouched by all of that.
