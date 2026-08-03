@@ -44,7 +44,7 @@ import { c, colorEnabled } from "../ui.js";
 import { taskDisplayOrder } from "../taskorder.js";
 import { isConfirmVerb } from "../confirmverb.js";
 import { classifyToken, completeCommand } from "./commands.js";
-import { oceanRows } from "./ocean.js";
+import { OCEAN_TICK_MS, oceanRows } from "./ocean.js";
 import { MarkdownRenderer, renderTable, type Rendered } from "./markdown.js";
 import {
   classify,
@@ -1108,6 +1108,22 @@ export interface TuiOptions {
    * not — the table is the co's own and needs no repo.
    */
   tasks?: TaskPanelSource;
+  /**
+   * Whether decoration the Tui starts BY ITSELF may move — today, the ocean at
+   * the foot of the Home tab.
+   *
+   * It is injected rather than read here for the same reason playAnimation makes
+   * no environment decision of its own: CO_VISUALS, NO_COLOR, reduced motion and
+   * the width floor are visuals.ts's call, and this file knows nothing about
+   * them. It is a predicate rather than a flag because every one of those inputs
+   * is live — a terminal narrowed mid-session, or a level read from the
+   * environment at the moment of use.
+   *
+   * Omit it and nothing moves. That is the right default for a Tui built without
+   * an opinion (every test harness, any future embedder): a scene that has not
+   * been told it may animate stays exactly as still as it was before.
+   */
+  scenery?: () => boolean;
 }
 
 /**
@@ -1609,18 +1625,34 @@ export class Tui implements SessionIO {
   private busyFrame = 0;
   private busyTimer: ReturnType<typeof setInterval> | null = null;
 
-  // The visual region: a fixed-height band of decorative rows between the
-  // confirm banner and the busy line, driven by its own slow timer (see
-  // playAnimation). Like `busy` it is ephemeral — nothing here ever reaches the
+  // The decorative animation, and the ONE slow timer that drives it. There are
+  // two things it can drive and they are mutually exclusive by construction, so
+  // they share a timer, a frame counter and a teardown rather than running two
+  // schemes side by side:
+  //
+  //   region  a fixed-height band between the confirm banner and the busy line
+  //           (the dispatch flourish, the exit ship), carrying its own spec.
+  //   ocean   the sea at the foot of the panel's Home tab, which is drawn as
+  //           part of the tab body and so needs nothing but the frame number.
+  //
+  // They cannot overlap because the panel covers the whole screen: opening it
+  // ends any region animation, and playAnimation refuses outright while it is
+  // up. Like `busy` this is ephemeral — nothing here ever reaches the
   // transcript, so the durable record of a dispatch or an exit is the static
   // line the caller committed, identical at every visuals level.
-  private visual: AnimationSpec | null = null;
+  private visual: { kind: "region"; spec: AnimationSpec } | { kind: "ocean" } | null = null;
+  // Not reset when an animation ends: the ocean's phase, so a stream that
+  // interrupts the tide (see appendStream) resumes it where it left off rather
+  // than snapping the swell back to still water. playAnimation zeroes it for the
+  // region, which does need to start from frame 0.
   private visualFrame = 0;
   private visualTimer: ReturnType<typeof setInterval> | null = null;
   /** Resolvers waiting on the running animation to clear (settle/stop). */
   private visualWaiters: Array<() => void> = [];
   /** Wall-clock start of the running animation, for settle()'s minimum. */
   private visualStartedAt = 0;
+  /** Whether self-started decoration may move at all (see TuiOptions.scenery). */
+  private readonly scenery: () => boolean;
 
   // Pending single-line resolver when awaiting input.
   private pendingResolve: ((line: string | null) => void) | null = null;
@@ -1651,6 +1683,10 @@ export class Tui implements SessionIO {
    *  laid out. It is what lets a moved selection scroll itself into view without
    *  the key handler having to reproduce the table's wrapping arithmetic. */
   private readonly homeTaskStarts = new Map<string, number>();
+  /** Whether the LAST layout of the Home tab actually got a scene out of its
+   *  leftovers. Set by homeTabRows and read by syncOcean, so the tide follows
+   *  what was drawn rather than a second guess at whether it would fit. */
+  private oceanDrawn = false;
   private panel: PanelState | null = null;
   private unsubscribeDocs: (() => void) | null = null;
   // The panel-native merge (D-20260724-12). `queueMerging` names the feature
@@ -1703,6 +1739,7 @@ export class Tui implements SessionIO {
     this.queue = opts.queue;
     this.features = opts.features;
     this.tasks = opts.tasks;
+    this.scenery = opts.scenery ?? ((): boolean => false);
   }
 
   // --- lifecycle -------------------------------------------------------------
@@ -1870,9 +1907,11 @@ export class Tui implements SessionIO {
   }
 
   /** Rows the decorative visual region occupies (0 when nothing is playing).
-   *  Fixed for the life of an animation, so the screen never jumps mid-flight. */
+   *  Fixed for the life of an animation, so the screen never jumps mid-flight.
+   *  The ocean costs nothing here: it is drawn inside the panel's own body, and
+   *  the panel is not on screen at the same time as the input bar. */
   private visualRows(): number {
-    return this.visual ? this.visual.rows : 0;
+    return this.visual?.kind === "region" ? this.visual.spec.rows : 0;
   }
 
   /**
@@ -2027,7 +2066,11 @@ export class Tui implements SessionIO {
     // Model tokens are landing: scenery yields immediately. playAnimation
     // already refuses to start over an open stream; this is the other direction
     // — a stream that starts while something is playing kills it — so the
-    // "never animate during streaming" rule holds no matter the ordering.
+    // "never animate during streaming" rule holds no matter the ordering. It
+    // covers the panel's ocean too: the panel stays up while the model streams
+    // underneath it, and a tide repainting the screen against arriving tokens is
+    // exactly the competition this rule exists to prevent. syncOcean sees the
+    // open stream and leaves it stopped until the turn ends.
     if (this.visual) this.stopVisual();
     if (this.open === null) this.open = "";
     this.openMarkdown = Boolean(opts?.markdown);
@@ -2127,7 +2170,12 @@ export class Tui implements SessionIO {
     // The Ctrl-O panel owns the whole screen while open. The transcript
     // underneath keeps updating (streamed output still lands in the model);
     // closing the panel repaints it.
-    if (this.panel) { this.paintPanel(); return; }
+    //
+    // The tide is decided AFTER the frame, in both directions: what the panel
+    // just painted is what says whether there is a sea to animate, and painting
+    // the transcript at all means the panel is gone and the sea with it. Every
+    // route that closes the panel or leaves the tab ends in one of these two.
+    if (this.panel) { this.paintPanel(); this.syncOcean(); return; }
     // The input region height is dynamic (it grows as the buffer wraps), so the
     // transcript viewport height changes as the user types. Re-pin to the bottom
     // when following, so a growing input never leaves the transcript showing
@@ -2164,8 +2212,8 @@ export class Tui implements SessionIO {
     // frame. A generator that returns too few rows leaves blanks — the region's
     // height is fixed at play time either way.
     const visualRows = this.visualRows();
-    if (this.visual) {
-      const art = this.visual.render(this.visualFrame, this.cols);
+    if (this.visual?.kind === "region") {
+      const art = this.visual.spec.render(this.visualFrame, this.cols);
       for (let ar = 0; ar < visualRows; ar++) {
         frame.push(
           term.moveTo(vp + confirmRows + 1 + ar, 1) +
@@ -2220,6 +2268,7 @@ export class Tui implements SessionIO {
       term.moveTo(firstRow + view.cursorRow, promptW + 1 + view.cursorCol) + term.showCursor,
     );
     this.out.write(frame.join(""));
+    this.syncOcean(); // the panel is shut: the sea is not on screen
   }
 
   /**
@@ -2469,7 +2518,7 @@ export class Tui implements SessionIO {
     // waiters) rather than stacking two bands above the input bar.
     this.stopVisual();
 
-    this.visual = spec;
+    this.visual = { kind: "region", spec };
     this.visualFrame = 0;
     this.visualStartedAt = Date.now();
     const total = spec.frames;
@@ -2490,39 +2539,87 @@ export class Tui implements SessionIO {
     this.visualTimer.unref?.();
     this.paint();
 
-    const mine = spec;
+    const mine = (): boolean => this.visual?.kind === "region" && this.visual.spec === spec;
     const cleared = new Promise<void>((resolve) => this.visualWaiters.push(resolve));
     return {
       animating: true,
       stop: () => {
-        if (this.visual === mine) this.stopVisual();
+        if (mine()) this.stopVisual();
       },
       settle: async () => {
         // Already gone (frames exhausted, replaced, or torn down): it had its
         // time on screen, so there is nothing left to wait out.
-        if (this.visual !== mine) return cleared;
+        if (!mine()) return cleared;
         const remaining = (spec.minDurationMs ?? 0) - (Date.now() - this.visualStartedAt);
         if (remaining > 0) await new Promise((r) => setTimeout(r, remaining));
-        if (this.visual === mine) this.stopVisual();
+        if (mine()) this.stopVisual();
         return cleared;
       },
     };
   }
 
-  /** End whatever is playing in the visual region and release its waiters.
-   *  Idempotent, and safe during teardown (it only repaints while active). */
-  private stopVisual(): void {
+  /**
+   * End whatever the decorative timer is driving — region or ocean — and release
+   * any waiters. Idempotent, and safe during teardown (it only repaints while
+   * active). `repaint` is false for callers that are already inside a paint, so
+   * clearing scenery mid-frame can't recurse into a second write of the same
+   * screen.
+   *
+   * visualFrame is deliberately NOT zeroed here; see the field.
+   */
+  private stopVisual(repaint = true): void {
     if (this.visualTimer) {
       clearInterval(this.visualTimer);
       this.visualTimer = null;
     }
     const had = this.visual !== null;
     this.visual = null;
-    this.visualFrame = 0;
     const waiters = this.visualWaiters;
     this.visualWaiters = [];
     for (const w of waiters) w();
-    if (had && this.active) this.paint();
+    if (had && repaint && this.active) this.paint();
+  }
+
+  /**
+   * Start or stop the Home tab's tide, from the state the frame just painted.
+   * Called at the end of every paint, which makes this the ONE place the timer's
+   * life is decided — there is no start call sitting on a keybinding to be
+   * forgotten by the next route onto (or off) the tab.
+   *
+   * Every clause is a reason not to tick, and each is load-bearing:
+   *
+   *   the panel is shut, or showing another tab — the sea is not on screen, and
+   *     a timer repainting a screen nobody can see is pure waste (the same
+   *     judgement openPanel already makes about the region).
+   *   the scene was not drawn — the content took the rows, or the terminal is
+   *     too narrow for water. There is nothing to animate, so nothing ticks.
+   *   a stream is open — model tokens own the frame (see appendStream).
+   *   scenery may not move — CO_VISUALS, NO_COLOR, reduced motion, a pipe.
+   *
+   * Recovery is by the same route: the tab redraws for its own reasons after a
+   * turn ends or a resize widens the pane, and the tide starts again there.
+   */
+  private syncOcean(): void {
+    const running = this.visual?.kind === "ocean";
+    const wanted =
+      this.active &&
+      this.panel?.view.kind === "home" &&
+      this.oceanDrawn &&
+      this.open === null &&
+      this.scenery();
+    if (wanted === running) return;
+    if (!wanted) {
+      this.stopVisual(false);
+      return;
+    }
+    this.stopVisual(false); // never two timers, whatever was running
+    this.visual = { kind: "ocean" };
+    this.visualTimer = setInterval(() => {
+      this.visualFrame++;
+      this.paint();
+    }, OCEAN_TICK_MS);
+    // Scenery never holds the event loop open (same rule as the busy spinner).
+    this.visualTimer.unref?.();
   }
 
   /** Drop any active selection and repaint if it was showing. */
@@ -5805,11 +5902,19 @@ export class Tui implements SessionIO {
    * can only ever return that many, which is what makes the art unable to cost a
    * row of content. As the content grows the ship goes first, then the water,
    * then there is simply no scene. The list never gives up a line for it.
+   *
+   * The sea moves, on a frame this method only READS. It is a phase, not state:
+   * the row COUNT is a function of width and leftovers alone, so a tide running
+   * or stopped cannot change how much room the scene takes, and the scroll
+   * arithmetic that calls this for its own purposes gets the same answer at
+   * every frame. syncOcean decides whether the number ever changes.
    */
   private homeTabRows(): string[] {
     const content = [...this.taskTableRows(), "", ...this.worktreeRows()];
     const spare = this.overlayViewport() - content.length;
-    return [...content, ...oceanRows(this.cols, spare)];
+    const scene = oceanRows(this.cols, spare, this.visualFrame);
+    this.oceanDrawn = scene.length > 0;
+    return [...content, ...scene];
   }
 
   /**

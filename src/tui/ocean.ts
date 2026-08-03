@@ -22,9 +22,14 @@
  * clipped, because half a hull is worse than open water. The waterline itself is
  * a tile and fits any width, so it is the last thing to go.
  *
- * It is STATIC. There is no timer, no frame counter and no repaint loop here:
- * the rows are a pure function of (width, spare rows), rebuilt on the paints the
- * panel was already doing. Nothing about this scene ever causes one.
+ * It MOVES, and it is still a pure function. Everything here is a function of
+ * (width, spare rows, frame) with no timer, no clock and no state of its own:
+ * the same three numbers always give the same rows back. tui.ts owns the frame
+ * counter and decides when to advance it — and whether to advance it at all —
+ * exactly as it already does for the dispatch flourish and the exit ship.
+ *
+ * Frame 0 is the still water this scene shipped as, so a terminal that may not
+ * animate never asks for another frame and gets precisely the old picture.
  */
 
 import { c } from "../ui.js";
@@ -56,10 +61,39 @@ const SHIP_CLEARANCE = 2;
 
 /**
  * The sea floor: scattered sand and pebbles, tiled. Deliberately a fixed
- * repeating unit rather than anything sampled: the scene is static, and a
- * randomised floor would redraw differently on every repaint.
+ * repeating unit rather than anything sampled: a randomised floor would redraw
+ * differently on every repaint, and the scene has to be reproducible from its
+ * frame number alone.
+ *
+ * The floor does NOT drift with the water. It is the ground, and it is also the
+ * bottom row of the panel: two rows sliding together would read as the screen
+ * scrolling rather than as a sea. Water over still ground is what makes the
+ * motion a current.
  */
 const FLOOR_UNIT = "  .  ,   . :  o   ,  .";
+
+/**
+ * Milliseconds a frame is held. Forty times a repaint's budget and seven times
+ * the dispatch flourish's, because this is not a flourish over a wait — it sits
+ * under the captain's task table for as long as he leaves the panel open, and
+ * anything quicker pulls his eye off the content above it. One column of swell
+ * every two thirds of a second is a tide, not an animation.
+ */
+export const OCEAN_TICK_MS = 640;
+
+/**
+ * The ship's sway, in columns, indexed by frame. The galleon rides the swell
+ * rather than sailing it: one column to either side of centre and no further,
+ * so it always keeps clear water around it (SHIP_CLEARANCE is 2) and can never
+ * be pushed into a clip.
+ *
+ * Ten entries against the waterline's four, deliberately not a multiple: the two
+ * motions come back into step only after sixteen frames — ten seconds, against
+ * the water's own two and a half — so the scene does not read as the short loop
+ * the swell alone would be. The runs of equal values are what keep it slow: the
+ * hull holds a position for two or three frames rather than stepping every tick.
+ */
+const SHIP_SWAY = [0, 0, 1, 1, 1, 0, 0, -1, -1, -1];
 
 /** The narrowest terminal that can hold the ship, chrome included. Exported so
  *  the width gate can be asserted against one number rather than restated. */
@@ -75,16 +109,23 @@ export const OCEAN_SEA_MIN_ROWS = SEA_ROWS + SEA_GAP;
 /**
  * The scene's own rows, top to bottom, with no leading padding: either the ship
  * over the sea, or the sea alone, or nothing. `spare` is how many rows of the
- * viewport the real content left unused.
+ * viewport the real content left unused, and `frame` is the tick this is being
+ * drawn on (0 for still water).
+ *
+ * Both motions are HORIZONTAL, and that is a rule rather than an aesthetic: the
+ * scene's height is what the yield arithmetic is written against, so a bobbing
+ * hull would be a scene whose row count moved, and a row count that moves is a
+ * row of the task table at risk. The frame changes what is in the rows and
+ * never how many there are.
  */
-export function oceanScene(cols: number, spare: number): string[] {
+export function oceanScene(cols: number, spare: number, frame = 0): string[] {
   const seaWidth = cols - SEA_LEFT - SEA_RIGHT;
   if (seaWidth < MIN_SEA_COLS) return [];
   if (spare < OCEAN_SEA_MIN_ROWS) return [];
 
   const indent = " ".repeat(SEA_LEFT);
   const sea = [
-    indent + c.blue(seaLine(seaWidth)),
+    indent + c.blue(seaLine(seaWidth, frame)),
     indent + c.dim(floorLine(seaWidth)),
   ];
 
@@ -94,8 +135,12 @@ export function oceanScene(cols: number, spare: number): string[] {
     cols >= OCEAN_SHIP_MIN_COLS && spare >= OCEAN_SHIP_MIN_ROWS;
   if (!roomForShip) return sea;
 
-  // Centered in the water as a block, so the hull keeps its internal alignment.
-  const margin = indent + " ".repeat(Math.floor((seaWidth - GALLEON_WIDTH) / 2));
+  // Centered in the water as a block, so the hull keeps its internal alignment,
+  // then swayed a column with the swell — as a block too, for the same reason.
+  // The width gate guarantees at least SHIP_CLEARANCE columns either side, so a
+  // sway of one can move the hull but can never move it off the water.
+  const centre = Math.floor((seaWidth - GALLEON_WIDTH) / 2);
+  const margin = indent + " ".repeat(centre + sway(frame));
   const ship = GALLEON.map((line, i) => galleonRow(margin + line, i, GALLEON_HEIGHT));
   return [...ship, ...sea];
 }
@@ -111,10 +156,17 @@ export function oceanScene(cols: number, spare: number): string[] {
  * push a row of content out of view, or invent a scroll position, or put a "more
  * below" count on the footer.
  */
-export function oceanRows(cols: number, spare: number): string[] {
-  const scene = oceanScene(cols, spare);
+export function oceanRows(cols: number, spare: number, frame = 0): string[] {
+  const scene = oceanScene(cols, spare, frame);
   if (scene.length === 0) return [];
   return [...new Array<string>(spare - scene.length).fill(""), ...scene];
+}
+
+/** How far the hull is off centre on `frame`, normalised so any integer — a
+ *  negative one, or a counter that has been running all afternoon — is legal. */
+function sway(frame: number): number {
+  const n = SHIP_SWAY.length;
+  return SHIP_SWAY[((frame % n) + n) % n]!;
 }
 
 /** The sea floor, tiled to `width` columns. */

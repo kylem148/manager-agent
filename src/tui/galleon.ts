@@ -62,10 +62,19 @@ export function galleonRow(line: string, i: number, total: number): string {
 /**
  * A stylized waterline that fills `width` columns. A repeating `~~~^` gives a
  * gentle swell without any wide glyphs, so alignment stays exact.
+ *
+ * `phase` slides the window along the pattern, which is what lets a caller
+ * animate the swell: raising it by one walks the crests one column to the LEFT,
+ * so a ship drawn over it reads as making way to the right. It is normalised
+ * modulo the pattern, so any integer — including a negative one, or a frame
+ * counter that has run for hours — is a legal phase. Phase 0 is the still
+ * water the banner draws, and the width is exact at every phase.
  */
-export function seaLine(width: number): string {
+export function seaLine(width: number, phase = 0): string {
+  if (width <= 0) return "";
   const unit = "~~~^";
+  const off = ((phase % unit.length) + unit.length) % unit.length;
   let out = "";
-  while (out.length < width) out += unit;
-  return out.slice(0, width);
+  while (out.length < width + unit.length) out += unit;
+  return out.slice(off, off + width);
 }

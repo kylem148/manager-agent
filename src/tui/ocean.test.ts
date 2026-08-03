@@ -5,6 +5,7 @@ import {
   OCEAN_SEA_MIN_ROWS,
   OCEAN_SHIP_MIN_COLS,
   OCEAN_SHIP_MIN_ROWS,
+  OCEAN_TICK_MS,
   oceanRows,
   oceanScene,
 } from "./ocean.js";
@@ -118,18 +119,118 @@ test("oceanRows can never cost a row: it returns at most the spare it was given"
   }
 });
 
-test("the scene is static: the same size renders the same rows, every time", () => {
-  // No timer, no frame counter, no sampling. A repaint at an unchanged size must
-  // be byte-identical, or the panel would flicker on every keystroke.
-  const once = oceanScene(WIDE, 40);
-  for (let n = 0; n < 5; n++) assert.deepEqual(oceanScene(WIDE, 40), once);
+test("a repaint on the same frame renders the same rows, every time", () => {
+  // No clock, no sampling, no state. Two paints on one frame must be
+  // byte-identical, or the panel would flicker on every keystroke.
+  const once = oceanScene(WIDE, 40, 7);
+  for (let n = 0; n < 5; n++) assert.deepEqual(oceanScene(WIDE, 40, 7), once);
+  assert.deepEqual(oceanScene(WIDE, 40), oceanScene(WIDE, 40, 0), "no frame means frame 0");
 });
 
 test("the art is width-1 ASCII throughout, so the panel's columns cannot desync", () => {
-  const rows = plain(oceanScene(WIDE, 40));
-  for (const row of rows) {
-    assert.match(row, /^[\x20-\x7e]*$/, `non-ASCII in the scene: ${JSON.stringify(row)}`);
-    assert.equal(visibleWidth(row), row.length, "one char, one column");
+  for (const frame of [0, 1, 2, 5, 13]) {
+    for (const row of plain(oceanScene(WIDE, 40, frame))) {
+      assert.match(row, /^[\x20-\x7e]*$/, `non-ASCII at frame ${frame}: ${JSON.stringify(row)}`);
+      assert.equal(visibleWidth(row), row.length, "one char, one column");
+    }
   }
   assert.equal(GALLEON_WIDTH, Math.max(...GALLEON.map((l) => l.length)));
+});
+
+// --- the tide ----------------------------------------------------------------
+//
+// The second half of the scene, and the half that has to earn its place: motion
+// at the bottom of a page whose job is a task table. So these tests are as much
+// about what does NOT move as about what does — the row count, the sea floor,
+// the content's room — because a decoration that moves is a decoration with a
+// new set of ways to cost the captain a line.
+
+/** The waterline of a scene, without its indent or its colour. */
+function water(cols: number, spare: number, frame: number): string {
+  return stripAnsi(oceanScene(cols, spare, frame).at(-2) ?? "").trimStart();
+}
+
+/** How far the ship's block sits from the left edge on `frame`. */
+function shipAt(frame: number): number {
+  const row = stripAnsi(oceanScene(WIDE, 40, frame)[0] ?? "");
+  return row.length - row.trimStart().length;
+}
+
+test("the water drifts one column a frame, and the ground under it does not", () => {
+  for (let f = 0; f < 9; f++) {
+    const now = water(WIDE, 40, f);
+    const next = water(WIDE, 40, f + 1);
+    assert.notEqual(next, now, `frame ${f}: the swell moves`);
+    assert.equal(next.slice(0, -1), now.slice(1), `frame ${f}: it moves by exactly one column`);
+    assert.equal(next.length, now.length, "and the row is the same width either way");
+
+    // The sea floor is ground. Water sliding over still ground is what makes the
+    // motion read as a current instead of the whole panel scrolling.
+    const floorNow = stripAnsi(oceanScene(WIDE, 40, f).at(-1) ?? "");
+    const floorNext = stripAnsi(oceanScene(WIDE, 40, f + 1).at(-1) ?? "");
+    assert.equal(floorNext, floorNow, `frame ${f}: the sea floor stays put`);
+  }
+});
+
+test("the ship rides the swell: it sways a column, whole, and never further", () => {
+  const centre = shipAt(0);
+  const seen = new Set<number>();
+  for (let f = 0; f < 40; f++) {
+    const at = shipAt(f);
+    seen.add(at - centre);
+    assert.ok(Math.abs(at - centre) <= 1, `frame ${f}: the sway is a column, not a voyage`);
+    // Whole or absent is the rule at every frame, exactly as it is at every
+    // width: a sway that clipped a mast would be worse than no sway at all.
+    const ship = plain(oceanScene(WIDE, 40, f)).slice(0, GALLEON_HEIGHT);
+    for (const [i, r] of ship.entries()) {
+      assert.ok(r.trimStart().startsWith(GALLEON[i]!.trimStart()), `frame ${f}: row ${i} is intact`);
+    }
+  }
+  assert.deepEqual([...seen].sort(), [-1, 0, 1], "it rolls both ways, and rests amidships");
+});
+
+test("the two motions are slow, and out of step with each other", () => {
+  assert.ok(OCEAN_TICK_MS >= 500, `a frame lasts ${OCEAN_TICK_MS}ms: half a second or slower`);
+  // A scene that repeated every few seconds would read as a loop rather than as
+  // weather. The water's period is 4 frames; the ship's must not divide into it.
+  const period = (at: (f: number) => unknown): number => {
+    const first = JSON.stringify(at(0));
+    for (let f = 1; f < 200; f++) if (JSON.stringify(at(f)) === first) return f;
+    return -1;
+  };
+  const swell = period((f) => water(WIDE, 40, f));
+  const whole = period((f) => oceanScene(WIDE, 40, f));
+  assert.equal(swell, 4, "the swell alone is a four-frame loop");
+  assert.ok(whole >= swell * 4, `the ship stretches that to ${whole} frames, not ${swell}`);
+  assert.ok(whole * OCEAN_TICK_MS >= 10_000, `${whole} frames is ${whole * OCEAN_TICK_MS}ms of it`);
+});
+
+test("a frame is a phase: any integer is legal, and none of them is a special case", () => {
+  const ref = oceanScene(WIDE, 40, 3);
+  assert.deepEqual(oceanScene(WIDE, 40, 3 + 20), ref, "it comes back around");
+  assert.deepEqual(oceanScene(WIDE, 40, 3 - 20), ref, "in both directions");
+  for (const frame of [-7, -1, 999_999]) {
+    const rows = plain(oceanScene(WIDE, 40, frame));
+    assert.equal(rows.length, GALLEON_HEIGHT + 2, `frame ${frame} draws the whole scene`);
+    for (const row of rows) assert.ok(visibleWidth(row) < WIDE, `frame ${frame} fits`);
+  }
+});
+
+test("no frame can cost a row or reach the last column, at any size", () => {
+  // The yield arithmetic is written against the scene's HEIGHT, so the one thing
+  // the frame must never change is how many rows come back.
+  for (let cols = 0; cols < 120; cols++) {
+    for (let spare = -2; spare < 24; spare++) {
+      const still = oceanScene(cols, spare).length;
+      for (const frame of [1, 2, 5, 9]) {
+        const scene = oceanScene(cols, spare, frame);
+        assert.equal(scene.length, still, `cols=${cols} spare=${spare} frame=${frame}: same height`);
+        for (const row of scene) {
+          assert.ok(visibleWidth(row) < cols, `cols=${cols} frame=${frame}: off the last column`);
+        }
+        const padded = oceanRows(cols, spare, frame);
+        assert.ok(padded.length <= Math.max(0, spare), `cols=${cols} spare=${spare}: never more`);
+      }
+    }
+  }
 });
