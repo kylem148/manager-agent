@@ -72,6 +72,14 @@ import {
   featureSlug,
 } from "./worktrees.js";
 import { resolveReviewRecord } from "./reviewrecord.js";
+import {
+  firstLineOf,
+  flushHistoryNotes,
+  noteDispatchCancelled,
+  noteDispatchFired,
+  noteDispatchLaunchFailed,
+  noteMergeOutcome,
+} from "./historynotes.js";
 
 /**
  * Interactive terminal session for one co-manager instance.
@@ -133,6 +141,16 @@ interface SessionState {
    * that lands cleanly queues NOTHING: co is deliberately not in that loop.
    */
   queueNotices: string[];
+  /**
+   * The other half of the same queue: one-line records of events the co must
+   * have SEEN but must not be woken for — an armed dispatch resolving (fired or
+   * cancelled) and the captain's [m]. Same single path into the model's history
+   * as queueNotices, a user-role `SYSTEM:` message; the difference is that these
+   * are flushed into the history ahead of the next turn rather than drained by
+   * driving one, so nothing here costs a model call or a word on screen. See
+   * historynotes.ts for why they are buffered rather than pushed in place.
+   */
+  historyNotes: string[];
   /**
    * `Date.now()` when the last model turn finished, or null before the first.
    *
@@ -449,6 +467,7 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     armed: null,
     reviewQueue: [],
     queueNotices: [],
+    historyNotes: [],
     tasks: taskStore,
     costs,
   };
@@ -653,6 +672,12 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
           await fireDispatch(state, armed.order, confirm.agent, armed.feature, armed.resolve, lane);
           continue;
         }
+        // Recorded BEFORE the line that cancelled it is appended, which is what
+        // pushUserTurn's flush guarantees: the co reads "you were cancelled"
+        // and then what the captain said instead, on the one turn it has to
+        // react to both. Without this it could only guess which of the two
+        // resolutions its armed order got.
+        noteDispatchCancelled(state, state.armed.order);
         state.armed = null;
         io.setConfirmBanner(null);
         io.appendBlock(c.dim("  · dispatch cancelled."));
@@ -715,8 +740,25 @@ const COMPACT_REQUEST =
   " it as notes to yourself in plain prose, no preamble, no sign-off. Do not" +
   " address the captain and do not call any tools.";
 
+/**
+ * Append a turn's own message to the model's history, after anything that
+ * happened outside the loop and before it.
+ *
+ * Every user-role message the session appends goes through here, and that is
+ * what makes the ordering guarantee hold without a rule anyone has to remember:
+ * a cancellation recorded in the input loop is already in the history by the
+ * time the line that caused it is added. The one deliberate exception is the
+ * compaction request, which snapshots the history length around its own push and
+ * would slice a note flushed there back off again; a note that arrives during a
+ * compaction simply stays pending for the next turn.
+ */
+function pushUserTurn(state: SessionState, content: string): void {
+  flushHistoryNotes(state, state.messages);
+  state.messages.push({ role: "user", content });
+}
+
 async function runUserTurn(state: SessionState, userText: string): Promise<void> {
-  state.messages.push({ role: "user", content: userText });
+  pushUserTurn(state, userText);
   await drive(state);
   // After the turn, never before: compacting first would summarise a history
   // that is about to grow anyway, and the captain would wait through a
@@ -739,10 +781,9 @@ async function runUserTurn(state: SessionState, userText: string): Promise<void>
  * live state AND no tail) is treated as a blank start.
  */
 async function runOpeningGreeting(state: SessionState): Promise<void> {
-  state.messages.push({
-    role: "user",
-    content:
-      "SESSION START (spoken by you, the co-manager, unprompted). You have just" +
+  pushUserTurn(
+    state,
+    "SESSION START (spoken by you, the co-manager, unprompted). You have just" +
       " come aboard and read your session briefing above, which holds your live" +
       " state AND a verbatim tail of our last conversation. Greet the captain and" +
       " report where we left off. Open with an acknowledgement in character — e.g." +
@@ -754,7 +795,7 @@ async function runOpeningGreeting(state: SessionState): Promise<void> {
       " genuinely nothing to go on — empty live state AND no recent conversation —" +
       " say so plainly and ask what we're charting, rather than inventing history." +
       " Do not call any tools; do not list open questions exhaustively. Keep it tight.",
-  });
+  );
   // Deliberately low effort. This turn blocks the first prompt, so its latency is
   // the most visible in the whole session — and it is the least demanding work
   // the co does: summarise state that is already sitting in the system prompt,
@@ -941,6 +982,9 @@ async function maybeCompact(state: SessionState): Promise<void> {
   // Snapshot the length before the summarising turn appends to it, so the cut
   // index computed above still addresses the same messages afterwards.
   const before = state.messages.length;
+  // Deliberately NOT pushUserTurn: this snapshot is what the compaction slices
+  // back to, so a note flushed here would be cut off again. Pending notes wait
+  // for the next real turn instead (see pushUserTurn).
   state.messages.push({ role: "user", content: COMPACT_REQUEST });
   // Low effort deliberately: this is a summary of context the model is already
   // holding, the same call the cold-start greeting makes, and reasoning depth
@@ -1274,6 +1318,7 @@ async function fireDispatch(
   } catch (e) {
     await flourish.settle();
     io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));
+    noteDispatchLaunchFailed(state, { order, error: (e as Error).message });
     return;
   }
   await flourish.settle();
@@ -1281,8 +1326,19 @@ async function fireDispatch(
   try {
     if (job.status === "failed") {
       io.appendBlock(c.red(`  · dispatch failed to launch: ${job.error ?? "unknown error"}`));
+      noteDispatchLaunchFailed(state, { order, error: job.error ?? "unknown error" });
       return;
     }
+    // The armed order resolved the other way: the captain confirmed and this is
+    // running. One line into the co's own history so it stops guessing whether a
+    // typed confirm fired the order or the next message cancelled it — the
+    // screen line below says the same thing, but only to the captain.
+    noteDispatchFired(state, {
+      order,
+      jobId: job.id,
+      ...(job.agentName ? { agent: job.agentName } : {}),
+      ...(job.feature ? { feature: job.feature } : {}),
+    });
     // A resolver dispatch that actually launched moves the merge-queue head to
     // "resolving" (and counts the attempt). Done only on a real launch so a
     // failed placement burns no attempt; the completion drain re-processes it.
@@ -1382,6 +1438,7 @@ async function panelMergeHead(state: SessionState): Promise<QueueMergeResult> {
   } catch (e) {
     const error = (e as Error).message;
     io.appendBlock(c.red(`  · merge failed: ${error}`));
+    noteMergeOutcome(state, { merged: false, outcome: "failed", feature: "", summary: error, error });
     state.queueNotices.push(
       `SYSTEM: The captain pressed [m] on the merge-queue head in the panel and the merge THREW: ${error}. ` +
         `Nothing was merged. Tell them plainly what failed and what you'd do about it. Do not retry it yourself.`,
@@ -1402,6 +1459,12 @@ async function panelMergeHead(state: SessionState): Promise<QueueMergeResult> {
   } else {
     io.appendBlock(c.yellow(`  · [m] merged nothing: ${res.summary}`));
   }
+
+  // What the co could never learn otherwise: [m] runs with it nowhere in the
+  // loop, so a feature would land on dev while it went on reporting the feature
+  // as in flight. One line, no turn, no word on screen — the captain's own
+  // reading of this merge is the two lines above and is unchanged.
+  noteMergeOutcome(state, res);
 
   // The co is engaged for exactly one reason: a head that needs a decision.
   const notice = queueMergeNotice(res);
@@ -1473,7 +1536,7 @@ async function drainQueueNotices(state: SessionState): Promise<void> {
   while (state.queueNotices.length > 0) {
     const note = state.queueNotices.shift()!;
     state.userTurns++;
-    state.messages.push({ role: "user", content: note });
+    pushUserTurn(state, note);
     await drive(state);
   }
 }
@@ -1529,7 +1592,7 @@ async function drainReviews(state: SessionState): Promise<void> {
     const { record, source } = await resolveReviewRecord(job, state.dispatch);
 
     state.userTurns++;
-    state.messages.push({ role: "user", content: completionTurn(job, record, source, resolveNote) });
+    pushUserTurn(state, completionTurn(job, record, source, resolveNote));
 
     // Both lanes drive the same way; which turn they were handed is the only
     // difference, and completionTurn has already decided that (D-20260729-6).
@@ -1576,11 +1639,6 @@ function reviewTurn(job: Job, record: string, source: string, resolveNote: strin
     `\n\n--- record of the run ---\n${record}` +
     resolveNote
   );
-}
-
-function firstLineOf(order: string): string {
-  const l = order.split("\n").find((x) => x.trim() !== "")?.trim() ?? "";
-  return l.length > 80 ? l.slice(0, 77) + "…" : l;
 }
 
 /**
@@ -1702,10 +1760,10 @@ async function handleCommand(state: SessionState, raw: string): Promise<CommandR
       }
       // A shortcut to record a decision explicitly. There is no confirmation
       // step — recording is silent and self-managed.
-      state.messages.push({
-        role: "user",
-        content: `Record this as a decision now with memory_write (kind: decision). Use the rationale already in our conversation; if some context is thin, record it anyway and note the open questions inline in the entry. Then rewrite activeContext (memory_rewrite) to reference the new decision id. Keep your spoken reply natural and brief, and do not narrate the memory write. Decision: ${arg}`,
-      });
+      pushUserTurn(
+        state,
+        `Record this as a decision now with memory_write (kind: decision). Use the rationale already in our conversation; if some context is thin, record it anyway and note the open questions inline in the entry. Then rewrite activeContext (memory_rewrite) to reference the new decision id. Keep your spoken reply natural and brief, and do not narrate the memory write. Decision: ${arg}`,
+      );
       await drive(state);
       return "ok";
     }
@@ -1807,10 +1865,9 @@ async function syncActiveContext(state: SessionState, force: boolean, quiet = fa
   if (!quiet) io.appendBlock(c.dim("\nsyncing activeContext.md…"));
 
   const before = state.effects.liveRewritten.has("activeContext.md");
-  state.messages.push({
-    role: "user",
-    content:
-      "Session sync: update .memory/activeContext.md so the next cold start orients" +
+  pushUserTurn(
+    state,
+    "Session sync: update .memory/activeContext.md so the next cold start orients" +
       " correctly. Use memory_rewrite (file: activeContext). Reflect the current focus, decisions" +
       " in flight, recent confirmed decisions (compressed, with ids), open questions," +
       " known risks, and next likely actions. Crucially, update the \"Recent" +
@@ -1821,7 +1878,7 @@ async function syncActiveContext(state: SessionState, force: boolean, quiet = fa
       " letting older detail age out. Reply with a brief, natural one-line" +
       " acknowledgement, and do not narrate the memory write or say things like" +
       " saved, logged, or wrote to memory.",
-  });
+  );
   // On the exit distill (quiet), the model's acknowledgement is suppressed on
   // screen so `/exit` doesn't look like the co replied to a chat message; the
   // memory write still happens and the reply is still kept in the transcript.
