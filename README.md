@@ -769,6 +769,7 @@ that exists — including the ones still being worked, which the queue never see
   Tasks
 
   building   Fix crew handoff truncation
+  enqueued   Passkey login for the web app
   queued     Ctrl-O home page cleanup
 
   Worktrees
@@ -781,34 +782,44 @@ that exists — including the ones still being worked, which the queue never see
 
 The table is the same handful of live items the co-manager has always kept —
 "you are here", pruned hard — except that it is **stored**, and it is **yours**.
-A row's status is one of exactly two words, `building` or `queued`: a table that
-grows a row per step is a tracker, and the point of this block is that it can be
-read at a glance. There is **no row limit** — the restraint against tracker-creep
-is aimed at the co-manager, whose prompt tells it that adding a row is the
-exception, and it was never meant to stop you jotting a sixth. Put as many on it
-as you want: the tab is one scrolling body, so a table longer than the screen
+A row's status is one of exactly four words, and they are the stages a piece of
+work actually passes through: `queued` (not started), `building` (the crew has
+it), `enqueued` (built and handed to the merge queue, not yet checked) and
+`testing` (landed, waiting on you to check it). Four and no more, because a table
+that grows a row or a word per step is a tracker, and the point of this block is
+that it can be read at a glance. Nothing sets `enqueued` for you: the merge
+queue does not write to this table, so a row moves there when you press `s` or
+when the co-manager says so. There is **no row limit** — the restraint against
+tracker-creep is aimed at the co-manager, whose prompt tells it that adding a row
+is the exception, and it was never meant to stop you jotting a sixth. Put as many
+on it as you want: the tab is one scrolling body, so a table longer than the screen
 pages with `space`/`b` (and `g`/`G` for the ends) like everything else here, and
 the heading counts the rows (`Tasks (12)`) once there are more than fit. A
 missing or unreadable table file is an empty table, never a failed start.
 
-**`building` rows are painted first**, then the `queued` ones, each group in the
-order you put them in — so the thing actually being worked is the first line of
-the panel rather than wherever it happened to be typed. That is a display order
-only: the stored table keeps insertion order, so flipping a row's status moves it
-on screen without rewriting anything, and the row you retire disturbs nobody
-else's place. The same rule paints the table everywhere it is shown — this tab,
-what the co-manager's tool hands back, and the copy in its session-start context
-— so you and it are never reading differently-ordered tables.
+**Rows are painted most-active-first**: `building`, then `enqueued`, then
+`testing`, then `queued`, each group in the order you put them in, so the thing
+actually being worked is the first line of the panel rather than wherever it
+happened to be typed, and the two middle groups sit where you will see them.
+That is a display order only: the stored table keeps insertion order, so moving
+a row's status moves it on screen without rewriting anything, and the row you retire
+disturbs nobody else's place. The same rule paints the table everywhere it is
+shown — this tab, what the co-manager's tool hands back, and the copy in its
+session-start context — so you and it are never reading differently-ordered
+tables.
 
 **You write to it here, and the co-manager reads it.** `a` opens a one-line
 field (Enter adds the task as `queued`, Esc adds nothing); the arrows or `j`/`k`
 pick a row, `e` reopens that field on it to fix the wording, `x` retires it, `s`
-flips it between `queued` and `building`, and `Esc` drops the selection. `e`, `x`
-and `s` do nothing at all until you have picked a row, so no single stray key can
-change the table. Changes are on disk immediately, and a retired row is kept with
-the time it left. The co-manager edits the same table through a tool, one row at
-a time — it can't overwrite what you typed — and the table is in what it reads at
-session start, so a note you jot here is context it actually has.
+advances it a stage (`queued` → `building` → `enqueued` → `testing` → `queued`,
+the way the work runs, wrapping for a row that failed its test), and `Esc` drops
+the selection. `Ctrl-O` leaves outright, selected row or not: it is the way out
+of the panel, not a step back through it, so one press lands you in the chat.
+`e`, `x` and `s` do nothing at all until you have picked a row, so no single
+stray key can change the table. Changes are on disk immediately, and a retired
+row is kept with the time it left. The co-manager edits the same table through a
+tool, one row at a time — it can't overwrite what you typed — and the table is in
+what it reads at session start, so a note you jot here is context it actually has.
 
 `e` is a rewrite of the words, not a new row: the field opens prefilled with the
 caret at the end, Ctrl-S or Enter commits, Esc leaves the row untouched, and what
@@ -1752,8 +1763,8 @@ also types here it is a silent way to delete what he just wrote. Text matching n
 row, or matching two, is an error rather than a guess (an index would go stale
 between turns), an add past the cap fails rather than evicting anyone, and
 retiring moves a row into `done` with a timestamp instead of leaving it in the
-table under a third status. Junk rows are dropped, cells are folded to one line,
-a status the store does not know becomes `queued` rather than an error, and a
+table under a status of its own. Junk rows are dropped, cells are folded to one
+line, a status the store does not know becomes `queued` rather than an error, and a
 bare-array file from before the `done` list reads back fine. A missing or corrupt
 file is an empty table, never a failed start.
 

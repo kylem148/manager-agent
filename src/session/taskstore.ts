@@ -36,9 +36,9 @@ import { serializeWrite } from "../memory/writequeue.js";
  * The order kept here is INSERTION order, and nothing below reorders it: `add`
  * appends, `rename` rewrites a row's text in place, `retire` leaves the rest
  * where they were, and a status change moves no row at all. The order the table
- * is PAINTED in — `building`, then `testing`, then `queued` — is a separate
- * thing entirely and lives in ../taskorder.ts, so that a status change can alter
- * what the captain sees without rewriting the file underneath him.
+ * is PAINTED in — `building`, `enqueued`, `testing`, then `queued` — is a
+ * separate thing entirely and lives in ../taskorder.ts, so that a status change
+ * can alter what the captain sees without rewriting the file underneath him.
  *
  * Like the feature store it is a CACHE of a conversation, not a source of truth
  * about anything: a missing, corrupt or unwritable file is an empty table and
@@ -48,14 +48,15 @@ import { serializeWrite } from "../memory/writequeue.js";
  */
 
 /**
- * The whole status vocabulary: something is being built, it is being tested, or
- * it is waiting its turn. Three words and no more.
+ * The whole status vocabulary: something is being built, it has been handed to
+ * the merge queue, it is being tested, or it is waiting its turn. Four words and
+ * no more.
  *
  * A free-form status looked harmless and was not. It let the table drift into a
  * tracker — `ready-to-arm`, `scoping`, `recommended`, `backlog` all appeared in
  * real stores — and a column of eight different words is a column you read
  * instead of scan, which is the opposite of what an at-a-glance block is for.
- * The tool's schema offers only these three, and anything else that reaches the
+ * The tool's schema offers only these four, and anything else that reaches the
  * store (an older file, a model that ignored the enum) coerces to `queued`.
  *
  * `testing` is the captain's own addition and it is a STAGE, not a second way of
@@ -65,11 +66,19 @@ import { serializeWrite } from "../memory/writequeue.js";
  * why it is a status and not another action. A row can go back to `building` from
  * it, and a row that never needed a test goes straight out as it always did.
  *
- * Declared in DISPLAY order — building, testing, queued — because this array is
- * also what the tool's enum and its refusal message are built from, and one
- * order everywhere is one less thing to keep in sync.
+ * `enqueued` is the stage BEFORE that one, and it names the gap the other three
+ * left: work that is built and handed to the merge queue but not yet checked.
+ * It had nowhere to sit — it squatted in `building`, which claims the crew is
+ * still working, or jumped early to `testing`, which claims the captain can
+ * check something that has not landed. Nothing sets it automatically: the merge
+ * queue does not write here, so a row moves into it the same way it moves
+ * anywhere else, by the captain's key or the co's tool call.
+ *
+ * Declared in DISPLAY order — building, enqueued, testing, queued — because this
+ * array is also what the tool's enum and its refusal message are built from, and
+ * one order everywhere is one less thing to keep in sync.
  */
-export const TASK_STATUSES = ["building", "testing", "queued"] as const;
+export const TASK_STATUSES = ["building", "enqueued", "testing", "queued"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 /** One row of the table: what it is, and whether it is being built or waiting.
@@ -141,20 +150,22 @@ function cell(raw: unknown): string | undefined {
 }
 
 /**
- * The status of a row, narrowed to the three the table has. `building` and
- * `testing` are the only words that mean anything specific; EVERYTHING else — a
- * missing status, a word from the old free-form vocabulary, junk — is `queued`.
+ * The status of a row, narrowed to the four the table has. `building`,
+ * `enqueued` and `testing` are the only words that mean anything specific;
+ * EVERYTHING else — a missing status, a word from the old free-form vocabulary,
+ * junk — is `queued`.
  *
  * That is a coercion and not a validation on purpose: a store written under the
  * old shape is read, not rejected, and the panel is never handed a word it has
- * no column for. Adding `testing` to the vocabulary cannot disturb a file
- * written before it existed, either: such a file holds only `building` and
- * `queued`, and both still read as themselves. The WRITE path is strict (see
- * setStatus); this is the read.
+ * no column for. Adding a status to the vocabulary cannot disturb a file written
+ * before it existed, either: such a file holds only the older words, and each
+ * still reads as itself. The WRITE path is strict (see setStatus); this is the
+ * read.
  */
 function status(raw: unknown): TaskStatus {
   const word = cell(raw)?.toLowerCase();
   if (word === "building") return "building";
+  if (word === "enqueued") return "enqueued";
   if (word === "testing") return "testing";
   return "queued";
 }

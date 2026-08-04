@@ -85,6 +85,32 @@ test("a `testing` row paints its status yellow, through the shared colour helper
   p.stop();
 });
 
+test("an `enqueued` row paints green, the panel's colour for the merge queue", async () => {
+  const p = paint([
+    { task: "green row", status: "enqueued" },
+    { task: "yellow row", status: "testing" },
+    { task: "cyan row", status: "building" },
+    { task: "dim row", status: "queued" },
+  ]);
+  await settle();
+
+  // Green is the colour the queue tab and the worktree chips already use for the
+  // merge queue's own progress, and `enqueued` is exactly "the queue has it".
+  assert.ok(p.frame.includes(sgr(32, "enqueued")), "the status word is wrapped in green");
+
+  // Four rows, four colours: the group above and the group below it are the two
+  // it must not be confusable with, and neither moved.
+  assert.ok(p.frame.includes(sgr(36, "building")), "building is still cyan");
+  assert.ok(p.frame.includes(sgr(33, "testing")), "testing is still yellow");
+  assert.ok(p.frame.includes(sgr(2, "queued")), "queued is still dim");
+
+  // And the column holds: `enqueued` is as wide as `building`, so the padding is
+  // by visible width and no escape byte was counted as a column.
+  const plain = p.frame.replace(/\x1b\[[0-9;]*m/g, "");
+  assert.match(plain, /enqueued\s{3}green row/, "one gap of three, like every other row");
+  p.stop();
+});
+
 test("yellow comes from the theme handling, so NO_COLOR strips it like everything else", async () => {
   // Not a new hardcoded escape scheme: the same `c` helper the rest of the panel
   // uses, which means the existing opt-out already covers it. Proved by painting

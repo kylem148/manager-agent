@@ -259,9 +259,9 @@ export function fieldWindow(
 }
 
 /** The Home tab's task list: the status word in a fixed left column (sized to
- *  the longest the contract allows, still `building` now that `testing` has
- *  joined it), then a gap, then the name. Fixed rather than content-sized
- *  because a column that moves is a column you have to read instead of scan. */
+ *  the longest the contract allows — `building` and `enqueued` tie at eight),
+ *  then a gap, then the name. Fixed rather than content-sized because a column
+ *  that moves is a column you have to read instead of scan. */
 const TASK_STATUS_W = "building".length;
 const TASK_STATUS_GAP = "   ";
 
@@ -685,19 +685,21 @@ export interface FeaturePanelSource {
  *  the low-level Tui never depends on the session layer. */
 export interface TaskPanelRow {
   task: string;
-  /** Exactly three values, because the table is a "you are here" and not a
-   *  tracker: something is being built, it is built and waiting on the captain
-   *  to test it, or it is waiting its turn. The store coerces anything else to
-   *  `queued`, so the painter only ever sees these. */
-  status: "building" | "testing" | "queued";
+  /** Exactly four values, because the table is a "you are here" and not a
+   *  tracker: something is being built, it is built and handed to the merge
+   *  queue, it has landed and is waiting on the captain to test it, or it is
+   *  waiting its turn. The store coerces anything else to `queued`, so the
+   *  painter only ever sees these. */
+  status: "building" | "enqueued" | "testing" | "queued";
 }
 
 /** What `s` moves a row to, one press at a time: the cycle the work runs in.
- *  Total over the three statuses, so the key can never compute a status the
+ *  Total over the four statuses, so the key can never compute a status the
  *  store would refuse — see toggleSelectedTask for why it is a cycle at all. */
 const NEXT_TASK_STATUS: Record<TaskPanelRow["status"], TaskPanelRow["status"]> = {
   queued: "building",
-  building: "testing",
+  building: "enqueued",
+  enqueued: "testing",
   testing: "queued",
 };
 
@@ -4135,6 +4137,10 @@ export class Tui implements SessionIO {
     // It takes each view's OWN escape exit rather than a second, divergent close
     // path, so it inherits their rules (notably the review view's mid-merge
     // lockout: a merge in flight can't be walked away from by any key).
+    //
+    // The one thing it does NOT inherit is an escape meaning that stops SHORT of
+    // that exit — see clearEscapeStops.
+    if ("nav" in input && input.nav === "close") this.clearEscapeStops();
     const ev: OverlayInput = "nav" in input && input.nav === "close" ? { nav: "escape" } : input;
     // The picker owns the keyboard whole while it is up - BEFORE the panel's own
     // Tab and digits get a look. It is holding `/model` open, and a key that
@@ -4224,6 +4230,9 @@ export class Tui implements SessionIO {
     if ("nav" in input) {
       if (input.nav === "up" && this.moveTaskSelection(-1)) return;
       if (input.nav === "down" && this.moveTaskSelection(1)) return;
+      // Esc's two meanings: drop the selection, then close. A Ctrl-O arriving
+      // here as an escape has already had the first one spent for it upstream
+      // (clearEscapeStops), so it falls straight through to the close below.
       if (input.nav === "escape" && this.clearTaskSelection()) return;
       if (this.overlayScrollInput(input)) return;
       if (input.nav === "escape" || input.nav === "back") this.closePanel();
@@ -4269,6 +4278,26 @@ export class Tui implements SessionIO {
     this.ensureTaskVisible();
     this.paint();
     return true;
+  }
+
+  /**
+   * Spend every escape meaning that stops SHORT of closing the panel, so the
+   * escape Ctrl-O folds into lands on the exit itself.
+   *
+   * Home is the only view that has one: its Esc drops the task selection first
+   * and closes on the press after, which is right for Esc — it steps back
+   * through what you did — and wrong for Ctrl-O, which is the way OUT and not a
+   * step back. Two presses to leave the surface the captain is in most is the
+   * friction this removes; one press now lands in the chat from any selection
+   * state, and Esc keeps both of its meanings exactly as they were.
+   *
+   * Silent, and no repaint: the close that follows immediately repaints the
+   * whole screen, and a frame showing an unselected Home would be a flicker of a
+   * state nobody asked to see. A no-op on every other view, which is what keeps
+   * this from being a second close path with rules of its own.
+   */
+  private clearEscapeStops(): void {
+    if (this.panel?.view.kind === "home") this.panel.taskSel = null;
   }
 
   /** Esc's first meaning on Home: drop the selection and leave the tab inert
@@ -4331,15 +4360,17 @@ export class Tui implements SessionIO {
    * pressing it more than once and the row moves under them as it re-sorts.
    *
    * ONE KEY, CYCLING, rather than a key per status. `s` was a two-way toggle
-   * while there were two statuses, and the third had to reach it the same way —
-   * a new key for `testing` would have made the one status the captain reaches
-   * for most the odd one out, and Home's letters are nearly spent besides.
+   * while there were two statuses, and every status since has reached it the
+   * same way — a key of its own for one of them would have made the odd one out
+   * of whichever the captain reaches for most, and Home's letters are nearly
+   * spent besides.
    *
-   * The cycle runs the way the work does — queued -> building -> testing ->
-   * queued — so pressing `s` means "this moved on", which is the thing actually
-   * being recorded. Wrapping back to `queued` from `testing` is the way back for
-   * a row that failed its test; a row that PASSED leaves by `x`, because
-   * retiring is still what done means and no amount of pressing `s` reaches it.
+   * The cycle runs the way the work does — queued -> building -> enqueued ->
+   * testing -> queued — so pressing `s` means "this moved on", which is the
+   * thing actually being recorded. Wrapping back to `queued` from `testing` is
+   * the way back for a row that failed its test; a row that PASSED leaves by
+   * `x`, because retiring is still what done means and no amount of pressing `s`
+   * reaches it.
    */
   private toggleSelectedTask(): void {
     const row = this.selectedTask();
@@ -6514,11 +6545,12 @@ export class Tui implements SessionIO {
    * and it was buried on the right behind two content-sized columns before. The
    * old `Type` column is gone: it never changed what the captain did next.
    *
-   * Rows are painted `building`, then `testing`, then `queued` (D-20260729-5),
-   * through the same shared helper the tool and the live-state block call, so
-   * the row actually being worked cannot sit below two rows waiting their turn,
-   * and the rows waiting on the captain's own test sit where they will be seen.
-   * The STORE is untouched by that: it keeps insertion order, this is a view.
+   * Rows are painted most-active-first — `building`, `enqueued`, `testing`,
+   * then `queued` (D-20260729-5) — through the same shared helper the tool and
+   * the live-state block call, so the row actually being worked cannot sit below
+   * two rows waiting their turn, and the rows waiting on the captain's own test
+   * sit where they will be seen. The STORE is untouched by that: it keeps
+   * insertion order, this is a view.
    *
    * Building the rows is also where the selection is RECONCILED with the table:
    * a selected row the co retired mid-session is simply no longer selected. The
@@ -6623,13 +6655,17 @@ export class Tui implements SessionIO {
   }
 
   /** A task's status, coloured by the panel's existing convention rather than a
-   *  new one: the worktree chips already paint a live crew cyan, a thing needing
-   *  the captain's eye yellow, and a thing waiting its turn dim, and these three
-   *  words mean the same three things. The colours come from the shared `c`
-   *  helper, so NO_COLOR and a non-TTY strip them here exactly as everywhere
-   *  else and the column keeps its width either way. */
+   *  new one: the worktree chips already paint a live crew cyan, the merge
+   *  queue's own progress green, a thing needing the captain's eye yellow, and a
+   *  thing waiting its turn dim, and these four words mean the same four things.
+   *  Green for `enqueued` also keeps it distinct from the group under it at a
+   *  glance, which dim would not — `enqueued` and `queued` are adjacent and read
+   *  alike already. The colours come from the shared `c` helper, so NO_COLOR and
+   *  a non-TTY strip them here exactly as everywhere else and the column keeps
+   *  its width either way. */
   private taskStatusLabel(status: TaskPanelRow["status"]): string {
     if (status === "building") return c.cyan("building");
+    if (status === "enqueued") return c.green("enqueued");
     if (status === "testing") return c.yellow("testing");
     return c.dim("queued");
   }
