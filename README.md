@@ -391,6 +391,17 @@ The session is a scrollable terminal UI, not a plain read-out:
   between its lines before falling through to anything else. `↑` has one more
   meaning when messages are queued (below): the row above first, then the newest
   queued message, then history — in that order, always.
+- **`Esc Esc` cuts the line.** Two presses in quick succession clear whatever is
+  typed and not sent, and the text goes to your system clipboard on the way out
+  (OSC 52, the same escape everything else here copies with), so a line you
+  abandon on second thought is still a paste away. A collapsed paste chip is cut
+  as the paste it stands for, not as the placeholder. An empty line writes
+  nothing at all — an empty OSC 52 write is a real "clear the clipboard", and a
+  stray double-tap must not cost you what you copied earlier. The two presses
+  have to be close together (750ms), which is a deadline read off the second
+  press and never a timer holding the first: `Esc` is also the first byte of
+  every arrow key, so anything that waited on it would put a delay on the front
+  of every one of them.
 - **Multi-line messages**: `Shift+Enter` inserts a newline instead of sending,
   and `Enter` still sends. Shift+Enter needs a terminal that can report it —
   the app asks for the Kitty keyboard protocol on startup (Kitty, Ghostty,
@@ -409,7 +420,8 @@ The session is a scrollable terminal UI, not a plain read-out:
   queue actually raises. (That shape is Claude Code's, in our prompt mark; the
   key it names is the same key there.) `↑` lifts the newest one back onto the
   line to rewrite it, or to simply not send it; `Esc Esc` on an empty line drops
-  the whole queue. On a short terminal the list has a ceiling — a third of the
+  the whole queue (with a line on it, it cuts that line instead — above). On a
+  short terminal the list has a ceiling — a third of the
   screen — and elides the OLDEST behind a single `…`, never the newest, because
   the newest is the one `↑` acts on. Piped/non-TTY sessions read ahead the way
   they always have.
