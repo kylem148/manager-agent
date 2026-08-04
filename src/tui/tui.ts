@@ -78,6 +78,26 @@ const CSI = "\x1b[";
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 
+/**
+ * How close together the two presses of esc-esc must land to read as one
+ * gesture. Exported so the tests can sit either side of it rather than
+ * hard-coding a number that would drift.
+ *
+ * It is a DEADLINE CHECKED ON THE SECOND PRESS, never a timer started by the
+ * first — that distinction is the whole design. A timer would have to hold the
+ * first ESC back to see what follows it, and since ESC is also the first byte of
+ * every arrow key, function key and mouse report, holding it would put a delay
+ * on the front of every one of those sequences (or, worse, swallow one that
+ * arrived split across two reads). Nothing here is deferred: a lone ESC is
+ * dispatched the instant it arrives, exactly as it always was, and the clock is
+ * only ever read to decide what a SECOND ESC means. So the window costs no
+ * latency anywhere, and cannot exist on the path of a sequence at all.
+ *
+ * 750ms is comfortably slower than a deliberate double-press and far faster than
+ * an ESC the captain pressed and then thought about.
+ */
+export const ESC_ESC_WINDOW_MS = 750;
+
 // The chip a collapsed multi-line paste leaves in the input buffer. It's plain
 // text (no ANSI) so the editor's cursor-index == visible-column math still
 // holds; (\d+) captures the paste id used to expand it back on submit.
@@ -1154,6 +1174,12 @@ export interface TuiOptions {
    * been told it may animate stays exactly as still as it was before.
    */
   scenery?: () => boolean;
+  /**
+   * Injectable monotonic-enough clock, for testing. Only esc-esc's window reads
+   * it (see ESC_ESC_WINDOW_MS), and a test that has to prove "two presses far
+   * apart are not one gesture" would otherwise have to sleep for real.
+   */
+  now?: () => number;
 }
 
 /**
@@ -1805,9 +1831,17 @@ export class Tui implements SessionIO {
   // interlock itself lives in the session loop, which decides what to do with
   // the typed line. Null when nothing is armed.
   private confirmBanner: string[] | null = null;
-  // Armed by a lone ESC; a second consecutive lone ESC clears the input line
-  // (matches Claude Code's esc-esc). Any other key disarms it.
+  // Armed by a lone ESC; a second consecutive lone ESC within ESC_ESC_WINDOW_MS
+  // CUTS the input line — the text goes to the clipboard and the line is
+  // cleared. Any other key disarms it, and so does letting the window lapse:
+  // `escArmedAt` is when the arming press landed, and the second press compares
+  // against it. Nothing is ever held back waiting to find out (see
+  // ESC_ESC_WINDOW_MS), so a lone ESC and every ESC-prefixed sequence are as
+  // fast as they were before the window existed.
   private escPending = false;
+  private escArmedAt = 0;
+  /** Injected clock; only the esc-esc window reads it. */
+  private readonly now: () => number;
 
   // The persistent Ctrl-O panel: the shared home for docs AND the live merge
   // queue. While `panel` is non-null it takes the whole screen and drives every
@@ -1883,6 +1917,7 @@ export class Tui implements SessionIO {
     this.features = opts.features;
     this.tasks = opts.tasks;
     this.scenery = opts.scenery ?? ((): boolean => false);
+    this.now = opts.now ?? Date.now;
   }
 
   // --- lifecycle -------------------------------------------------------------
@@ -3040,13 +3075,38 @@ export class Tui implements SessionIO {
       .join("\n");
   }
 
-  /** Clear the input line and reset history browsing (esc-esc). */
+  /** Clear the input line and reset history browsing. */
   private clearInput(): void {
     this.buf = "";
     this.cursor = 0;
     this.histIdx = -1;
     this.draft = "";
     this.paint();
+  }
+
+  /**
+   * esc-esc's meaning when there is a line to lose: a CUT, not a wipe. The text
+   * goes to the system clipboard first (the same OSC 52 write the panel's
+   * drag-select, `y` and the popup's Ctrl-X all use), so a line the captain
+   * abandons is still a paste away rather than gone.
+   *
+   * It cuts the EXPANDED text, exactly as submit() sends the expanded text: a
+   * buffer holding a `[Pasted text #1 +43 lines]` chip has 43 lines in it as far
+   * as the captain is concerned, and a clipboard carrying the placeholder
+   * instead of the paste would be the one case where "recoverable" was a lie.
+   *
+   * An empty line writes NOTHING. OSC 52 with an empty payload is a real
+   * instruction to empty the clipboard, so a stray double-tap on a blank prompt
+   * would otherwise destroy whatever the captain had copied earlier — the one
+   * way this gesture could lose data instead of preserving it.
+   */
+  private cutInput(): void {
+    const text = this.expandChips(this.buf);
+    this.clearInput();
+    if (text === "") return;
+    this.copyToClipboard(text);
+    const n = countLines(text);
+    this.setStatus(`cut · ${n} line${n === 1 ? "" : "s"} on the clipboard`);
   }
 
   private handleData = (data: string): void => {
@@ -3078,9 +3138,11 @@ export class Tui implements SessionIO {
     // reports (ESC [ < ...) must not — they drive the selection itself.
     const isMouse = ch === ESC && data[i + 1] === "[" && data[i + 2] === "<";
     if (!isMouse && this.selection) this.clearSelection();
-    // esc-esc clears the input line. Arm on a lone ESC, fire on the next one.
-    // Any other key disarms, so clear by default and re-arm only below.
-    const wasEscPending = this.escPending;
+    // esc-esc cuts the input line. Arm on a lone ESC, fire on the next one if it
+    // lands inside the window. Any other key disarms, so clear by default and
+    // re-arm only below. The window is read HERE, off the byte that just
+    // arrived, and nowhere else: no timer, nothing deferred.
+    const wasEscPending = this.escPending && this.now() - this.escArmedAt <= ESC_ESC_WINDOW_MS;
     this.escPending = false;
 
     // Start of a bracketed paste. Checked before the generic CSI/ESC dispatch
@@ -3104,7 +3166,7 @@ export class Tui implements SessionIO {
     if (ch === ESC && data[i + 1] === "[") {
       return this.consumeCsi(data, i, wasEscPending);
     }
-    // Lone ESC: arm esc-esc; a second consecutive lone ESC clears the input.
+    // Lone ESC: arm esc-esc; a second consecutive lone ESC cuts the input.
     if (ch === ESC) {
       this.applyAction({ kind: "escape" }, wasEscPending);
       return 1;
@@ -3149,14 +3211,18 @@ export class Tui implements SessionIO {
 
       case "escape":
         if (!wasEscPending) {
+          // Arm (or RE-arm, when the previous arming has gone stale): this press
+          // becomes the first half of a gesture the next one may complete.
           this.escPending = true;
+          this.escArmedAt = this.now();
           return;
         }
         // esc-esc clears what has been typed and not sent. With an empty line
         // that is the queue, so it clears that instead; with anything on the
-        // line it means exactly what it always meant.
+        // line it means exactly what it always meant — except that the line now
+        // goes to the clipboard on its way out (cutInput).
         if (this.buf === "" && this.queued.length > 0) this.dropQueue();
-        else this.clearInput();
+        else this.cutInput();
         return;
 
       case "interrupt": {
