@@ -120,6 +120,51 @@ test("a final line with no trailing newline is still read", async () => {
   });
 });
 
+/**
+ * A failed turn must not end the session.
+ *
+ * This is the bug that made sessions look like they quit on their own: any
+ * exception out of a turn escaped the input loop, and the only handler outside
+ * it is the `finally` that runs the end-of-session distill — so one refused
+ * request closed the session mid-conversation and printed `fatal:`.
+ *
+ * Driven the way the captain hits it: the real CLI, a real turn, and a model
+ * call that is guaranteed to fail. The bearer token outranks every other auth
+ * path (see the resolution order in README), so a bogus one refuses the call
+ * even on a machine with working credentials; with no network at all it fails
+ * in the client instead. Which of the two happens does not matter — the point
+ * is that the turn threw and the session is still there afterwards.
+ */
+test("a turn that fails leaves the session running instead of exiting", async () => {
+  await withInstance(async (coHome) => {
+    const out = await runCli(coHome, ["t"], "say something\n/effort low\nand again\n/exit\n", {
+      AWS_BEARER_TOKEN_BEDROCK: "not-a-real-token",
+      BEDROCK_API_KEY: "not-a-real-token",
+    });
+
+    // The failure is surfaced rather than swallowed...
+    assert.match(out, /that turn failed:/);
+    assert.match(out, /the session is still open/);
+    // ...and everything typed after it was still read and run, which is only
+    // possible if the loop was still there to read it. Before the fix the
+    // session was already tearing down by this point and none of these ran.
+    assert.match(out, /effort: high → low/);
+    assert.equal(
+      out.match(/that turn failed:/g)?.length,
+      2,
+      "the second spoken turn ran too — a failed turn leaves the history usable",
+    );
+
+    // And the distill belongs to the exit, not to the failed turn: the work
+    // that came after the failure happened BEFORE anything exit-shaped.
+    const saving = out.indexOf("saving...");
+    assert.ok(
+      saving === -1 || out.indexOf("effort: high → low") < saving,
+      "the exit path must not have run when the turn threw",
+    );
+  });
+});
+
 test("parseConfirm reads the interlock verb, the lane word, and an optional agent override", () => {
   // Bare confirm → fire with the default agent (no override).
   assert.deepEqual(parseConfirm("confirm"), { isConfirm: true });

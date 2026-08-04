@@ -111,39 +111,96 @@ function blockCount(m: MessageParam): number {
 }
 
 /**
- * Indices of the messages whose final content block should carry a breakpoint:
- * the newest message, plus one far enough back to stay inside the lookback
- * window. Returns at most two.
+ * Blocks that may carry `cache_control`, which is not all of them.
+ *
+ * A thinking block has no such field: it is signed by the model and replayed
+ * verbatim, and the API rejects the extra key outright rather than ignoring it
+ * — `400 messages.16.content.0.thinking.cache_control: Extra inputs are not
+ * permitted`. That is a hard failure of the whole turn, and it is reached with
+ * a history the captain cannot edit, so every later turn fails the same way.
+ * The type cast that used to sit on the marker below is exactly what let this
+ * compile; markBlock takes the narrowed type instead, so a block type the SDK
+ * says cannot carry a breakpoint is now a compile error rather than a 400.
+ */
+type BreakpointBlock = Exclude<
+  ContentBlockParam,
+  { type: "thinking" } | { type: "redacted_thinking" }
+>;
+
+function acceptsBreakpoint(b: ContentBlockParam): b is BreakpointBlock {
+  return b.type !== "thinking" && b.type !== "redacted_thinking";
+}
+
+/** True when this message has somewhere legal to put a breakpoint. */
+function canCarryBreakpoint(m: MessageParam): boolean {
+  return typeof m.content === "string" || m.content.some(acceptsBreakpoint);
+}
+
+/**
+ * The newest message at or before `from` that can carry a breakpoint, or null.
+ * An assistant turn that stopped inside its reasoning is nothing but a thinking
+ * block, so an anchor that lands on one slides back to the nearest message with
+ * a legal spot rather than being dropped — the anchor moves, the count doesn't.
+ */
+function anchorAtOrBefore(messages: MessageParam[], from: number): number | null {
+  for (let i = Math.min(from, messages.length - 1); i >= 0; i--) {
+    if (canCarryBreakpoint(messages[i]!)) return i;
+  }
+  return null;
+}
+
+/**
+ * Indices of the messages whose final cacheable content block should carry a
+ * breakpoint: the newest message, plus one far enough back to stay inside the
+ * lookback window. Returns at most two.
  */
 function pickMessageBreakpoints(messages: MessageParam[]): Set<number> {
   const marks = new Set<number>();
   if (messages.length === 0) return marks;
 
-  const newest = messages.length - 1;
+  const newest = anchorAtOrBefore(messages, messages.length - 1);
+  if (newest === null) return marks;
   marks.add(newest);
 
   let blocks = 0;
-  for (let i = newest; i >= 0; i--) {
+  for (let i = messages.length - 1; i >= 0; i--) {
     blocks += blockCount(messages[i]!);
     if (blocks >= LOOKBACK_BLOCK_BUDGET && i > 0) {
-      marks.add(i - 1);
+      // Strictly older than the newest anchor: two marks on one message is one
+      // breakpoint, and the lagging anchor exists to sit further back.
+      const lagging = newest === 0 ? null : anchorAtOrBefore(messages, Math.min(i - 1, newest - 1));
+      if (lagging !== null) marks.add(lagging);
       break;
     }
   }
   return marks;
 }
 
-/** A copy of `m` whose last content block carries a cache breakpoint. */
+/** A copy of `b` carrying a cache breakpoint. */
+function markBlock(b: BreakpointBlock): ContentBlockParam {
+  return { ...b, cache_control: CACHE_CONTROL };
+}
+
+/** A copy of `m` whose last cacheable content block carries a cache breakpoint. */
 function markMessage(m: MessageParam): MessageParam {
   // A string body has to become a block before it can carry cache_control.
   // Semantically identical to the API.
   if (typeof m.content === "string") {
     return { ...m, content: [{ type: "text", text: m.content, cache_control: CACHE_CONTROL }] };
   }
-  if (m.content.length === 0) return m;
-  const content = m.content.map((b, i) =>
-    i === m.content.length - 1 ? ({ ...b, cache_control: CACHE_CONTROL } as ContentBlockParam) : b,
-  );
+  // The last block the API will take one on: the final block of an ordinary
+  // message, and an earlier one when the tail of the message is thinking.
+  let at = -1;
+  for (let i = m.content.length - 1; i >= 0; i--) {
+    if (acceptsBreakpoint(m.content[i]!)) {
+      at = i;
+      break;
+    }
+  }
+  if (at === -1) return m;
+  // The guard is re-run rather than cast away: it is what narrows the block for
+  // markBlock, and narrowing is the whole point of the exercise.
+  const content = m.content.map((b, i) => (i === at && acceptsBreakpoint(b) ? markBlock(b) : b));
   return { ...m, content };
 }
 

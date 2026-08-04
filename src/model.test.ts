@@ -144,6 +144,142 @@ test("breakpoints never leak into the caller's message history", async () => {
   assert.deepEqual(messages, before);
 });
 
+/** Every block in the outgoing request that carries a marker, in order. */
+function markedBlocks(p: SentParams): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (const m of p.messages) {
+    if (typeof m.content === "string") continue;
+    for (const b of m.content as Array<Record<string, unknown>>) {
+      if (b && typeof b === "object" && "cache_control" in b) out.push(b);
+    }
+  }
+  return out;
+}
+
+const thinking = (text: string) => ({ type: "thinking" as const, thinking: text, signature: "sig" });
+
+/** One turn over `history`, and the request it put on the wire. */
+async function requestFor(history: MessageParam[]): Promise<SentParams> {
+  const provider = new ModelProvider({ ...CFG });
+  const sent = stubClient(provider, [endTurn]);
+  await provider.runTurn(turn(history));
+  return sent[0]!;
+}
+
+/**
+ * A session's history as it really looks with adaptive thinking on: every
+ * assistant turn opens with a thinking block, and every fifth one stopped
+ * inside its reasoning and is nothing else. Ends user-side, the way a history
+ * always does at the moment a turn is sent.
+ */
+function thinkingHistory(turns: number): MessageParam[] {
+  const history: MessageParam[] = [];
+  for (let i = 0; i < turns; i++) {
+    history.push({ role: "user", content: `q${i}` });
+    history.push({
+      role: "assistant",
+      content:
+        i % 5 === 4
+          ? [thinking(`stopped mid-thought ${i}`)]
+          : [thinking(`reasoning ${i}`), { type: "text", text: `a${i}` }],
+    });
+  }
+  history.push({ role: "user", content: "next" });
+  return history;
+}
+
+/**
+ * The failure that killed a live session mid-turn:
+ *
+ *   400 messages.16.content.0.thinking.cache_control: Extra inputs are not permitted
+ *
+ * A rolling anchor was placed on the last content block of a historical
+ * assistant message, and that block was a thinking block. Thinking blocks are
+ * signed and replayed verbatim and carry no cache_control field at all, so the
+ * API refuses the whole request rather than ignoring the key — and since the
+ * offending block is in HISTORY, every later turn fails identically. Adaptive
+ * thinking is on for the whole session, so every assistant turn in the history
+ * opens with one of these; the only question is where the anchor lands.
+ */
+test("a breakpoint never lands on a thinking block", async () => {
+  // Where an anchor lands is a function of how many blocks the tail of the
+  // history holds, so any single history only proves the one spot it happened
+  // to hit — the first version of this test passed against the unfixed code for
+  // exactly that reason. Sweeping the length walks both anchors across every
+  // kind of message the history holds, thinking-only turns included.
+  for (let turns = 1; turns <= 30; turns++) {
+    const sent = await requestFor(thinkingHistory(turns));
+    const marked = markedBlocks(sent);
+    const where = `history of ${turns} turn(s)`;
+
+    assert.deepEqual(
+      marked.filter((b) => b.type === "thinking" || b.type === "redacted_thinking"),
+      [],
+      `no thinking block may carry cache_control — ${where}`,
+    );
+    // And caching is not quietly given up to achieve that: the anchors move,
+    // they do not disappear, and they stay inside Bedrock's ceiling of four.
+    assert.ok(marked.length >= 1 && marked.length <= 2, `${marked.length} anchors — ${where}`);
+    assert.ok(countBreakpoints(sent) <= 4, `${countBreakpoints(sent)} breakpoints — ${where}`);
+  }
+
+  // Long enough for both rolling anchors, plus the one on the system prefix.
+  assert.equal(markedBlocks(await requestFor(thinkingHistory(30))).length, 2);
+  assert.equal(countBreakpoints(await requestFor(thinkingHistory(30))), 3);
+});
+
+test("inside a message, the anchor moves to the last block that can take one", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  const sent = stubClient(provider, [endTurn]);
+
+  // Thinking last is the case the old code got wrong; a text block ahead of it
+  // is a legal home for the marker and must be the one used.
+  await provider.runTurn(
+    turn([
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "answer" }, thinking("afterthought")],
+      },
+    ]),
+  );
+
+  const content = sent[0]!.messages.at(-1)!.content as Array<Record<string, unknown>>;
+  assert.equal(content[0]!.cache_control !== undefined, true, "the text block carries it");
+  assert.equal(content[1]!.cache_control, undefined, "the thinking block does not");
+});
+
+test("an anchor with no legal spot slides to an older message rather than vanishing", async () => {
+  const provider = new ModelProvider({ ...CFG });
+  const sent = stubClient(provider, [endTurn]);
+
+  // Pathological on purpose: every assistant turn is thinking and nothing else,
+  // so neither anchor has a home where it would naturally fall. Caching must
+  // degrade to an older message, never to fewer breakpoints.
+  const history: MessageParam[] = [];
+  for (let i = 0; i < 20; i++) {
+    history.push({ role: "user", content: `q${i}` });
+    history.push({ role: "assistant", content: [thinking(`reasoning ${i}`)] });
+  }
+
+  await provider.runTurn(turn(history));
+
+  const marked = markedBlocks(sent[0]!);
+  assert.deepEqual(
+    marked.filter((b) => b.type === "thinking"),
+    [],
+  );
+  assert.equal(marked.length, 2, "still two rolling anchors, on the messages that can hold them");
+  // Distinct messages: two marks on one message would be one breakpoint, and
+  // the lagging anchor exists to sit further back than the newest.
+  const markedMessages = sent[0]!.messages.filter(
+    (m) =>
+      typeof m.content !== "string" &&
+      (m.content as Array<Record<string, unknown>>).some((b) => "cache_control" in b),
+  );
+  assert.equal(markedMessages.length, 2);
+});
+
 test("a tool round runs its calls concurrently and returns results in order", async () => {
   const provider = new ModelProvider({ ...CFG });
   const toolRound = {
