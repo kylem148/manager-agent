@@ -3,12 +3,13 @@ import {
   branchTipSha,
   executeLanding,
   prepareLanding,
+  updateOpenPrMessage,
   type AuthoredPrMessage,
   type LandingOptions,
   type PrepareGreen,
   type PrepareResult,
 } from "./landing.js";
-import { splitEvidence, type CommandRunner } from "./forge.js";
+import { splitEvidence, type CommandRunner, type PrPriorMessage } from "./forge.js";
 import { resolveWorktreeOptions } from "./worktrees.js";
 
 /**
@@ -275,6 +276,9 @@ export interface MergeQueueDeps {
   /** The head branch's current tip, for the staleness question a cached green has
    *  to answer before it is served again. A local read; writes nothing. */
   branchSha: typeof branchTipSha;
+  /** Write a passed PR message onto the head's already-open pull request, with no
+   *  git — the whole of a re-enqueue whose branch has not moved. */
+  updateMessage: typeof updateOpenPrMessage;
 }
 
 export interface MergeQueueOptions {
@@ -290,6 +294,13 @@ export interface MergeQueueOptions {
   deps?: Partial<MergeQueueDeps>;
 }
 
+/** A pull request whose message this enqueue rewrote, and the words that were on
+ *  it first — read off the forge immediately before the write (D-20260804-1). */
+export interface ReplacedPrMessage extends PrPriorMessage {
+  number: number;
+  url: string;
+}
+
 /** enqueue's outcome: the entry's place plus the head's (possibly just-updated)
  *  state, so the co can see in one call whether the head is now ready/blocked. */
 export interface EnqueueResult {
@@ -300,6 +311,11 @@ export interface EnqueueResult {
   head: QueueEntryView | null;
   queue: QueueView;
   summary: string;
+  /** Present when this enqueue's own message landed on a pull request that was
+   *  ALREADY OPEN: what that PR said beforehand. It is here rather than in any
+   *  stored flag because the read-back is the only honest record of an overwrite
+   *  — nothing has to stay true about it afterwards. */
+  prMessageReplaced?: ReplacedPrMessage;
 }
 
 /**
@@ -368,6 +384,7 @@ export class MergeQueue {
       prepare: opts.deps?.prepare ?? prepareLanding,
       execute: opts.deps?.execute ?? executeLanding,
       branchSha: opts.deps?.branchSha ?? branchTipSha,
+      updateMessage: opts.deps?.updateMessage ?? updateOpenPrMessage,
     };
   }
 
@@ -556,15 +573,24 @@ export class MergeQueue {
    * A green head that IS re-processed drops to awaiting-checks until its CI
    * reports on the new tip, and that is correct rather than unfortunate: the green
    * belonged to the sha that was replaced.
+   *
+   * `update` is the message passed on THIS call (never the stored one). On the
+   * unchanged-sha path it is the only thing that reaches the forge — a message-only
+   * `gh pr edit`, no rebase and no push — and either way the pull request's prior
+   * words come back on the result.
    */
-  async enqueue(feature: string): Promise<EnqueueResult> {
+  async enqueue(feature: string, update?: AuthoredPrMessage): Promise<EnqueueResult> {
     const alreadyQueued = this.has(feature);
     if (!alreadyQueued) this.entries.push({ feature, status: "queued" });
 
+    let replaced: ReplacedPrMessage | undefined;
     const head = this.entries[0]!;
     if (head.feature === feature) {
       const cached = head.status === "ready" && head.prepared?.kind === "green" ? head.prepared : undefined;
-      if (!cached || !(await this.cacheDescribesBranch(cached))) {
+      if (cached && (await this.cacheDescribesBranch(cached))) {
+        // Nothing to re-derive. The only write is the message, if one was passed.
+        if (update) replaced = await this.writeHeadPrMessage(cached, update);
+      } else {
         // Either the head is not green, or its green describes a sha the branch
         // has left. Invalidate before processing: runProcessHead deliberately
         // skips a still-"ready" head, and a stale green must not be one.
@@ -572,7 +598,8 @@ export class MergeQueue {
           head.status = "queued";
           delete head.prepared;
         }
-        await this.runProcessHead();
+        await this.runProcessHead(update);
+        replaced = this.replacedByPrepare();
       }
     }
 
@@ -584,6 +611,7 @@ export class MergeQueue {
       head: this.entries[0] ? this.toView(this.entries[0], 0) : null,
       queue: this.view(),
       summary: this.summarize(feature, alreadyQueued),
+      ...(replaced ? { prMessageReplaced: replaced } : {}),
     };
   }
 
@@ -593,6 +621,29 @@ export class MergeQueue {
   private async cacheDescribesBranch(green: PrepareGreen): Promise<boolean> {
     const sha = await this.deps.branchSha(this.landingOptions(), green.branch);
     return sha !== undefined && sha === green.featureSha;
+  }
+
+  /** The message-only write for an unchanged head: no git, one `gh pr edit`, and
+   *  the cached PR brought into step with the forge so the panel paints what the
+   *  pull request now says rather than what it said before. */
+  private async writeHeadPrMessage(
+    green: PrepareGreen,
+    update: AuthoredPrMessage,
+  ): Promise<ReplacedPrMessage | undefined> {
+    const res = await this.deps.updateMessage(this.landingOptions(), green.branch, update);
+    if (!res) return undefined;
+    if (green.pr) green.pr = { ...green.pr, title: res.pr.title, body: res.pr.body };
+    if (!res.replaced) return undefined;
+    return { number: res.pr.number, url: res.pr.url, ...res.replaced };
+  }
+
+  /** The prior message a just-finished prepare reported, when its ensurePr wrote
+   *  onto a pull request that was already open. */
+  private replacedByPrepare(): ReplacedPrMessage | undefined {
+    const prepared = this.entries[0]?.prepared;
+    if (!prepared || !("pr" in prepared) || !prepared.pr?.messageReplaced) return undefined;
+    const { number, url, messageReplaced } = prepared.pr;
+    return { number, url, ...messageReplaced };
   }
 
   /**
@@ -618,8 +669,13 @@ export class MergeQueue {
 
   /** The core head-processing transition. Returns the head entry (still the head
    *  afterwards), or undefined for an empty queue. Never throws: a prepare
-   *  precondition failure becomes a blocked head, not an exception. */
-  private async runProcessHead(): Promise<QueueEntry | undefined> {
+   *  precondition failure becomes a blocked head, not an exception.
+   *
+   *  `update` is the message passed on the enqueue that drove this processing, if
+   *  any — the only thing allowed to rewrite an already-open PR's words. Every
+   *  other caller (a merge advancing the queue, a resolver finishing, a removal)
+   *  passes nothing, so an automatic re-process can never touch the message. */
+  private async runProcessHead(update?: AuthoredPrMessage): Promise<QueueEntry | undefined> {
     const head = this.entries[0];
     if (!head) return undefined;
     // Already green and waiting for the merge keystroke: nothing to redo. The
@@ -656,6 +712,7 @@ export class MergeQueue {
         this.landingOptions(),
         head.feature,
         this.host.prMessage?.(head.feature),
+        update,
       );
     } catch (e) {
       // prepareLanding throws on a lifecycle problem (no branch/worktree, a

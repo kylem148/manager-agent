@@ -696,6 +696,15 @@ export class FeatureManager {
    * head processing; each field is an independent override, and OMITTING one
    * leaves whatever is stored intact. A bare re-enqueue after a resolver run
    * therefore reuses the co's message rather than reverting to the fallback.
+   *
+   * AND IT REACHES AN ALREADY-OPEN PULL REQUEST (D-20260804-1). Storing it was
+   * only ever half the job: a message passed for a feature whose PR was already
+   * open used to sit in the store and never be delivered, so the pull request
+   * went on saying whatever the first enqueue composed. The halves passed on THIS
+   * call are handed to the queue as well as stored, and the PR's prior title and
+   * body come back on the result (`prMessageReplaced`) so the co can see what it
+   * overwrote. Only the passed halves travel: the stored message stays create-only,
+   * or every automatic re-process would revert a captain's edit on GitHub.
    */
   async enqueue(
     name: string,
@@ -723,7 +732,16 @@ export class FeatureManager {
       ...(prTitle ? { prTitle } : {}),
       ...(prBody ? { prBody } : {}),
     });
-    const res = await this.queue.enqueue(record.feature);
+    // The same halves again, this time as what was passed NOW rather than what is
+    // stored — the queue writes these onto an open PR and leaves the rest alone.
+    const passed: AuthoredPrMessage = {
+      ...(prTitle ? { title: prTitle } : {}),
+      ...(prBody ? { body: prBody } : {}),
+    };
+    const res = await this.queue.enqueue(
+      record.feature,
+      passed.title === undefined && passed.body === undefined ? undefined : passed,
+    );
     return { enqueued: true, prMessage: this.prMessageOrigin(record.slug), ...res };
   }
 

@@ -115,11 +115,35 @@ export interface PullRequest {
   state?: string;
 }
 
+/** What a pull request's human message said immediately BEFORE co rewrote it —
+ *  read off the forge, never reconstructed, so it is what was actually there. */
+export interface PrPriorMessage {
+  title: string;
+  /** The whole body GitHub held, evidence fence and all. */
+  body: string;
+  /** That body's human half, with co's fenced evidence block split off. */
+  prose: string;
+}
+
+/** A rewrite of a pull request's human message whose halves are INDEPENDENT: an
+ *  omitted half leaves that half of the PR exactly as it is. That is the same
+ *  rule the feature store applies to a stored message, held here so a caller
+ *  that passed only a title can never stomp a description. */
+export interface PrMessagePatch {
+  title?: string;
+  prose?: string;
+}
+
 /** What ensurePr did, so a caller can report it honestly. */
 export interface PrEnsureResult {
   pr: PullRequest;
   /** True when this call created the PR; false when one was already open. */
   created: boolean;
+  /** Present when this call rewrote the message of a PR that was ALREADY OPEN:
+   *  what that pull request said immediately before the write. Absent on a
+   *  create (nothing was replaced), when no patch was passed, and when the patch
+   *  said exactly what the PR already said (nothing was sent). */
+  replaced?: PrPriorMessage;
 }
 
 /** What updatePrEvidence did. */
@@ -474,20 +498,48 @@ export function splitEvidence(body: string): PrBodyParts {
 /**
  * Make sure the feature has an open PR into the integration branch, and return
  * it. Creating one writes the whole message co composes: title, description, and
- * the fenced evidence block. An already-open PR is returned UNTOUCHED — its
- * title and prose are the captain's, and its evidence is refreshed separately by
- * updatePrEvidence once there is something new to say.
+ * the fenced evidence block.
  *
- * The split exists because the PR has to exist BEFORE its verdict is known: the
- * checks that gate the merge run on the forge, against this PR, so co opens it
- * first and writes the result into it afterwards (D-20260727-1).
+ * An already-open PR is returned UNTOUCHED unless the caller passes `update`.
+ * With no `update` the old rule holds exactly: the title and prose on an open PR
+ * are the captain's, and only updatePrEvidence refreshes the fence. With one, the
+ * named halves are written onto that PR (D-20260804-1) — because a message the co
+ * passed on a second enqueue was, until then, stored and never delivered, so the
+ * pull request went on saying the superseded thing. What the PR said first is
+ * read back off the forge and handed up as `replaced`, which is how a caller sees
+ * what it overwrote; there is deliberately no provenance flag anywhere, because
+ * the read-back IS the record.
+ *
+ * The create/read split exists because the PR has to exist BEFORE its verdict is
+ * known: the checks that gate the merge run on the forge, against this PR, so co
+ * opens it first and writes the result into it afterwards (D-20260727-1).
  */
 export async function ensurePr(
   o: ForgeOptions,
-  spec: { branch: string; title: string; body: string; evidence: string },
+  spec: {
+    branch: string;
+    title: string;
+    body: string;
+    evidence: string;
+    /** Halves to write onto an ALREADY-OPEN PR. Omit it (or pass an empty patch)
+     *  to keep the old leave-it-alone behaviour. Ignored on a create, where the
+     *  composed title/body already carry the message. */
+    update?: PrMessagePatch;
+  },
 ): Promise<PrEnsureResult> {
   const existing = await findOpenPr(o, spec.branch);
-  if (existing) return { pr: existing, created: false };
+  if (existing) {
+    const patch = spec.update;
+    if (!patch || (patch.title === undefined && patch.prose === undefined)) {
+      return { pr: existing, created: false };
+    }
+    const patched = await patchPrMessage(o, existing, patch);
+    return {
+      pr: patched.pr,
+      created: false,
+      ...(patched.replaced ? { replaced: patched.replaced } : {}),
+    };
+  }
 
   const body = spliceEvidence(spec.body, spec.evidence);
   const out = await execOrThrow(o, "gh", [
@@ -560,6 +612,39 @@ export async function updatePrMessage(
   const body = existing ? spliceEvidence(prose, existing) : prose.trim() === "" ? "" : `${prose.trim()}\n`;
   await execOrThrow(o, "gh", ["pr", "edit", String(pr.number), "--title", title, "--body", body]);
   return { ...pr, title, body };
+}
+
+/**
+ * updatePrMessage with the two things a machine-driven rewrite needs that the
+ * captain's editor does not: HALVES THAT ARE INDEPENDENT, and a READ-BACK of what
+ * was there first.
+ *
+ * A half the patch does not name is filled from the pull request itself, so
+ * passing a title alone rewrites the title and leaves the description exactly
+ * where it was. A patch that ends up saying precisely what the PR already says
+ * sends nothing at all and reports no replacement — there is nothing to record if
+ * nothing moved.
+ *
+ * `replaced` is the whole reporting story for this write. It is the PR's own
+ * words, taken from the object that was just read off the forge rather than from
+ * any cache, so a caller can show the captain what it overwrote instead of
+ * claiming a provenance it would have to store somewhere and keep true.
+ */
+export async function patchPrMessage(
+  o: ForgeOptions,
+  pr: PullRequest,
+  patch: PrMessagePatch,
+): Promise<{ pr: PullRequest; replaced?: PrPriorMessage }> {
+  const before: PrPriorMessage = {
+    title: pr.title,
+    body: pr.body,
+    prose: splitEvidence(pr.body).prose,
+  };
+  const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
+  const title = oneLine(patch.title ?? before.title);
+  const prose = splitEvidence(patch.prose ?? before.prose).prose.trim();
+  if (title === oneLine(before.title) && prose === before.prose.trim()) return { pr };
+  return { pr: await updatePrMessage(o, pr, { title, prose }), replaced: before };
 }
 
 // --- checks ------------------------------------------------------------------

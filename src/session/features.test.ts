@@ -14,6 +14,7 @@ import type { QueueEntryView } from "./mergequeue.js";
 import { composePrMessage } from "./landing.js";
 import { splitEvidence } from "./forge.js";
 import { makeExecutor, newSideEffects, toolDefinitions } from "./tools.js";
+import { protocolBody } from "./protocols.js";
 import type { ResearchConfig } from "../config.js";
 import {
   featureBranch,
@@ -1229,12 +1230,19 @@ test("each half of the PR message overrides on its own; omitting one keeps what 
       prBody: "Second body, better argued.",
     });
 
-    // The PR itself was opened by the FIRST enqueue and is a human artifact from
-    // then on: co refreshes only its fenced evidence, never the title or the
-    // prose the captain may have edited on GitHub.
+    // And the halves reach the OPEN pull request one at a time too: the body-only
+    // enqueue replaced the description and left the title, the title-only one the
+    // reverse. Storing them without delivering them was the bug (D-20260804-1) —
+    // the PR went on saying what the first enqueue composed.
     const pr = fx.forge.prFor("feat/halves")!;
-    assert.equal(pr.title, "First title", "an open PR's title is not rewritten");
-    assert.equal(splitEvidence(pr.body).prose, "First body.");
+    assert.equal(pr.title, "Second title");
+    assert.equal(splitEvidence(pr.body).prose, "Second body, better argued.");
+    assert.match(splitEvidence(pr.body).evidence, /### Checks/, "and co's fence is carried across");
+
+    // What each write replaced is reported back, read off the PR immediately
+    // before it — which is the whole record of the overwrite, in place of a flag.
+    assert.equal(second.prMessageReplaced?.title, "First title");
+    assert.equal(second.prMessageReplaced?.prose, "First body.");
   } finally {
     await fx.cleanup();
   }
@@ -1263,6 +1271,7 @@ test("a re-enqueue on the SAME sha serves the cached green: nothing is run, noth
     if (!again.enqueued) return;
     assert.equal(again.head?.status, "ready", "the cached status comes straight back");
     assert.equal(again.head?.commitsReady, first.head?.commitsReady);
+    assert.equal(again.prMessageReplaced, undefined, "no message was passed, so none was written");
 
     // The whole point: the branch is where the cache says it is, so there is
     // nothing to re-derive. No fetch, no rebase, no push, no gh call.
@@ -1320,6 +1329,61 @@ test("a re-enqueue after the crew commits again re-processes the head: rebase, p
     assert.deepEqual(
       fx.features.queueView().entries.map((e) => [e.feature, e.position]),
       [["moved", 1], ["waiting", 2]],
+    );
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a message passed for an ALREADY-OPEN pull request reaches it, and reports what it replaced", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("words");
+    await commitIn(a.feature.worktreePath, "w.txt", "w\n", "job: the words slice");
+
+    await fx.features.enqueue("words", { prTitle: "First title", prBody: "The first draft." });
+    const before = { ...fx.forge.prFor("feat/words")! };
+    const evidenceBefore = splitEvidence(before.body).evidence;
+    assert.match(evidenceBefore, /### Checks/, "there is a real fence to preserve");
+    fx.forge.pushes.length = 0;
+
+    const second = await fx.features.enqueue("words", {
+      prTitle: "Add the words, and say why",
+      prBody: "The second draft, which actually argues for it.",
+    });
+    assert.equal(second.enqueued, true);
+    if (!second.enqueued) return;
+
+    // It landed on the pull request — which, until D-20260804-1, it never did.
+    const after = fx.forge.prFor("feat/words")!;
+    assert.equal(after.title, "Add the words, and say why");
+    assert.equal(splitEvidence(after.body).prose, "The second draft, which actually argues for it.");
+    assert.equal(splitEvidence(after.body).evidence, evidenceBefore, "co's fence carried across untouched");
+
+    // And what it replaced comes back, read off the PR immediately before the
+    // write. This is the record of the overwrite; nothing is flagged anywhere.
+    assert.equal(second.prMessageReplaced?.number, before.number);
+    assert.equal(second.prMessageReplaced?.title, "First title");
+    assert.equal(second.prMessageReplaced?.prose, "The first draft.");
+    assert.equal(second.prMessageReplaced?.body, before.body, "the whole body GitHub held, fence and all");
+
+    // Message-only: the head was already on its tested sha, so no git ran.
+    assert.deepEqual(fx.forge.pushes, [], "nothing was pushed to carry a sentence");
+    assert.equal(second.head?.status, "ready", "and the head's state and its [m] are untouched");
+    assert.equal(second.entry.position, 1, "and its place in the queue is where it was");
+
+    // The store holds the new message too, so a later re-create composes with it.
+    assert.deepEqual((await FeatureStore.load(fx.paths)).prMessage("words"), {
+      prTitle: "Add the words, and say why",
+      prBody: "The second draft, which actually argues for it.",
+    });
+
+    // The panel repaints from the pull request, not from what was typed.
+    const detail = fx.features.headDetail();
+    assert.equal(detail?.kind === "ready" ? detail.pr?.title : undefined, "Add the words, and say why");
+    assert.equal(
+      detail?.kind === "ready" ? detail.pr?.prose : undefined,
+      "The second draft, which actually argues for it.",
     );
   } finally {
     await fx.cleanup();
@@ -1505,7 +1569,13 @@ test("the feature_enqueue TOOL declares the message and threads it to the pull r
   assert.match(props.prBody?.description ?? "", /pr-message protocol/);
   assert.match(def.description, /a body written without it is refused/);
   assert.match(def.description, /`prTitle` and `prBody`/, "the description tells co to write it");
-  assert.match(def.description, /omitted message fields keep what is stored/, "omitting preserves it");
+  assert.match(def.description, /omitted fields keep stored text/, "omitting preserves it");
+  // And the half that used to be missing: a field the co DOES pass is delivered
+  // to the pull request, not merely stored. The serialized tool budget has no
+  // room for the rest of that story, so it lives in the features protocol.
+  assert.match(def.description, /passed ones edit the PR/, "and passing it changes the PR");
+  assert.match(protocolBody("features"), /a field you DO pass is written to\n  the pull request/);
+  assert.match(protocolBody("features"), /re-processed only if its sha did/);
 
   const fx = await makeFixture();
   try {

@@ -4,6 +4,7 @@ import {
   ensurePr,
   fetchRemote,
   mergePr,
+  patchPrMessage,
   pushFeatureBranch,
   remoteDevSha,
   requireForge,
@@ -11,6 +12,8 @@ import {
   updatePrEvidence,
   viewPr,
   findOpenPr,
+  type PrMessagePatch,
+  type PrPriorMessage,
   type PullRequest,
 } from "./forge.js";
 import {
@@ -121,6 +124,11 @@ export interface LandingPullRequest {
   /** True when this prepare opened the PR; false when it refreshed one that was
    *  already open. */
   created: boolean;
+  /** Present when this prepare rewrote the MESSAGE of a PR that was already
+   *  open, because a message was passed on the call that drove it: what that
+   *  pull request said immediately beforehand (D-20260804-1). Absent whenever
+   *  nothing of the sort happened, which is the usual case. */
+  messageReplaced?: PrPriorMessage;
 }
 
 /** Prepare succeeded: the feature is rebased onto devSha, the branch is pushed,
@@ -258,12 +266,20 @@ export interface LandResult {
  * (stored per slug in featurestore.ts and handed down by the queue). Each field
  * falls back independently to the mechanical composition below, and it is only
  * ever used to CREATE the pull request — an open PR's title and prose are the
- * captain's, and nothing here rewrites them.
+ * captain's, and a stored message never rewrites them.
+ *
+ * `update` is the different thing that looks the same: the halves the co passed
+ * on THIS call. Those DO reach an already-open pull request (D-20260804-1), and
+ * the PR's prior title and body come back on the result so the caller can report
+ * what was overwritten. The two are kept apart on purpose — if the stored message
+ * were the one that wrote, every automatic re-processing would quietly revert a
+ * captain's edit on GitHub, which is exactly what `authored` must not do.
  */
 export async function prepareLanding(
   opts: LandingOptions,
   feature: string,
   authored?: AuthoredPrMessage,
+  update?: AuthoredPrMessage,
 ): Promise<PrepareResult> {
   const r = resolveWorktreeOptions(opts);
   const forge = forgeOptions(opts);
@@ -349,11 +365,13 @@ export async function prepareLanding(
   const evidenceOf = (checks?: ChecksSummary): string =>
     composeEvidence({ commits, devSha, featureSha, devRef: r.devRef, ...(checks ? { checks } : {}) });
   const message = composePrMessage({ feature, commits, branch, ...(authored ? { authored } : {}) });
+  const patch = prMessagePatch(update);
   const ensured = await ensurePr(forge, {
     branch,
     title: message.title,
     body: message.body,
     evidence: evidenceOf(),
+    ...(patch ? { update: patch } : {}),
   });
 
   // Wait out anything still running, within bounds. The grace window for "no
@@ -370,6 +388,7 @@ export async function prepareLanding(
     title: refreshed.pr.title,
     body: refreshed.pr.body,
     created: ensured.created,
+    ...(ensured.replaced ? { messageReplaced: ensured.replaced } : {}),
   };
 
   if (checks.verdict === "failed") {
@@ -412,6 +431,69 @@ export async function branchTipSha(
   } catch {
     return undefined;
   }
+}
+
+/** A message write that landed on an already-open pull request. */
+export interface OpenPrMessageUpdate {
+  /** The pull request as co left it. */
+  pr: { number: number; url: string; title: string; body: string };
+  /** What it said immediately before the write. Absent when the passed halves
+   *  already matched the PR, in which case nothing was sent. */
+  replaced?: PrPriorMessage;
+}
+
+/**
+ * Write a PASSED PR message onto the feature branch's already-open pull request,
+ * and report what it replaced — with NO git at all: no fetch, no rebase, no push,
+ * no checks read (D-20260804-1).
+ *
+ * This is the whole of what a re-enqueue does when the branch has not moved. The
+ * head's cached green still describes the sha the branch is on, so there is
+ * nothing to re-derive and nothing to publish; the only thing that has changed is
+ * the words, and the words are one `gh pr edit`. Rebasing and pushing a head that
+ * is already green just to carry a sentence would drop it to awaiting-checks for
+ * no reason at all.
+ *
+ * Returns undefined when the branch has no open PR — the message stays stored,
+ * and the prepare that eventually opens the PR composes it in.
+ */
+export async function updateOpenPrMessage(
+  opts: LandingOptions,
+  branch: string,
+  update: AuthoredPrMessage,
+): Promise<OpenPrMessageUpdate | undefined> {
+  const patch = prMessagePatch(update);
+  if (!patch) return undefined;
+  const forge = forgeOptions(opts);
+  const existing = await findOpenPr(forge, branch);
+  if (!existing) return undefined;
+  const patched = await patchPrMessage(forge, existing, patch);
+  return {
+    pr: {
+      number: patched.pr.number,
+      url: patched.pr.url,
+      title: patched.pr.title,
+      body: patched.pr.body,
+    },
+    ...(patched.replaced ? { replaced: patched.replaced } : {}),
+  };
+}
+
+/**
+ * An authored message as a forge patch: normalised the same way a stored one is
+ * (a one-line title, prose with any evidence fence stripped) and reduced to the
+ * halves that actually carry text. Undefined when nothing usable was passed,
+ * which is what makes an omitted — or blank — field mean "leave it alone" all the
+ * way down to the pull request.
+ */
+function prMessagePatch(update?: AuthoredPrMessage): PrMessagePatch | undefined {
+  if (!update) return undefined;
+  const patch: PrMessagePatch = {};
+  const title = authoredPrTitle(update.title);
+  if (title) patch.title = title;
+  const prose = authoredPrBody(update.body);
+  if (prose) patch.prose = prose;
+  return patch.title === undefined && patch.prose === undefined ? undefined : patch;
 }
 
 /**

@@ -144,7 +144,10 @@ single trivial change.
   \`origin/dev\`, pushed, PR'd, gated on the PR's own CI checks - and comes
   back \`ready\`, \`awaiting-checks\`, \`blocked\`, or \`resolving\`. You write the
   PR message (read the \`pr-message\` protocol); omitted fields keep what is
-  stored, so pass them only to change it.
+  stored, so pass them only to change it - a field you DO pass is written to
+  the pull request even when it is already open, and its prior words come
+  back. Re-calling costs nothing when the branch has not moved: the head is
+  re-processed only if its sha did, and its queue position never changes.
 - co runs no build and no test: the PR's real GitHub checks are the gate.
   \`awaiting-checks\` is a wait, not a failure; re-enqueue re-reads it. A PR
   reporting NO checks at all is ready but UNGATED - nothing verified it. Say

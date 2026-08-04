@@ -964,9 +964,19 @@ blocked head a retry and not a reset. And what the co-manager writes is prose, o
 prose: the commit list and the checks result stay co's own, regenerated on every
 processing inside the fenced block further down the description, so an authored
 description that arrives carrying a fence of its own has it stripped before it is
-stored. Either way co only ever writes the message when it CREATES the pull
-request — once it exists, the title and the description are yours, and
-re-processing rewrites nothing but the fenced evidence.
+stored.
+
+**A message it writes again is delivered again.** The stored message is used to
+CREATE the pull request and only to create it: once the PR exists, re-processing
+it rewrites nothing but the fenced evidence, so a title you retyped on GitHub
+survives every rebase, resolver run and merge behind it. What does reach an open
+PR is a message the co-manager passes on *that* call — it says the feature is done
+a second time, with different words, and the words land, which is the whole reason
+it would say them. Each half travels on its own: a new description leaves your
+title alone and vice versa, and a call carrying neither writes nothing at all.
+Before it overwrites anything it reads the pull request back and keeps what was
+there, so the co-manager can tell you what it replaced instead of silently
+replacing it — and if the words it displaced were yours, it says so.
 
 **The message has a shape.** The description is five sections: `## What` changed,
 `## Why` it was necessary, `## How` it was approached (the roads not taken
@@ -1139,7 +1149,10 @@ costs no model call, wakes nothing, and prints nothing — it is simply sitting
 there the next time the co speaks. The PR is a normal PR while it waits — retitle it, rewrite
 the description (on GitHub, or with `e` without leaving the panel), comment on
 it, review the diff on GitHub. Re-processing only
-rewrites the fenced evidence block co owns; your edits stay.
+rewrites the fenced evidence block co owns; your edits stay. The one thing that
+does replace them is the co-manager writing the message again on purpose, which
+it reports rather than performs quietly (see "The co-manager writes that message"
+above).
 
 The co-manager is pulled in for exactly one case: a head that comes back
 **blocked** — a rebase conflict, a red CI check, or a missing prerequisite

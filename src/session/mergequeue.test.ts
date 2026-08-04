@@ -13,6 +13,7 @@ import type {
   PreparePending,
   PrepareResult,
   prepareLanding,
+  updateOpenPrMessage,
 } from "./landing.js";
 
 /**
@@ -138,10 +139,17 @@ interface Harness {
   /** What each prepare was handed as the feature's authored message —
    *  `<feature>:<title|-></body|->` — so a test can see it was looked up fresh. */
   authoredSeen: string[];
+  /** What each prepare was handed as the message PASSED on that call, in the same
+   *  shape. Distinct from `authoredSeen`: only this one may rewrite an open PR. */
+  passedSeen: string[];
   /** branch -> the sha the branch is on right now, as the queue's staleness read
    *  sees it. Seeded by every prepare that produced a tip; a test moves a branch
    *  by writing here, which is exactly what a crew agent committing does. */
   branchTips: Map<string, string>;
+  /** branch -> the open pull request, as the forge holds it. */
+  openPrs: Map<string, { number: number; url: string; title: string; body: string }>;
+  /** Every message-only PR write the queue drove: `<branch>:<title|-></body|->`. */
+  messageWrites: string[];
 }
 
 function makeHarness(): Harness {
@@ -152,7 +160,10 @@ function makeHarness(): Harness {
   const forgotten: string[] = [];
   const authored = new Map<string, AuthoredPrMessage>();
   const authoredSeen: string[] = [];
+  const passedSeen: string[] = [];
   const branchTips = new Map<string, string>();
+  const openPrs = new Map<string, { number: number; url: string; title: string; body: string }>();
+  const messageWrites: string[] = [];
   const h = {
     prepareFn,
     prepareCalls,
@@ -161,23 +172,44 @@ function makeHarness(): Harness {
     forgotten,
     authored,
     authoredSeen,
+    passedSeen,
     branchTips,
+    openPrs,
+    messageWrites,
   } as Harness;
   h.executeError = null;
 
-  const fakePrepare: typeof prepareLanding = async (_opts, feature, message) => {
+  const fakePrepare: typeof prepareLanding = async (_opts, feature, message, update) => {
     prepareCalls.push(feature);
     authoredSeen.push(`${feature}:${message?.title ?? "-"}/${message?.body ?? "-"}`);
+    passedSeen.push(`${feature}:${update?.title ?? "-"}/${update?.body ?? "-"}`);
     const fn = prepareFn.get(feature) ?? (() => green(feature));
     const res = fn();
-    // A real prepare leaves the branch at the tip it published, and the staleness
-    // read looks at exactly that afterwards — so the fake has to leave it too.
+    // A real prepare leaves the branch at the tip it published and the PR at the
+    // message it composed; the staleness read and the message write both look at
+    // exactly those afterwards, so the fake has to leave them too.
     if ("featureSha" in res) branchTips.set(res.branch, res.featureSha);
+    if ("pr" in res && res.pr) {
+      const { number, url, title, body } = res.pr;
+      openPrs.set(res.branch, { number, url, title, body });
+    }
     return res;
   };
 
   /** The queue's staleness read: what sha is this branch on right now. */
   const fakeBranchSha: typeof branchTipSha = async (_opts, branch) => branchTips.get(branch);
+
+  /** The message-only PR write: no git anywhere in it, and it reports the words
+   *  it replaced the way the real one reads them back off the forge. */
+  const fakeUpdateMessage: typeof updateOpenPrMessage = async (_opts, branch, update) => {
+    const pr = openPrs.get(branch);
+    if (!pr) return undefined;
+    messageWrites.push(`${branch}:${update.title ?? "-"}/${update.body ?? "-"}`);
+    const replaced = { title: pr.title, body: pr.body, prose: pr.body };
+    const next = { ...pr, title: update.title ?? pr.title, body: update.body ?? pr.body };
+    openPrs.set(branch, next);
+    return { pr: next, replaced };
+  };
 
   const fakeExecute: typeof executeLanding = async (_opts, feature, expect) => {
     // The pin is recorded in full: the tested tip, the origin/dev it was tested
@@ -208,7 +240,12 @@ function makeHarness(): Harness {
       forget: (f) => forgotten.push(f),
       prMessage: (f) => authored.get(f),
     },
-    deps: { prepare: fakePrepare, execute: fakeExecute, branchSha: fakeBranchSha },
+    deps: {
+      prepare: fakePrepare,
+      execute: fakeExecute,
+      branchSha: fakeBranchSha,
+      updateMessage: fakeUpdateMessage,
+    },
   });
   return h;
 }
@@ -312,6 +349,8 @@ test("enqueue is idempotent: re-enqueuing a ready head ON THE SAME SHA keeps its
   assert.equal(again.alreadyQueued, true);
   assert.equal(again.head?.status, "ready");
   assert.deepEqual(h.prepareCalls, ["aaa"], "a ready head on its tested sha is not re-prepared");
+  assert.deepEqual(h.messageWrites, [], "and with no message passed, nothing is written either");
+  assert.equal(again.prMessageReplaced, undefined, "nothing was replaced, so nothing is reported");
   assert.equal(h.queue.view().size, 1);
 });
 
@@ -368,6 +407,67 @@ test("a re-processed head that comes back awaiting-checks says so rather than ke
   assert.equal(again.head?.status, "awaiting-checks");
   assert.equal(again.head?.commitsReady, undefined, "there is no [m] on it any more");
   assert.match(again.summary, /WAITING on its pull request's CI checks/);
+});
+
+test("a message on an unchanged head is written to its open PR alone — no rebase, no push", async () => {
+  // The one thing a re-enqueue on an unchanged sha may do to the forge, and the
+  // thing it never did before: deliver the words (D-20260804-1).
+  const h = makeHarness();
+  await h.queue.enqueue("aaa");
+  assert.deepEqual(h.prepareCalls, ["aaa"]);
+
+  const res = await h.queue.enqueue("aaa", { title: "A better title", body: "A better description." });
+  assert.deepEqual(h.prepareCalls, ["aaa"], "an unchanged sha is still not re-prepared");
+  assert.deepEqual(h.messageWrites, ["feat/aaa:A better title/A better description."]);
+
+  // What it replaced comes back, read off the pull request rather than remembered.
+  assert.equal(res.prMessageReplaced?.number, 7);
+  assert.equal(res.prMessageReplaced?.title, "aaa work");
+  assert.equal(res.prMessageReplaced?.body, "why and what");
+  assert.equal(res.head?.status, "ready", "the head is untouched by an edit to its message");
+
+  // And the panel's cached copy is in step with the forge, not with the buffer.
+  const detail = h.queue.headDetail();
+  assert.equal(detail?.kind === "ready" ? detail.pr?.title : undefined, "A better title");
+});
+
+test("a message on a head that IS re-processed rides the prepare, and reports what the open PR said", async () => {
+  const h = makeHarness();
+  await h.queue.enqueue("aaa");
+  h.branchTips.set("feat/aaa", "feat-aaa-moved");
+  // The prepare's ensurePr found the PR already open and rewrote its message; the
+  // prior words come back on the result the same way.
+  h.prepareFn.set("aaa", () => {
+    const g = green("aaa");
+    g.pr = { ...g.pr!, title: "Rewritten", created: false, messageReplaced: {
+      title: "aaa work",
+      body: "why and what",
+      prose: "why and what",
+    } };
+    return g;
+  });
+
+  const res = await h.queue.enqueue("aaa", { title: "Rewritten", body: "Because the fix changed the story." });
+  assert.deepEqual(h.prepareCalls, ["aaa", "aaa"]);
+  assert.deepEqual(h.passedSeen[1], "aaa:Rewritten/Because the fix changed the story.");
+  assert.deepEqual(h.messageWrites, [], "the prepare wrote it; there is no second write");
+  assert.equal(res.prMessageReplaced?.title, "aaa work");
+  assert.equal(res.prMessageReplaced?.prose, "why and what");
+});
+
+test("only the message PASSED on the call travels: an automatic re-process never rewrites a PR", async () => {
+  // The stored message stays create-only. If it rode every processing, the merge
+  // that promotes the next head — or a resolver finishing — would silently revert
+  // whatever the captain had written on GitHub.
+  const h = makeHarness();
+  h.authored.set("bbb", { title: "Stored title", body: "Stored body." });
+  await h.queue.enqueue("aaa");
+  await h.queue.enqueue("bbb");
+  assert.equal((await h.queue.mergeReadyHead()).merged, true);
+
+  assert.equal(h.passedSeen[1], "bbb:-/-", "the promoted head was handed no passed message");
+  assert.equal(h.authoredSeen[1], "bbb:Stored title/Stored body.", "only the stored one");
+  assert.deepEqual(h.messageWrites, []);
 });
 
 test("a rebase conflict blocks the head and it holds the queue", async () => {
