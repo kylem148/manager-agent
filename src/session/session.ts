@@ -15,7 +15,7 @@ import {
   type ModelOrigin,
 } from "../config.js";
 import type { InstancePaths, LiveFile } from "../paths.js";
-import { CACHE_TTL, ModelProvider, type MessageParam } from "../model.js";
+import { CACHE_TTL, ModelProvider, apiErrorText, type MessageParam } from "../model.js";
 import { CostLedger, formatCostReport } from "../cost.js";
 import { buildSystemPrompt, buildStartupInjection } from "./prompt.js";
 import {
@@ -692,11 +692,19 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
       // slash-command turn `continue`s without reaching any post-turn hook, so
       // draining anywhere later than the top of the loop leaves queued reviews
       // parked until an unrelated event. Every path re-enters here.
-      await drainReviews(state);
-      // Same contract for anything the panel-native merge left the co to handle
-      // (a blocked new head, a refused merge). Drained after the reviews so a
-      // completion that arrived first still reports first.
-      await drainQueueNotices(state);
+      //
+      // Guarded like the turn below, and for the same reason: these drive real
+      // model turns, and a crew review that throws must cost the captain that
+      // review, not the session it arrived in.
+      try {
+        await drainReviews(state);
+        // Same contract for anything the panel-native merge left the co to
+        // handle (a blocked new head, a refused merge). Drained after the
+        // reviews so a completion that arrived first still reports first.
+        await drainQueueNotices(state);
+      } catch (e) {
+        await reportTurnFailure(state, e);
+      }
 
       const input = await io.question();
       if (input === null) break; // EOF → clean exit, run the guard below
@@ -711,79 +719,96 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
       const raw = input.trim();
       if (raw === "") continue;
 
-      // Confirm interlock: while a dispatch is armed, ONLY a typed `confirm`
-      // (case-insensitive) fires it. A bare `confirm` uses the default crew
-      // agent; `confirm <name>` targets a specific one for this dispatch only.
-      // Anything that isn't a confirm cancels the armed dispatch and is then
-      // handled as ordinary input. There is no other path to launch a dispatch,
-      // so nothing runs without this explicit confirmation.
-      if (state.armed) {
-        const confirm = parseConfirm(raw);
-        if (confirm.isConfirm) {
-          const config = state.dispatch;
-          // An explicit agent name must resolve; if it doesn't, keep the order
-          // armed (don't make the captain re-draft) and show the valid names.
-          if (confirm.agent && config && !resolveAgent(config, confirm.agent)) {
-            const names = config.agents.map((a) => a.name).join(", ");
-            io.appendBlock(
-              c.yellow(
-                `  · unknown crew agent "${confirm.agent}". Available: ${names}. Type \`confirm <name>\` or plain \`confirm\` for the default (${config.defaultAgent}).`,
-              ),
-            );
-            continue; // stays armed
+      // Everything the line can set off is inside this guard. A turn is the one
+      // thing here that talks to Bedrock, and Bedrock refuses requests for
+      // reasons the captain did not cause and cannot fix from the prompt — a
+      // 400 on a malformed history, a 429, an expired token. Uncaught, any of
+      // those left the loop entirely and landed in the `finally` below, which
+      // runs the end-of-session distill: the session appeared to quit on its
+      // own, mid-conversation, after one bad request. A failed turn is now a
+      // failed turn. Nothing is distilled, nothing is written, the history is
+      // left as it was, and the next prompt comes back.
+      //
+      // `break` still leaves the loop from in here (EOF and /exit above and
+      // below), so the deliberate exits are untouched — only the accidental one
+      // is gone.
+      try {
+        // Confirm interlock: while a dispatch is armed, ONLY a typed `confirm`
+        // (case-insensitive) fires it. A bare `confirm` uses the default crew
+        // agent; `confirm <name>` targets a specific one for this dispatch only.
+        // Anything that isn't a confirm cancels the armed dispatch and is then
+        // handled as ordinary input. There is no other path to launch a dispatch,
+        // so nothing runs without this explicit confirmation.
+        if (state.armed) {
+          const confirm = parseConfirm(raw);
+          if (confirm.isConfirm) {
+            const config = state.dispatch;
+            // An explicit agent name must resolve; if it doesn't, keep the order
+            // armed (don't make the captain re-draft) and show the valid names.
+            if (confirm.agent && config && !resolveAgent(config, confirm.agent)) {
+              const names = config.agents.map((a) => a.name).join(", ");
+              io.appendBlock(
+                c.yellow(
+                  `  · unknown crew agent "${confirm.agent}". Available: ${names}. Type \`confirm <name>\` or plain \`confirm\` for the default (${config.defaultAgent}).`,
+                ),
+              );
+              continue; // stays armed
+            }
+            const armed = state.armed;
+            state.armed = null;
+            io.setConfirmBanner(null);
+            await appendTranscript(state.transcript, "you", raw);
+            // The lane is decided HERE, from the verb the captain typed and a
+            // FRESH reading of the target worktree — never from the arm-time
+            // snapshot. If the other agent finished while the order sat armed,
+            // the worktree is unoccupied again and a bare `confirm` means what it
+            // has always meant there: full write access.
+            const lane = laneForConfirm(state, armed, Boolean(confirm.write));
+            // That is a wider grant than the banner offered, so it is said out
+            // loud. A lane the captain did not read about is exactly the surprise
+            // this gate exists to prevent.
+            if (armed.occupied && lane === "writer" && !confirm.write) {
+              io.appendBlock(
+                c.dim(
+                  "  · the other agent has since finished, so the worktree is free and `confirm` granted" +
+                    " the full writing lane, not the read-only one the banner offered.",
+                ),
+              );
+            }
+            await fireDispatch(state, armed.order, confirm.agent, armed.feature, armed.resolve, lane);
+            continue;
           }
-          const armed = state.armed;
+          // Recorded BEFORE the line that cancelled it is appended, which is what
+          // pushUserTurn's flush guarantees: the co reads "you were cancelled"
+          // and then what the captain said instead, on the one turn it has to
+          // react to both. Without this it could only guess which of the two
+          // resolutions its armed order got.
+          noteDispatchCancelled(state, state.armed.order);
           state.armed = null;
           io.setConfirmBanner(null);
-          await appendTranscript(state.transcript, "you", raw);
-          // The lane is decided HERE, from the verb the captain typed and a
-          // FRESH reading of the target worktree — never from the arm-time
-          // snapshot. If the other agent finished while the order sat armed,
-          // the worktree is unoccupied again and a bare `confirm` means what it
-          // has always meant there: full write access.
-          const lane = laneForConfirm(state, armed, Boolean(confirm.write));
-          // That is a wider grant than the banner offered, so it is said out
-          // loud. A lane the captain did not read about is exactly the surprise
-          // this gate exists to prevent.
-          if (armed.occupied && lane === "writer" && !confirm.write) {
-            io.appendBlock(
-              c.dim(
-                "  · the other agent has since finished, so the worktree is free and `confirm` granted" +
-                  " the full writing lane, not the read-only one the banner offered.",
-              ),
-            );
-          }
-          await fireDispatch(state, armed.order, confirm.agent, armed.feature, armed.resolve, lane);
+          io.appendBlock(c.dim("  · dispatch cancelled."));
+          // Fall through: treat the typed line as normal conversation/command.
+        }
+
+        // Record what the captain actually typed, verbatim, before dispatching.
+        // Hidden instruction injections (greeting, /decide, /sync) are internal
+        // scaffolding and are deliberately not logged as "you" turns.
+        await appendTranscript(state.transcript, "you", raw);
+
+        if (raw.startsWith("/")) {
+          const handled = await handleCommand(state, raw);
+          if (handled === "exit") break;
           continue;
         }
-        // Recorded BEFORE the line that cancelled it is appended, which is what
-        // pushUserTurn's flush guarantees: the co reads "you were cancelled"
-        // and then what the captain said instead, on the one turn it has to
-        // react to both. Without this it could only guess which of the two
-        // resolutions its armed order got.
-        noteDispatchCancelled(state, state.armed.order);
-        state.armed = null;
-        io.setConfirmBanner(null);
-        io.appendBlock(c.dim("  · dispatch cancelled."));
-        // Fall through: treat the typed line as normal conversation/command.
+
+        // A real spoken turn: the exit distill uses this to know the session had
+        // conversational substance worth preserving, even if no tool ran.
+        state.userTurns++;
+        await runUserTurn(state, raw);
+        // Reviews that completed during the turn are drained at the loop top.
+      } catch (e) {
+        await reportTurnFailure(state, e);
       }
-
-      // Record what the captain actually typed, verbatim, before dispatching.
-      // Hidden instruction injections (greeting, /decide, /sync) are internal
-      // scaffolding and are deliberately not logged as "you" turns.
-      await appendTranscript(state.transcript, "you", raw);
-
-      if (raw.startsWith("/")) {
-        const handled = await handleCommand(state, raw);
-        if (handled === "exit") break;
-        continue;
-      }
-
-      // A real spoken turn: the exit distill uses this to know the session had
-      // conversational substance worth preserving, even if no tool ran.
-      state.userTurns++;
-      await runUserTurn(state, raw);
-      // Reviews that completed during the turn are drained at the loop top.
     }
   } finally {
     state.registry?.stop();
@@ -810,6 +835,37 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
 function printClosingSummary(state: SessionState): void {
   line(c.magenta(`co-manager: ${state.paths.name}`));
   line(c.dim(`  memory: ${state.paths.root}`));
+}
+
+/**
+ * A turn threw. Say so, and keep the session on its feet.
+ *
+ * Bedrock refuses requests for reasons the captain did not cause and cannot fix
+ * from the prompt line — a malformed history, a rate limit, an expired token —
+ * and the refusal lands in the middle of a conversation he is not finished
+ * having. Leaving is not a reasonable answer to that, and leaving is what used
+ * to happen: the exception escaped the input loop, and the only thing outside it
+ * is the `finally` that runs the end-of-session distill. One refused request
+ * closed the session, burned a model call on the way out, and the last thing on
+ * screen was `fatal:` — which is why sessions looked like they were quitting on
+ * their own.
+ *
+ * What happens instead is the API's own words, verbatim (see apiErrorText: a
+ * rewritten error is a guess about a failure we did not diagnose), a note in the
+ * durable transcript so the record shows the gap, and the prompt back. Nothing
+ * is distilled and nothing is written to memory — a failed turn produced no
+ * conversation to preserve. The history is left exactly as the turn left it,
+ * which is the captain's line sitting in it unanswered: true, and usable, since
+ * the next turn simply carries on from there.
+ */
+async function reportTurnFailure(state: SessionState, e: unknown): Promise<void> {
+  const { io } = state;
+  const text = apiErrorText(e);
+  io.flushStream();
+  io.appendBlock("");
+  io.appendBlock(c.red(`  · that turn failed: ${text}`));
+  io.appendBlock(c.dim("  · the session is still open — try again, or /exit to leave."));
+  await appendTranscript(state.transcript, "note", `turn failed: ${text}`);
 }
 
 const COMPACT_REQUEST =
