@@ -229,6 +229,39 @@ export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-5";
  */
 export const MODEL_ID_KEY = "BEDROCK_MODEL_ID";
 
+/** A row of the `/model` picker: the name a person uses, and the id it sets. */
+export interface ModelChoice {
+  label: string;
+  id: string;
+}
+
+/**
+ * The models bare `/model` offers, in the order the picker lists them.
+ *
+ * IT IS CURATED AND FIXED, and it is here rather than fetched because Bedrock
+ * cannot answer the question a picker has to answer - "what may this key
+ * actually invoke". ListFoundationModels returns every model in the region
+ * regardless of access, and GetFoundationModelAvailability has been observed
+ * reporting AUTHORIZED for models that still 403 on invoke. A list built from
+ * either would offer rows that cannot be selected, which is worse than a short
+ * list somebody maintains. The probe `/model` runs before it persists stays the
+ * only honest check, and `/model <id>` remains the escape hatch for anything not
+ * on this list.
+ *
+ * Every id is the cross-region INFERENCE PROFILE form (`us.`). The bare
+ * `anthropic.claude-…` spelling is rejected for on-demand throughput (see
+ * model.ts), so a list carrying it would fail its own probe on every row.
+ *
+ * It lives beside DEFAULT_MODEL_ID deliberately: the picker marks the model in
+ * force, and a default that had drifted out of the list would leave the picker
+ * with nothing marked.
+ */
+export const MODEL_CHOICES: readonly ModelChoice[] = [
+  { label: "Opus 4.8", id: "us.anthropic.claude-opus-4-8" },
+  { label: "Opus 5", id: DEFAULT_MODEL_ID },
+  { label: "Sonnet 5", id: "us.anthropic.claude-sonnet-5" },
+];
+
 export interface ModelConfig {
   region: string;
   /**

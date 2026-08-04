@@ -6,8 +6,15 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { completionTurn, parseConfirm, runModelCommand, type ModelSwitch } from "./session.js";
-import { DEFAULT_MODEL_ID, MODEL_ID_KEY, persistInstanceModel, type ModelOrigin } from "../config.js";
+import {
+  DEFAULT_MODEL_ID,
+  MODEL_CHOICES,
+  MODEL_ID_KEY,
+  persistInstanceModel,
+  type ModelOrigin,
+} from "../config.js";
 import { readEnvFile } from "../envfile.js";
+import type { ModelPickerEntry } from "../tui/tui.js";
 import type { Job } from "./registry.js";
 
 /**
@@ -341,6 +348,141 @@ test("re-setting the model already in force pins it without asking the API again
   assert.deepEqual(s.probed, [], "it is answering turns already");
   assert.deepEqual(s.persisted, [DEFAULT_MODEL_ID], "and pinning it is the point of typing it");
   assert.match(out, /already in force/);
+});
+
+// --- /model, the picker -------------------------------------------------------
+//
+// Bare `/model` opens a picker where there is a screen for one, and a picked id
+// then walks the SAME path a typed one does. That is the property these pin:
+// there is one way this co-manager's model changes, and it goes through the
+// probe and the store in that order, whichever surface asked for it. The picker
+// itself (the box, the keys, what Enter and Esc resolve) is proved against real
+// bytes in tui/modelpicker.test.ts; here it is a stub, so what is under test is
+// the command's half of the contract.
+
+/** A picker that answers with `answer` and records what it was offered. */
+function picker(answer: string | null): {
+  calls: { choices: readonly ModelPickerEntry[]; current: string }[];
+  pick: NonNullable<ModelSwitch["pick"]>;
+} {
+  const calls: { choices: readonly ModelPickerEntry[]; current: string }[] = [];
+  return {
+    calls,
+    pick: async (choices, current) => {
+      calls.push({ choices, current });
+      return answer;
+    },
+  };
+}
+
+test("bare /model offers the three curated models, with the one in force named", async () => {
+  const p = picker(null);
+  const s = spy({ pick: p.pick });
+  await runModelCommand("", s.deps);
+
+  assert.equal(p.calls.length, 1, "the picker opened");
+  assert.deepEqual(
+    p.calls[0]!.choices.map((ch) => ch.id),
+    MODEL_CHOICES.map((ch) => ch.id),
+    "the list is the curated constant - no Bedrock call decides what is on it",
+  );
+  assert.equal(p.calls[0]!.current, DEFAULT_MODEL_ID, "so the picker can mark the one in force");
+});
+
+test("a model picked from the list is probed, then stored, then switched", async () => {
+  const p = picker("us.anthropic.claude-sonnet-5");
+  const s = spy({ pick: p.pick });
+  const out = (await runModelCommand("", s.deps)).join("\n");
+
+  assert.deepEqual(s.probed, ["us.anthropic.claude-sonnet-5"], "asked before committed, exactly as a typed id is");
+  assert.deepEqual(s.persisted, ["us.anthropic.claude-sonnet-5"]);
+  assert.deepEqual(s.committed, ["us.anthropic.claude-sonnet-5"]);
+  assert.match(out, /→ us\.anthropic\.claude-sonnet-5 \(from the next turn\)/);
+  assert.match(out, /stored for this co-manager in \/co\/instances\/one\/\.env/);
+  // The report the bare command has always printed is still printed.
+  assert.match(out, new RegExp(`model: {2}${ESCAPED_DEFAULT}`));
+  assert.match(out, /source: the built-in default/);
+});
+
+test("a picked model the API refuses leaves the previous one in force, like a typed one", async () => {
+  const p = picker("us.anthropic.claude-sonnet-5");
+  const s = spy({
+    pick: p.pick,
+    probe: async () => ({ ok: false, error: "403 AccessDeniedException" }),
+  });
+  const out = (await runModelCommand("", s.deps)).join("\n");
+
+  // The list is curated, not verified: a row on it can still be one this
+  // account may not invoke, which is exactly why the probe is not skipped for
+  // a pick (AWS cannot tell us what a key may call - see MODEL_CHOICES).
+  assert.match(out, new RegExp(`staying on ${ESCAPED_DEFAULT}`));
+  assert.match(out, /403 AccessDeniedException/);
+  assert.deepEqual(s.persisted, [], "and nothing is written");
+  assert.deepEqual(s.committed, []);
+});
+
+test("cancelling the picker changes nothing at all", async () => {
+  const p = picker(null);
+  const s = spy({ pick: p.pick });
+  const out = (await runModelCommand("", s.deps)).join("\n");
+
+  assert.deepEqual(s.probed, [], "no call is made for a choice that was not made");
+  assert.deepEqual(s.persisted, []);
+  assert.deepEqual(s.committed, []);
+  assert.match(out, new RegExp(`model: {2}${ESCAPED_DEFAULT}`), "just the report it opened with");
+  assert.ok(!out.includes("→"), "and no switch is announced");
+});
+
+test("picking the model already in force pins it, without asking the API again", async () => {
+  const p = picker(DEFAULT_MODEL_ID);
+  const s = spy({ pick: p.pick });
+  const out = (await runModelCommand("", s.deps)).join("\n");
+  assert.deepEqual(s.probed, [], "it is answering turns already");
+  assert.deepEqual(s.persisted, [DEFAULT_MODEL_ID], "and pinning it is what choosing it means");
+  assert.match(out, /already in force/);
+});
+
+test("/model <id> never opens the picker - the typed id is the escape hatch", async () => {
+  const p = picker("us.anthropic.claude-opus-4-8");
+  const s = spy({ pick: p.pick });
+  const out = (await runModelCommand("us.anthropic.claude-sonnet-5", s.deps)).join("\n");
+
+  assert.deepEqual(p.calls, [], "an id was typed; there is nothing to choose");
+  assert.deepEqual(s.probed, ["us.anthropic.claude-sonnet-5"]);
+  assert.deepEqual(s.persisted, ["us.anthropic.claude-sonnet-5"], "the typed id, not the picker's answer");
+  assert.match(out, /→ us\.anthropic\.claude-sonnet-5/);
+});
+
+test("an id not on the list still sets, so the list is a shortcut and not a gate", async () => {
+  const s = spy({ pick: picker(null).pick });
+  const out = (await runModelCommand("us.anthropic.claude-sonnet-4-6", s.deps)).join("\n");
+  assert.deepEqual(s.persisted, ["us.anthropic.claude-sonnet-4-6"]);
+  assert.match(out, /→ us\.anthropic\.claude-sonnet-4-6/);
+});
+
+test("with an exported BEDROCK_MODEL_ID, bare /model reports and offers no choice", async () => {
+  // The variable outranks a stored choice at load, so every row of the picker
+  // would be refused the moment it was chosen. Reporting is the honest answer.
+  const p = picker("us.anthropic.claude-sonnet-5");
+  const s = spy({
+    pick: p.pick,
+    origin: origin({ source: "env", where: `${MODEL_ID_KEY} in the environment` }),
+  });
+  const out = (await runModelCommand("", s.deps)).join("\n");
+
+  assert.deepEqual(p.calls, [], "no list is offered where nothing on it could be set");
+  assert.deepEqual(s.persisted, []);
+  assert.match(out, new RegExp(`source: ${MODEL_ID_KEY} in the environment`));
+  assert.match(out, /an exported variable outranks anything stored/);
+});
+
+test("with no picker wired (a piped session), bare /model reports exactly as it always has", async () => {
+  const s = spy();
+  const out = (await runModelCommand("", s.deps)).join("\n");
+  assert.match(out, new RegExp(`model: {2}${ESCAPED_DEFAULT}`));
+  assert.match(out, /switch it with \/model <bedrock model id>/);
+  assert.deepEqual(s.probed, []);
+  assert.deepEqual(s.persisted, []);
 });
 
 test("a model id that could not survive a KEY=VALUE line is refused before anything happens", async () => {

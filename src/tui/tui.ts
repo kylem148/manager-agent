@@ -1359,7 +1359,11 @@ type PanelView =
    *  carries no state of its own — the buffer lives on `PanelState.popup` and is
    *  mutated in place, so a resize (which re-lays every row) can never swap the
    *  text under the captain's caret. */
-  | { kind: "popup" };
+  | { kind: "popup" }
+  /** The model picker, open over whichever view was showing when `/model` was
+   *  typed. Like `popup` it carries no state of its own - the choices, the
+   *  cursor and the caller's promise live on `PanelState.picker`. */
+  | { kind: "picker" };
 
 /**
  * The panel's home tabs: the kinds that appear in the bar and that a digit jumps
@@ -1432,6 +1436,10 @@ interface PanelState {
    *  `popup`; kept on the panel rather than in the view so the buffer survives
    *  a resize and a repaint by identity. */
   popup: PopupState | null;
+  /** The open model picker, or null. Non-null exactly while the view is
+   *  `picker`, and kept here for the same reason the popup's buffer is: a
+   *  resize re-lays every row, and the cursor must not move with them. */
+  picker: PickerState | null;
 }
 
 /**
@@ -1554,6 +1562,60 @@ function popupLabel(target: PopupTarget): string {
 }
 
 /**
+ * One row of the model picker: the name a person uses for the model, and the
+ * Bedrock id that row sets.
+ *
+ * The list is handed IN. Nothing here asks Bedrock what exists, because Bedrock
+ * cannot answer the question this list has to answer - see MODEL_CHOICES in
+ * config.ts, which is the list itself and carries the reasoning.
+ */
+export interface ModelPickerEntry {
+  /** The friendly name on the row, e.g. "Opus 5". */
+  label: string;
+  /** The Bedrock model id this row sets, verbatim. */
+  id: string;
+}
+
+/**
+ * The open model picker: a short fixed list, a cursor, and the promise the
+ * caller is parked on until Enter or Esc.
+ *
+ * It is the popup's SIBLING, not a tab. Same box, same borders, same "open over
+ * the view underneath and put it back on the way out" rule - which is what lets
+ * `/model`, typed at the prompt, use the panel without becoming a permanent
+ * fixture of it. The selection is the Home tab's: arrows and j/k move a cursor
+ * that clamps at the ends, because a second movement rule on one screen is a
+ * second one to keep in step.
+ *
+ * The one thing it does that the editor does not is hold a caller's promise
+ * open, and that is why it owns the keyboard whole (see pickerInput).
+ */
+interface PickerState {
+  choices: readonly ModelPickerEntry[];
+  /** The highlighted row. Opens on the model in force, so Enter with no
+   *  movement re-pins what is already running rather than silently switching to
+   *  whatever happens to be first. */
+  index: number;
+  /** The id in force, marked on its row IN WORDS - the panel has to answer
+   *  "which one am I on" on a terminal with no colour. */
+  current: string;
+  /** The view the picker opened over, restored when it closes. Held here rather
+   *  than left on `panel.view` for the popup's reason: the view slot is what
+   *  routes the keyboard, and the picker has to own that. */
+  under: PanelView;
+  /** True when the picker opened the panel itself - the normal case, since
+   *  `/model` is typed at the prompt with the panel shut. Closing then shuts it
+   *  again, so the captain lands back where he typed rather than on a panel he
+   *  never asked for. */
+  opened: boolean;
+  /** Resolve openModelPicker's promise. Idempotent: first call wins. */
+  settle: (id: string | null) => void;
+}
+
+/** What the picker's top border says it is for. */
+const PICKER_LABEL = "set the model";
+
+/**
  * A merge review awaiting the captain's verdict, tracked INDEPENDENTLY of whether
  * the panel is open (openLandingReview sets it and flashes a hint; the captain
  * opens the panel to act). At most one exists at a time — the queue is serial, and
@@ -1596,6 +1658,9 @@ type OverlayInput =
         | "close"
         | "back"
         | "tab"
+        /** Enter. Means something on exactly one view - the picker, where it
+         *  takes the highlighted model - and is inert on every other. */
+        | "enter"
         | "up"
         | "down"
         | "pageup"
@@ -1876,6 +1941,9 @@ export class Tui implements SessionIO {
       this.pendingReview.settle(this.pendingReview.status === "failed" ? "failed" : "rejected");
     }
     this.pendingReview = null;
+    // Same for an open model picker: `/model` is awaiting it, and a screen that
+    // has been torn down will never deliver a keystroke.
+    this.panel?.picker?.settle(null);
     this.panel = null;
     if (this.statusTimer) { clearTimeout(this.statusTimer); this.statusTimer = null; }
     if (this.busyTimer) { clearInterval(this.busyTimer); this.busyTimer = null; }
@@ -3531,9 +3599,13 @@ export class Tui implements SessionIO {
    * because no single keystroke on it acts: the screen a keystroke lands on by
    * default must not be one where a stray press can merge a branch. Subscribes to the doc
    * write queue for live refresh and loads the doc list asynchronously.
+   *
+   * `force` skips the nothing-to-show refusal, for the one caller that brings
+   * its own content: the model picker stands a panel up whether or not this
+   * session wired a tab into one.
    */
-  private openPanel(): void {
-    if (!this.docs && !this.queue && !this.features && !this.tasks && !this.pendingReview) {
+  private openPanel(force = false): void {
+    if (!force && !this.docs && !this.queue && !this.features && !this.tasks && !this.pendingReview) {
       this.setStatus("panel unavailable");
       return;
     }
@@ -3578,6 +3650,7 @@ export class Tui implements SessionIO {
       selecting: false,
       lastStart: 0,
       popup: null,
+      picker: null,
     };
     if (this.docs) {
       this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
@@ -3613,6 +3686,10 @@ export class Tui implements SessionIO {
    *  captain can reopen and act on it later. */
   private closePanel(): void {
     if (!this.panel) return;
+    // A picker still up when the panel goes settles as a cancel: it is holding a
+    // caller open, and no screen means no verdict. (closePicker clears it before
+    // it gets here on the ordinary route; this is for every other one.)
+    this.panel.picker?.settle(null);
     this.panel = null;
     this.clearStatus();
     if (this.unsubscribeDocs) {
@@ -3820,11 +3897,12 @@ export class Tui implements SessionIO {
     // A doc sitting UNDER the popup is still painted, so it is re-laid too; the
     // buffer above it needs nothing (its selection is buffer offsets, and its
     // rows are laid out fresh on every paint).
-    const under = panel.popup?.under;
-    if (panel.view.kind === "popup" && under?.kind === "doc") {
+    const under = panel.popup?.under ?? panel.picker?.under;
+    if ((panel.view.kind === "popup" || panel.view.kind === "picker") && under?.kind === "doc") {
       const rows = renderMarkdownDoc(under.content, this.cols);
       const scroll = Math.min(under.scroll, Math.max(0, rows.length - this.overlayViewport()));
-      panel.popup!.under = { ...under, rows, scroll };
+      const held = panel.popup ?? panel.picker!;
+      held.under = { ...under, rows, scroll };
       return;
     }
     const v = panel.view;
@@ -3946,6 +4024,9 @@ export class Tui implements SessionIO {
     switch (code) {
       case 9:
         return { nav: "tab" }; // Tab switches tabs
+      case 13:
+      case 10:
+        return { nav: "enter" }; // Enter - the picker's select; inert elsewhere
       case 15:
         return { nav: "close" }; // Ctrl-O — the key that opened the panel closes it
       case 8:
@@ -3960,7 +4041,7 @@ export class Tui implements SessionIO {
       case 21:
         return { nav: "halfup" }; // Ctrl-U
     }
-    return null; // Enter, other control bytes: nothing to do in the panel
+    return null; // other control bytes: nothing to do in the panel
   }
 
   private consumeOverlayCsi(data: string, i: number): number {
@@ -4055,6 +4136,13 @@ export class Tui implements SessionIO {
     // path, so it inherits their rules (notably the review view's mid-merge
     // lockout: a merge in flight can't be walked away from by any key).
     const ev: OverlayInput = "nav" in input && input.nav === "close" ? { nav: "escape" } : input;
+    // The picker owns the keyboard whole while it is up - BEFORE the panel's own
+    // Tab and digits get a look. It is holding `/model` open, and a key that
+    // switched tabs would leave that caller waiting on a view nobody can act on.
+    // (It is routed here rather than in consumeOverlay, next to the editor's
+    // branch, because it wants exactly this decode table: the panel's, not the
+    // editor's.)
+    if (this.panel.view.kind === "picker") { this.pickerInput(ev); return; }
     // Tab switches tabs from any view, and `i` is its second spelling
     // (D-20260724-9). Both live HERE, on the panel's own input path, which is
     // reached only while the panel owns the keyboard — a bare `i` typed at the
@@ -4656,6 +4744,10 @@ export class Tui implements SessionIO {
    * the button, 32 is motion, 64 is the wheel.
    */
   private handlePanelMouse(body: string, press: boolean): void {
+    // The picker owns the mouse as well as the keyboard while it is up: the view
+    // underneath is context, not a surface to scroll or drag a selection out of,
+    // and a wheel event that moved it would move it out from under the box.
+    if (this.panel?.picker) return;
     const parts = body.split(";");
     const b = Number.parseInt(parts[0] ?? "", 10);
     const x = Number.parseInt(parts[1] ?? "", 10);
@@ -5712,13 +5804,9 @@ export class Tui implements SessionIO {
 
     const pad = (s: string, w: number): string => s + " ".repeat(Math.max(0, w - visibleWidth(s)));
     // The two borders carry the two things worth carrying: what is being edited,
-    // and how to leave. Built as plain text and dimmed whole, so a colour reset
-    // inside can't cancel the border's own styling.
-    const border = (label: string, open: string, close: string): string => {
-      const lead = "─ " + this.clip(label, Math.max(0, width - 6)) + " ";
-      const fill = Math.max(0, width - visibleWidth(lead) - 2);
-      return c.dim(open + lead + "─".repeat(fill) + close);
-    };
+    // and how to leave.
+    const border = (label: string, open: string, close: string): string =>
+      this.boxBorder(label, open, close, width);
     // The title line is the first BUFFER line, however many visual rows it takes
     // — a PR message thing only. A doc's first line is ordinary markdown, and the
     // renderer under the box, not the box, is what makes a heading look like one.
@@ -5741,6 +5829,20 @@ export class Tui implements SessionIO {
     rows.push(c.dim("│") + " " + pad(this.popupMessage(state, inner), inner) + " " + c.dim("│"));
     rows.push(border(this.popupKeys(state, width), "└", "┘"));
     return { rows, cursorRow: layout.cursorRow - state.scroll, cursorCol: layout.cursorCol };
+  }
+
+  /**
+   * One titled border of a box drawn over the panel - the editor's and the
+   * picker's alike, so the two cannot drift into two different boxes.
+   *
+   * Built as plain text and dimmed whole, so a colour reset inside the label
+   * can't cancel the border's own styling, and the label is clipped to what is
+   * left after the corners rather than pushing the box wider.
+   */
+  private boxBorder(label: string, open: string, close: string, width: number): string {
+    const lead = "─ " + this.clip(label, Math.max(0, width - 6)) + " ";
+    const fill = Math.max(0, width - visibleWidth(lead) - 2);
+    return c.dim(open + lead + "─".repeat(fill) + close);
   }
 
   /**
@@ -5823,6 +5925,219 @@ export class Tui implements SessionIO {
     );
   }
 
+  // --- the model picker (in-panel) ---------------------------------------------
+  //
+  // Bare `/model` opens this: a short fixed list of models, the one in force
+  // marked, arrows to move and Enter to set it. Typing a Bedrock id from memory
+  // is a fine escape hatch - `/model <id>` still takes any id verbatim, alias
+  // table and friendly-name registry deliberately absent - and a poor primary
+  // surface, which is the whole of why this exists.
+  //
+  // THE LIST IS HANDED IN, never discovered. No Bedrock call stands behind it and
+  // there is no useful one to make: ListFoundationModels returns every model in
+  // the region regardless of what this key may invoke, and
+  // GetFoundationModelAvailability has been seen answering AUTHORIZED for models
+  // that then 403. The probe `/model` already runs before it persists remains the
+  // only honest check, and it runs on a picked id exactly as on a typed one.
+  //
+  // Everything about the box is the editor's - geometry, borders, the rule that
+  // it opens over a view and puts it back. What differs is that it holds a
+  // caller's promise, so every exit settles exactly once and nothing on screen
+  // can leave it unsettled.
+
+  /**
+   * Show the picker and resolve to the chosen model id, or null when it is
+   * cancelled (Esc, Ctrl-O, the panel closing, teardown).
+   *
+   * Opens the panel if it is shut - `/model` is typed at the prompt, so it
+   * normally is - and shuts it again on the way out, so the captain lands back
+   * on the conversation he typed it from.
+   */
+  openModelPicker(choices: readonly ModelPickerEntry[], current: string): Promise<string | null> {
+    return new Promise((resolve) => {
+      // Nothing in the session runs two `/model`s at once, but never strand a
+      // caller: an unsettled promise hangs the loop that is awaiting it.
+      const prior = this.panel?.picker ?? null;
+      prior?.settle(null);
+      const opened = prior ? prior.opened : !this.panel;
+      if (!this.panel) this.openPanel(/*force*/ true);
+      const panel = this.panel;
+      // Only reachable if a panel could not be stood up at all. Answering null
+      // beats hanging: `/model` then just reports, as it does on PlainIO.
+      if (!panel) { resolve(null); return; }
+      let settled = false;
+      const at = choices.findIndex((ch) => ch.id === current);
+      panel.picker = {
+        choices,
+        // Nothing marked (a `current` off the list) starts at the top rather
+        // than nowhere - the cursor is how you move, not what is in force.
+        index: at >= 0 ? at : 0,
+        current,
+        under: prior && panel.view.kind === "picker" ? prior.under : panel.view,
+        opened,
+        settle: (id) => {
+          if (settled) return;
+          settled = true;
+          resolve(id);
+        },
+      };
+      panel.view = { kind: "picker" };
+      // A Home task field, if one were somehow open, takes the keyboard BEFORE
+      // the view does - and the picker would then be on screen with no key able
+      // to reach it, which is a hung session rather than a wrong pixel. It
+      // cannot happen from the session loop (the panel owns the keyboard while
+      // it is up, so `/model` is never typed underneath one), and closing it is
+      // one call.
+      this.closeTaskField();
+      this.clearPanelSelection();
+      this.paint();
+    });
+  }
+
+  /** Move the cursor one row, clamped at the ends - the Home tab's rule, so the
+   *  one selection idiom on this screen behaves the same wherever it turns up. */
+  private movePicker(delta: 1 | -1): void {
+    const st = this.panel?.picker;
+    if (!st || st.choices.length === 0) return;
+    const next = Math.max(0, Math.min(st.choices.length - 1, st.index + delta));
+    if (next === st.index) return;
+    st.index = next;
+    this.paint();
+  }
+
+  /**
+   * Leave the picker with a verdict: an id, or null for a cancel.
+   *
+   * The promise is settled LAST, after the screen is back, so the lines the
+   * caller prints in response land in a transcript the captain can already see
+   * rather than behind a panel that is still up.
+   */
+  private closePicker(id: string | null): void {
+    const panel = this.panel;
+    const st = panel?.picker;
+    if (!panel || !st) return;
+    panel.picker = null;
+    if (panel.view.kind === "picker") panel.view = st.under;
+    if (st.opened) this.closePanel();
+    else this.paint();
+    st.settle(id);
+  }
+
+  /**
+   * The picker's keys, and ONLY these: up/down (and j/k) move, Enter takes the
+   * highlighted model, Esc / Ctrl-O / Backspace cancel.
+   *
+   * Everything else is swallowed rather than falling through to the panel's own
+   * meanings. The picker is holding a caller open, so a digit that jumped to
+   * another tab - or a paging key that scrolled the view underneath - would
+   * leave `/model` waiting on a surface that is no longer on screen.
+   */
+  private pickerInput(input: OverlayInput): void {
+    const st = this.panel?.picker;
+    if (!st) return;
+    if ("nav" in input) {
+      switch (input.nav) {
+        case "up": this.movePicker(-1); return;
+        case "down": this.movePicker(1); return;
+        case "enter": this.closePicker(st.choices[st.index]?.id ?? null); return;
+        case "escape":
+        case "close":
+        case "back": this.closePicker(null); return;
+        default: return;
+      }
+    }
+    if (input.ch === "j") this.movePicker(1);
+    else if (input.ch === "k") this.movePicker(-1);
+  }
+
+  /**
+   * The rows, unstyled: a cursor, the name, the id it sets, and - on the model
+   * in force - a word saying so.
+   *
+   * The mark is a word and a glyph rather than a colour, because "which one am I
+   * on" must not be a question only a colour terminal can answer (the rule the
+   * tab bar follows). `withId` is the one tier: on a screen too narrow for the
+   * ids, the whole column goes rather than every id being cut off mid-string -
+   * these ids differ in their LAST few characters and share a twenty-character
+   * prefix, so a truncated one says strictly less than the name beside it.
+   */
+  private pickerRows(state: PickerState, withId: boolean): string[] {
+    const nameWidth = state.choices.reduce((n, ch) => Math.max(n, visibleWidth(ch.label)), 0);
+    return state.choices.map(
+      (ch, i) =>
+        (i === state.index ? "▸ " : "  ") +
+        pad(ch.label, nameWidth) +
+        (withId ? "  " + ch.id : "") +
+        (ch.id === state.current ? "  · in force" : ""),
+    );
+  }
+
+  /**
+   * The picker as painted rows, plus where its box sits.
+   *
+   * Sized to its CONTENT, unlike the editor's box: that one takes the majority
+   * of the screen because it is replacing a whole description, and a three-row
+   * list in a forty-four-row box is mostly emptiness. The clamps are the same
+   * idea though - never wider than the screen, and never so tall it paints over
+   * the footer, which is what the row window is for on a very short terminal.
+   */
+  private pickerFrame(state: PickerState): {
+    rows: string[];
+    box: { left: number; top: number; width: number };
+  } {
+    const keys = "↑↓ move · Enter select · Esc cancel";
+    // The box's own width: the widest row plus the border and one space of
+    // padding on each side, with the two border labels setting a floor of their
+    // own - a hint that is always clipped away is a hint nobody discovers. The
+    // ceiling is the screen (a box wider than the terminal is a torn frame) and
+    // 88 columns, so a full-screen terminal doesn't stretch three short rows
+    // across a metre of glass.
+    const avail = Math.max(1, Math.min(this.cols - 2, 88));
+    const width = (rows: string[]): number =>
+      Math.max(
+        1,
+        Math.min(
+          avail,
+          Math.max(
+            rows.reduce((n, t) => Math.max(n, visibleWidth(t)), 0) + 4,
+            visibleWidth(keys) + 6,
+            PICKER_LABEL.length + 6,
+          ),
+        ),
+      );
+    let texts = this.pickerRows(state, /*withId*/ true);
+    // Only drop the id column when the ids genuinely do not fit - never to make
+    // room for the borders' own hints, which is why this measures the rows.
+    if (texts.reduce((n, t) => Math.max(n, visibleWidth(t)), 0) + 4 > avail) {
+      texts = this.pickerRows(state, /*withId*/ false);
+    }
+    const boxWidth = width(texts);
+    const inner = Math.max(1, boxWidth - 4);
+    // Last resort on a terminal too narrow even for the names: a hard column cut,
+    // not the word wrap `clip` does - these rows are a laid-out table, and a
+    // wrapped one loses its indent and stops lining up.
+    const fit = (t: string): string =>
+      visibleWidth(t) <= inner ? t : sliceVisibleText(t, 0, Math.max(0, inner - 1)) + "…";
+
+    // The panel body is rows 2..rows-1; the box lives inside that, and on a
+    // screen too short for every row it windows rather than overflowing.
+    const room = Math.max(1, this.rows - 4);
+    const shown = Math.min(texts.length, room);
+    const start = Math.max(0, Math.min(state.index - shown + 1, texts.length - shown));
+    const height = shown + 2;
+    const left = 1 + Math.max(0, Math.floor((this.cols - boxWidth) / 2));
+    const top = Math.max(2, Math.min(1 + Math.floor((this.rows - height) / 2), this.rows - height));
+
+    const rows: string[] = [this.boxBorder(PICKER_LABEL, "┌", "┐", boxWidth)];
+    for (let r = 0; r < shown; r++) {
+      const i = start + r;
+      const text = fit(texts[i]!);
+      rows.push(c.dim("│") + " " + pad(i === state.index ? c.cyan(text) : text, inner) + " " + c.dim("│"));
+    }
+    rows.push(this.boxBorder(keys, "└", "┘", boxWidth));
+    return { rows, box: { left, top, width: boxWidth } };
+  }
+
   /** Paint the full-screen panel: tab bar, content viewport, footer. */
   /**
    * What the panel is showing right now: which TAB the current view belongs to,
@@ -5844,6 +6159,14 @@ export class Tui implements SessionIO {
     const panel = this.panel;
     if (!panel) return { tab: "home", suffix: "", body: [], start: 0 };
     const v = panel.view;
+    // The picker is the popup's sibling and gets the popup's treatment: the view
+    // it opened over stays painted underneath it, and the bar says what the box
+    // on top of it is for.
+    if (v.kind === "picker") {
+      const st = panel.picker;
+      const base = this.viewFrame(st?.under ?? { kind: "home" });
+      return st ? { ...base, suffix: PICKER_LABEL } : base;
+    }
     if (v.kind !== "popup") return this.viewFrame(v);
     // The editor is a POPUP over the view that called it up, not a view of its
     // own: that view stays painted underneath (paintPanel overlays the box), so
@@ -5878,6 +6201,9 @@ export class Tui implements SessionIO {
     if (v.kind === "docs") return { tab: "docs", suffix: "", body: this.docsTabRows(panel), start: 0 };
     if (v.kind === "doc") return { tab: "docs", suffix: v.name, body: v.rows, start: v.scroll };
     if (v.kind === "popup") return { tab: "queue", suffix: "", body: [], start: 0 };
+    // Never reached in practice (panelFrame resolves a picker to the view it
+    // opened over), and here so the switch stays total.
+    if (v.kind === "picker") return { tab: "home", suffix: "", body: [], start: 0 };
     const pr = this.pendingReview;
     return {
       tab: "review",
@@ -5908,6 +6234,7 @@ export class Tui implements SessionIO {
     // visible around it. It is also the one panel view with a real text cursor,
     // so the caret is placed and shown instead of hidden.
     const edit = panel.view.kind === "popup" ? panel.popup : null;
+    const pick = panel.view.kind === "picker" ? panel.picker : null;
     if (edit) {
       const box = this.popupBox();
       const { rows: boxRows, cursorRow, cursorCol } = this.popupFrame(edit);
@@ -5915,6 +6242,15 @@ export class Tui implements SessionIO {
         frame.push(term.moveTo(box.top + r, box.left) + this.clip(boxRows[r]!, w));
       }
       frame.push(term.moveTo(box.top + 1 + cursorRow, box.left + 2 + cursorCol) + term.showCursor);
+    } else if (pick) {
+      // The picker rides on top the same way, and for the same reason: what was
+      // on screen when `/model` was typed stays there around it. It has no text
+      // cursor of its own - the ▸ is the cursor - so the caret stays hidden.
+      const { rows: boxRows, box } = this.pickerFrame(pick);
+      for (let r = 0; r < boxRows.length; r++) {
+        frame.push(term.moveTo(box.top + r, box.left) + this.clip(boxRows[r]!, w));
+      }
+      frame.push(term.hideCursor);
     } else {
       // Every other panel view has no text cursor; hide the hardware caret.
       frame.push(term.hideCursor);
@@ -6497,6 +6833,12 @@ export class Tui implements SessionIO {
             : c.cyan("Ctrl-S") + c.dim(` save ${what} · `) + c.cyan("Esc") + c.dim(" cancel")) +
           " "
         : " ";
+    } else if (v?.kind === "picker") {
+      // The box carries the same two keys on its bottom border; the footer says
+      // what Enter will actually do, which is the part the border has no room
+      // to spell out.
+      left =
+        " " + c.cyan("Enter") + c.dim(" set the model · ") + c.cyan("Esc") + c.dim(" cancel, changing nothing") + " ";
     } else if (v?.kind === "review") {
       left = " " + this.reviewActionBar() + " ";
     } else if (v?.kind === "queue") {
