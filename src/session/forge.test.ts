@@ -253,6 +253,66 @@ test("ensurePr returns an already-open PR UNTOUCHED — its body is the captain'
   assert.ok(!h.calls.some((c) => c.startsWith("gh pr edit")), "and nothing is sent");
 });
 
+test("ensurePr WRITES an already-open PR's message when one is passed, and hands back what it said first", async () => {
+  const openBody = `The first draft.\n\n${EVIDENCE_OPEN}\nold evidence\n${EVIDENCE_CLOSE}\n`;
+  const h = harness([
+    {
+      match: /^gh pr list/,
+      result: { stdout: JSON.stringify([{ number: 5, url: "u", title: "First title", body: openBody }]) },
+    },
+  ]);
+  const res = await ensurePr(opts(h.run), {
+    branch: "co/feat-a",
+    title: "the composed title, which only a CREATE would use",
+    body: "the composed body",
+    evidence: "co would have written this",
+    update: { title: "A better title", prose: "A better description." },
+  });
+  assert.equal(res.created, false, "it is still not a create");
+  // What it replaced, read off the pull request rather than reconstructed.
+  assert.deepEqual(res.replaced, {
+    title: "First title",
+    body: openBody,
+    prose: "The first draft.",
+  });
+  const edit = h.calls.find((c) => c.startsWith("gh pr edit"))!;
+  assert.match(edit, /^gh pr edit 5 --title A better title --body /);
+  assert.match(edit, /A better description\./);
+  assert.ok(!edit.includes("the composed"), "the composed message is for a create, and never lands here");
+  assert.equal(splitEvidence(res.pr.body).evidence, "old evidence", "co's fence is carried across");
+});
+
+test("ensurePr's message halves are independent, and an unchanged one sends nothing", async () => {
+  const openBody = `The draft.\n\n${EVIDENCE_OPEN}\nev\n${EVIDENCE_CLOSE}\n`;
+  const listed = JSON.stringify([{ number: 5, url: "u", title: "The title", body: openBody }]);
+
+  // A title-only patch rewrites the title and leaves the description alone.
+  const titleOnly = harness([{ match: /^gh pr list/, result: { stdout: listed } }]);
+  const a = await ensurePr(opts(titleOnly.run), {
+    branch: "co/feat-a",
+    title: "x",
+    body: "y",
+    evidence: "z",
+    update: { title: "A new title" },
+  });
+  assert.equal(a.replaced?.title, "The title");
+  const edit = titleOnly.calls.find((c) => c.startsWith("gh pr edit"))!;
+  assert.match(edit, /--title A new title /);
+  assert.match(edit, /The draft\./, "the description it did not name survives");
+
+  // A patch that says exactly what the PR already says is not a write at all.
+  const same = harness([{ match: /^gh pr list/, result: { stdout: listed } }]);
+  const b = await ensurePr(opts(same.run), {
+    branch: "co/feat-a",
+    title: "x",
+    body: "y",
+    evidence: "z",
+    update: { title: "The title", prose: "The draft." },
+  });
+  assert.equal(b.replaced, undefined, "nothing moved, so nothing is reported as replaced");
+  assert.ok(!same.calls.some((c) => c.startsWith("gh pr edit")), "and nothing is sent");
+});
+
 test("updatePrEvidence rewrites only the evidence block, never the captain's title or prose", async () => {
   const captainBody = `The captain rewrote this description.\n\n${EVIDENCE_OPEN}\nold evidence\n${EVIDENCE_CLOSE}\n`;
   const h = harness([]);

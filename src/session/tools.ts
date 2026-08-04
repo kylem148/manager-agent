@@ -278,7 +278,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     tools.push({
       name: "feature_enqueue",
       description:
-        "Mark a feature done and join the serial merge queue; no confirm gate. Only the head is processed: rebased onto fresh `origin/dev`, pushed, PR'd into dev, gated on that PR's own CI checks (co runs no build or test). Returns `ready` (or ready-but-UNGATED when the PR reports no checks: say so, nothing verified it), `awaiting-checks` (a wait, not a failure - re-call to re-read), `blocked` (holds the queue), or `resolving`. You write the PR message: `prTitle` and `prBody` to the pr-message protocol (a body written without it is refused). Idempotent; omitted message fields keep what is stored. A ready head merges by the captain's [m], never by you: report it, give the PR link, move on.",
+        "Mark a feature done and join the serial merge queue; no confirm gate. Only the head is processed: rebased onto fresh `origin/dev`, pushed, PR'd into dev, gated on that PR's own CI checks (co runs no build or test). Returns `ready` (or ready-but-UNGATED when the PR reports no checks: say so, nothing verified it), `awaiting-checks` (a wait, not a failure - re-call to re-read), `blocked` (holds the queue), or `resolving`. You write the PR message: `prTitle` and `prBody` to the pr-message protocol (a body written without it is refused). Idempotent; omitted fields keep stored text, passed ones edit the PR. A ready head merges by the captain's [m], never by you: report it, give the PR link, move on.",
       input_schema: {
         type: "object",
         properties: {

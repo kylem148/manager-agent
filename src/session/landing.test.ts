@@ -9,11 +9,13 @@ import { CHECKS_GRACE_MS, CHECKS_INTERVAL_MS, CHECKS_TIMEOUT_MS, type ChecksPoli
 import {
   authoredPrBody,
   authoredPrTitle,
+  branchTipSha,
   composePrBody,
   composePrMessage,
   composePrTitle,
   executeLanding,
   prepareLanding,
+  updateOpenPrMessage,
   type LandingOptions,
   type PrepareGreen,
 } from "./landing.js";
@@ -333,6 +335,98 @@ test("an authored message opens the PR verbatim, with only the evidence fence ad
     assert.match(parts.evidence, /job: passkey ceremony/, "the commit list is co's, not the author's");
     assert.match(parts.evidence, /job: recovery codes/);
     assert.doesNotMatch(parts.prose, /### Checks|### Commits|<!--/, "and none of it leaked into the prose");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a stored message never rewrites an open PR; a PASSED one does, and reports the prior words", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "twice");
+    await commitIn(rec.worktreePath, "one.ts", "1\n", "job: the first slice");
+    const stored = { title: "First title", body: "The first draft." };
+    const opened = await prepareLanding(f.opts(), "twice", stored);
+    assert.equal(opened.kind, "green", `expected green, got ${JSON.stringify(opened)}`);
+    if (opened.kind !== "green") return;
+    assert.equal(opened.pr?.created, true);
+    assert.equal(opened.pr?.messageReplaced, undefined, "a create replaces nothing");
+    const bodyBefore = f.forge.prFor("feat/twice")!.body;
+
+    // Re-prepared with the SAME stored message and nothing passed: the PR is a
+    // human artifact now, and only its fenced evidence is co's to rewrite.
+    const bare = await prepareLanding(f.opts(), "twice", stored);
+    assert.equal(bare.kind, "green");
+    assert.equal(bare.kind === "green" ? bare.pr?.messageReplaced : "x", undefined);
+    assert.equal(f.forge.prFor("feat/twice")!.title, "First title");
+
+    // Now the co passes a new message on the call. It lands, and what it
+    // displaced comes back off the pull request (D-20260804-1).
+    const passed = { title: "A better title", body: "The second draft, which argues for it." };
+    const rewritten = await prepareLanding(f.opts(), "twice", stored, passed);
+    assert.equal(rewritten.kind, "green", `expected green, got ${JSON.stringify(rewritten)}`);
+    if (rewritten.kind !== "green") return;
+    assert.deepEqual(rewritten.pr?.messageReplaced, {
+      title: "First title",
+      body: bodyBefore,
+      prose: "The first draft.",
+    });
+
+    const pr = f.forge.prFor("feat/twice")!;
+    assert.equal(pr.title, passed.title);
+    const parts = splitEvidence(pr.body);
+    assert.equal(parts.prose, passed.body);
+    assert.match(parts.evidence, /### Checks/, "and co's fence is still there, exactly once");
+    assert.equal(pr.body.match(new RegExp(EVIDENCE_OPEN, "g"))?.length, 1);
+    assert.equal(f.forge.prs.length, 1, "one pull request throughout; nothing was re-opened");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("branchTipSha reads the branch where it is now, and says nothing rather than guessing", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "tip");
+    assert.equal(await branchTipSha(f.opts(), "feat/tip"), sha(f.repo, "feat/tip"));
+    await commitIn(rec.worktreePath, "t.txt", "t\n", "job: a commit");
+    assert.equal(
+      await branchTipSha(f.opts(), "feat/tip"),
+      sha(f.repo, "feat/tip"),
+      "it follows the branch, which is what makes a cached green checkable",
+    );
+    // A branch that is not there is undefined — deliberately not "unchanged".
+    assert.equal(await branchTipSha(f.opts(), "feat/never-cut"), undefined);
+    assert.equal(await branchTipSha({ ...f.opts(), repoPath: path.join(f.root, "gone") }, "feat/tip"), undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("updateOpenPrMessage writes the message and NOTHING else: no fetch, no rebase, no push", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "quiet");
+    await commitIn(rec.worktreePath, "q.ts", "q\n", "job: the quiet slice");
+    await prepareLanding(f.opts(), "quiet", { title: "Old title", body: "Old prose." });
+    const tipBefore = sha(f.repo, "feat/quiet");
+    f.forge.calls.length = 0;
+    f.forge.pushes.length = 0;
+
+    const res = await updateOpenPrMessage(f.opts(), "feat/quiet", { title: "New title" });
+    assert.equal(res?.replaced?.title, "Old title");
+    assert.equal(res?.replaced?.prose, "Old prose.");
+    assert.equal(res?.pr.title, "New title");
+
+    assert.deepEqual(f.forge.pushes, [], "nothing published");
+    assert.ok(!f.forge.calls.some((c) => c.startsWith("git")), "no git at all");
+    assert.ok(!f.forge.calls.some((c) => c.startsWith("gh pr checks")), "and the checks were not re-read");
+    assert.equal(sha(f.repo, "feat/quiet"), tipBefore, "the branch did not move");
+    assert.equal(splitEvidence(f.forge.prFor("feat/quiet")!.body).prose, "Old prose.", "the half it did not name");
+
+    // A branch with no open PR is not an error: the message stays stored and the
+    // prepare that eventually opens the PR composes it in.
+    assert.equal(await updateOpenPrMessage(f.opts(), "feat/no-such-branch", { title: "t" }), undefined);
   } finally {
     await f.cleanup();
   }
