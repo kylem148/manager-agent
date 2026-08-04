@@ -157,18 +157,20 @@ test("adding the text of a row already on the table is refused, not duplicated",
   assert.deepEqual(store.list(), ROWS);
 });
 
-test("status takes the three words and nothing else", async () => {
+test("status takes the four words and nothing else", async () => {
   const store = TaskStore.ephemeral(ROWS);
   await store.setStatus("ctrl-o overhaul", "queued");
   assert.equal(store.list()[0]!.status, "queued");
   await store.setStatus("ctrl-o overhaul", "building");
   assert.equal(store.list()[0]!.status, "building");
-  // The third one is a status like the others: it is set directly, from any of
-  // them, and it is not a step the store makes a row walk to.
+  // The stages are statuses like the others: each is set directly, from any of
+  // them, and neither is a step the store makes a row walk to.
+  await store.setStatus("ctrl-o overhaul", "enqueued");
+  assert.equal(store.list()[0]!.status, "enqueued");
   await store.setStatus("ctrl-o overhaul", "testing");
   assert.equal(store.list()[0]!.status, "testing");
   await store.setStatus("ctrl-o overhaul", "building");
-  assert.equal(store.list()[0]!.status, "building", "and there is a way back out of it");
+  assert.equal(store.list()[0]!.status, "building", "and there is a way back out of them");
 
   // Strict on the way in, unlike the read path: a write that silently became
   // `queued` is a write the caller believes landed. `done` and `tested` are the
@@ -413,13 +415,14 @@ test("a file holding the wrong shape entirely is an empty table too", async () =
   }
 });
 
-test("rows are coerced: junk is dropped, cells are one line, status is one of three", () => {
+test("rows are coerced: junk is dropped, cells are one line, status is one of four", () => {
   assert.deepEqual(
     coerceTasks([
       { task: "  spaced  out  ", status: " Building " },
       { task: "multi\nline\ndescription", status: "queued" },
       { task: "no status at all" },
       { task: "under test", status: " Testing " },
+      { task: "in the queue", status: " Enqueued " },
       { task: "" }, // nothing to show
       { status: "queued" }, // no task text at all
       "a bare string",
@@ -432,6 +435,7 @@ test("rows are coerced: junk is dropped, cells are one line, status is one of th
       // Read the same way `building` is: trimmed and case-folded, so a row the
       // panel wrote and a row typed into the file by hand land identically.
       { task: "under test", status: "testing" },
+      { task: "in the queue", status: "enqueued" },
     ],
   );
 });
@@ -465,7 +469,7 @@ test("a store written under the old shape loads: bare array, type ignored, statu
     ]);
     assert.deepEqual(store.done(), [], "a file with no done list has retired nothing");
     for (const row of store.list()) {
-      assert.ok(TASK_STATUSES.includes(row.status), `${row.status} is one of the three`);
+      assert.ok(TASK_STATUSES.includes(row.status), `${row.status} is one of the four`);
       assert.ok(!("type" in row), "and nothing carries the old field forward");
     }
 
@@ -523,6 +527,46 @@ test("a two-status file written before `testing` existed loads unchanged", async
   }
 });
 
+/**
+ * The same compatibility case one status later, and the one `enqueued` could
+ * actually have broken: a file holding `testing` rows, written before a bucket
+ * was inserted ABOVE them. Every row must load and paint exactly where it did.
+ */
+test("a file written before `enqueued` existed loads and paints unchanged", async () => {
+  const { paths, cleanup } = await tmpPaths();
+  try {
+    await fsp.mkdir(path.dirname(paths.taskTable), { recursive: true });
+    const before = {
+      tasks: [
+        { task: "bedrock retry backoff", status: "queued" },
+        { task: "ctrl-o overhaul", status: "testing" },
+        { task: "pricing table refresh", status: "building" },
+      ],
+      done: [{ task: "prompt overhaul", retiredAt: "2026-07-30T00:00:00.000Z" }],
+    };
+    await fsp.writeFile(paths.taskTable, JSON.stringify(before, null, 2) + "\n", "utf8");
+
+    const store = await TaskStore.load(paths);
+    assert.deepEqual(store.list(), before.tasks, "every row exactly as it was stored");
+    assert.deepEqual(store.done(), before.done, "and the done list with it");
+    assert.deepEqual(
+      taskDisplayOrder(store.list()).map((r) => r.task),
+      ["pricing table refresh", "ctrl-o overhaul", "bedrock retry backoff"],
+      "an empty bucket in the middle moves nothing",
+    );
+
+    // And the new stage is reachable from that file with no migration step.
+    await store.setStatus("pricing table refresh", "enqueued");
+    assert.deepEqual((await TaskStore.load(paths)).list(), [
+      { task: "bedrock retry backoff", status: "queued" },
+      { task: "ctrl-o overhaul", status: "testing" },
+      { task: "pricing table refresh", status: "enqueued" },
+    ]);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("an ephemeral store holds a table with no file behind it", async () => {
   const store = TaskStore.ephemeral(ROWS);
   assert.equal(store.size, 2);
@@ -569,11 +613,11 @@ test("the task_table tool is declared, linked or not, and dispatches on a comman
     assert.deepEqual(tool.input_schema.required, ["command"]);
     const props = tool.input_schema.properties as Record<string, { enum?: string[] }>;
     assert.deepEqual(props.command?.enum, ["add", "status", "rename", "retire", "list"]);
-    // All three, in display order. The enum is the gate: a status the TUI can
+    // All four, in display order. The enum is the gate: a status the TUI can
     // put on a row and the tool's schema cannot name is a row the co fails on.
     assert.deepEqual(
       props.status?.enum,
-      ["building", "testing", "queued"],
+      ["building", "enqueued", "testing", "queued"],
       "and the status enum is the gate",
     );
     assert.ok("new_task" in props, "rename needs a second text, and it is declared");
@@ -804,4 +848,64 @@ test("the tool sets, lists and sorts `testing` like any other status", async () 
   assert.ok(!retired.is_error, retired.content);
   assert.equal(store.done()[0]!.task, "checking");
   assert.deepEqual(store.list().map((r) => r.task), ["waiting", "working"]);
+});
+
+/**
+ * `enqueued` through the TOOL, which is the half a panel-only status would have
+ * left broken: the captain can park a row there with `s`, and the co's next call
+ * has to be able to read it, sort it and set it. A tool whose enum stopped at
+ * three would refuse the write and mis-sort the read on a row it never made.
+ *
+ * Nothing here is automatic, and that is the point of setting it by hand: the
+ * merge queue does not write to this table, so `enqueued` arrives the same way
+ * every other status does.
+ */
+test("the tool sets, lists and sorts `enqueued` like any other status", async () => {
+  const store = TaskStore.ephemeral([
+    { task: "waiting", status: "queued" },
+    { task: "in the queue", status: "enqueued" }, // as if the captain parked it there
+    { task: "checking", status: "testing" },
+    { task: "working", status: "building" },
+  ]);
+  const tableOf = (content: string): TaskRow[] =>
+    (JSON.parse(content) as { table: TaskRow[] }).table ?? [];
+
+  const listed = await callTool(store, { command: "list" });
+  assert.ok(!listed.is_error, listed.content);
+  assert.deepEqual(
+    tableOf(listed.content),
+    [
+      { task: "working", status: "building" },
+      { task: "in the queue", status: "enqueued" },
+      { task: "checking", status: "testing" },
+      { task: "waiting", status: "queued" },
+    ],
+    "most-active-first: building, enqueued, testing, queued",
+  );
+
+  // The co writes it itself — the schema enum is the only gate, and it names
+  // this one. A row goes there from `building`, which is the move it is for.
+  const moved = await callTool(store, { command: "status", task: "working", status: "enqueued" });
+  assert.ok(!moved.is_error, moved.content);
+  assert.match(moved.content, /"status": ?"enqueued"/);
+  // STORED order decides inside the group: "in the queue" sits at index 1 of the
+  // store and "working" at index 3, so the row that was already there stays on
+  // top. The same rule every other group has.
+  assert.deepEqual(
+    tableOf(moved.content).map((r) => `${r.status}:${r.task}`),
+    ["enqueued:in the queue", "enqueued:working", "testing:checking", "queued:waiting"],
+    "and it lands in the enqueued group, keeping stored order inside it",
+  );
+
+  // And back out again: it is a stage a row sits in, not a trap it falls into.
+  const back = await callTool(store, { command: "status", task: "working", status: "building" });
+  assert.ok(!back.is_error, back.content);
+  assert.equal(store.list().find((r) => r.task === "working")!.status, "building");
+
+  // Retire is untouched by it: done is still an action off the table, and no
+  // stage reaches it.
+  const retired = await callTool(store, { command: "retire", task: "in the queue" });
+  assert.ok(!retired.is_error, retired.content);
+  assert.equal(store.done()[0]!.task, "in the queue");
+  assert.deepEqual(store.list().map((r) => r.task), ["waiting", "checking", "working"]);
 });

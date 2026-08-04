@@ -442,8 +442,9 @@ function taskTableBlock(rows: TaskRow[]): string {
   return (
     "## Task table (the captain's, painted on Ctrl-O Home)\n\n" +
     "_As it stood when this session opened, `building` rows first, then" +
-    " `testing` (built, awaiting their check), then `queued`. They edit it" +
-    " there themselves; call `task_table list` for the current one._\n\n" +
+    " `enqueued` (handed to the merge queue), then `testing` (built, awaiting" +
+    " their check), then `queued`. They edit it there themselves; call" +
+    " `task_table list` for the current one._\n\n" +
     body
   );
 }

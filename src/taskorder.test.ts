@@ -69,18 +69,19 @@ test("it is deterministic: the same rows give the same order, every time", () =>
   }
 });
 
-test("anything that is not exactly `building` or `testing` is queued, matching the store's read", () => {
+test("anything that is not exactly a named stage is queued, matching the store's read", () => {
   // A hand-edited file can hold a word from the old free-form vocabulary. The
   // store coerces it to `queued` on read; this must bucket it the same way
   // rather than dropping it out of the painted table entirely.
   const odd = [
     { task: "junk", status: "ready-to-arm" as unknown as "queued" },
     { task: "real", status: "building" as const },
+    { task: "landing", status: "enqueued" as const },
     { task: "checking", status: "testing" as const },
   ];
   assert.deepEqual(
     taskDisplayOrder(odd).map((r) => r.task),
-    ["real", "checking", "junk"],
+    ["real", "landing", "checking", "junk"],
     "nothing vanishes, whatever the word says",
   );
 });
@@ -127,6 +128,60 @@ test("a table of nothing but testing rows is handed back exactly as it came", ()
 test("a table written before `testing` existed orders exactly as it always did", () => {
   // The regression that matters most: adding a bucket in the middle must not
   // move a row in a table that has no rows in it.
+  assert.deepEqual(
+    taskDisplayOrder(ROWS).map((r) => r.task),
+    ["two", "four", "one", "three"],
+  );
+});
+
+// --- the fourth status --------------------------------------------------------
+//
+// `enqueued` is the stage between them: built and handed to the merge queue, not
+// yet checked. It paints under `building` and above `testing`, which is the
+// order the work runs in read downward — most active first.
+
+const FOUR = [
+  { task: "waiting", status: "queued" as const },
+  { task: "checking", status: "testing" as const },
+  { task: "landing", status: "enqueued" as const },
+  { task: "working", status: "building" as const },
+];
+
+test("the four groups paint building, enqueued, testing, then queued", () => {
+  assert.deepEqual(
+    taskDisplayOrder(FOUR).map((r) => r.task),
+    ["working", "landing", "checking", "waiting"],
+  );
+});
+
+test("stored order still holds INSIDE the enqueued group, like the other three", () => {
+  const many = [
+    { task: "e-z", status: "enqueued" as const },
+    { task: "q", status: "queued" as const },
+    { task: "e-a", status: "enqueued" as const },
+    { task: "t", status: "testing" as const },
+    { task: "b", status: "building" as const },
+    { task: "e-m", status: "enqueued" as const },
+  ];
+  assert.deepEqual(
+    taskDisplayOrder(many).map((r) => r.task),
+    ["b", "e-z", "e-a", "e-m", "t", "q"],
+    "a stable partition over four buckets, not a sort",
+  );
+});
+
+test("a table of nothing but enqueued rows is handed back exactly as it came", () => {
+  const enqueued = FOUR.filter((r) => r.status === "enqueued");
+  assert.deepEqual(taskDisplayOrder(enqueued), enqueued);
+});
+
+test("a table written before `enqueued` existed orders exactly as it always did", () => {
+  // The same regression the `testing` bucket had to clear: a bucket inserted in
+  // the middle must not move a row in a table that has no rows in it.
+  assert.deepEqual(
+    taskDisplayOrder(THREE).map((r) => r.task),
+    ["working", "checking", "waiting"],
+  );
   assert.deepEqual(
     taskDisplayOrder(ROWS).map((r) => r.task),
     ["two", "four", "one", "three"],

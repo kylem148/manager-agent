@@ -187,7 +187,7 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
     {
       name: "task_table",
       description:
-        "Read and edit the captain's task table, one row at a time. Commands: `list`; `add` (new row, always `queued`); `status` (`building`, `testing` - built but not yet checked - or `queued`); `rename` (`task` -> `new_task`, keeps status and place); `retire` (what done means; `testing` precedes it, never replaces it). Address a row by its EXACT text from `list`, never by position: the captain edits it between turns, and text matching no row or several is an error, not a guess. No whole-table write, clear or reorder. Rows return in that status order.",
+        "Read and edit the captain's task table, one row at a time. Commands: `list`; `add` (always `queued`); `status` (`building`; `enqueued` - in the merge queue; `testing` - built but not yet checked; or `queued`); `rename` (`task` -> `new_task`, keeps status and place); `retire` (what done means; the stages precede it, never replace it). Address a row by its EXACT text from `list`, never by position: the captain edits it between turns, and text matching no row or several is an error, not a guess. No whole-table write, clear or reorder.",
       input_schema: {
         type: "object",
         properties: {

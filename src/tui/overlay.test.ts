@@ -2663,6 +2663,63 @@ test("Ctrl-O closes the panel from Home", async () => {
   h.stop();
 });
 
+/**
+ * ONE Ctrl-O leaves, from a selected row as much as from an unselected table.
+ *
+ * Esc has two meanings on this tab — drop the selection, then close — and Ctrl-O
+ * used to inherit both, so leaving the surface the captain is in most cost two
+ * presses. Ctrl-O is the way OUT of the panel, not a step back through it. Esc
+ * keeps both of its meanings; the test above it pins that.
+ */
+test("one Ctrl-O from a selected row lands in the chat, not on an unselected table", async () => {
+  const tasks = fakeTasks(TASKS);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), tasks);
+  const answer = h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("j");
+  h.send("j");
+  await settle();
+  assert.match(selectedRow(h), /bedrock retry backoff/, "a row is deliberately selected");
+
+  h.send(CTRL_O);
+  await settle();
+  assert.match(h.lastFramePlain(), /you > /, "one press, and the conversation is back");
+  assert.ok(!h.lastFramePlain().includes("Tasks"), "the panel is gone, not merely deselected");
+  assert.deepEqual(tasks.writes, [], "and leaving wrote nothing to the table");
+
+  // The selection did not survive the trip: reopening lands inert, exactly as a
+  // fresh open does, so the next `x` has nothing to act on.
+  h.send(CTRL_O);
+  await settle();
+  assert.equal(selectedRow(h), "", "reopened with nothing selected");
+
+  h.send(CTRL_O);
+  await settle();
+  h.send("typed\r");
+  assert.equal(await answer, "typed", "and no press leaked a keystroke into the buffer");
+  h.stop();
+});
+
+test("the single-press exit holds in Ctrl-O's enhanced-protocol spellings too", async () => {
+  for (const [name, seq] of [
+    ["Kitty CSI-u", "\x1b[111;5u"],
+    ["xterm modifyOtherKeys", "\x1b[27;5;111~"],
+  ] as const) {
+    const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+    h.tui.question();
+    h.send(CTRL_O);
+    await settle();
+    h.send("j");
+    await settle();
+    assert.match(selectedRow(h), /ctrl-o overhaul/, `${name}: a row is selected`);
+    h.send(seq);
+    await settle();
+    assert.match(h.lastFramePlain(), /you > /, `${name}: one press closed it`);
+    h.stop();
+  }
+});
+
 // --- editing the task table from Home ----------------------------------------
 //
 // The table has two writers now (D-20260729-3): the co, through its tool, and
@@ -2687,7 +2744,7 @@ function taskRows(h: Harness): string[] {
   const out: string[] = [];
   for (let i = head + 1; i < rows.length; i++) {
     if (rows[i]!.trim() === "Worktrees") break;
-    if (/\b(building|testing|queued|new)\b/.test(rows[i]!)) out.push(rows[i]!);
+    if (/\b(building|enqueued|testing|queued|new)\b/.test(rows[i]!)) out.push(rows[i]!);
   }
   return out;
 }
@@ -2773,7 +2830,7 @@ test("`x` retires the highlighted row and drops the selection with it", async ()
   h.stop();
 });
 
-test("`s` cycles the highlighted row queued -> building -> testing -> queued", async () => {
+test("`s` cycles the highlighted row queued -> building -> enqueued -> testing -> queued", async () => {
   const tasks = fakeTasks(TASKS);
   const h = harness(undefined, 80, 20, undefined, fakeFeatures(FEATURES), tasks);
   h.tui.question();
@@ -2782,13 +2839,19 @@ test("`s` cycles the highlighted row queued -> building -> testing -> queued", a
   h.send("j"); // ctrl-o overhaul, which is building
   await settle();
 
-  // One key for three statuses, running the way the work does. From `building`
-  // the next press is `testing` — the row is built and waiting on the captain.
+  // One key for four statuses, running the way the work does. From `building`
+  // the next press is `enqueued` — the row is built and handed to the queue.
   h.send("s");
   await settle();
-  assert.deepEqual(tasks.writes, ["status:ctrl-o overhaul:testing"]);
+  assert.deepEqual(tasks.writes, ["status:ctrl-o overhaul:enqueued"]);
+  assert.equal(tasks.list()[0]!.status, "enqueued");
+  assert.match(selectedRow(h), /enqueued\s+ctrl-o overhaul/, "the row is repainted, still selected");
+
+  // Then `testing` — it has landed and is waiting on the captain to check it.
+  h.send("s");
+  await settle();
   assert.equal(tasks.list()[0]!.status, "testing");
-  assert.match(selectedRow(h), /testing\s+ctrl-o overhaul/, "the row is repainted, still selected");
+  assert.match(selectedRow(h), /testing\s+ctrl-o overhaul/, "still the same row, still selected");
 
   // Round the cycle: `testing` wraps to `queued`, which is the way back for a
   // row that failed its test. Nothing here reaches `done` — `x` is that key.
@@ -2799,6 +2862,7 @@ test("`s` cycles the highlighted row queued -> building -> testing -> queued", a
   await settle();
   assert.equal(tasks.list()[0]!.status, "building", "and it comes all the way round");
   assert.deepEqual(tasks.writes, [
+    "status:ctrl-o overhaul:enqueued",
     "status:ctrl-o overhaul:testing",
     "status:ctrl-o overhaul:queued",
     "status:ctrl-o overhaul:building",
@@ -3109,6 +3173,36 @@ const UNSORTED: TaskPanelRow[] = [
   { task: "waiting second", status: "queued" },
   { task: "being worked", status: "building" },
 ];
+
+test("the tab paints the four groups most-active-first, whatever order they were stored in", async () => {
+  const tasks = fakeTasks([
+    { task: "waiting", status: "queued" },
+    { task: "checking", status: "testing" },
+    { task: "landing", status: "enqueued" },
+    { task: "being worked", status: "building" },
+  ]);
+  const h = harness(undefined, 80, 20, undefined, fakeFeatures([]), tasks);
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.deepEqual(
+    taskRows(h).map((r) => r.trim().replace(/^▸\s*/, "")),
+    [
+      "building   being worked",
+      "enqueued   landing",
+      "testing    checking",
+      "queued     waiting",
+    ],
+    "building, enqueued, testing, queued — and the column still lines up",
+  );
+  // The cursor walks what the eye reads, which is the whole reason the order is
+  // one shared function rather than something the painter does on its way out.
+  h.send("j");
+  h.send("j");
+  await settle();
+  assert.match(selectedRow(h), /landing/, "j takes the row painted below the building one");
+  h.stop();
+});
 
 test("the tab paints building rows above queued ones, whatever order they were stored in", async () => {
   const tasks = fakeTasks(UNSORTED);
