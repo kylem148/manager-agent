@@ -1240,6 +1240,92 @@ test("each half of the PR message overrides on its own; omitting one keeps what 
   }
 });
 
+test("a re-enqueue on the SAME sha serves the cached green: nothing is run, nothing is written", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("cached");
+    const b = await fx.features.create("behind");
+    await commitIn(a.feature.worktreePath, "c.txt", "c\n", "job: the cached slice");
+    await commitIn(b.feature.worktreePath, "b.txt", "b\n", "job: behind");
+
+    const first = await fx.features.enqueue("cached", { prTitle: "Add the cached slice", prBody: "Because." });
+    await fx.features.enqueue("behind");
+    assert.equal(first.enqueued, true);
+    if (!first.enqueued) return;
+    assert.equal(first.head?.status, "ready");
+
+    const branchSha = run(fx.repo, ["rev-parse", "feat/cached"]);
+    const callsBefore = [...fx.forge.calls];
+    const prBefore = { ...fx.forge.prFor("feat/cached")! };
+
+    const again = await fx.features.enqueue("cached");
+    assert.equal(again.enqueued, true);
+    if (!again.enqueued) return;
+    assert.equal(again.head?.status, "ready", "the cached status comes straight back");
+    assert.equal(again.head?.commitsReady, first.head?.commitsReady);
+
+    // The whole point: the branch is where the cache says it is, so there is
+    // nothing to re-derive. No fetch, no rebase, no push, no gh call.
+    assert.deepEqual(fx.forge.calls, callsBefore, "not one command against the remote or the forge");
+    assert.deepEqual(fx.forge.prFor("feat/cached"), prBefore, "the pull request is byte-identical");
+    assert.equal(run(fx.repo, ["rev-parse", "feat/cached"]), branchSha, "and the branch never moved");
+
+    // And the queue is exactly as it was: nothing re-joined it, nothing reordered.
+    assert.deepEqual(
+      fx.features.queueView().entries.map((e) => [e.feature, e.position, e.status]),
+      [["cached", 1, "ready"], ["behind", 2, "queued"]],
+    );
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("a re-enqueue after the crew commits again re-processes the head: rebase, push, checks re-read", async () => {
+  const fx = await makeFixture();
+  try {
+    const a = await fx.features.create("moved");
+    const b = await fx.features.create("waiting");
+    await commitIn(a.feature.worktreePath, "m.txt", "m\n", "job: the first slice");
+    await commitIn(b.feature.worktreePath, "w.txt", "w\n", "job: waiting");
+
+    const first = await fx.features.enqueue("moved", { prTitle: "Add the moved slice", prBody: "Because." });
+    await fx.features.enqueue("waiting");
+    assert.equal(first.enqueued, true);
+    if (!first.enqueued) return;
+    assert.equal(first.head?.commitsReady, 1);
+    const publishedFirst = run(fx.repo, ["rev-parse", "feat/moved"]);
+    assert.equal(fx.forge.branches.get("feat/moved"), publishedFirst);
+
+    // A crew agent commits a fix onto the head AFTER it went green. The cached
+    // green now describes a sha the branch has left; serving it was the bug.
+    await commitIn(a.feature.worktreePath, "fix.txt", "fix\n", "job: the fix");
+    const movedSha = run(fx.repo, ["rev-parse", "feat/moved"]);
+    assert.notEqual(movedSha, publishedFirst);
+    fx.forge.calls.length = 0;
+    fx.forge.pushes.length = 0;
+
+    const again = await fx.features.enqueue("moved");
+    assert.equal(again.enqueued, true);
+    if (!again.enqueued) return;
+    assert.equal(again.head?.status, "ready");
+    assert.equal(again.head?.commitsReady, 2, "the NEW tip's commits, not the cached one's");
+    assert.ok(fx.forge.calls.some((c) => c.startsWith("git fetch")), "it fetched a fresh origin/dev");
+    assert.deepEqual(fx.forge.pushes, [`feat/moved=${movedSha}`], "and published the rebased tip");
+    assert.equal(fx.forge.branches.get("feat/moved"), movedSha);
+    assert.ok(fx.forge.calls.some((c) => c.startsWith("gh pr checks")), "and read the checks again");
+
+    // Still one PR, still the same one — nothing re-joined the queue and the
+    // follower did not move.
+    assert.equal(fx.forge.prs.filter((p) => p.head === "feat/moved").length, 1);
+    assert.deepEqual(
+      fx.features.queueView().entries.map((e) => [e.feature, e.position]),
+      [["moved", 1], ["waiting", 2]],
+    );
+  } finally {
+    await fx.cleanup();
+  }
+});
+
 test("the captain's in-panel edit rewrites the PR and the stored message, and keeps the fence", async () => {
   const fx = await makeFixture();
   try {

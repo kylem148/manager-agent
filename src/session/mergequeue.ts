@@ -1,9 +1,11 @@
 import { checksLine, type ChecksPolicy, type ChecksSummary } from "./checks.js";
 import {
+  branchTipSha,
   executeLanding,
   prepareLanding,
   type AuthoredPrMessage,
   type LandingOptions,
+  type PrepareGreen,
   type PrepareResult,
 } from "./landing.js";
 import { splitEvidence, type CommandRunner } from "./forge.js";
@@ -263,12 +265,16 @@ export interface MergeQueueHost {
   prMessage?(feature: string): AuthoredPrMessage | undefined;
 }
 
-/** Test seams: the two pieces of the EXISTING landing machinery the queue
- *  drives. Defaulted to the real ones; overridden in unit tests so the state
- *  machine can be exercised without a real git repo. */
+/** Test seams: the pieces of the EXISTING landing machinery the queue drives.
+ *  Defaulted to the real ones; overridden in unit tests so the state machine can
+ *  be exercised without a real git repo. The queue still owns no git of its own —
+ *  every one of these is landing.ts's. */
 export interface MergeQueueDeps {
   prepare: typeof prepareLanding;
   execute: typeof executeLanding;
+  /** The head branch's current tip, for the staleness question a cached green has
+   *  to answer before it is served again. A local read; writes nothing. */
+  branchSha: typeof branchTipSha;
 }
 
 export interface MergeQueueOptions {
@@ -361,6 +367,7 @@ export class MergeQueue {
     this.deps = {
       prepare: opts.deps?.prepare ?? prepareLanding,
       execute: opts.deps?.execute ?? executeLanding,
+      branchSha: opts.deps?.branchSha ?? branchTipSha,
     };
   }
 
@@ -529,18 +536,44 @@ export class MergeQueue {
    * only gate in the whole flow is the merge keystroke on the head.
    *
    * Re-enqueuing the head is also the RETRY lever for a blocked head: if the
-   * enqueued feature is the head and not already green, it is (re)processed, so a
-   * captain who has resolved a conflict or fixed a red check can re-run the head
-   * without a dedicated tool. A head already "ready" is left as-is (no wasted
-   * checks read).
+   * enqueued feature is the head, it is (re)processed, so a captain who has
+   * resolved a conflict or fixed a red check can re-run the head without a
+   * dedicated tool.
+   *
+   * WHAT SERVES THE CACHE (D-20260803-1). The skip used to ask "is this head
+   * ready?", and a ready head was left alone forever — so a crew agent that
+   * committed a fix onto an already-green head got a cached `ready` back
+   * describing a sha that no longer existed, and only the merge keystroke ever
+   * found out. The question it asks now is the one that was always meant: is my
+   * prepared cache still describing the sha the branch is on RIGHT NOW? The same
+   * sha serves the cache, and costs one local rev-parse and nothing else. A
+   * different sha falls straight through to the path a not-yet-ready head already
+   * takes — rebase onto fresh `origin/dev`, force-with-lease push, re-read the
+   * checks. There is no new verb, nothing re-joins the queue, and the entry does
+   * not move: queue position is landing order between features, and re-processing
+   * one feature says nothing about the order of the others.
+   *
+   * A green head that IS re-processed drops to awaiting-checks until its CI
+   * reports on the new tip, and that is correct rather than unfortunate: the green
+   * belonged to the sha that was replaced.
    */
   async enqueue(feature: string): Promise<EnqueueResult> {
     const alreadyQueued = this.has(feature);
     if (!alreadyQueued) this.entries.push({ feature, status: "queued" });
 
     const head = this.entries[0]!;
-    if (head.feature === feature && head.status !== "ready") {
-      await this.runProcessHead();
+    if (head.feature === feature) {
+      const cached = head.status === "ready" && head.prepared?.kind === "green" ? head.prepared : undefined;
+      if (!cached || !(await this.cacheDescribesBranch(cached))) {
+        // Either the head is not green, or its green describes a sha the branch
+        // has left. Invalidate before processing: runProcessHead deliberately
+        // skips a still-"ready" head, and a stale green must not be one.
+        if (cached) {
+          head.status = "queued";
+          delete head.prepared;
+        }
+        await this.runProcessHead();
+      }
     }
 
     const idx = this.entries.findIndex((e) => e.feature === feature);
@@ -552,6 +585,14 @@ export class MergeQueue {
       queue: this.view(),
       summary: this.summarize(feature, alreadyQueued),
     };
+  }
+
+  /** Whether a cached green still describes the sha its branch is on right now.
+   *  An unreadable branch answers false — see branchTipSha for why that is the
+   *  safe direction. */
+  private async cacheDescribesBranch(green: PrepareGreen): Promise<boolean> {
+    const sha = await this.deps.branchSha(this.landingOptions(), green.branch);
+    return sha !== undefined && sha === green.featureSha;
   }
 
   /**
@@ -581,7 +622,10 @@ export class MergeQueue {
   private async runProcessHead(): Promise<QueueEntry | undefined> {
     const head = this.entries[0];
     if (!head) return undefined;
-    // Already green and waiting for the merge keystroke: nothing to redo.
+    // Already green and waiting for the merge keystroke: nothing to redo. The
+    // staleness question belongs to enqueue, which invalidates a green whose sha
+    // has moved BEFORE it gets here — so reaching this line means the cache was
+    // either just checked or was never in doubt.
     if (head.status === "ready") return head;
     // A live crew agent owns the worktree; we cannot rebase under it. Hold the
     // head — a later enqueue/processHead (once the crew is done) advances it. If

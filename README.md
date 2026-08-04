@@ -1110,6 +1110,20 @@ The wait on pending checks is bounded (five minutes by default, re-read every
 ten seconds). When it runs out the head sits in `awaiting-checks` rather than
 hanging or claiming a verdict; re-enqueuing it reads the checks again.
 
+**A head is re-processed when its branch has moved, and not otherwise.** Saying a
+feature is done a second time is free when nothing has happened since: what the
+queue holds for a green head is a result about one exact commit, so it checks
+whether the branch is still on that commit, and if it is you get the same answer
+back with no fetch, no rebase, no push and nothing asked of GitHub. If it isn't —
+a crew agent went back in and committed a fix onto an already-green head — the
+cached green describes a commit that is no longer there, and the head goes back
+through the ordinary path: rebase onto the current `origin/dev`, push, read the
+checks. Nothing re-joins the queue and no feature changes place, because position
+is landing order between features and re-testing one says nothing about the rest.
+The one cost is the honest one: a head that was green drops to `awaiting-checks`
+until its CI reports on the new commit, which is correct — the green belonged to
+the commit that was replaced.
+
 `[m]` is a state, not a prompt. It appears because the head's checks are green
 (or it is ungated), it stays there until you press it, and pressing it runs
 `gh pr merge --merge`: the PR lands on `dev` as a **merge commit**, co fetches so

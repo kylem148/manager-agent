@@ -9,6 +9,7 @@ import { CHECKS_GRACE_MS, CHECKS_INTERVAL_MS, CHECKS_TIMEOUT_MS, type ChecksPoli
 import {
   authoredPrBody,
   authoredPrTitle,
+  branchTipSha,
   composePrBody,
   composePrMessage,
   composePrTitle,
@@ -333,6 +334,25 @@ test("an authored message opens the PR verbatim, with only the evidence fence ad
     assert.match(parts.evidence, /job: passkey ceremony/, "the commit list is co's, not the author's");
     assert.match(parts.evidence, /job: recovery codes/);
     assert.doesNotMatch(parts.prose, /### Checks|### Commits|<!--/, "and none of it leaked into the prose");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("branchTipSha reads the branch where it is now, and says nothing rather than guessing", async () => {
+  const f = await makeRepo();
+  try {
+    const rec = await provision(f, "tip");
+    assert.equal(await branchTipSha(f.opts(), "feat/tip"), sha(f.repo, "feat/tip"));
+    await commitIn(rec.worktreePath, "t.txt", "t\n", "job: a commit");
+    assert.equal(
+      await branchTipSha(f.opts(), "feat/tip"),
+      sha(f.repo, "feat/tip"),
+      "it follows the branch, which is what makes a cached green checkable",
+    );
+    // A branch that is not there is undefined — deliberately not "unchanged".
+    assert.equal(await branchTipSha(f.opts(), "feat/never-cut"), undefined);
+    assert.equal(await branchTipSha({ ...f.opts(), repoPath: path.join(f.root, "gone") }, "feat/tip"), undefined);
   } finally {
     await f.cleanup();
   }

@@ -5,6 +5,7 @@ import { EVIDENCE_CLOSE, EVIDENCE_OPEN } from "./forge.js";
 import type { ChecksSummary } from "./checks.js";
 import type {
   AuthoredPrMessage,
+  branchTipSha,
   executeLanding,
   PrepareConflict,
   PrepareFailed,
@@ -137,6 +138,10 @@ interface Harness {
   /** What each prepare was handed as the feature's authored message —
    *  `<feature>:<title|-></body|->` — so a test can see it was looked up fresh. */
   authoredSeen: string[];
+  /** branch -> the sha the branch is on right now, as the queue's staleness read
+   *  sees it. Seeded by every prepare that produced a tip; a test moves a branch
+   *  by writing here, which is exactly what a crew agent committing does. */
+  branchTips: Map<string, string>;
 }
 
 function makeHarness(): Harness {
@@ -147,15 +152,32 @@ function makeHarness(): Harness {
   const forgotten: string[] = [];
   const authored = new Map<string, AuthoredPrMessage>();
   const authoredSeen: string[] = [];
-  const h = { prepareFn, prepareCalls, mergeCalls, busy, forgotten, authored, authoredSeen } as Harness;
+  const branchTips = new Map<string, string>();
+  const h = {
+    prepareFn,
+    prepareCalls,
+    mergeCalls,
+    busy,
+    forgotten,
+    authored,
+    authoredSeen,
+    branchTips,
+  } as Harness;
   h.executeError = null;
 
   const fakePrepare: typeof prepareLanding = async (_opts, feature, message) => {
     prepareCalls.push(feature);
     authoredSeen.push(`${feature}:${message?.title ?? "-"}/${message?.body ?? "-"}`);
     const fn = prepareFn.get(feature) ?? (() => green(feature));
-    return fn();
+    const res = fn();
+    // A real prepare leaves the branch at the tip it published, and the staleness
+    // read looks at exactly that afterwards — so the fake has to leave it too.
+    if ("featureSha" in res) branchTips.set(res.branch, res.featureSha);
+    return res;
   };
+
+  /** The queue's staleness read: what sha is this branch on right now. */
+  const fakeBranchSha: typeof branchTipSha = async (_opts, branch) => branchTips.get(branch);
 
   const fakeExecute: typeof executeLanding = async (_opts, feature, expect) => {
     // The pin is recorded in full: the tested tip, the origin/dev it was tested
@@ -186,7 +208,7 @@ function makeHarness(): Harness {
       forget: (f) => forgotten.push(f),
       prMessage: (f) => authored.get(f),
     },
-    deps: { prepare: fakePrepare, execute: fakeExecute },
+    deps: { prepare: fakePrepare, execute: fakeExecute, branchSha: fakeBranchSha },
   });
   return h;
 }
@@ -283,14 +305,69 @@ test("the head's authored PR message is looked up on EVERY processing, never cap
   assertHeadOnly(h.queue);
 });
 
-test("enqueue is idempotent: re-enqueuing a ready head keeps its place and does not re-process", async () => {
+test("enqueue is idempotent: re-enqueuing a ready head ON THE SAME SHA keeps its place and does not re-process", async () => {
   const h = makeHarness();
   await h.queue.enqueue("aaa");
   const again = await h.queue.enqueue("aaa");
   assert.equal(again.alreadyQueued, true);
   assert.equal(again.head?.status, "ready");
-  assert.deepEqual(h.prepareCalls, ["aaa"], "a ready head is not re-prepared");
+  assert.deepEqual(h.prepareCalls, ["aaa"], "a ready head on its tested sha is not re-prepared");
   assert.equal(h.queue.view().size, 1);
+});
+
+test("a ready head whose BRANCH SHA MOVED is re-processed, and keeps its queue position", async () => {
+  // The cache's whole claim is "this sha is green". A crew agent that commits a
+  // fix onto an already-green head invalidates that claim, and the old skip guard
+  // — which only ever asked "is this head ready?" — went on serving it, so the
+  // captain read a green describing a sha the branch had left. D-20260803-1.
+  const h = makeHarness();
+  await h.queue.enqueue("aaa");
+  await h.queue.enqueue("bbb");
+  await h.queue.enqueue("ccc");
+  assert.deepEqual(h.prepareCalls, ["aaa"], "only the head was ever prepared");
+
+  // The crew commits again in the head's worktree: the branch is somewhere else.
+  h.branchTips.set("feat/aaa", "feat-aaa-plus-a-fix");
+  h.prepareFn.set("aaa", () => green("aaa", 2));
+
+  const again = await h.queue.enqueue("aaa");
+  assert.deepEqual(h.prepareCalls, ["aaa", "aaa"], "the moved sha fell through to a real processing");
+  assert.equal(again.head?.status, "ready");
+  assert.equal(again.head?.commitsReady, 2, "and the state reflects the NEW tip, not the cached one");
+
+  // Nothing about the ORDER moved: position is landing order between features,
+  // and re-processing one of them says nothing about the others.
+  assert.deepEqual(
+    h.queue.view().entries.map((e) => [e.feature, e.position]),
+    [["aaa", 1], ["bbb", 2], ["ccc", 3]],
+  );
+  assert.equal(again.entry.position, 1);
+  assert.equal(again.alreadyQueued, true, "and it did not re-join the queue");
+  assertHeadOnly(h.queue);
+});
+
+test("a ready head whose sha cannot be read is re-processed: an unanswerable question is not a yes", async () => {
+  const h = makeHarness();
+  await h.queue.enqueue("aaa");
+  h.branchTips.delete("feat/aaa"); // the branch is gone, or git could not be run
+  await h.queue.enqueue("aaa");
+  assert.deepEqual(h.prepareCalls, ["aaa", "aaa"], "the green nobody could verify was not served");
+});
+
+test("a re-processed head that comes back awaiting-checks says so rather than keeping the old green", async () => {
+  // The accepted price of the fix: pushing onto a green head drops it to
+  // awaiting-checks until CI reports on the new tip. That is the honest answer —
+  // the green belonged to the sha that was replaced — and it is not papered over.
+  const h = makeHarness();
+  await h.queue.enqueue("aaa");
+  assert.equal(h.queue.view().head?.status, "ready");
+
+  h.branchTips.set("feat/aaa", "feat-aaa-moved");
+  h.prepareFn.set("aaa", () => pending("aaa"));
+  const again = await h.queue.enqueue("aaa");
+  assert.equal(again.head?.status, "awaiting-checks");
+  assert.equal(again.head?.commitsReady, undefined, "there is no [m] on it any more");
+  assert.match(again.summary, /WAITING on its pull request's CI checks/);
 });
 
 test("a rebase conflict blocks the head and it holds the queue", async () => {

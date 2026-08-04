@@ -386,6 +386,35 @@ export async function prepareLanding(
 }
 
 /**
+ * The feature branch's tip AS IT IS RIGHT NOW, read from the local repo: no
+ * fetch, no remote, no gh, nothing written.
+ *
+ * This is the staleness question a cached prepare result has to answer before it
+ * can be served again (D-20260803-1). A PrepareGreen describes exactly ONE sha —
+ * the tip it rebased, pushed, PR'd and read the checks on — so the moment the
+ * branch moves off that sha the result describes nothing that exists, and "is
+ * this head ready?" is the wrong question to be asking of it.
+ *
+ * Undefined when the branch cannot be read at all (deleted, repo gone, git
+ * broken). That is deliberately NOT reported as "unchanged": an unanswerable
+ * question is not a yes, and the caller re-processes rather than serving a green
+ * nobody could verify.
+ */
+export async function branchTipSha(
+  opts: WorktreeOptions,
+  branch: string,
+): Promise<string | undefined> {
+  try {
+    const r = resolveWorktreeOptions(opts);
+    const res = await runGit(r.repoPath, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
+    const sha = res.stdout.trim();
+    return res.code === 0 && sha ? sha : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * EXECUTE phase: the single callable the human gate fires on approval. Merges
  * the feature's PR on GitHub with a MERGE COMMIT, fetches so co sees the moved
  * `origin/dev`, and tears down the local worktree. NOTHING local is written but
