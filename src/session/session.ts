@@ -3,6 +3,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import {
   DEFAULT_MODEL_ID,
+  MODEL_CHOICES,
   MODEL_ID_KEY,
   effortLevelsFor,
   isPlausibleModelId,
@@ -47,6 +48,7 @@ import {
   type SessionIO,
   type DocSaveResult,
   type DocSource,
+  type ModelPickerEntry,
   type PrMessageSaveResult,
   type QueueMergeResult,
 } from "../tui/tui.js";
@@ -1819,6 +1821,15 @@ export interface ModelSwitch {
   persist: (modelId: string) => Promise<string>;
   /** Switch the live provider. Returns a note if the switch moved anything else. */
   commit: (modelId: string) => string | null;
+  /**
+   * Show the picker and resolve to the id chosen, or null if it was cancelled.
+   *
+   * Present only where there is a screen to draw one on - the Tui wires it, and
+   * PlainIO (piped / non-TTY) leaves it undefined, where bare `/model` reports
+   * exactly as it always has. Optional for that reason and not as a convenience:
+   * a picker on a pipe would be a prompt nobody can answer.
+   */
+  pick?: (choices: readonly ModelPickerEntry[], current: string) => Promise<string | null>;
 }
 
 /**
@@ -1845,12 +1856,29 @@ export interface ModelSwitch {
  * Ids are taken verbatim. There is no alias table and no friendly-name registry:
  * either would be stale the day a new model ships, and would then reject an id
  * that works.
+ *
+ * BARE, IT ALSO OPENS THE PICKER (where there is a screen for one): the report
+ * is printed exactly as before and a short curated list of models goes up in the
+ * panel, because making the captain type a Bedrock id from memory is the wrong
+ * primary surface for a choice with three real answers. A picked id then walks
+ * the SAME path a typed one does - probe, store, commit, in that order - so
+ * there is one way a model is set and one way it is persisted, not two.
  */
 export async function runModelCommand(arg: string, deps: ModelSwitch): Promise<string[]> {
   const { current, origin } = deps;
   const wanted = arg.trim();
 
-  if (!wanted) return describeModel(current, origin);
+  if (!wanted) {
+    const report = describeModel(current, origin);
+    // No picker to show (a piped session), or nothing a pick could change: an
+    // exported variable outranks a stored choice, so offering a list would be
+    // offering a choice that is refused the moment it is made. Report, as ever.
+    if (!deps.pick || origin.source === "env") return report;
+    const chosen = await deps.pick(MODEL_CHOICES, current);
+    // Cancelled: nothing probed, nothing written, nothing switched.
+    if (chosen === null) return report;
+    return [...report, ...(await switchModel(chosen, deps))];
+  }
 
   if (!isPlausibleModelId(wanted)) {
     return [
@@ -1866,6 +1894,21 @@ export async function runModelCommand(arg: string, deps: ModelSwitch): Promise<s
       c.dim(`  unset ${MODEL_ID_KEY} to set a model per co-manager.`),
     ];
   }
+
+  return switchModel(wanted, deps);
+}
+
+/**
+ * Set the model to `wanted`: ask the API, store the choice, switch the provider,
+ * and say what happened at each step.
+ *
+ * ONE path, shared by the typed id and the picked one. A picker that wrote the
+ * `.env` itself, or skipped the probe because the list is curated, would be a
+ * second way for this co-manager's model to change - and the two would drift the
+ * first time either grew a rule.
+ */
+async function switchModel(wanted: string, deps: ModelSwitch): Promise<string[]> {
+  const { current } = deps;
 
   // Already the model in force: skip the probe (it is answering turns already)
   // and just pin it, so a changed default or a changed shared .env cannot move
@@ -2063,6 +2106,11 @@ async function handleCommand(state: SessionState, raw: string): Promise<CommandR
         }),
         probe: (id) => state.model.probeModel(id),
         persist: (id) => persistInstanceModel(state.paths.root, id),
+        // The picker is the Tui's, and only the Tui's: it is a panel view, and a
+        // piped session has no panel to put it in. Wired the way the landing
+        // gate is wired, for the same reason - the capability is narrowed to the
+        // one method, so nothing else of the screen is reachable from here.
+        ...(io instanceof Tui ? { pick: (choices, current) => io.openModelPicker(choices, current) } : {}),
         commit: (id) => {
           const before = state.model.effort;
           const lowered = state.model.setModel(id);

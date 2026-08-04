@@ -198,7 +198,7 @@ You run one co-manager per project, and projects don't all want the same model.
 `/model` is that choice, made from inside the session and remembered:
 
 ```
-/model                                    # what am I on, and what put me there
+/model                                    # pick from a list - and what put me here
 /model us.anthropic.claude-sonnet-5       # switch this co-manager, and keep it
 ```
 
@@ -206,6 +206,35 @@ Bare, it reports the model in force and its **source** — an exported
 `BEDROCK_MODEL_ID`, this co-manager's own `.env`, a shared `.env`, or the
 built-in default — plus anything that source is covering up, which is the whole
 answer to "why is this instance not on the model I set".
+
+**And it opens a picker**, because typing a Bedrock id from memory is the wrong
+way to make a choice with three real answers. A small box comes up over the
+session with the models this account runs on, the one in force marked in words:
+
+```
+┌─ set the model ────────────────────────────────────┐
+│   Opus 4.8  us.anthropic.claude-opus-4-8           │
+│ ▸ Opus 5    us.anthropic.claude-opus-5  · in force │
+│   Sonnet 5  us.anthropic.claude-sonnet-5           │
+└─ ↑↓ move · Enter select · Esc cancel ──────────────┘
+```
+
+Arrows (or `j`/`k`) move, **Enter** sets it, **Esc** cancels and changes
+nothing. The cursor opens on the model in force, so a blind Enter re-pins what
+is already running rather than switching to whatever is first. A picked id then
+goes through exactly what a typed one does - the probe, then the store, then the
+switch - so there is one way a model changes here, not two.
+
+**The list is fixed and curated, not discovered.** It cannot be discovered:
+`ListFoundationModels` returns every model in the region regardless of whether
+your key may invoke it, and `GetFoundationModelAvailability` has been observed
+reporting `AUTHORIZED` for models that then 403 on invoke. So it is a constant
+in `config.ts`, kept beside the default it must not drift from, and the probe
+below stays the only honest check. Nothing on the picker is exempt from it.
+
+`/model <id>` is the escape hatch and is untouched: any id, on the list or not,
+still sets. Where there is no screen to draw a box on - a piped or non-TTY
+session - bare `/model` just reports, as it always has.
 
 With an id, it switches. The id is taken **verbatim**: there is no alias table
 and no friendly-name registry, because either would be stale the day a new model
@@ -301,7 +330,7 @@ Slash-commands are optional overrides:
 | `/sync`            | refresh `activeContext.md` from recent activity           |
 | `/archive <log>`   | move a log's history into `archive/`                      |
 | `/effort [level]`  | show or set thinking effort for this session              |
-| `/model [id]`      | show the model and where it came from, or set it for this co-manager |
+| `/model [id]`      | pick this co-manager's model from a list, or set one by id |
 | `/cost`            | tokens, dollars and time spent — session, today, all time  |
 | `/help`            | list commands                                             |
 | `/exit`            | leave (auto-saves: refreshes `activeContext.md` if stale)  |
@@ -1394,7 +1423,11 @@ Tests live next to the code they cover (`src/tui/keys.test.ts`, etc.).
   then the shared ones, then the default) and reports which rung won and what it
   is covering; `persistInstanceModel` writes the instance rung. Both live beside
   the loader deliberately — a `/model` that reported a different answer than the
-  next turn used would be worse than no report at all.
+  next turn used would be worse than no report at all. `MODEL_CHOICES` is the
+  third thing here for the same reason: it is the fixed list bare `/model` offers,
+  and it sits beside `DEFAULT_MODEL_ID` so the default can never drift off the
+  list the picker marks it on. It is a constant because Bedrock cannot answer the
+  question it asks - see the `/model` section above.
 - **`src/paths.ts`** — the two-tier folder layout and instance path resolution.
 - **`src/ui.ts`** — colour and line-output primitives used by everything.
 - **`src/model.ts`** — `AnthropicBedrock` wrapper: streaming turns, the tool-use
@@ -1754,7 +1787,16 @@ it — the SAME popup, entered with a different target and a different save, not
 second editor. The popup carries the view it opened over and restores it on the
 way out, which is what lets one box sit on the queue tab and on a document
 without either knowing about the other; the target is read in exactly three
-places (what the borders say, what Ctrl-S calls, what a discard names). A doc's
+places (what the borders say, what Ctrl-S calls, what a discard names). The
+model picker (`openModelPicker`, bare `/model`) is that popup's SIBLING and not a
+tab: the same box, the same borders, the same open-over-a-view-and-put-it-back
+rule, with the Home tab's clamping cursor for a selection model. Two things are
+its own. It opens the panel itself and shuts it again, because `/model` is typed
+at the prompt with the panel down. And it owns the keyboard AND the mouse whole
+while it is up - even the digits that jump tabs everywhere else - because it is
+holding a caller's promise open, and a key that switched tabs would leave the
+session waiting on a surface nobody can act on. Every exit settles that promise
+exactly once, teardown included. A doc's
 save carries the text the buffer opened on back to `overwriteDocIfUnchanged`, so
 a concurrent write by the co is reported rather than clobbered, and leaves one
 line in the model's history naming the file — never its contents, and never a
