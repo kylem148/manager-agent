@@ -206,6 +206,30 @@ test("the orders protocol carries the commit rules and the report contract", () 
   assert.match(all, /stating its own\s+line count/);
 });
 
+test("decision ids stay in memory: nothing asks for one in an order or a PR", () => {
+  // The id is a lookup key inside co's own memory. Neither the captain nor the
+  // crew nor a PR reader can resolve one — the log lives under CO_HOME, outside
+  // the repo — so outward text carries the decision's substance instead.
+  const prompt = buildSystemPrompt({ dispatch: true });
+  assert.match(prompt, /Decision ids stay in memory/);
+  const orders = protocolBody("orders");
+  const pr = protocolBody("pr-message");
+  for (const [name, body] of [
+    ["orders", orders],
+    ["pr-message", pr],
+  ] as const) {
+    assert.ok(!/decision ids|ids and gist/i.test(body), `${name} still asks for a decision id`);
+  }
+  assert.ok(
+    !prompt.includes("the decisions and their ids"),
+    "the resident orders section no longer hands the crew an id",
+  );
+  assert.match(orders, /never an id/);
+  assert.match(pr, /\`## Why\`: the problem first, then the decision/);
+  // Minting is untouched: they are still recorded, still by id.
+  assert.match(protocolBody("memory"), /Decisions carry a stable id, D-YYYYMMDD-N/);
+});
+
 test("the division of knowledge is stated: goal co's, constraints captain's, repo crew's", () => {
   const prompt = buildSystemPrompt({});
   assert.match(prompt, /The goal and the why are yours/);

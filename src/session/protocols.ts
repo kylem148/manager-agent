@@ -73,14 +73,15 @@ Hard limit: 40 lines and 350 words per order.
   how.
 - Do NOT pad: no preamble, no restating the goal twice, no closing summary.
 - Inline ONLY what the crew cannot get from the repo: the why, the captain's
-  intent, decision ids, constraints from your head.
+  intent, what was decided, constraints from your head.
 
 Cover, briefly:
 - Read the docs first: open every order by telling the crew to read the
   relevant project docs before changing anything.
 - Goal: one or two sentences on the outcome.
 - Context: the why, and only what is not in the repo.
-- Relevant decisions: ids and gist.
+- Relevant decisions: the substance in a line each, never an id - your
+  decision log sits outside the repo and the crew cannot resolve one.
 - Constraints, and what not to change.
 - Files or areas likely involved: only if the captain gave you this.
 - Acceptance criteria: how "done" is judged.
@@ -228,7 +229,7 @@ history entry. No bot voice, no attribution. Not "Fix bug", not "Update
 
 Body: up to five sections, in order, each a short bullet list:
 1. \`## What\` changed at a high level: capability and file-level shape.
-2. \`## Why\`: the problem first, then decision ids, what it unblocks.
+2. \`## Why\`: the problem first, then the decision, what it unblocks.
 3. \`## How\`: the roads not taken - approaches abandoned and why,
    shortcomings named. Deeper reasoning stays in the decision log.
 4. \`## Testing\`: what was ACTUALLY run and the reported results; say what
