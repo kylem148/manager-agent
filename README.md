@@ -771,6 +771,56 @@ Everywhere: `space`/`b` page, `j`/`k` line, `d`/`u` half, `g`/`G` ends,
 `Backspace` steps back out of a doc, `Esc` (or `Ctrl-O`, or `q`) closes. A
 left-drag selects and copies on release, on every tab.
 
+**And underneath all of it, an ocean.** In whatever room the tab you're on
+leaves unused, a waterline with the same galleon the session-start greeting
+draws sitting on it, and nothing underneath it — the waterline is the last row
+of the panel, and the sea below it is left to the imagination rather than drawn
+as texture. It says nothing and tracks nothing; it is there because the panel is
+where you live in this app and opening it should feel like something. It belongs
+to the panel and not to one page of it, so it stays on screen as you move
+between tabs, and it is under an open doc as much as under the task table.
+
+The ship has **windows**, one per tab in the bar, in bar order. They are all lit,
+and the one for the tab you're on is lit brighter. That is charm and not
+information — the bar has already told you where you are, in a word and in a
+digit — so it costs nothing and claims nothing: a fourth tab appearing
+mid-session cuts a fourth window without the hull changing width, and a terminal
+with no colour simply gets a ship whose windows are part of the woodwork.
+
+Both are yellow — the windows glow, and the one you're on glows brighter. They
+name their own colours out of the 256-colour cube rather than using the
+terminal's yellow and bright yellow, and that is forced rather than fussy: a
+theme decides what those two are and is free to make them the same, which
+Ghostty's default does (`#f0c674` and `#e7c547` — the same colour to the eye,
+the "brighter" one fractionally the darker). Two windows a column apart cannot
+carry a difference the theme is allowed to flatten. The alternative was
+darkening the windows you're not on, which is very legible and makes the ship
+look abandoned.
+
+Being decoration is exactly why it is the first thing to go: it is drawn out of
+the leftovers and hands them back in a fixed order as the content grows, the
+ship first and the water second, until on a short pane there is no scene at all.
+**No tab reserves a row for it and no viewport shrinks to make room** — nothing
+on any tab is ever clipped, scrolled or pushed off screen to keep it, and a tab
+whose content already fills the pane simply has no sea. Narrow works the same
+way: below the width the hull needs, the ship is absent rather than cut in half,
+and the waterline, being a tile, fits anything. The one place it is dropped
+outright is **while you are editing** — the PR message editor and the doc
+editor — because water rolling in the gap around a box you are typing into is
+noise, not character.
+
+And it moves — slowly. The swell rolls a column about every two thirds of a
+second and the galleon rocks a column with it, on the same `CO_VISUALS` gate and
+the same timer as the dispatch flourish and the exit ship, so anything that says
+this terminal should not animate (`CO_VISUALS=minimal` or `off`, `NO_COLOR`, a
+reduced-motion signal, a pipe, `TERM=dumb`, a narrow screen) leaves the water
+still. It moves sideways only: the scene's height never changes with the frame,
+so the tide cannot cost a row any more than the scene can. The timer lives
+exactly as long as the sea is on screen — close the panel, open an editor,
+shrink the pane until the content wants the rows, or let the co start streaming
+an answer, and it is gone until the sea comes back. Changing tabs does not stop
+it, because changing tabs no longer takes the sea away.
+
 ### Home: what we're doing, and what's in flight
 
 `Ctrl-O` opens on **Home**, which answers the two questions you open the panel
@@ -865,31 +915,10 @@ with the task keys gated behind a submitted line or a picked row, is what lets
 this be the tab the panel opens on. Landing is the queue tab's keystroke, and
 creating, enqueuing and abandoning are the co-manager's levers.
 
-**And at the bottom, an ocean.** In whatever room the two blocks leave unused, a
-waterline with the same galleon the session-start greeting draws sitting on it,
-and nothing underneath it — the waterline is the last row of the panel, and the
-sea below it is left to the imagination rather than drawn as texture. It says
-nothing and tracks nothing; it is there because
-opening the panel should feel like something. Which is exactly why it is the
-first thing to go: it is drawn out of the leftovers and hands them back in a
-fixed order as the content grows, the ship first and the water second, until on
-a short pane there is no scene at all. No row of the table or the worktree list
-is ever clipped, scrolled or pushed off screen to keep it. Narrow works the same
-way: below the width the hull needs, the ship is absent rather than cut in half,
-and the waterline, being a tile, fits anything. The colour goes through the same
-handling as everything else here, so `NO_COLOR` and a non-colour terminal get
-plain ASCII.
-
-And it moves — slowly. The swell rolls a column about every two thirds of a
-second and the galleon rocks a column with it, on the same `CO_VISUALS` gate and
-the same timer as the dispatch flourish and the exit ship, so anything that says
-this terminal should not animate (`CO_VISUALS=minimal` or `off`, `NO_COLOR`, a
-reduced-motion signal, a pipe, `TERM=dumb`, a narrow screen) leaves the water
-still. It moves sideways only: the scene's height never changes with the frame,
-so the tide cannot cost a row any more than the scene can. The timer lives
-exactly as long as the sea is on screen — leave the tab, close the panel, shrink
-the pane until the content wants the rows, or let the co start streaming an
-answer, and it is gone until the sea comes back.
+The ocean underneath the two blocks is the panel's rather than this tab's — it
+is on every tab now, and described with the rest of the panel above. What has
+not changed is the rule it lives under: no row of the table or the worktree list
+is ever clipped, scrolled or pushed off screen to keep a glyph of it.
 
 ### Docs: read them here, and edit them here with `e`
 
