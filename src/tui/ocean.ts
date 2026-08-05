@@ -1,6 +1,14 @@
 /**
- * The ocean scene at the foot of the Ctrl-O home tab: a waterline with the
- * galleon from the session-start greeting riding on it, and nothing under it.
+ * The ocean scene at the foot of the Ctrl-O panel: a waterline with the galleon
+ * from the session-start greeting riding on it, and nothing under it.
+ *
+ * It belongs to the PANEL and not to one tab of it. The panel is the captain's
+ * home in this app and the ship is its character; confining it to the landing
+ * page made it decoration on a page rather than the room he is in, so it stays
+ * on screen as he moves between tabs and only the windows on its hull change.
+ * Nothing about the yield rule below is softened by that: it is drawn out of
+ * whatever rows each tab's own content left over, exactly as it always was, and
+ * no tab reserves so much as a row for it.
  *
  * Nothing is drawn below the waterline, and that is the point rather than an
  * omission. The scene used to carry a tiled sea floor on the row beneath, and on
@@ -39,7 +47,7 @@
  */
 
 import { c } from "../ui.js";
-import { GALLEON, GALLEON_HEIGHT, GALLEON_WIDTH, galleonRow, seaLine } from "./galleon.js";
+import { GALLEON_HEIGHT, GALLEON_WIDTH, galleonArt, galleonRow, seaLine } from "./galleon.js";
 
 /** Left inset: the same two columns every other row of the panel is indented by,
  *  so the water starts where the content starts. */
@@ -102,10 +110,31 @@ export const OCEAN_SHIP_MIN_ROWS = GALLEON_HEIGHT + SEA_ROWS + SEA_GAP;
 export const OCEAN_SEA_MIN_ROWS = SEA_ROWS + SEA_GAP;
 
 /**
+ * The ship's windows: one per tab in the panel's bar, in bar order, with the tab
+ * you are on lit.
+ *
+ * It is charm and not information — the bar itself already says where you are,
+ * in words and in a digit — so nothing here is load-bearing, nothing degrades
+ * into a claim, and a terminal with no colour simply gets an unlit ship. What it
+ * must not do is cost anything: the count changes the hull row's CONTENT and
+ * never its width or the scene's height, so a tab appearing mid-session cannot
+ * move a row of anybody's content.
+ */
+export interface Portholes {
+  /** How many windows the hull carries. */
+  count: number;
+  /** Which of them is lit, as an index into that same bar order. Out of range
+   *  (or a bar with nothing in it) lights none, which is a duller ship and
+   *  never a broken one. */
+  lit: number;
+}
+
+/**
  * The scene's own rows, top to bottom, with no leading padding: either the ship
  * over the sea, or the sea alone, or nothing. `spare` is how many rows of the
  * viewport the real content left unused, and `frame` is the tick this is being
- * drawn on (0 for still water).
+ * drawn on (0 for still water). `ports` gives the hull its windows; without it
+ * the ship carries the four it is authored with and none of them is lit.
  *
  * Both motions are HORIZONTAL, and that is a rule rather than an aesthetic: the
  * scene's height is what the yield arithmetic is written against, so a bobbing
@@ -113,7 +142,12 @@ export const OCEAN_SEA_MIN_ROWS = SEA_ROWS + SEA_GAP;
  * row of the task table at risk. The frame changes what is in the rows and
  * never how many there are.
  */
-export function oceanScene(cols: number, spare: number, frame = 0): string[] {
+export function oceanScene(
+  cols: number,
+  spare: number,
+  frame = 0,
+  ports?: Portholes,
+): string[] {
   const seaWidth = cols - SEA_LEFT - SEA_RIGHT;
   if (seaWidth < MIN_SEA_COLS) return [];
   if (spare < OCEAN_SEA_MIN_ROWS) return [];
@@ -133,7 +167,21 @@ export function oceanScene(cols: number, spare: number, frame = 0): string[] {
   // sway of one can move the hull but can never move it off the water.
   const centre = Math.floor((seaWidth - GALLEON_WIDTH) / 2);
   const margin = indent + " ".repeat(centre + sway(frame));
-  const ship = GALLEON.map((line, i) => galleonRow(margin + line, i, GALLEON_HEIGHT));
+  // The window columns are the art's own, so they ride the sway with the hull
+  // they are cut into rather than being absolute columns the ship drifts away
+  // from. Only the margin is added, and only on the row they are on.
+  const art = galleonArt(ports?.count, ports?.lit ?? null);
+  const lights = art.lights;
+  const ship = art.lines.map((line, i) =>
+    galleonRow(
+      margin + line,
+      i,
+      art.lines.length,
+      i === art.litRow && lights
+        ? { cols: lights.cols.map((col) => margin.length + col), lit: lights.lit }
+        : null,
+    ),
+  );
   return [...ship, ...sea];
 }
 
@@ -148,8 +196,13 @@ export function oceanScene(cols: number, spare: number, frame = 0): string[] {
  * push a row of content out of view, or invent a scroll position, or put a "more
  * below" count on the footer.
  */
-export function oceanRows(cols: number, spare: number, frame = 0): string[] {
-  const scene = oceanScene(cols, spare, frame);
+export function oceanRows(
+  cols: number,
+  spare: number,
+  frame = 0,
+  ports?: Portholes,
+): string[] {
+  const scene = oceanScene(cols, spare, frame, ports);
   if (scene.length === 0) return [];
   return [...new Array<string>(spare - scene.length).fill(""), ...scene];
 }

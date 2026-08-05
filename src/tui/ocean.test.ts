@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { GALLEON, GALLEON_HEIGHT, GALLEON_WIDTH } from "./galleon.js";
+import {
+  GALLEON,
+  GALLEON_HEIGHT,
+  GALLEON_PORTHOLE_ROW,
+  GALLEON_PORTHOLES,
+  GALLEON_WIDTH,
+  galleonArt,
+} from "./galleon.js";
 import {
   OCEAN_SEA_MIN_ROWS,
   OCEAN_SHIP_MIN_COLS,
@@ -150,6 +157,99 @@ test("the art is width-1 ASCII throughout, so the panel's columns cannot desync"
     }
   }
   assert.equal(GALLEON_WIDTH, Math.max(...GALLEON.map((l) => l.length)));
+});
+
+// --- the portholes -----------------------------------------------------------
+//
+// The hull carries one window per tab in the panel's bar. That is charm and not
+// information, so what these pin is that it cannot COST anything: the row keeps
+// its width at every count, the block keeps its height, and a count nobody
+// should ever pass still comes back as a ship.
+
+/** The windows on a hull row: their columns, left to right. */
+function windowsOf(row: string): number[] {
+  return [...row].flatMap((ch, i) => (ch === "o" ? [i] : []));
+}
+
+test("the authored ship is what the builder gives back at its own count", () => {
+  // The one guard against the row index drifting away from the art above it: if
+  // someone reorders a line of the block, this rebuild stops matching.
+  const art = galleonArt();
+  assert.deepEqual(art.lines, GALLEON, "no argument means the ship as typed");
+  assert.equal(art.litRow, GALLEON_PORTHOLE_ROW);
+  assert.equal(art.lights, null, "and no bar to carry, so the hull is plain timber");
+  assert.equal(
+    windowsOf(GALLEON[GALLEON_PORTHOLE_ROW]!).length,
+    GALLEON_PORTHOLES,
+    "the authored count is read off the authored row",
+  );
+});
+
+test("a count changes what is on the hull row and never how wide it is", () => {
+  const authored = GALLEON[GALLEON_PORTHOLE_ROW]!;
+  for (let n = 0; n <= 6; n++) {
+    const art = galleonArt(n);
+    const row = art.lines[GALLEON_PORTHOLE_ROW]!;
+    assert.equal(windowsOf(row).length, n, `${n} tabs put ${n} windows on the hull`);
+    assert.equal(row.length, authored.length, `${n}: the row is exactly as long as it was`);
+    assert.equal(art.lines.length, GALLEON_HEIGHT, `${n}: and the block exactly as tall`);
+    assert.equal(GALLEON_WIDTH, Math.max(...art.lines.map((l) => l.length)), `${n}: same ship width`);
+    assert.match(row, /^ \\[ o]+\/$/, `${n}: bow and stern untouched`);
+  }
+});
+
+test("the windows are centred on the hull, so a short bar is not a gap-toothed ship", () => {
+  for (const n of [1, 2, 3, 4, 5]) {
+    const row = galleonArt(n).lines[GALLEON_PORTHOLE_ROW]!;
+    const cols = windowsOf(row);
+    const lead = cols[0]! - 2; // past the bow
+    const trail = row.length - 1 - cols.at(-1)! - 1; // back from the stern
+    assert.ok(Math.abs(lead - trail) <= 1, `${n}: the run sits amidships (${lead} vs ${trail})`);
+  }
+});
+
+test("the lights name every window and light exactly one of them", () => {
+  for (let lit = 0; lit < 4; lit++) {
+    const art = galleonArt(4, lit);
+    assert.deepEqual(
+      art.lights?.cols,
+      windowsOf(art.lines[GALLEON_PORTHOLE_ROW]!),
+      `lit=${lit}: every window's column is handed over, not just the lit one`,
+    );
+    assert.equal(art.lights?.lit, lit, `window ${lit} is the one with the lamp in it`);
+  }
+  // A bar index that is not in the bar is a darkened ship, never a broken one —
+  // and its windows are still named, so they are still drawn as windows.
+  for (const lit of [-1, 4, 99]) {
+    const lights = galleonArt(4, lit).lights;
+    assert.equal(lights?.lit, null, `lit=${lit} lights nothing`);
+    assert.equal(lights?.cols.length, 4, `lit=${lit}: the four windows are still there`);
+  }
+});
+
+test("a nonsense count is still a ship", () => {
+  // Nothing in the panel can produce these — the bar has at most four tabs — and
+  // the scene must not be the thing that throws if something ever does.
+  for (const n of [-3, 0, 0.5, 999]) {
+    const row = galleonArt(n).lines[GALLEON_PORTHOLE_ROW]!;
+    assert.equal(row.length, GALLEON[GALLEON_PORTHOLE_ROW]!.length, `count ${n}: the hull holds`);
+    assert.match(row, /^ \\[ o]+\/$/, `count ${n}: still a hull`);
+  }
+});
+
+test("the scene passes the panel's windows through to the ship it draws", () => {
+  const hull = (ports?: { count: number; lit: number }): string =>
+    plain(oceanScene(WIDE, 40, 0, ports))[GALLEON_PORTHOLE_ROW]!;
+  assert.equal(windowsOf(hull()).length, GALLEON_PORTHOLES, "no bar means the authored ship");
+  assert.equal(windowsOf(hull({ count: 3, lit: 1 })).length, 3, "three tabs, three windows");
+  assert.equal(windowsOf(hull({ count: 2, lit: 0 })).length, 2, "two tabs, two windows");
+
+  // The sway moves the lit window with the hull rather than leaving it behind:
+  // the column is the art's own, so the two can never come apart.
+  for (const frame of [0, 1, 2, 3, 4, 7]) {
+    const rows = plain(oceanScene(WIDE, 40, frame, { count: 4, lit: 2 }));
+    assert.equal(windowsOf(rows[GALLEON_PORTHOLE_ROW]!).length, 4, `frame ${frame}: four windows still`);
+  }
 });
 
 // --- the tide ----------------------------------------------------------------

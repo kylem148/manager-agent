@@ -1860,9 +1860,9 @@ export class Tui implements SessionIO {
    *  laid out. It is what lets a moved selection scroll itself into view without
    *  the key handler having to reproduce the table's wrapping arithmetic. */
   private readonly homeTaskStarts = new Map<string, number>();
-  /** Whether the LAST layout of the Home tab actually got a scene out of its
-   *  leftovers. Set by homeTabRows and read by syncOcean, so the tide follows
-   *  what was drawn rather than a second guess at whether it would fit. */
+  /** Whether the LAST layout of a panel tab actually got a scene out of its
+   *  leftovers. Set by withOcean and read by syncOcean, so the tide follows what
+   *  was drawn rather than a second guess at whether it would fit. */
   private oceanDrawn = false;
   private panel: PanelState | null = null;
   private unsubscribeDocs: (() => void) | null = null;
@@ -2762,18 +2762,20 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * Start or stop the Home tab's tide, from the state the frame just painted.
+   * Start or stop the panel's tide, from the state the frame just painted.
    * Called at the end of every paint, which makes this the ONE place the timer's
    * life is decided — there is no start call sitting on a keybinding to be
-   * forgotten by the next route onto (or off) the tab.
+   * forgotten by the next route onto (or off) a tab.
    *
    * Every clause is a reason not to tick, and each is load-bearing:
    *
-   *   the panel is shut, or showing another tab — the sea is not on screen, and
-   *     a timer repainting a screen nobody can see is pure waste (the same
-   *     judgement openPanel already makes about the region).
-   *   the scene was not drawn — the content took the rows, or the terminal is
-   *     too narrow for water. There is nothing to animate, so nothing ticks.
+   *   the panel is shut — the sea is not on screen, and a timer repainting a
+   *     screen nobody can see is pure waste (the same judgement openPanel
+   *     already makes about the region).
+   *   the scene was not drawn — the content took the rows, the terminal is too
+   *     narrow for water, or an editor is up. Which TAB is showing is no longer
+   *     asked here: the scene rides under all of them now, so "was it drawn" is
+   *     the whole question and withOcean is the one place that answers it.
    *   a stream is open — model tokens own the frame (see appendStream).
    *   scenery may not move — CO_VISUALS, NO_COLOR, reduced motion, a pipe.
    *
@@ -2784,7 +2786,7 @@ export class Tui implements SessionIO {
     const running = this.visual?.kind === "ocean";
     const wanted =
       this.active &&
-      this.panel?.view.kind === "home" &&
+      this.panel !== null &&
       this.oceanDrawn &&
       this.open === null &&
       this.scenery();
@@ -6275,7 +6277,13 @@ export class Tui implements SessionIO {
   }
 
   /** One view as a frame. Split out of panelFrame so the popup can ask for the
-   *  frame of the view it is sitting on top of. */
+   *  frame of the view it is sitting on top of.
+   *
+   *  Every body that reaches the screen goes through withOcean on its way, which
+   *  is what makes the scene the panel's rather than one tab's. It appends only
+   *  into rows the body did not want, so every scroll clamp below still reads a
+   *  count the content earned: a decorated body is exactly a viewport tall, so
+   *  its own max is zero and it cannot page. */
   private viewFrame(v: PanelView): {
     tab: PanelTab;
     suffix: string;
@@ -6285,7 +6293,7 @@ export class Tui implements SessionIO {
     const panel = this.panel;
     if (!panel) return { tab: "home", suffix: "", body: [], start: 0 };
     if (v.kind === "home") {
-      const body = this.homeTabRows();
+      const body = this.withOcean("home", this.homeTabRows());
       // A feature landing (or being abandoned) shortens the list; never strand
       // the view past its end.
       const max = Math.max(0, body.length - this.overlayViewport());
@@ -6293,10 +6301,18 @@ export class Tui implements SessionIO {
       return { tab: "home", suffix: "", body, start: panel.homeScroll };
     }
     if (v.kind === "queue") {
-      return { tab: "queue", suffix: "", body: this.queueBody(), start: panel.queueScroll };
+      // queueBody() first: it clamps the scroll read on the next line, and it is
+      // the memoized rows that the scene is laid under rather than folded into,
+      // so the tide can roll on this tab without busting that memo.
+      const body = this.withOcean("queue", this.queueBody());
+      return { tab: "queue", suffix: "", body, start: panel.queueScroll };
     }
-    if (v.kind === "docs") return { tab: "docs", suffix: "", body: this.docsTabRows(panel), start: 0 };
-    if (v.kind === "doc") return { tab: "docs", suffix: v.name, body: v.rows, start: v.scroll };
+    if (v.kind === "docs") {
+      return { tab: "docs", suffix: "", body: this.withOcean("docs", this.docsTabRows(panel)), start: 0 };
+    }
+    if (v.kind === "doc") {
+      return { tab: "docs", suffix: v.name, body: this.withOcean("docs", v.rows), start: v.scroll };
+    }
     if (v.kind === "popup") return { tab: "queue", suffix: "", body: [], start: 0 };
     // Never reached in practice (panelFrame resolves a picker to the view it
     // opened over), and here so the switch stays total.
@@ -6305,7 +6321,7 @@ export class Tui implements SessionIO {
     return {
       tab: "review",
       suffix: pr ? `${pr.review.feature} → ${pr.review.target}` : "",
-      body: pr ? pr.rows : ["", "  " + c.dim("no review is pending.")],
+      body: this.withOcean("review", pr ? pr.rows : ["", "  " + c.dim("no review is pending.")]),
       start: pr ? pr.scroll : 0,
     };
   }
@@ -6579,25 +6595,62 @@ export class Tui implements SessionIO {
    * which was the complaint. So text that outgrows its room wraps instead, and a
    * long row costs a line or two rather than its meaning.
    *
-   * Under all of it, in whatever room the content did not use, an ocean. It is
-   * the one purely decorative thing in the panel, so it is drawn LAST and out of
-   * the leftovers: oceanRows() is handed the rows the content did not take and
-   * can only ever return that many, which is what makes the art unable to cost a
-   * row of content. As the content grows the ship goes first, then the water,
-   * then there is simply no scene. The list never gives up a line for it.
-   *
-   * The sea moves, on a frame this method only READS. It is a phase, not state:
-   * the row COUNT is a function of width and leftovers alone, so a tide running
-   * or stopped cannot change how much room the scene takes, and the scroll
-   * arithmetic that calls this for its own purposes gets the same answer at
-   * every frame. syncOcean decides whether the number ever changes.
+   * The ocean underneath all of it is not this tab's any more — it belongs to
+   * the panel, and viewFrame lays it under every tab out of that tab's own
+   * leftovers (see withOcean). Home is simply the tab it reads best on.
    */
   private homeTabRows(): string[] {
-    const content = [...this.taskTableRows(), "", ...this.worktreeRows()];
-    const spare = this.overlayViewport() - content.length;
-    const scene = oceanRows(this.cols, spare, this.visualFrame);
+    return [...this.taskTableRows(), "", ...this.worktreeRows()];
+  }
+
+  /**
+   * Lay the ocean under a tab's body, in whatever rows that body did not use.
+   *
+   * The scene is the one purely decorative thing in the panel, so it is added
+   * LAST and out of the leftovers: oceanRows() is handed the rows the content
+   * did not take and can only ever return that many, which is what makes the art
+   * unable to cost a row of content anywhere. As a body grows the ship goes
+   * first, then the water, then there is simply no scene — and a body that
+   * already fills the viewport (or overflows it and pages) never sees one at
+   * all. No tab reserves a row, and no viewport shrinks to make room.
+   *
+   * It rides under EVERY tab, and under an open doc, because the panel is the
+   * room and not the page: leaving it on Home alone made the ship a decoration
+   * you walked away from. What it is dropped for is the editor and the picker —
+   * the two boxes that ride on top. There the body is scenery behind something
+   * being typed into, most of it is covered by the box anyway, and water rolling
+   * in the gap around a document you are rewriting is noise. `panel.view.kind`
+   * is what says so, and it says so even here, on the call the popup makes for
+   * the view UNDERNEATH it.
+   *
+   * The hull's windows are this panel's tabs, in bar order, with the one being
+   * painted lit. The bar is read fresh, so a tab that appears mid-session (the
+   * feature_land review) puts a window on the ship on its next paint.
+   *
+   * The sea moves, on a frame this only READS. It is a phase, not state: the row
+   * COUNT is a function of width and leftovers alone, so a tide running or
+   * stopped cannot change how much room the scene takes, and the scroll
+   * arithmetic that calls this for its own purposes gets the same answer at
+   * every frame. syncOcean decides whether the number ever changes, and reads
+   * `oceanDrawn` — set here, on the one path that draws — to know whether there
+   * is anything on screen worth ticking for.
+   */
+  private withOcean(tab: PanelTab, body: string[]): string[] {
+    const kind = this.panel?.view.kind;
+    if (kind === "popup" || kind === "picker") {
+      this.oceanDrawn = false;
+      return body;
+    }
+    const tabs = this.panelTabs();
+    const lit = tabs.indexOf(tab);
+    const scene = oceanRows(
+      this.cols,
+      this.overlayViewport() - body.length,
+      this.visualFrame,
+      tabs.length > 0 ? { count: tabs.length, lit } : undefined,
+    );
     this.oceanDrawn = scene.length > 0;
-    return [...content, ...scene];
+    return scene.length === 0 ? body : [...body, ...scene];
   }
 
   /**

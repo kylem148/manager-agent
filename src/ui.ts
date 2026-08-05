@@ -23,6 +23,16 @@ export const c = {
   underline: (s: string) => wrap("4", s),
   strike: (s: string) => wrap("9", s),
   grey: (s: string) => wrap("90", s), // bright black — for light-grey ghost hints
+  // Two yellows a column apart have to be told apart at a glance, and the base
+  // palette cannot do it: a theme is free to put yellow and bright yellow at the
+  // same luminance, and Ghostty's default does (#f0c674 and #e7c547). So these
+  // two name their own colours out of the 256-colour cube — supported anywhere
+  // xterm-256color is, which is everywhere — and the step between them is a real
+  // one on every theme rather than one the theme is allowed to flatten.
+  // Both are true yellow (R and G equal, a little blue to take the acid off).
+  // Not 214, which is orange, and not 226, which is the harsh pure yellow.
+  lamp: (s: string) => wrap("38;5;185", s), // #d7d75f — a lit window
+  lampBright: (s: string) => wrap("38;5;227", s), // #ffff5f — the same yellow, brighter
   cyan: (s: string) => wrap("36", s),
   green: (s: string) => wrap("32", s),
   yellow: (s: string) => wrap("33", s),

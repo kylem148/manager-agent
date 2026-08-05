@@ -3466,23 +3466,112 @@ test("at a narrow width the ship is absent rather than clipped mid-hull", async 
   h.stop();
 });
 
-test("the scene is on Home alone: the other tabs are unchanged", async () => {
+// --- the scene belongs to the panel, not to Home -----------------------------
+//
+// The panel is the captain's home in this app and the ship is its character, so
+// it stays on screen as he moves between tabs. Everything above still holds
+// unchanged on every one of them: the scene is drawn out of the rows that tab's
+// own content left over, and no tab reserves a row for it.
+
+/** The interior of the ship's hull row — the span the windows are cut into —
+ *  or "" when there is no ship on screen. The row below it is the waterline
+ *  crest, which is `~` and `-` and so can never match this. */
+function hull(h: Harness): string {
+  const row = bodyRows(h).find((r) => /\\[ o]+\//.test(r));
+  return row ? (/\\([ o]+)\//.exec(row)?.[1] ?? "") : "";
+}
+
+/** How many windows the hull is carrying. */
+function windows(h: Harness): number {
+  return [...hull(h)].filter((ch) => ch === "o").length;
+}
+
+test("the scene follows the captain from tab to tab", async () => {
   const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(fakeDocs({ "plan.md": "# Plan\n" }), 90, 34, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  // Tall, because the queue tab's own content is the tallest of the three: the
+  // rule is unchanged everywhere, so "given the room" is per tab, not per panel.
+  const h = harness(fakeDocs({ "plan.md": "# Plan\n" }), 90, 48, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
   h.tui.question();
   h.send(CTRL_O);
   await settle();
   assert.ok(h.lastFramePlain().includes("~~~^"), "Home has it");
+  assert.ok(h.lastFramePlain().includes("|>>=x"), "the ship and all");
 
   h.send("2");
   await settle();
-  assert.ok(!h.lastFramePlain().includes("~~~^"), "the queue tab does not");
+  assert.ok(h.lastFramePlain().includes("~~~^"), "and so does the queue tab");
+  assert.ok(h.lastFramePlain().includes("|>>=x"), "with the same ship on it");
+  assert.match(h.lastFramePlain(), /#42/, "which has not cost the head its pull request");
+
   h.send("3");
   await settle();
-  assert.ok(!h.lastFramePlain().includes("~~~^"), "nor does the docs tab");
+  assert.ok(h.lastFramePlain().includes("~~~^"), "and the docs tab");
+  assert.match(h.lastFramePlain(), /a\) plan\.md/, "with the list still whole above it");
+
   h.send("1");
   await settle();
   assert.ok(h.lastFramePlain().includes("~~~^"), "and it is still there on the way back");
+  h.stop();
+});
+
+test("the hull carries one window per tab, and gains one when a tab appears", async () => {
+  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
+  const h = harness(fakeDocs({ "plan.md": "# Plan\n" }), 90, 48, q, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  assert.equal(tabsOf(h).length, 3, "three tabs in the bar");
+  assert.equal(windows(h), 3, "so three windows on the ship");
+
+  const before = hull(h);
+  h.send("2");
+  await settle();
+  assert.equal(windows(h), 3, "the same three from the queue tab");
+  assert.equal(hull(h), before, "and in the same places: only the lit one moved, and colour says which");
+
+  // A pending review takes the fourth place in the bar, mid-session.
+  const p = h.tui.openLandingReview(fakeReview(GREEN));
+  await settle();
+  assert.equal(tabsOf(h).length, 4, "the review joined the bar");
+  assert.equal(windows(h), 4, "and the ship cut another window for it");
+
+  // The row never changes WIDTH, whatever it is carrying — the scene's
+  // arithmetic is written against a fixed hull.
+  assert.equal(hull(h).length, before.length, "the hull is exactly as long as it was");
+
+  h.send("4");
+  await settle();
+  h.send("r");
+  assert.equal(await p, "rejected");
+  h.stop();
+});
+
+test("an open doc keeps the scene; editing one takes it away", async () => {
+  // `e` refuses on a source that cannot write, so this one can — and never has
+  // to, because the test walks away from the editor rather than saving.
+  const docs: DocSource = {
+    ...fakeDocs({ "plan.md": "# Plan\n\nShip it.\n" }),
+    write: () => Promise.resolve({ saved: true, summary: "saved" }),
+  };
+  const h = harness(docs, 90, 34, undefined, fakeFeatures(FEATURES), fakeTasks(TASKS));
+  h.tui.question();
+  h.send(CTRL_O);
+  await settle();
+  h.send("2"); // the docs tab
+  await settle();
+  h.send("a"); // and into the document itself
+  await settle();
+  assert.match(h.lastFramePlain(), /Ship it\./, "the doc is open");
+  assert.ok(h.lastFramePlain().includes("~~~^"), "reading one is still being in the room");
+
+  h.send("e");
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("~~~^"), "but writing one is not: the water goes");
+  assert.ok(!h.lastFramePlain().includes("|>>=x"), "ship and all");
+
+  h.send(ESC); // an untouched buffer needs no second press
+  await settle();
+  assert.ok(h.lastFramePlain().includes("~~~^"), "and comes back when the editor closes");
   h.stop();
 });
 
@@ -3574,21 +3663,37 @@ test("the tide stops dead when the panel closes", async () => {
   h.stop();
 });
 
-test("leaving Home stops the tide; coming back picks it up again", async () => {
-  const q = mergeableQueue(READY_VIEW, READY_DETAIL);
-  const h = harness(undefined, 90, 34, q, fakeFeatures(FEATURES), fakeTasks(TASKS), () => true);
+test("the tide rolls on across a tab change, and the editor stops it dead", async () => {
+  // Wide open on rows, because the queue tab has to have room for a scene of its
+  // own before it can prove the tide came with it. `editPrMessage` is wired so
+  // `e` actually opens the box (a source without it refuses and opens nothing).
+  const q: QueuePanelSource = {
+    ...mergeableQueue(READY_VIEW, READY_DETAIL),
+    editPrMessage: () => Promise.resolve({ saved: true, summary: "saved" }),
+  };
+  const h = harness(undefined, 90, 48, q, fakeFeatures(FEATURES), fakeTasks(TASKS), () => true);
   h.tui.question();
   h.send(CTRL_O);
   await settle();
-  h.send("2"); // the queue tab: no sea on it
-  await settle();
-  await quiet(h, "a tab with no scene must not be ticking");
 
-  h.send("1");
+  h.send("2"); // the queue tab, which has a sea of its own now
+  await settle();
+  assert.ok(h.lastFramePlain().includes("~~~^"), "the scene came with him");
+  const moved = paints(h);
+  await tick();
+  assert.ok(paints(h) > moved, "and so did the tide, without being restarted");
+
+  // The editor is the boundary: a box being typed into gets no water behind it.
+  h.send("e");
+  await settle();
+  assert.ok(!h.lastFramePlain().includes("~~~^"), "no scene under the editor");
+  await quiet(h, "and nothing ticking behind it either");
+
+  h.send(ESC);
   await settle();
   const back = paints(h);
   await tick();
-  assert.ok(paints(h) > back, "Home starts it again on arrival");
+  assert.ok(paints(h) > back, "closing it gives the sea and the tide back");
   h.stop();
 });
 
