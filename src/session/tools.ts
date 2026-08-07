@@ -300,7 +300,17 @@ export function toolDefinitions(opts: { dispatch?: boolean } = {}): Tool[] {
       name: "feature_resolve_head",
       description:
         "ARM a fresh crew agent to unblock the merge-queue head when it is blocked by a rebase conflict or a red CI check. The agent runs in the feature's own worktree (never dev), fires only on the captain's typed `confirm`, is bounded to a few attempts, and the head re-processes itself when it finishes. Use this on a blocked head instead of resolving anything yourself.",
-      input_schema: { type: "object", properties: {}, additionalProperties: false },
+      input_schema: {
+        type: "object",
+        properties: {
+          context: {
+            type: "string",
+            description:
+              "Optional guidance on intent for the resolver, e.g. which side of the conflict must win.",
+          },
+        },
+        additionalProperties: false,
+      },
     });
     tools.push({
       name: "feature_abandon",
@@ -363,9 +373,12 @@ export interface ExecutorContext {
   features?: FeatureManager;
   /**
    * Arm a resolver dispatch for the blocked merge-queue head. Confirm-gated
-   * like onArmDispatch; launches nothing. Supplied only when linked.
+   * like onArmDispatch; launches nothing. Supplied only when linked. The
+   * optional context is the co's guidance on intent, appended to the resolver
+   * order and shown to the captain in the arm banner; it is pass-through only,
+   * never stored.
    */
-  onArmResolve?: () => Promise<
+  onArmResolve?: (context?: string) => Promise<
     { armed: true; summary: string } | { armed: false; reason: string }
   >;
   /** The persisted task table, shared with the captain's panel. Always wired
@@ -740,7 +753,8 @@ export function makeExecutor(ctx: ExecutorContext) {
               "Resolving the head needs the confirm-gated dispatch path, which is unavailable in this session (not linked, or non-interactive).",
             );
           }
-          const res = await ctx.onArmResolve();
+          const context = String(input.context ?? "").trim();
+          const res = await ctx.onArmResolve(context || undefined);
           if (!res.armed) return err(id, res.reason);
           // Armed, not run. Same interlock as dispatch_order.
           return ok(id, {

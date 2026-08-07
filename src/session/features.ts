@@ -898,8 +898,13 @@ export class FeatureManager {
    * The order NAMES the failing checks (and links them) when the block is a red
    * check: co cannot run the suite itself, so the one useful thing it can hand a
    * resolver is exactly what GitHub said went wrong.
+   *
+   * `context` is the navigator's guidance on intent (e.g. which side of the
+   * conflict must win), appended verbatim to the order as guidance that never
+   * outranks its procedure or hard rules. Pass-through only: absent or blank
+   * yields the exact order this method always built, and nothing is stored.
    */
-  planResolveHead(): ResolveHeadPlan {
+  planResolveHead(context?: string): ResolveHeadPlan {
     const gate = this.queue.canResolveHead();
     if (!gate.ok) return { ok: false, reason: gate.reason };
     const record = this.findRecord(gate.feature);
@@ -921,6 +926,7 @@ export class FeatureManager {
         ? failedChecks(blocked.checks).map((r) => (r.link ? `${r.name} (${r.link})` : r.name))
         : [],
       ...(blocked?.checks ? { checksSummary: checksLine(blocked.checks) } : {}),
+      ...(context?.trim() ? { context: context.trim() } : {}),
     });
     return {
       ok: true,
@@ -1047,6 +1053,8 @@ function buildResolveOrder(opts: {
   checksSummary?: string;
   prNumber?: number;
   prUrl?: string;
+  /** Navigator guidance on intent, appended verbatim; never outranks the rules. */
+  context?: string;
 }): string {
   const { feature, branch, target, kind, reason, failedChecks: failing, checksSummary } = opts;
   const prRef = opts.prNumber ? `PR #${opts.prNumber}${opts.prUrl ? ` (${opts.prUrl})` : ""}` : "its pull request";
@@ -1087,6 +1095,16 @@ function buildResolveOrder(opts: {
     ``,
     `When the rebase is clean, what CI called out is fixed, and everything is committed, you are done. The queue`,
     `re-pushes the branch and re-reads ${prRef}'s checks; those are the verdict, not your own say-so.`,
+    // The navigator's intent, when supplied. Guidance only: it informs choices
+    // the procedure leaves open (which side of a conflict wins), and the framing
+    // line keeps the procedure and HARD RULES above it in charge.
+    ...(opts.context
+      ? [
+          ``,
+          `Navigator context (guidance on intent for your resolution; the procedure and HARD RULES above still bind):`,
+          opts.context,
+        ]
+      : []),
   ];
   return lines.join("\n");
 }

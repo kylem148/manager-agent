@@ -1809,6 +1809,54 @@ test("planResolveHead refuses when the head is not blocked by a fixable conflict
   }
 });
 
+test("planResolveHead carries navigator context verbatim, and without it nothing changes", async () => {
+  const seen: LandingReview[] = [];
+  const fx = await makeFixture(approvingHost(seen));
+  try {
+    // The same conflict shape as the resolve-path test: land base, block follow.
+    const a = await fx.features.create("base");
+    const b = await fx.features.create("follow");
+    await commitIn(a.feature.worktreePath, "file.txt", "from base\n", "job: base");
+    await commitIn(b.feature.worktreePath, "file.txt", "from follow\n", "job: follow");
+    await fx.features.enqueue("base");
+    assert.equal((await fx.features.mergeReadyHead()).merged, true);
+    const eb = await fx.features.enqueue("follow");
+    assert.equal(eb.enqueued, true);
+    if (!eb.enqueued) return;
+    assert.equal(eb.head?.status, "blocked");
+
+    const bare = fx.features.planResolveHead();
+    const blank = fx.features.planResolveHead("   \n  ");
+    const guidance = "Keep follow's version of file.txt; base's edit is superseded by this branch.";
+    const guided = fx.features.planResolveHead(guidance);
+    assert.equal(bare.ok, true);
+    assert.equal(blank.ok, true);
+    assert.equal(guided.ok, true);
+    if (!bare.ok || !blank.ok || !guided.ok) return;
+
+    // Absent and blank are the same order, byte for byte — the no-context path
+    // is exactly what it was before context existed.
+    assert.equal(blank.order, bare.order);
+
+    // Context is APPENDED: the standing order (procedure, bounds, HARD RULES)
+    // is untouched ahead of it, and the framing line subordinates the guidance
+    // to those rules rather than letting the last word override them.
+    assert.ok(guided.order.startsWith(bare.order), "the hardcoded order is byte-identical up front");
+    const tail = guided.order.slice(bare.order.length);
+    assert.match(tail, /Navigator context \(guidance on intent/);
+    assert.match(tail, /the procedure and HARD RULES above still bind/);
+    assert.ok(tail.includes(guidance), "the guidance itself lands verbatim");
+
+    // Pass-through only: a later call without context carries nothing over.
+    const after = fx.features.planResolveHead();
+    assert.equal(after.ok, true);
+    if (!after.ok) return;
+    assert.equal(after.order, bare.order, "context is never stored or reused");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
 test("feature_list and feature_status surface queue position and head state", async () => {
   const fx = await makeFixture();
   try {

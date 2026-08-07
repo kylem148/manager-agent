@@ -989,7 +989,9 @@ async function drive(
       ? { onArmDispatch: (order: string, feature?: string) => armDispatch(state, order, feature) }
       : {}),
     ...(state.features ? { features: state.features } : {}),
-    ...(state.dispatch && state.features ? { onArmResolve: () => armResolve(state) } : {}),
+    ...(state.dispatch && state.features
+      ? { onArmResolve: (context?: string) => armResolve(state, context) }
+      : {}),
     // The task table the Home tab paints. Always wired: it is the co's own state
     // and outlives any link to a repo.
     tasks: state.tasks,
@@ -1183,11 +1185,16 @@ async function maybeCompact(state: SessionState): Promise<void> {
  * the order and shows the confirm banner; it launches NOTHING. Returns a short
  * summary for the tool result. Re-arming replaces any prior armed order — only
  * one can be pending, and the last one the model staged this turn wins.
+ *
+ * `extraBannerLines` are appended to the confirm banner, after the order line.
+ * Display only — they change nothing about what fires. The resolver arm uses
+ * them to put its navigator context in front of the captain verbatim.
  */
 async function armDispatch(
   state: SessionState,
   order: string,
   feature?: string,
+  extraBannerLines?: string[],
 ): Promise<{ armed: true; summary: string } | { armed: false; reason: string }> {
   // Read the config the NEXT dispatch will actually use, re-reading disk so a
   // mid-session `co link` is reflected. Without this the banner shows the config
@@ -1254,6 +1261,7 @@ async function armDispatch(
     c.dim(`  target: ${targetLine}`),
     ...(overrideHint ? [c.dim(overrideHint)] : []),
     c.dim(`  order: ${firstLineOf(order)}`),
+    ...(extraBannerLines ?? []),
   ]);
   const targetSummary = target
     ? ` It targets feature '${target}' (its isolated worktree${
@@ -1337,14 +1345,26 @@ function laneForConfirm(
  * flagged `resolve` so the fire path marks the head "resolving" and the
  * completion drain re-processes it. Launches nothing. Refuses cleanly when there
  * is no resolvable head.
+ *
+ * `context` is the co's guidance on intent for the resolver (which side of the
+ * conflict must win). It rides the order verbatim and goes into the confirm
+ * banner so the captain approves the guidance along with the command. Absent or
+ * blank, the arm is exactly what it always was; nothing is stored either way.
  */
 async function armResolve(
   state: SessionState,
+  context?: string,
 ): Promise<{ armed: true; summary: string } | { armed: false; reason: string }> {
   if (!state.features) return { armed: false, reason: "Feature levers are unavailable (not linked)." };
-  const plan = state.features.planResolveHead();
+  const guidance = context?.trim() || undefined;
+  const plan = state.features.planResolveHead(guidance);
   if (!plan.ok) return { armed: false, reason: plan.reason };
-  const res = await armDispatch(state, plan.order, plan.feature);
+  // The banner's order line is one line; the context must be seen whole, so it
+  // gets its own lines, verbatim, under the same dim weight as the rest.
+  const contextLines = guidance
+    ?.split("\n")
+    .map((line, i) => c.dim(i === 0 ? `  navigator context: ${line}` : `    ${line}`));
+  const res = await armDispatch(state, plan.order, plan.feature, contextLines);
   if (!res.armed) return res;
   // Tag the armed order as a resolver so fireDispatch drives the queue's
   // resolving/re-process transitions instead of a plain review-on-completion.
@@ -1355,6 +1375,7 @@ async function armResolve(
     summary:
       `Resolver for head '${plan.feature}' (blocked by ${kindWord}, attempt ${plan.attempt}/${plan.maxAttempts}) armed. ` +
       `It will run in that feature's own worktree on its branch and never touch dev. ` +
+      (guidance ? `Your context rides the order and is shown to the captain verbatim. ` : "") +
       res.summary,
   };
 }
