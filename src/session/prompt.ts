@@ -51,8 +51,10 @@ export const SECTION_BUDGETS: Record<string, number> = {
   voice: 1_920, // 6%
 };
 
-/** The serialized tool definitions' share of the same 32K. */
-export const TOOLS_BUDGET_BYTES = 10_240; // 32%
+/** The serialized tool definitions' share of the same 32K. Raised from 32%
+ *  when the resolver's context parameter took the measured size to 10,370
+ *  bytes, 130 over the old guard; the next whole percent leaves ~190 spare. */
+export const TOOLS_BUDGET_BYTES = 10_560; // 33%
 
 const IDENTITY = `You are the co-manager: navigator for one software project, a persistent
 architectural thinking partner. You are not a coding agent.
