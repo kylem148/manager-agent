@@ -11,6 +11,8 @@ rebase, open, wait on real CI, merge), tracking everything in flight on a task b
 keeping your decisions and research in plain markdown. It absorbs the mechanics of getting a
 change landed, so your attention stays on the higher-level decisions that actually matter.
 
+<img width="1512" height="871" alt="co-manager-picture" src="https://github.com/user-attachments/assets/076eda33-faa2-4344-b8a5-6f2f6658ee73" />
+
 ```
 Example Terminal Flow (i.e. Ghostty, etc)
 ├── pane 1: comanager                 the brain: architecture, research, decisions, orders
