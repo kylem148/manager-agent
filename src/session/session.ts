@@ -1,10 +1,23 @@
 import * as readline from "node:readline";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { EFFORT_LEVELS, parseEffort, type Config, type Effort } from "../config.js";
-import type { InstancePaths } from "../paths.js";
-import { ModelProvider, type MessageParam } from "../model.js";
-import { buildSystemPrompt } from "./prompt.js";
+import {
+  DEFAULT_MODEL_ID,
+  MODEL_CHOICES,
+  MODEL_ID_KEY,
+  effortLevelsFor,
+  isPlausibleModelId,
+  parseEffort,
+  persistInstanceModel,
+  resolveModelOrigin,
+  type Config,
+  type Effort,
+  type ModelOrigin,
+} from "../config.js";
+import type { InstancePaths, LiveFile } from "../paths.js";
+import { CACHE_TTL, ModelProvider, apiErrorText, type MessageParam } from "../model.js";
+import { CostLedger, formatCostReport } from "../cost.js";
+import { buildSystemPrompt, buildStartupInjection } from "./prompt.js";
 import {
   toolDefinitions,
   makeExecutor,
@@ -22,10 +35,32 @@ import {
   appendTranscript,
   type TranscriptHandle,
 } from "../memory/memory.js";
-import { listDocs, readDoc } from "../memory/docs.js";
+import { DocError, listDocs, overwriteDocIfUnchanged, readDoc } from "../memory/docs.js";
 import { onWrite } from "../memory/writequeue.js";
 import { c, line, write } from "../ui.js";
-import { Tui, WAKE_SENTINEL, type SessionIO, type DocSource } from "../tui/tui.js";
+import { isConfirmVerb } from "../confirmverb.js";
+import {
+  Tui,
+  WAKE_SENTINEL,
+  NO_ANIMATION,
+  type AnimationHandle,
+  type AnimationSpec,
+  type SessionIO,
+  type DocSaveResult,
+  type DocSource,
+  type ModelPickerEntry,
+  type PrMessageSaveResult,
+  type QueueMergeResult,
+} from "../tui/tui.js";
+import {
+  currentVisuals,
+  dispatchFlourish,
+  dispatchLabel,
+  exitVoyage,
+  savingLabel,
+  type DispatchTarget,
+  type EffectiveVisuals,
+} from "../tui/visuals.js";
 import { SLASH_COMMANDS } from "../tui/commands.js";
 import { pirateBanner } from "../tui/banner.js";
 import { LOG_NAMES, type LogName } from "../paths.js";
@@ -36,11 +71,31 @@ import {
   resolveAgentCommand,
   type DispatchConfig,
 } from "./dispatchconfig.js";
-import { DispatchRegistry, readFileTail, type Job } from "./registry.js";
+import { DispatchRegistry, type Job } from "./registry.js";
+import { readOnlyEnforcement, type ActiveAgent, type DispatchLane } from "./lanes.js";
 import { FeatureManager } from "./features.js";
-import { defaultWorktreeBase, featureSlug } from "./worktrees.js";
-import { scrubCapture } from "./transport.js";
-import { findCrewTranscript, renderTranscriptForReview } from "./crewtranscript.js";
+import { FeatureStore } from "./featurestore.js";
+import { TaskError, TaskStore } from "./taskstore.js";
+import { startCacheKeepAlive, type KeepAlive } from "./keepalive.js";
+import { applyCompaction, planCompaction } from "./compaction.js";
+import type { MergeHeadResult } from "./mergequeue.js";
+import {
+  DEFAULT_FEATURE_BRANCH_TYPE,
+  checkRepoPath,
+  defaultWorktreeBase,
+  featureSlug,
+} from "./worktrees.js";
+import { resolveReviewRecord } from "./reviewrecord.js";
+import {
+  firstLineOf,
+  flushHistoryNotes,
+  noteDispatchCancelled,
+  noteDispatchFired,
+  noteDispatchLaunchFailed,
+  noteDocEdited,
+  noteMergeOutcome,
+  type HistoryNoteSink,
+} from "./historynotes.js";
 
 /**
  * Interactive terminal session for one co-manager instance.
@@ -85,10 +140,58 @@ interface SessionState {
    *  callback; consumed by the confirm interlock in the input loop. `feature`
    *  scopes the dispatch to a feature's worktree (undefined = bare main tree).
    *  `resolve` marks a merge-queue resolver dispatch: on fire the head is moved
-   *  to "resolving" and re-processed when the agent finishes. */
-  armed: { order: string; feature?: string; resolve?: boolean } | null;
+   *  to "resolving" and re-processed when the agent finishes. `occupied` records
+   *  whether the target worktree already had a live crew agent when the banner
+   *  was shown — i.e. whether the captain was offered the lane choice at all
+   *  (D-20260729-5); the lane itself is decided fresh at fire time. */
+  armed: { order: string; feature?: string; resolve?: boolean; occupied?: boolean } | null;
   /** Completed jobs waiting for a review turn, drained on the next idle prompt. */
   reviewQueue: Job[];
+  /**
+   * Out-of-band turns the co owes the captain, drained on the next idle prompt
+   * exactly like reviewQueue. The merge queue is the only producer today: the
+   * captain's panel-native [m] runs entirely outside the agent loop, so when it
+   * leaves the NEW head blocked (or the merge itself is refused) this is how that
+   * reaches the co — it wakes, reads what happened, and can arm the resolver
+   * without the captain having to re-explain any of it (D-20260724-12). A merge
+   * that lands cleanly queues NOTHING: co is deliberately not in that loop.
+   */
+  queueNotices: string[];
+  /**
+   * The other half of the same queue: one-line records of events the co must
+   * have SEEN but must not be woken for — an armed dispatch resolving (fired or
+   * cancelled), the captain's [m], and a doc he edited himself in the panel.
+   * Same single path into the model's history as queueNotices, a user-role
+   * `SYSTEM:` message; the difference is that these are flushed into the history
+   * ahead of the next turn rather than drained by driving one, so nothing here
+   * costs a model call or a word on screen. See historynotes.ts for why they are
+   * buffered rather than pushed in place.
+   */
+  historyNotes: string[];
+  /**
+   * `Date.now()` when the last model turn finished, or null before the first.
+   *
+   * Exists to measure the gap the captain spends thinking between turns, which
+   * is the thing the cache TTL is a bet on: the entry lives 5 minutes or an hour
+   * from its last hit, so the distribution of these gaps decides whether we are
+   * paying a 2x write premium for protection we need or for pauses that were
+   * never long enough to matter. Kept on the session rather than the provider
+   * because it measures the CAPTAIN's time, not the model's — the provider only
+   * ever sees the intervals it was awake for.
+   */
+  lastTurnEndedAt: number | null;
+  /** True while a model turn is in flight, so the cache keep-alive stands down
+   *  rather than racing a real request for the same cache entry. */
+  inTurn: boolean;
+  /** The cache keep-alive, or null when disabled. Owned here so every turn can
+   *  reset its clock and the exit path can stop it. */
+  keepAlive: KeepAlive | null;
+  /** The co's at-a-glance task table (the Ctrl-O Home tab). Loaded at session
+   *  start, so the panel shows the last table the co wrote before it says a word
+   *  this session. */
+  tasks: TaskStore;
+  /** The token/cost meter. Fed after every turn, shown only by /cost. */
+  costs: CostLedger;
 }
 
 const PROMPT_LABEL = c.cyan("you › ");
@@ -153,12 +256,81 @@ const BUSY_CHORES = [
  * write, and only the doc tier emits there, so the hidden substrate stays
  * invisible to this feature.
  */
-function docSource(paths: InstancePaths): DocSource {
+export function docSource(
+  paths: InstancePaths,
+  write: DocSource["write"],
+): DocSource {
   return {
     list: () => listDocs(paths),
     read: (name) => readDoc(paths, name),
     subscribe: (listener) => onWrite((e) => listener(e.name)),
+    ...(write ? { write } : {}),
   };
+}
+
+/** What panelWriteDoc needs, and nothing more: where the docs are, the note
+ *  buffer the line goes into, and one line for the session's own record.
+ *  `messages` is the history that buffer eventually flushes into, carried here
+ *  so a test can assert the save pushed nothing into it on the spot. */
+export interface DocEditContext extends HistoryNoteSink {
+  paths: InstancePaths;
+  messages: MessageParam[];
+  note(line: string): void;
+}
+
+/**
+ * The panel's `e` → Ctrl-S on a doc: write the captain's buffer to the file.
+ *
+ * The twin of panelEditPrMessage, and deliberately shaped like it: it runs
+ * outside the agent loop, it never throws into the Tui, and a failure comes back
+ * as a result the popup prints over the captain's still-intact buffer. Two
+ * things differ, and both come from the file being the co's own working memory
+ * rather than GitHub's copy of a message:
+ *
+ *  - it goes through overwriteDocIfUnchanged, so a doc the co rewrote while the
+ *    popup was open is reported instead of overwritten, and the write itself
+ *    shares the one serialized lane every other doc write uses;
+ *  - it leaves ONE line in the model's history naming the file, buffered through
+ *    the same path an armed dispatch and the captain's [m] use, so the co learns
+ *    the copy it was handed at startup is stale without a turn being driven to
+ *    tell it. See noteDocEdited for what that line says and why it stops there.
+ */
+export async function panelWriteDoc(
+  ctx: DocEditContext,
+  edit: { name: string; content: string; baseline: string },
+): Promise<DocSaveResult> {
+  try {
+    const res = await overwriteDocIfUnchanged(ctx.paths, edit.name, edit.content, edit.baseline);
+    noteDocEdited(ctx, res.name);
+    ctx.note(`  · wrote docs/${res.name} (${res.bytes} bytes)`);
+    return { saved: true, summary: `saved docs/${res.name}` };
+  } catch (e) {
+    const changed = e instanceof DocError && e.code === "DOC_CHANGED";
+    const error =
+      (e instanceof DocError ? e.message : `${edit.name} could not be written: ${(e as Error).message}`) +
+      (changed ? " Copy your text out with Ctrl-Y, then reopen the doc." : "");
+    return { saved: false, summary: error, error };
+  }
+}
+
+/**
+ * Run one of the captain's task-table writes for the panel.
+ *
+ * The store has already mutated in memory by the time this is called (its
+ * operations do that synchronously and only the file write is awaited), so the
+ * panel repaints immediately and this settles a moment later with the verdict.
+ * A refusal — a full table, a row the co retired between the paint and the
+ * keystroke — comes back as the one line the panel has room for, never as a
+ * thrown error over a session.
+ */
+async function taskWrite(op: Promise<unknown>): Promise<{ ok: boolean; message?: string }> {
+  try {
+    await op;
+    return { ok: true };
+  } catch (e) {
+    if (e instanceof TaskError) return { ok: false, message: e.message };
+    return { ok: false, message: `the task table could not be written: ${(e as Error).message}` };
+  }
 }
 
 /** The chore showing right now, so we never pick the same one twice running —
@@ -223,8 +395,32 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
   // co-manager writes plain-text orders exactly as before.
   const dispatch = await readDispatchConfig(paths);
 
-  const system = await buildSystemPrompt(paths, cfg.research, {
+  // The durable half of a feature record: the one-line intents the co authored at
+  // create time, and the PR title/body it authored at enqueue. Everything else
+  // about a feature is rebuilt from git by the boot reconcile below; that prose is
+  // what git cannot recover, so it is read back from disk here — which is what
+  // lets a recovered worktree still show its description, and a head re-processed
+  // after a restart still open its pull request with the message the co wrote.
+  const featureStore = await FeatureStore.load(paths);
+
+  // The captain's at-a-glance task table, painted AND edited on the panel's Home
+  // tab. Loaded whether or not the instance is linked — the table needs no repo
+  // — and a missing or corrupt file is simply an empty table.
+  const taskStore = await TaskStore.load(paths);
+
+  // The spend meter. Loads before the first turn (including the cold-start
+  // greeting, which is a real billed turn) and is otherwise silent all session.
+  const costs = await CostLedger.load(paths);
+
+  // The resident prompt is static (identity + behaviour + tools); everything
+  // per-instance rides the startup injection below, as the first message of
+  // history, where it ages and scrolls like the state it is.
+  const system = buildSystemPrompt({ dispatch: Boolean(dispatch) });
+  const briefing = await buildStartupInjection(paths, cfg.research, {
     excludeTranscript: transcript.file,
+    // The table is read ONCE, here. The captain edits it all session from the
+    // panel; the co reads the current table with `task_table list`.
+    tasks: taskStore.list(),
     dispatch: dispatch
       ? {
           repoPath: dispatch.repoPath,
@@ -245,10 +441,60 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     ? new Tui({
         promptLabel: PROMPT_LABEL,
         header,
-        docs: docSource(paths),
+        // Whether the sea at the foot of the Home tab may move. The Tui starts
+        // that one itself (there is no caller to hand it a spec), so the
+        // CO_VISUALS decision has to reach it as a predicate instead — resolved
+        // per call for the same reason visualsFor is, and hard-coded plainIO
+        // false because this branch IS the Tui.
+        scenery: () => currentVisuals({ plainIO: false }).animate,
+        // `e` on an open doc edits it in the same popup the queue tab's `e`
+        // opens on a PR message, and Ctrl-S lands here. Wired unconditionally —
+        // the docs are the co's own memory and need no link to a repo — and
+        // sandboxed by construction: the name can only ever be one `list`
+        // already vetted, so `.memory/` is as unreachable through the write as
+        // it is through the read.
+        docs: docSource(paths, (edit) =>
+          panelWriteDoc(
+            {
+              paths,
+              messages: state.messages,
+              historyNotes: state.historyNotes,
+              note: (l) => state.io.appendBlock(c.dim(l)),
+            },
+            edit,
+          ),
+        ),
+        // The Home tab's task table: read fresh at paint time,
+        // so a row either writer added shows on the next paint. Wired whether or
+        // not the instance is linked, so Ctrl-O always has a Home.
+        //
+        // The four writes are the captain's own keys (a/e/x/s), calling straight
+        // into the SAME store the co's task_table tool holds — one table with
+        // two writers, not two copies of one. Each names a single row, so
+        // neither writer can clobber the other's, and a refusal (a full table, a
+        // row that has since moved) comes back as a line the panel prints rather
+        // than an exception.
+        //
+        // `list` hands over STORED order; the panel paints it building-first
+        // through the shared helper, exactly as the tool and the live-state
+        // block do. Sorting here instead would give the panel one order and the
+        // tool another the day one of them stopped calling it.
+        tasks: {
+          list: () => taskStore.list(),
+          add: (task) => taskWrite(taskStore.add(task)),
+          setStatus: (task, status) => taskWrite(taskStore.setStatus(task, status)),
+          rename: (task, next) => taskWrite(taskStore.rename(task, next)),
+          retire: (task) => taskWrite(taskStore.retire(task)),
+        },
         // The merge-queue panel tab only exists when the instance is linked (a
         // queue needs a repo). Read fresh at paint time via the FeatureManager,
         // which is created below; the closure is never called before then.
+        //
+        // `merge` is what makes the tab panel-native (D-20260724-12): the
+        // captain's [m] on a ready head calls straight into the engine here, so
+        // the merge never routes through a tool call and the co's loop is never
+        // parked on the keystroke. It is the ONLY caller of mergeReadyHead in an
+        // interactive session.
         ...(dispatch
           ? {
               queue: {
@@ -256,6 +502,25 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
                   state.features
                     ? state.features.queueView()
                     : { size: 0, head: null, entries: [] },
+                headDetail: () => state.features?.headDetail() ?? null,
+                merge: () => panelMergeHead(state),
+                // `e` in the queue tab edits the head PR's message in place
+                // (D-20260727-15). Like `merge` it is a keystroke calling
+                // straight into the engine — but it merges nothing: it rewrites
+                // a title and a description on GitHub and in the feature store,
+                // and leaves the checks, the gate and the queue untouched.
+                editPrMessage: (message) => panelEditPrMessage(state, message),
+              },
+              // The Home tab's worktree list: every tracked worktree, not just
+              // the queued ones. Derived in memory from the registry + the queue
+              // + the stored intents, so this reads fresh at paint time like the
+              // other sources and costs no git call and no model call. `refresh`
+              // is the one exception and the reason it exists: the dirty flag
+              // needs a `git status` per worktree, so the panel asks for it when
+              // the captain opens Home and never on a paint.
+              features: {
+                list: () => state.features?.overview() ?? [],
+                refresh: () => state.features?.refreshDirty() ?? Promise.resolve(),
               },
             }
           : {}),
@@ -267,16 +532,26 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     paths,
     model,
     system,
-    messages: [],
+    // Layer 3: the session briefing opens the history. It is a plain user
+    // message - internal scaffolding, never logged as a "you" turn - and the
+    // rolling anchors cache it incrementally like everything after it.
+    messages: [{ role: "user", content: briefing }],
     effects,
     io,
     transcript,
     userTurns: 0,
+    lastTurnEndedAt: null,
+    inTurn: false,
+    keepAlive: null,
     dispatch,
     registry: null,
     features: null,
     armed: null,
     reviewQueue: [],
+    queueNotices: [],
+    historyNotes: [],
+    tasks: taskStore,
+    costs,
   };
 
   // Wire the job registry when linked. On completion a job is queued for review
@@ -311,24 +586,47 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
 
     // The feature levers drive the parallel-worktree flow over the registry.
     // The landing gate needs the interactive overlay (openLandingReview), which
-    // only the Tui provides; on PlainIO (piped/non-TTY) feature_land reports it
+    // only the Tui provides; on PlainIO (piped/non-TTY) the engine reports it
     // needs an interactive session rather than crashing.
     state.features = new FeatureManager({
       registry: state.registry,
       repoPath: dispatch.repoPath,
+      store: featureStore,
       ...(io instanceof Tui ? { gateHost: io } : {}),
     });
   }
 
   io.start();
 
+  // The linked repo is the cwd of every git call in the feature layer AND of
+  // every crew dispatch, so a path that is missing or is not a repository root
+  // disables both — silently, until something deep in git plumbing throws. It is
+  // checked once here so the session opens by naming the config value at fault
+  // instead of letting a `spawn git ENOENT` pass itself off as a broken git
+  // install (the fault this whole check was written for; see checkRepoPath).
+  let repoUsable = true;
+  if (dispatch) {
+    const repo = await checkRepoPath(dispatch.repoPath);
+    if (!repo.ok) {
+      repoUsable = false;
+      io.appendBlock(c.yellow(`  · the linked repo is unusable: ${repo.reason}`));
+      io.appendBlock(c.dim(`    stored in ${paths.dispatchConfig}`));
+      io.appendBlock(
+        c.dim(`    Feature and dispatch levers fail until it is fixed — re-run \`co link ${paths.name}\`.`),
+      );
+    }
+  }
+
   // Boot reconcile: rebuild feature records from the on-disk worktrees so a
   // feature (1 feature → 1 worktree → 1 branch) survives a restart. Read-only
-  // over feature state — it rebuilds records and SURFACES anomalies (a branch
-  // with no worktree, a half-landed branch, a stray dir), destroying nothing.
+  // over feature state — it rebuilds records and surfaces the one thing it
+  // cannot account for (a stray dir under the managed base), destroying nothing.
+  // A bare branch ref is never reported: landed or abandoned, that is a state co
+  // leaves behind on purpose, so it would fire every session and mean nothing.
   // Best-effort: a repo that has never seen the flow, or a git hiccup, must not
-  // block the session opening.
-  if (state.features) {
+  // block the session opening. Skipped outright when the repo path is already
+  // known bad, so the one honest message above is not followed by its symptom.
+  if (state.features && repoUsable) {
     try {
       const report = await state.features.reconcileAtBoot();
       if (report.records.length > 0) {
@@ -359,6 +657,33 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
     await runOpeningGreeting(state);
   }
 
+  // Started after the greeting, so the first thing it can ever refresh is a
+  // prefix a real turn has already written. Interactive sessions only: a piped
+  // or scripted run has no thinking pauses to protect and must stay
+  // deterministic.
+  if (tui && cfg.model.cacheKeepAliveMs > 0) {
+    state.keepAlive = startCacheKeepAlive({
+      intervalMs: cfg.model.cacheKeepAliveMs,
+      maxConsecutive: cfg.model.cacheKeepAliveMax,
+      isBusy: () => state.inTurn,
+      // Read fresh on every probe rather than captured once: the history grows
+      // all session, and a stale snapshot would refresh a prefix that no longer
+      // matches what the next turn will send.
+      snapshot: () =>
+        state.messages.length === 0
+          ? null
+          : {
+              system: state.system,
+              messages: state.messages,
+              tools: toolDefinitions({ dispatch: Boolean(state.dispatch) }),
+            },
+      refresh: (s) => state.model.refreshCache(s),
+      // Metered apart from turns: real spend, but not a turn (see cost.ts).
+      record: (usage, ms) => state.costs.recordKeepAlive(state.model.modelId, usage, { ms }),
+      ...(cfg.model.debugTiming ? { onNote: (l) => io.appendBlock(c.dim(`  ⏱ ${l}`)) } : {}),
+    });
+  }
+
   try {
     while (true) {
       // Deliver any completed crew reviews BEFORE idling on input. This is the
@@ -367,7 +692,19 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
       // slash-command turn `continue`s without reaching any post-turn hook, so
       // draining anywhere later than the top of the loop leaves queued reviews
       // parked until an unrelated event. Every path re-enters here.
-      await drainReviews(state);
+      //
+      // Guarded like the turn below, and for the same reason: these drive real
+      // model turns, and a crew review that throws must cost the captain that
+      // review, not the session it arrived in.
+      try {
+        await drainReviews(state);
+        // Same contract for anything the panel-native merge left the co to
+        // handle (a blocked new head, a refused merge). Drained after the
+        // reviews so a completion that arrived first still reports first.
+        await drainQueueNotices(state);
+      } catch (e) {
+        await reportTurnFailure(state, e);
+      }
 
       const input = await io.question();
       if (input === null) break; // EOF → clean exit, run the guard below
@@ -382,59 +719,104 @@ export async function runSession(cfg: Config, paths: InstancePaths): Promise<voi
       const raw = input.trim();
       if (raw === "") continue;
 
-      // Confirm interlock: while a dispatch is armed, ONLY a typed `confirm`
-      // (case-insensitive) fires it. A bare `confirm` uses the default crew
-      // agent; `confirm <name>` targets a specific one for this dispatch only.
-      // Anything that isn't a confirm cancels the armed dispatch and is then
-      // handled as ordinary input. There is no other path to launch a dispatch,
-      // so nothing runs without this explicit confirmation.
-      if (state.armed) {
-        const confirm = parseConfirm(raw);
-        if (confirm.isConfirm) {
-          const config = state.dispatch;
-          // An explicit agent name must resolve; if it doesn't, keep the order
-          // armed (don't make the captain re-draft) and show the valid names.
-          if (confirm.agent && config && !resolveAgent(config, confirm.agent)) {
-            const names = config.agents.map((a) => a.name).join(", ");
-            io.appendBlock(
-              c.yellow(
-                `  · unknown crew agent "${confirm.agent}". Available: ${names}. Type \`confirm <name>\` or plain \`confirm\` for the default (${config.defaultAgent}).`,
-              ),
-            );
-            continue; // stays armed
+      // Everything the line can set off is inside this guard. A turn is the one
+      // thing here that talks to Bedrock, and Bedrock refuses requests for
+      // reasons the captain did not cause and cannot fix from the prompt — a
+      // 400 on a malformed history, a 429, an expired token. Uncaught, any of
+      // those left the loop entirely and landed in the `finally` below, which
+      // runs the end-of-session distill: the session appeared to quit on its
+      // own, mid-conversation, after one bad request. A failed turn is now a
+      // failed turn. Nothing is distilled, nothing is written, the history is
+      // left as it was, and the next prompt comes back.
+      //
+      // `break` still leaves the loop from in here (EOF and /exit above and
+      // below), so the deliberate exits are untouched — only the accidental one
+      // is gone.
+      try {
+        // Confirm interlock: while a dispatch is armed, ONLY a typed `confirm`
+        // (case-insensitive) fires it. A bare `confirm` uses the default crew
+        // agent; `confirm <name>` targets a specific one for this dispatch only.
+        // Anything that isn't a confirm cancels the armed dispatch and is then
+        // handled as ordinary input. There is no other path to launch a dispatch,
+        // so nothing runs without this explicit confirmation.
+        if (state.armed) {
+          const confirm = parseConfirm(raw);
+          if (confirm.isConfirm) {
+            const config = state.dispatch;
+            // An explicit agent name must resolve; if it doesn't, keep the order
+            // armed (don't make the captain re-draft) and show the valid names.
+            if (confirm.agent && config && !resolveAgent(config, confirm.agent)) {
+              const names = config.agents.map((a) => a.name).join(", ");
+              io.appendBlock(
+                c.yellow(
+                  `  · unknown crew agent "${confirm.agent}". Available: ${names}. Type \`confirm <name>\` or plain \`confirm\` for the default (${config.defaultAgent}).`,
+                ),
+              );
+              continue; // stays armed
+            }
+            const armed = state.armed;
+            state.armed = null;
+            io.setConfirmBanner(null);
+            await appendTranscript(state.transcript, "you", raw);
+            // The lane is decided HERE, from the verb the captain typed and a
+            // FRESH reading of the target worktree — never from the arm-time
+            // snapshot. If the other agent finished while the order sat armed,
+            // the worktree is unoccupied again and a bare `confirm` means what it
+            // has always meant there: full write access.
+            const lane = laneForConfirm(state, armed, Boolean(confirm.write));
+            // That is a wider grant than the banner offered, so it is said out
+            // loud. A lane the captain did not read about is exactly the surprise
+            // this gate exists to prevent.
+            if (armed.occupied && lane === "writer" && !confirm.write) {
+              io.appendBlock(
+                c.dim(
+                  "  · the other agent has since finished, so the worktree is free and `confirm` granted" +
+                    " the full writing lane, not the read-only one the banner offered.",
+                ),
+              );
+            }
+            await fireDispatch(state, armed.order, confirm.agent, armed.feature, armed.resolve, lane);
+            continue;
           }
-          const armed = state.armed;
+          // Recorded BEFORE the line that cancelled it is appended, which is what
+          // pushUserTurn's flush guarantees: the co reads "you were cancelled"
+          // and then what the captain said instead, on the one turn it has to
+          // react to both. Without this it could only guess which of the two
+          // resolutions its armed order got.
+          noteDispatchCancelled(state, state.armed.order);
           state.armed = null;
           io.setConfirmBanner(null);
-          await appendTranscript(state.transcript, "you", raw);
-          await fireDispatch(state, armed.order, confirm.agent, armed.feature, armed.resolve);
+          io.appendBlock(c.dim("  · dispatch cancelled."));
+          // Fall through: treat the typed line as normal conversation/command.
+        }
+
+        // Record what the captain actually typed, verbatim, before dispatching.
+        // Hidden instruction injections (greeting, /decide, /sync) are internal
+        // scaffolding and are deliberately not logged as "you" turns.
+        await appendTranscript(state.transcript, "you", raw);
+
+        if (raw.startsWith("/")) {
+          const handled = await handleCommand(state, raw);
+          if (handled === "exit") break;
           continue;
         }
-        state.armed = null;
-        io.setConfirmBanner(null);
-        io.appendBlock(c.dim("  · dispatch cancelled."));
-        // Fall through: treat the typed line as normal conversation/command.
+
+        // A real spoken turn: the exit distill uses this to know the session had
+        // conversational substance worth preserving, even if no tool ran.
+        state.userTurns++;
+        await runUserTurn(state, raw);
+        // Reviews that completed during the turn are drained at the loop top.
+      } catch (e) {
+        await reportTurnFailure(state, e);
       }
-
-      // Record what the captain actually typed, verbatim, before dispatching.
-      // Hidden instruction injections (greeting, /decide, /sync) are internal
-      // scaffolding and are deliberately not logged as "you" turns.
-      await appendTranscript(state.transcript, "you", raw);
-
-      if (raw.startsWith("/")) {
-        const handled = await handleCommand(state, raw);
-        if (handled === "exit") break;
-        continue;
-      }
-
-      // A real spoken turn: the exit distill uses this to know the session had
-      // conversational substance worth preserving, even if no tool ran.
-      state.userTurns++;
-      await runUserTurn(state, raw);
-      // Reviews that completed during the turn are drained at the loop top.
     }
   } finally {
     state.registry?.stop();
+    // Stopped BEFORE the exit guard, which runs a real model turn of its own: a
+    // probe firing alongside the distill would race it for the same entry, and
+    // there is nothing left to keep warm afterwards either way.
+    state.keepAlive?.stop();
+    state.keepAlive = null;
     // The end-of-session guard runs inside the live UI so its prompts render
     // in-session; then we tear the UI down and leave a short, persistent
     // footprint on the user's primary screen.
@@ -455,9 +837,73 @@ function printClosingSummary(state: SessionState): void {
   line(c.dim(`  memory: ${state.paths.root}`));
 }
 
+/**
+ * A turn threw. Say so, and keep the session on its feet.
+ *
+ * Bedrock refuses requests for reasons the captain did not cause and cannot fix
+ * from the prompt line — a malformed history, a rate limit, an expired token —
+ * and the refusal lands in the middle of a conversation he is not finished
+ * having. Leaving is not a reasonable answer to that, and leaving is what used
+ * to happen: the exception escaped the input loop, and the only thing outside it
+ * is the `finally` that runs the end-of-session distill. One refused request
+ * closed the session, burned a model call on the way out, and the last thing on
+ * screen was `fatal:` — which is why sessions looked like they were quitting on
+ * their own.
+ *
+ * What happens instead is the API's own words, verbatim (see apiErrorText: a
+ * rewritten error is a guess about a failure we did not diagnose), a note in the
+ * durable transcript so the record shows the gap, and the prompt back. Nothing
+ * is distilled and nothing is written to memory — a failed turn produced no
+ * conversation to preserve. The history is left exactly as the turn left it,
+ * which is the captain's line sitting in it unanswered: true, and usable, since
+ * the next turn simply carries on from there.
+ */
+async function reportTurnFailure(state: SessionState, e: unknown): Promise<void> {
+  const { io } = state;
+  const text = apiErrorText(e);
+  io.flushStream();
+  io.appendBlock("");
+  io.appendBlock(c.red(`  · that turn failed: ${text}`));
+  io.appendBlock(c.dim("  · the session is still open — try again, or /exit to leave."));
+  await appendTranscript(state.transcript, "note", `turn failed: ${text}`);
+}
+
+const COMPACT_REQUEST =
+  "Session compaction (bookkeeping, not a question from the captain). This" +
+  " conversation has grown long enough to be worth compressing. Write a summary" +
+  " of everything we have discussed SO FAR that you would want in front of you" +
+  " to carry on without a gap. Keep: decisions reached and the reasoning behind" +
+  " them, what is currently in flight, anything unresolved or awaiting the" +
+  " captain, constraints and corrections he has given you, and the thread of" +
+  " what we were doing. Drop: pleasantries, superseded working detail, and" +
+  " anything already written to memory or the logs, which you can search. Write" +
+  " it as notes to yourself in plain prose, no preamble, no sign-off. Do not" +
+  " address the captain and do not call any tools.";
+
+/**
+ * Append a turn's own message to the model's history, after anything that
+ * happened outside the loop and before it.
+ *
+ * Every user-role message the session appends goes through here, and that is
+ * what makes the ordering guarantee hold without a rule anyone has to remember:
+ * a cancellation recorded in the input loop is already in the history by the
+ * time the line that caused it is added. The one deliberate exception is the
+ * compaction request, which snapshots the history length around its own push and
+ * would slice a note flushed there back off again; a note that arrives during a
+ * compaction simply stays pending for the next turn.
+ */
+function pushUserTurn(state: SessionState, content: string): void {
+  flushHistoryNotes(state, state.messages);
+  state.messages.push({ role: "user", content });
+}
+
 async function runUserTurn(state: SessionState, userText: string): Promise<void> {
-  state.messages.push({ role: "user", content: userText });
+  pushUserTurn(state, userText);
   await drive(state);
+  // After the turn, never before: compacting first would summarise a history
+  // that is about to grow anyway, and the captain would wait through a
+  // summarising call before getting an answer to what they actually asked.
+  await maybeCompact(state);
 }
 
 /**
@@ -475,13 +921,12 @@ async function runUserTurn(state: SessionState, userText: string): Promise<void>
  * live state AND no tail) is treated as a blank start.
  */
 async function runOpeningGreeting(state: SessionState): Promise<void> {
-  state.messages.push({
-    role: "user",
-    content:
-      "SESSION START (spoken by you, the co-manager, unprompted). You have just" +
-      " come aboard and read the system prompt above, which holds your live state" +
-      " AND a verbatim tail of our last conversation. Greet the captain and report" +
-      " where we left off. Open with an acknowledgement in character — e.g." +
+  pushUserTurn(
+    state,
+    "SESSION START (spoken by you, the co-manager, unprompted). You have just" +
+      " come aboard and read your session briefing above, which holds your live" +
+      " state AND a verbatim tail of our last conversation. Greet the captain and" +
+      " report where we left off. Open with an acknowledgement in character — e.g." +
       ' "Aye, ready to work, captain." — then, in 2-4 sentences, summarise the' +
       " current focus, anything in flight, and the most useful next step. Draw on" +
       " your live state first; where it is thin or stale, lean on the recent" +
@@ -490,7 +935,7 @@ async function runOpeningGreeting(state: SessionState): Promise<void> {
       " genuinely nothing to go on — empty live state AND no recent conversation —" +
       " say so plainly and ask what we're charting, rather than inventing history." +
       " Do not call any tools; do not list open questions exhaustively. Keep it tight.",
-  });
+  );
   // Deliberately low effort. This turn blocks the first prompt, so its latency is
   // the most visible in the whole session — and it is the least demanding work
   // the co does: summarise state that is already sitting in the system prompt,
@@ -516,9 +961,14 @@ async function runOpeningGreeting(state: SessionState): Promise<void> {
 async function drive(
   state: SessionState,
   opts: { effort?: Effort; quiet?: boolean } = {},
-): Promise<void> {
+): Promise<string> {
   const { effort, quiet } = opts;
   const { io } = state;
+  // Stamped before any model work so the gap measured is the captain's thinking
+  // pause, not the pause plus this turn's latency.
+  const turnStartedAt = Date.now();
+  const idleMs = state.lastTurnEndedAt === null ? 0 : turnStartedAt - state.lastTurnEndedAt;
+  state.inTurn = true;
   const executor = makeExecutor({
     paths: state.paths,
     research: state.cfg.research,
@@ -539,7 +989,12 @@ async function drive(
       ? { onArmDispatch: (order: string, feature?: string) => armDispatch(state, order, feature) }
       : {}),
     ...(state.features ? { features: state.features } : {}),
-    ...(state.dispatch && state.features ? { onArmResolve: () => armResolve(state) } : {}),
+    ...(state.dispatch && state.features
+      ? { onArmResolve: (context?: string) => armResolve(state, context) }
+      : {}),
+    // The task table the Home tab paints. Always wired: it is the co's own state
+    // and outlives any link to a repo.
+    tasks: state.tasks,
   });
 
   // Streaming render state. "mode" tracks whether the open transcript line is
@@ -603,6 +1058,25 @@ async function drive(
   } finally {
     // Never leave the wheel spinning — including when the turn throws.
     io.setBusy(null);
+    // Bank what this turn cost, before anything else can fail. In the `finally`
+    // so a turn that threw still records the rounds that completed and were
+    // billed; a quiet turn (the exit distill) is metered exactly like a spoken
+    // one, because it costs exactly like one.
+    const spent = state.model.drainUsage();
+    await state.costs.record(state.model.modelId, spent.usage, {
+      ms: spent.ms,
+      rounds: spent.rounds,
+      rebuild: spent.rebuild,
+      idleMs,
+    });
+    // Set even on a turn that threw: the cache clock started ticking from the
+    // last request the model actually served, not from the last one that
+    // succeeded, so a failed turn still resets the gap.
+    state.lastTurnEndedAt = Date.now();
+    state.inTurn = false;
+    // The turn just touched every cache entry a probe would have, so the
+    // keep-alive's clock restarts from here rather than from the last probe.
+    state.keepAlive?.noteTurn();
   }
 
   // If the model produced no streamed text but a final string exists, show it
@@ -620,6 +1094,88 @@ async function drive(
 
   // Persist the co's turn as soon as it lands — the "save along the way" path.
   await appendTranscript(state.transcript, "co", answer);
+  // Returned for the callers that need the words rather than the side effects:
+  // compaction feeds the reply straight back into the history as its summary.
+  return answer;
+}
+
+/**
+ * The hard history ceiling, engaged when a session runs long.
+ *
+ * The cap is generous because compaction is expensive: a cached read bills at
+ * 0.1x base input and a 1-hour write at 2x, and every compaction rewrites the
+ * retained tail, so a normal session should never reach it. What HARD buys is
+ * the other end: a runaway session trims in a controlled way instead of
+ * growing until the API refuses the request mid-conversation.
+ *
+ * Nothing is lost that the co cannot get back. The transcript is written every
+ * turn and the logs are append-only and searchable, so this moves detail out
+ * of the live window, not off the disk.
+ */
+async function maybeCompact(state: SessionState): Promise<void> {
+  const maxBytes = state.cfg.model.historyMaxBytes;
+  if (maxBytes <= 0) return;
+  const plan = planCompaction(state.messages, {
+    maxBytes,
+    keepTurns: state.cfg.model.compactKeepTurns,
+  });
+  if (!plan) return;
+
+  // Snapshot the length before the summarising turn appends to it, so the cut
+  // index computed above still addresses the same messages afterwards.
+  const before = state.messages.length;
+  // Deliberately NOT pushUserTurn: this snapshot is what the compaction slices
+  // back to, so a note flushed here would be cut off again. Pending notes wait
+  // for the next real turn instead (see pushUserTurn).
+  state.messages.push({ role: "user", content: COMPACT_REQUEST });
+  // Low effort deliberately: this is a summary of context the model is already
+  // holding, the same call the cold-start greeting makes, and reasoning depth
+  // buys nothing here while being billed on every token of it.
+  const summary = await drive(state, { quiet: true, effort: "low" });
+  if (summary.trim() === "") {
+    // No usable summary: leave the history exactly as it was. A compaction that
+    // dropped turns and replaced them with nothing would be worse than the cost
+    // it was trying to avoid.
+    state.messages = state.messages.slice(0, before);
+    return;
+  }
+
+  // Orientation rides the compaction message so it can never be summarized
+  // out of the window (see applyCompaction). Best-effort: a read failure
+  // costs the re-injection, never the compaction itself.
+  let orientation: string | undefined;
+  try {
+    const live = await readLiveMemory(state.paths);
+    orientation = (Object.keys(live) as LiveFile[])
+      .map((f) => `## .memory/${f}\n\n${live[f].trim() || "(empty)"}`)
+      .join("\n\n");
+  } catch {
+    orientation = undefined;
+  }
+  state.messages = applyCompaction(state.messages.slice(0, before), plan.cut, summary, orientation);
+
+  // The compacted head may have carried protocol sections, so the live window
+  // can no longer be assumed to hold them. Resetting the ledger keeps its
+  // meaning crisp - "this section is verbatim in the window" - and restores
+  // both mechanisms: the next re-read returns the real body, and the next
+  // gated act is re-handed the contract. Worst case is one redundant copy.
+  state.effects.protocolsRead.clear();
+
+  // Said out loud, unlike every other piece of the co's bookkeeping. Memory
+  // writes are invisible because they change nothing the captain can observe;
+  // this changes what the co can recall mid-conversation, and a co that quietly
+  // stops remembering something you both said an hour ago is a bug report
+  // waiting to happen. One dim line, once.
+  const freed = plan.before - plan.after;
+  const note = `compacted earlier conversation (~${Math.round(freed / 1024).toLocaleString("en-US")} KB)`;
+  state.io.appendBlock(c.dim(`  · ${note}`));
+  // Written to the transcript as well as the screen, unlike the screen-only
+  // notices elsewhere. A compaction is the one piece of bookkeeping whose effect
+  // outlives the session: it is why the co may not recall something later, and
+  // it is the only record that the ceiling ever engaged. The first attempt at
+  // auditing this feature failed precisely because the notice was on screen and
+  // nowhere else, so "did it fire?" was unanswerable after the fact.
+  await appendTranscript(state.transcript, "note", note);
 }
 
 // --- dispatch (arm → confirm → launch → review) ------------------------------
@@ -629,11 +1185,16 @@ async function drive(
  * the order and shows the confirm banner; it launches NOTHING. Returns a short
  * summary for the tool result. Re-arming replaces any prior armed order — only
  * one can be pending, and the last one the model staged this turn wins.
+ *
+ * `extraBannerLines` are appended to the confirm banner, after the order line.
+ * Display only — they change nothing about what fires. The resolver arm uses
+ * them to put its navigator context in front of the captain verbatim.
  */
 async function armDispatch(
   state: SessionState,
   order: string,
   feature?: string,
+  extraBannerLines?: string[],
 ): Promise<{ armed: true; summary: string } | { armed: false; reason: string }> {
   // Read the config the NEXT dispatch will actually use, re-reading disk so a
   // mid-session `co link` is reflected. Without this the banner shows the config
@@ -650,7 +1211,11 @@ async function armDispatch(
     return { armed: false, reason: "No crew agent is registered. Re-run `co link` to set one." };
   }
   const target = feature && feature.trim() ? feature.trim() : undefined;
-  state.armed = { order, ...(target ? { feature: target } : {}) };
+  // Who is already in that worktree. This is the whole gate: an empty list is
+  // the ordinary dispatch, unchanged in every particular; anything in it turns
+  // the banner into a lane choice (D-20260729-5).
+  const live = target ? activeAgentsFor(state, target) : [];
+  state.armed = { order, ...(target ? { feature: target } : {}), ...(live.length ? { occupied: true } : {}) };
 
   const cmd = displayCommand(resolveAgentCommand(config), config.repoPath);
   // Dispatch is visible-only: a crew agent runs in a visible Ghostty pane or not
@@ -668,12 +1233,35 @@ async function armDispatch(
   const others = config.agents.map((a) => a.name).filter((n) => n !== config.defaultAgent);
   const overrideHint =
     others.length > 0 ? `  or \`confirm <${others.join("|")}>\` to pick another agent` : "";
+  // The enforcement clause is stated for the agent a bare confirm would run.
+  // An override picks a different agent at fire time, and the dispatch line says
+  // what THAT one got — so nothing here ever over-claims for an agent that never ran.
+  const enforcement = readOnlyEnforcement(resolveAgentCommand(config));
   state.io.setConfirmBanner([
-    c.yellow(c.bold("  ⚑ dispatch armed — type `confirm` to launch, anything else cancels")),
+    live.length > 0
+      ? c.yellow(c.bold(`  ⚑ dispatch armed — feature '${target}' ALREADY HAS ${describeAgents(live)}`))
+      : c.yellow(c.bold("  ⚑ dispatch armed — type `confirm` to launch, anything else cancels")),
+    ...(live.length > 0
+      ? [
+          c.yellow(
+            "  ⚠ a second WRITER shares one git index, one dist/ and one node_modules: a scratch file," +
+              " a coverage dir or a build artifact it drops can be swept into the other agent's next" +
+              " `git add -A` commit, unseen by either of them.",
+          ),
+          c.dim(
+            `  \`confirm\` → READ-ONLY lane: the order is prefixed with a no-writes-of-any-kind mandate,` +
+              ` and for ${config.defaultAgent} that is ${enforcement.detail}.`,
+          ),
+          c.dim(
+            "  `confirm write` → a SECOND WRITING lane. Both agents write this worktree. Anything else cancels.",
+          ),
+        ]
+      : []),
     c.dim(`  transport: ${transport}   agent: ${config.defaultAgent}   command: ${cmd}`),
     c.dim(`  target: ${targetLine}`),
     ...(overrideHint ? [c.dim(overrideHint)] : []),
     c.dim(`  order: ${firstLineOf(order)}`),
+    ...(extraBannerLines ?? []),
   ]);
   const targetSummary = target
     ? ` It targets feature '${target}' (its isolated worktree${
@@ -682,6 +1270,14 @@ async function armDispatch(
           : ", provisioned on first use"
       }).`
     : " It targets the bare main tree (no feature).";
+  const laneSummary =
+    live.length > 0
+      ? ` NOTE: that worktree already has ${describeAgents(live)}, so this dispatch is LANE-GATED:` +
+        ` a bare \`confirm\` grants the READ-ONLY audit lane (${enforcement.detail} for ${config.defaultAgent})` +
+        ` and \`confirm write\` grants a second WRITING lane. The captain chooses, not you.` +
+        ` If it lands as a read-only run you will be handed its findings as context to answer with,` +
+        ` and you must NOT file a review for it.`
+      : "";
   return {
     armed: true,
     summary:
@@ -691,8 +1287,54 @@ async function armDispatch(
             ? ` The captain can type \`confirm <${others.join("|")}>\` to pick another.`
             : "")
         : `No crew pane is available, so a dispatch will fail cleanly until one is designated with \`co pane\`.` +
-          ` The intended command is: ${cmd} (agent ${config.defaultAgent}).`) + targetSummary,
+          ` The intended command is: ${cmd} (agent ${config.defaultAgent}).`) +
+      targetSummary +
+      laneSummary,
   };
+}
+
+/**
+ * The crew agents live in a feature's worktree right now, with their roles. Goes
+ * through the FeatureManager first so a feature addressed by slug and one
+ * addressed by its created name resolve to the SAME worktree — the occupancy
+ * question must not come back empty just because the co armed under a different
+ * handle than the running job used. Falls back to the registry for a feature
+ * that has no record yet (nothing can be running in a worktree that does not
+ * exist, so that answer is empty too, but it stays honest rather than assumed).
+ */
+function activeAgentsFor(state: SessionState, feature: string): ActiveAgent[] {
+  const view = state.features?.list().find((f) => f.feature === feature || f.slug === feature);
+  if (view) return view.agents;
+  return state.registry?.activeAgents(feature) ?? [];
+}
+
+/** "a live crew agent (job-002 [cc], writing)" — the banner's subject line. */
+function describeAgents(agents: ActiveAgent[]): string {
+  const parts = agents.map(
+    (a) =>
+      `${a.jobId}${a.agentName ? ` [${a.agentName}]` : ""}, ${a.lane === "writer" ? "WRITING" : "read-only"}`,
+  );
+  return `${agents.length === 1 ? "a live crew agent" : `${agents.length} live crew agents`} (${parts.join("; ")})`;
+}
+
+/**
+ * Which lane a confirmed dispatch gets. Read fresh at fire time, never from the
+ * arm-time snapshot:
+ *
+ *  - `confirm write`, or no feature at all (the bare main tree), or a worktree
+ *    with nothing in it → the ordinary WRITING lane. This is every dispatch that
+ *    existed before the gate, unchanged.
+ *  - a bare `confirm` into a worktree that has a live agent → the READ-ONLY
+ *    lane. The safe default is the one that cannot corrupt the other agent's
+ *    commit, and buying the risky one costs one typed word.
+ */
+function laneForConfirm(
+  state: SessionState,
+  armed: { feature?: string },
+  write: boolean,
+): DispatchLane {
+  if (write || !armed.feature) return "writer";
+  return activeAgentsFor(state, armed.feature).length > 0 ? "reader" : "writer";
 }
 
 /**
@@ -703,24 +1345,37 @@ async function armDispatch(
  * flagged `resolve` so the fire path marks the head "resolving" and the
  * completion drain re-processes it. Launches nothing. Refuses cleanly when there
  * is no resolvable head.
+ *
+ * `context` is the co's guidance on intent for the resolver (which side of the
+ * conflict must win). It rides the order verbatim and goes into the confirm
+ * banner so the captain approves the guidance along with the command. Absent or
+ * blank, the arm is exactly what it always was; nothing is stored either way.
  */
 async function armResolve(
   state: SessionState,
+  context?: string,
 ): Promise<{ armed: true; summary: string } | { armed: false; reason: string }> {
   if (!state.features) return { armed: false, reason: "Feature levers are unavailable (not linked)." };
-  const plan = state.features.planResolveHead();
+  const guidance = context?.trim() || undefined;
+  const plan = state.features.planResolveHead(guidance);
   if (!plan.ok) return { armed: false, reason: plan.reason };
-  const res = await armDispatch(state, plan.order, plan.feature);
+  // The banner's order line is one line; the context must be seen whole, so it
+  // gets its own lines, verbatim, under the same dim weight as the rest.
+  const contextLines = guidance
+    ?.split("\n")
+    .map((line, i) => c.dim(i === 0 ? `  navigator context: ${line}` : `    ${line}`));
+  const res = await armDispatch(state, plan.order, plan.feature, contextLines);
   if (!res.armed) return res;
   // Tag the armed order as a resolver so fireDispatch drives the queue's
   // resolving/re-process transitions instead of a plain review-on-completion.
   if (state.armed) state.armed.resolve = true;
-  const kindWord = plan.kind === "conflict" ? "a rebase conflict" : "a red build+test";
+  const kindWord = plan.kind === "conflict" ? "a rebase conflict" : "failed CI checks";
   return {
     armed: true,
     summary:
       `Resolver for head '${plan.feature}' (blocked by ${kindWord}, attempt ${plan.attempt}/${plan.maxAttempts}) armed. ` +
       `It will run in that feature's own worktree on its branch and never touch dev. ` +
+      (guidance ? `Your context rides the order and is shown to the captain verbatim. ` : "") +
       res.summary,
   };
 }
@@ -750,11 +1405,47 @@ function safeFeatureSlug(feature: string): string {
 }
 
 /**
+ * The visuals in force for this session's IO. PlainIO (piped / non-TTY) is a
+ * degraded context by definition — it has no addressable screen to animate on —
+ * and stdout can't tell us that, so it's the one thing we pass in. Resolved per
+ * use, not cached: the terminal width is live, so a window narrowed mid-session
+ * degrades on the next dispatch rather than drawing into a screen that shrank.
+ */
+function visualsFor(io: SessionIO): EffectiveVisuals {
+  return currentVisuals({ plainIO: !(io instanceof Tui) });
+}
+
+/**
+ * Where a confirmed dispatch is headed, as the flourish and its static label
+ * show it: a feature's own branch, or the bare main tree. Prefers the branch the
+ * feature record already carries and falls back to projecting the name a
+ * provision would mint (the default type, since a first-use dispatch never
+ * supplied one), so a dispatch with nothing provisioned yet still names the
+ * branch the crew will actually be on. Pure display — it provisions nothing,
+ * exactly like describeTarget above it.
+ */
+function dispatchTarget(state: SessionState, feature?: string): DispatchTarget {
+  if (!feature) return { kind: "main" };
+  const record = state.features?.list().find((f) => f.feature === feature || f.slug === feature);
+  return {
+    kind: "feature",
+    branch: record?.branch ?? `${DEFAULT_FEATURE_BRANCH_TYPE}/${safeFeatureSlug(feature)}`,
+  };
+}
+
+/**
  * Fire a confirmed dispatch: hand the order to the registry, which launches it
  * into a visible Ghostty pane and watches for completion. Non-blocking — we
  * report where it landed and return immediately; the review lands later via the
  * completion callback. A dispatch that can't place a pane comes back failed (no
  * background path); we surface that cleanly. Never throws into the loop.
+ *
+ * This is also where the dispatch flourish plays. The destination line is
+ * committed to the transcript first and unconditionally, so the record of where
+ * an order went is identical at every visuals level; the waves are then scenery
+ * over the launch itself — an idle wait the captain already had — and are
+ * settled before the result is reported. Nothing about the dispatch depends on
+ * them.
  */
 async function fireDispatch(
   state: SessionState,
@@ -762,18 +1453,53 @@ async function fireDispatch(
   agentName?: string,
   feature?: string,
   resolve?: boolean,
+  lane: DispatchLane = "writer",
 ): Promise<void> {
   const { io, registry } = state;
   if (!registry) {
     io.appendBlock(c.yellow("  · dispatch unavailable (not linked)."));
     return;
   }
+
+  const visuals = visualsFor(io);
+  const target = dispatchTarget(state, feature);
+  io.appendBlock(dispatchLabel(target, visuals));
+  const flourish = visuals.animate
+    ? io.playAnimation(
+        dispatchFlourish({ target, glyphs: visuals.glyphs, color: visuals.color }),
+      )
+    : NO_ANIMATION;
+
+  let job: Job;
   try {
-    const job = await registry.dispatch(order, agentName, feature ? { feature } : {});
+    job = await registry.dispatch(order, agentName, {
+      ...(feature ? { feature } : {}),
+      lane,
+    });
+  } catch (e) {
+    await flourish.settle();
+    io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));
+    noteDispatchLaunchFailed(state, { order, error: (e as Error).message });
+    return;
+  }
+  await flourish.settle();
+
+  try {
     if (job.status === "failed") {
       io.appendBlock(c.red(`  · dispatch failed to launch: ${job.error ?? "unknown error"}`));
+      noteDispatchLaunchFailed(state, { order, error: job.error ?? "unknown error" });
       return;
     }
+    // The armed order resolved the other way: the captain confirmed and this is
+    // running. One line into the co's own history so it stops guessing whether a
+    // typed confirm fired the order or the next message cancelled it — the
+    // screen line below says the same thing, but only to the captain.
+    noteDispatchFired(state, {
+      order,
+      jobId: job.id,
+      ...(job.agentName ? { agent: job.agentName } : {}),
+      ...(job.feature ? { feature: job.feature } : {}),
+    });
     // A resolver dispatch that actually launched moves the merge-queue head to
     // "resolving" (and counts the attempt). Done only on a real launch so a
     // failed placement burns no attempt; the completion drain re-processes it.
@@ -785,18 +1511,194 @@ async function fireDispatch(
     }
     const agentNote = job.agentName ? ` [${job.agentName}]` : "";
     const featureNote = job.feature ? ` in feature '${job.feature}'` : "";
-    const where =
-      job.status === "queued"
-        ? "queued for a free crew pane"
-        : `running in a Ghostty pane (${job.paneId ?? "?"})`;
+    // A read-only run names its lane AND how it is held, every time. The one
+    // thing this must never do is let an advisory-only run read as an enforced
+    // one: the captain confirmed a lane, and which of the two they actually got
+    // depends on the agent that ran, which an override may have changed.
+    const laneNote =
+      job.lane === "reader"
+        ? ` (READ-ONLY audit lane — ${
+            job.readOnlyEnforced
+              ? "write tools denied at launch"
+              : "ADVISORY only for this agent: the mandate is in the order, nothing blocks a write"
+          })`
+        : "";
+    const where = `running in a Ghostty pane (${job.paneId ?? "?"})`;
     const followup = resolve
       ? "I'll re-process the head when it finishes."
-      : "I'll review it when it finishes.";
+      : job.lane === "reader"
+        ? "I'll report what it found when it finishes."
+        : "I'll review it when it finishes.";
     io.appendBlock(
-      c.green(`  · dispatched ${job.id}${agentNote}${featureNote}: ${where}. ${followup}`),
+      c.green(`  · dispatched ${job.id}${agentNote}${featureNote}${laneNote}: ${where}. ${followup}`),
     );
   } catch (e) {
-    io.appendBlock(c.red(`  · dispatch error: ${(e as Error).message}`));
+    // The launch itself is handled above; this covers the bookkeeping after it
+    // (the resolver-head transition), so it must not read as "nothing ran".
+    io.appendBlock(c.red(`  · dispatch launched but post-launch bookkeeping failed: ${(e as Error).message}`));
+  }
+}
+
+/**
+ * The panel's `e` → Ctrl-S (D-20260727-15): write the captain's edited title and
+ * description onto the head's pull request.
+ *
+ * Runs outside the agent loop, exactly like the [m] below, and tells the co
+ * nothing: the PR's message is the captain's to write, and a model turn about it
+ * would be pure noise. What it does leave is a dim transcript line, so the
+ * session's own record shows the message changed and when.
+ *
+ * Never throws into the Tui — a failure comes back as a result the popup prints
+ * over the captain's still-intact buffer.
+ */
+async function panelEditPrMessage(
+  state: SessionState,
+  message: { title: string; body: string; prNumber: number },
+): Promise<PrMessageSaveResult> {
+  const { io } = state;
+  if (!state.features) {
+    return { saved: false, summary: "the merge queue is unavailable in this session." };
+  }
+  try {
+    const res = await state.features.editHeadPrMessage(message);
+    io.appendBlock(c.dim(`  · rewrote the message on PR #${res.prNumber} (${res.feature})`));
+    return { saved: true, summary: `PR #${res.prNumber} message updated: ${res.title}` };
+  } catch (e) {
+    const error = e instanceof Error ? e.message : String(e);
+    return { saved: false, summary: `the PR message was not written: ${error}`, error };
+  }
+}
+
+/**
+ * The panel's [m] (D-20260724-12): merge the ready queue head, from the keystroke,
+ * with the co nowhere in the loop.
+ *
+ * This runs OUTSIDE the agent loop — it is called by the Tui while the session is
+ * idling on question() — and that is the entire point: no tool call is made, no
+ * turn is held open, and the co is free the whole time. What it owes the session
+ * afterwards is only what the captain can't see for themselves:
+ *
+ *  - a merge that lands and leaves a ready/queued/empty queue: one dim transcript
+ *    line and nothing else. The co is not told and not woken; the captain is
+ *    looking right at the result.
+ *  - a merge that lands and leaves the NEW head BLOCKED, or a merge the engine
+ *    refused: a system turn is queued and the loop woken, so the co picks it up
+ *    on the next idle prompt and can offer the (confirm-gated, attempt-bounded)
+ *    resolver without the captain re-explaining anything.
+ *
+ * Never throws into the Tui: a failure comes back as a result the panel banners.
+ */
+async function panelMergeHead(state: SessionState): Promise<QueueMergeResult> {
+  const { io } = state;
+  if (!state.features) {
+    return { merged: false, summary: "the merge queue is unavailable in this session." };
+  }
+  let res: Awaited<ReturnType<FeatureManager["mergeReadyHead"]>>;
+  try {
+    res = await state.features.mergeReadyHead();
+  } catch (e) {
+    const error = (e as Error).message;
+    io.appendBlock(c.red(`  · merge failed: ${error}`));
+    noteMergeOutcome(state, { merged: false, outcome: "failed", feature: "", summary: error, error });
+    state.queueNotices.push(
+      `SYSTEM: The captain pressed [m] on the merge-queue head in the panel and the merge THREW: ${error}. ` +
+        `Nothing was merged. Tell them plainly what failed and what you'd do about it. Do not retry it yourself.`,
+    );
+    io.wake("queue-merge-error");
+    return { merged: false, summary: `merge failed: ${error}`, error };
+  }
+
+  const head = res.head;
+  if (res.merged) {
+    io.appendBlock(
+      c.green(
+        `  · merged ${res.feature}${res.pr ? ` (PR #${res.pr.number})` : ""} → ${res.target} ` +
+          `(${res.mergeSha?.slice(0, 7) ?? "?"})` +
+          (head ? `; next head '${head.feature}' is ${head.status}` : "; the queue is now empty"),
+      ),
+    );
+  } else {
+    io.appendBlock(c.yellow(`  · [m] merged nothing: ${res.summary}`));
+  }
+
+  // What the co could never learn otherwise: [m] runs with it nowhere in the
+  // loop, so a feature would land on dev while it went on reporting the feature
+  // as in flight. One line, no turn, no word on screen — the captain's own
+  // reading of this merge is the two lines above and is unchanged.
+  noteMergeOutcome(state, res);
+
+  // The co is engaged for exactly one reason: a head that needs a decision.
+  const notice = queueMergeNotice(res);
+  if (notice) {
+    state.queueNotices.push(notice);
+    io.wake("queue-merge");
+  }
+
+  return {
+    merged: res.merged,
+    summary: res.summary,
+    ...(res.error ? { error: res.error } : {}),
+  };
+}
+
+/**
+ * What (if anything) the co owes the captain after a panel-native merge — the
+ * ONE decision that determines whether the co is engaged at all, so it is pure
+ * and unit-tested rather than buried in the keystroke path (same reasoning as
+ * parseConfirm below).
+ *
+ * Null means silence, and silence is the happy path: a merge that landed and
+ * left a ready/queued/empty queue needs no model turn at all — the captain is
+ * looking straight at the result, and waking the co would be pure noise plus a
+ * round trip. A notice is returned only when something needs a decision the
+ * panel can't offer: the new head came back BLOCKED (the resolver is the co's
+ * to arm, confirm-gated), or the merge itself was refused.
+ */
+export function queueMergeNotice(res: MergeHeadResult): string | null {
+  const head = res.head;
+  if (head && head.status === "blocked") {
+    const kind =
+      head.blockedKind === "conflict"
+        ? "a rebase conflict"
+        : head.blockedKind === "failed"
+          ? "a red CI check on its pull request"
+          : "a lifecycle problem (not a conflict or a red check)";
+    const merged = res.merged
+      ? `The captain merged the merge-queue head '${res.feature}' themselves, with [m] in the Ctrl-O panel. ` +
+        `You were not involved and nothing is waiting on you. The queue advanced and the new head`
+      : `The merge-queue head`;
+    return (
+      `SYSTEM: ${merged} '${head.feature}' is BLOCKED by ${kind}: ${head.blockedReason ?? "not mergeable"}. ` +
+      `It holds the queue and has no [m] until it is green again.\n\n` +
+      `Tell the captain in one line what is blocked and why. If it is a conflict or a red CI check, offer ` +
+      `feature_resolve_head — it ARMS a fresh crew agent in that feature's own worktree and runs only when ` +
+      `they type \`confirm\`; it is bounded to a few attempts. If it is neither, say what you'd do instead ` +
+      `(fix by hand, or feature_abandon). Do not try to merge anything yourself, and never tell them to press ` +
+      `[m] on a blocked head — there is no [m] there.`
+    );
+  }
+  if (!res.merged && res.outcome === "failed") {
+    return (
+      `SYSTEM: The captain pressed [m] on the merge-queue head '${res.feature}' in the panel and the merge was ` +
+      `REFUSED: ${res.error ?? "the merge could not proceed"}. Nothing was written to dev. The head was ` +
+      `re-processed and is now ${head?.status ?? "unknown"}. Explain in one line what happened and what it ` +
+      `takes to make it mergeable again. Do not attempt the merge yourself.`
+    );
+  }
+  return null;
+}
+
+/**
+ * Drain the out-of-band queue notices into turns, same shape as drainReviews:
+ * one system turn each, in order, at the top of the input loop. These exist only
+ * because the panel's [m] runs outside the agent loop (see panelMergeHead).
+ */
+async function drainQueueNotices(state: SessionState): Promise<void> {
+  while (state.queueNotices.length > 0) {
+    const note = state.queueNotices.shift()!;
+    state.userTurns++;
+    pushUserTurn(state, note);
+    await drive(state);
   }
 }
 
@@ -823,7 +1725,7 @@ async function drainReviews(state: SessionState): Promise<void> {
     const job = state.reviewQueue.shift()!;
 
     // A resolver agent finishing on the current resolving head: re-process the
-    // head now (rebase + build+test on its just-fixed worktree) so it becomes
+    // head now (rebase + push + a fresh read of its PR's checks) so it becomes
     // ready if green or blocked again if not, and fold the outcome into the
     // review turn so the co reports what the queue now shows. One agent per
     // feature, so the resolving head's only in-flight agent is its resolver.
@@ -838,7 +1740,7 @@ async function drainReviews(state: SessionState): Promise<void> {
         resolveNote =
           `\n\nThis dispatch was a merge-queue RESOLVER for '${job.feature}'. After it finished the ` +
           `head was re-processed: ${headLine}. Tell the captain whether the head is ready to merge ` +
-          `(feature_merge_head), still blocked (they can resolve again with feature_resolve_head until ` +
+          `(the captain's [m] in the panel), still blocked (they can resolve again with feature_resolve_head until ` +
           `the attempt limit, or fix by hand / abandon), and factor that into your verdict.`;
         state.io.appendBlock(c.dim(`  · resolver finished for '${job.feature}': ${headLine}`));
       } catch (e) {
@@ -846,112 +1748,306 @@ async function drainReviews(state: SessionState): Promise<void> {
       }
     }
 
-    let record = "";
-    let source = "";
-    const config = state.dispatch;
-
-    // 1. The Stop hook's exact transcript path for this job's session, if any.
-    if (job.transcriptPath) {
-      try {
-        const raw = await readFileTail(job.transcriptPath, 4 * 1024 * 1024);
-        record = renderTranscriptForReview(raw, 16000);
-        if (record) source = "the crew agent's own session transcript";
-      } catch {
-        /* fall through to locating it by order text */
-      }
-    }
-    // 2. Locate the transcript by matching the order text (no hook, or its path
-    //    was unreadable).
-    if (!record && config) {
-      try {
-        const transcript = await findCrewTranscript({
-          agentCommand: resolveAgentCommand(config, job.agentName),
-          repoPath: config.repoPath,
-          order: job.order,
-          startedAtMs: job.startedAt ?? 0,
-        });
-        if (transcript) {
-          const raw = await readFileTail(transcript, 4 * 1024 * 1024);
-          record = renderTranscriptForReview(raw, 16000);
-          if (record) source = "the crew agent's own session transcript";
-        }
-      } catch {
-        /* fall through to the hook message / capture */
-      }
-    }
-    // 3. The hook's captured last assistant message — a real result even when no
-    //    transcript could be read.
-    if (!record && job.lastAssistantMessage) {
-      record = job.lastAssistantMessage;
-      source = "the crew agent's final message";
-    }
-    // 4. The raw capture (background print-mode output, or a degrade note).
-    if (!record) {
-      try {
-        record = await readCapture(state, job.captureFile);
-        source = "the raw run capture";
-      } catch {
-        record = "(no transcript was found and the capture file could not be read)";
-        source = "nothing — no record was recoverable";
-      }
-    }
+    // Resolve the run's record (reviewrecord.ts): the four sources in order of
+    // trust, and — the point of that module — nothing cut without saying so.
+    const { record, source } = await resolveReviewRecord(job, state.dispatch);
 
     state.userTurns++;
-    state.messages.push({
-      role: "user",
-      content:
-        "SYSTEM: A crew dispatch you launched has finished; review it now for the captain. This is" +
-        " not something the captain typed — you triggered it. The agent ran in a separate coding" +
-        " session against the registered repo; below is the record of that run, taken from " +
-        source +
-        ". Review it per the report-review protocol (what went right, what went wrong, escalations," +
-        " then a verdict: accept / fix-commit / rework). Be concise. Do NOT ask the captain to paste" +
-        " anything; you already have the record. Separate verified from claimed. If the record is" +
-        " only a completion marker with no content, say plainly that the run left no reviewable" +
-        " record and what the exit code implies.\n\n" +
-        `Job: ${job.id} (${job.label})\nStatus: ${job.status}` +
-        (job.exitCode !== undefined ? ` (exit ${job.exitCode})` : "") +
-        `\n\n--- record of the run ---\n${record}` +
-        resolveNote,
-    });
+    pushUserTurn(state, completionTurn(job, record, source, resolveNote));
+
+    // Both lanes drive the same way; which turn they were handed is the only
+    // difference, and completionTurn has already decided that (D-20260729-6).
     await drive(state);
   }
 }
 
-/** Read a capture file for review, capping its size so a runaway log can't blow
- *  the context window. Reads only the file tail, scrubs terminal escape noise
- *  into readable text, and keeps the last MAX characters — where the run's
- *  conclusion and the sentinel live. (Pane captures hold just probe + sentinel;
- *  this mainly serves background-run captures and degrade notes.) */
-async function readCapture(_state: SessionState, file: string): Promise<string> {
-  const raw = await readFileTail(file, 256 * 1024);
-  const clean = scrubCapture(raw);
-  const MAX = 16000;
-  return clean.length > MAX ? "…[capture truncated to the last part]\n" + clean.slice(-MAX) : clean;
+/**
+ * The system turn a finished job produces — the ROUTING decision, in one pure
+ * function so it can be tested without a model call.
+ *
+ * Two destinations, and which one a run takes is its LANE and nothing else:
+ *
+ *  - a WRITER built something, so it is reviewed and given a verdict;
+ *  - a READER was forbidden to change anything, so there is nothing to accept or
+ *    rework — it comes back as context the co answers the captain with
+ *    (D-20260729-6).
+ */
+export function completionTurn(job: Job, record: string, source: string, resolveNote = ""): string {
+  return job.lane === "reader"
+    ? auditTurn(job, record, source)
+    : reviewTurn(job, record, source, resolveNote);
 }
 
-function firstLineOf(order: string): string {
-  const l = order.split("\n").find((x) => x.trim() !== "")?.trim() ?? "";
-  return l.length > 80 ? l.slice(0, 77) + "…" : l;
+/** The review turn: a crew run that produced work, handed over to be reviewed
+ *  per the report-review protocol. */
+function reviewTurn(job: Job, record: string, source: string, resolveNote: string): string {
+  return (
+    "SYSTEM: A crew dispatch you launched has finished; review it now for the captain. This is" +
+    " not something the captain typed — you triggered it. The agent ran in a separate coding" +
+    " session against the registered repo; below is the record of that run, taken from " +
+    source +
+    ". Review it per the report-review protocol (what went right, what went wrong, escalations," +
+    " then a verdict: accept / fix-commit / rework). Be concise. Do NOT ask the captain to paste" +
+    " anything; you already have the record. Separate verified from claimed. If the record is" +
+    " only a completion marker with no content, say plainly that the run left no reviewable" +
+    " record and what the exit code implies.\n\n" +
+    "SAY NOTHING UNLESS IT IS VITAL: reach the verdict, then speak only if it is `rework`, a" +
+    " genuine escalation, or a fork only the captain can resolve — and then state that decision" +
+    " alone, in a line or two. Otherwise say nothing at all and let the run pass: no summary, no" +
+    " headline, no line reporting that you reviewed it. He asks when he wants the detail.\n\n" +
+    `Job: ${job.id} (${job.label})\nStatus: ${job.status}` +
+    (job.exitCode !== undefined ? ` (exit ${job.exitCode})` : "") +
+    `\n\n--- record of the run ---\n${record}` +
+    resolveNote
+  );
+}
+
+/**
+ * The turn a finished READ-ONLY run produces. Deliberately not the review turn:
+ * an audit is a question the captain asked, answered by an agent that was
+ * forbidden to change anything, so there is no delivery to accept and no verdict
+ * to reach (D-20260729-6). Reviewing one would put an accept/rework on a run that
+ * built nothing.
+ */
+function auditTurn(job: Job, record: string, source: string): string {
+  return (
+    "SYSTEM: A READ-ONLY AUDIT you dispatched has finished. This is not something the captain typed" +
+    " — you triggered it — and it is NOT a crew implementation run. The agent was launched into a" +
+    " worktree another agent is still working in, under a read-only mandate: no edits, no commits," +
+    " no builds, nothing written to disk at all" +
+    (job.readOnlyEnforced
+      ? " (its write-capable tools were also denied at launch)" +
+        ". So it produced no diff and changed nothing."
+      : " (advisory only for this agent — nothing mechanically blocked it, so if the record shows it" +
+        " wrote anything, say so plainly: that is a real problem worth raising)." +
+        " It was supposed to produce no diff and change nothing.") +
+    "\n\nDO NOT REVIEW THIS RUN. Do not give it a verdict (accept / fix-commit / rework), and do" +
+    " not treat it as work delivered. Its findings are" +
+    " CONTEXT FOR YOU TO ANSWER WITH: read the report below, and reply to the captain with what it" +
+    " found and what you make of it, in your own voice and at your usual length. Say plainly where" +
+    " the audit is uncertain or where it only looked at part of the picture, and separate what it" +
+    " verified from what it merely asserts. If it turned up something that changes a decision, the" +
+    " architecture, or what we do next, that is the part to lead with.\n\n" +
+    `Job: ${job.id} (${job.label})\nStatus: ${job.status}` +
+    (job.exitCode !== undefined ? ` (exit ${job.exitCode})` : "") +
+    (job.feature ? `\nWorktree: feature '${job.feature}'` : "") +
+    `\nRecord taken from ${source}.` +
+    `\n\n--- the audit's report ---\n${record}`
+  );
 }
 
 /**
  * Parse a typed line against the confirm interlock. Pure so the interlock's
- * two decisions — is this a confirm, and does it name a crew agent — can be
- * unit-tested without arming a real dispatch (which needs a model call).
+ * three decisions — is this a confirm, which LANE does it grant, and does it
+ * name a crew agent — can be unit-tested without arming a real dispatch (which
+ * needs a model call).
  *
- *   "confirm"        → { isConfirm: true }                 (use the default agent)
- *   "confirm ccw"    → { isConfirm: true, agent: "ccw" }   (override for this run)
- *   "CONFIRM"        → { isConfirm: true }                 (case-insensitive verb)
- *   anything else    → { isConfirm: false }                (cancels the dispatch)
+ *   "confirm"           → { isConfirm: true }
+ *   "confirm write"     → { isConfirm: true, write: true }
+ *   "confirm ccw"       → { isConfirm: true, agent: "ccw" }
+ *   "confirm write ccw" → { isConfirm: true, write: true, agent: "ccw" }
+ *   "CONFIRM"           → { isConfirm: true }              (case-insensitive verb)
+ *   anything else       → { isConfirm: false }             (cancels the dispatch)
  *
- * Only the verb and the first token after it matter; trailing words are ignored
- * so a fat-fingered "confirm cc please" still selects cc rather than cancelling.
+ * `write` is the WORD that buys a second writing lane in an occupied worktree
+ * (D-20260729-5). It is folded into the confirm verb rather than asked as a
+ * second question after it, because a free-text prompt after `confirm` is
+ * another cancel-trap: one wrong keystroke there discards an order the captain
+ * has already approved.
+ *
+ * On an UNOCCUPIED worktree `write` changes nothing — a bare `confirm` already
+ * grants full write access there — so it is accepted as a harmless synonym
+ * rather than rejected as noise.
+ *
+ * Only the verb, an optional `write`, and the next token matter; trailing words
+ * are ignored so a fat-fingered "confirm cc please" still selects cc rather than
+ * cancelling. A crew agent literally NAMED "write" cannot be selected by
+ * `confirm write` — the lane word wins — which is a fair trade for a lane verb
+ * that reads like English.
  */
-export function parseConfirm(raw: string): { isConfirm: boolean; agent?: string } {
-  const [verb, agentToken] = raw.trim().split(/\s+/, 2);
-  if (verb?.toLowerCase() !== "confirm") return { isConfirm: false };
-  return agentToken ? { isConfirm: true, agent: agentToken } : { isConfirm: true };
+export function parseConfirm(raw: string): { isConfirm: boolean; write?: boolean; agent?: string } {
+  // The verb test itself is shared with the TUI, which uses it to decide whether
+  // a queued line may answer an armed gate. See src/confirmverb.ts for why that
+  // is one function and not two.
+  if (!isConfirmVerb(raw)) return { isConfirm: false };
+  const parts = raw.trim().split(/\s+/);
+  let next = 1;
+  const write = parts[next]?.toLowerCase() === "write";
+  if (write) next += 1;
+  const agent = parts[next];
+  return {
+    isConfirm: true,
+    ...(write ? { write: true } : {}),
+    ...(agent ? { agent } : {}),
+  };
+}
+
+/**
+ * Everything `/model` needs, injected — so the command's decisions (does an
+ * exported variable outrank this, does an unreachable id change anything, is the
+ * choice actually stored) are provable without a Bedrock account or a session.
+ */
+export interface ModelSwitch {
+  /** The model in force this instant: what a turn sent right now would use. */
+  current: string;
+  /** Where a session opened right now would get its model, read fresh off disk. */
+  origin: ModelOrigin;
+  /** Ask the API whether it will answer to this id. Never throws. */
+  probe: (modelId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Store the choice for this instance; resolves to the file written. */
+  persist: (modelId: string) => Promise<string>;
+  /** Switch the live provider. Returns a note if the switch moved anything else. */
+  commit: (modelId: string) => string | null;
+  /**
+   * Show the picker and resolve to the id chosen, or null if it was cancelled.
+   *
+   * Present only where there is a screen to draw one on - the Tui wires it, and
+   * PlainIO (piped / non-TTY) leaves it undefined, where bare `/model` reports
+   * exactly as it always has. Optional for that reason and not as a convenience:
+   * a picker on a pipe would be a prompt nobody can answer.
+   */
+  pick?: (choices: readonly ModelPickerEntry[], current: string) => Promise<string | null>;
+}
+
+/**
+ * `/model` — report the model in force and where it came from; `/model <id>`
+ * switches this co-manager to a different Bedrock model and remembers it.
+ *
+ * Three rules, in this order, and each of them is a thing that would otherwise
+ * bite silently:
+ *
+ *  1. An EXPORTED `BEDROCK_MODEL_ID` wins and the command refuses. It already
+ *     outranks the stored value at load, so a `/model` that beat it for one
+ *     session and lost at the next restart would give "which model is this
+ *     co-manager on" two different answers depending on when you asked — which
+ *     is the exact confusion this command exists to end. Refusing says so and
+ *     names the way out.
+ *  2. The API is asked BEFORE anything is committed. A bad or unentitled id
+ *     otherwise sets cleanly and kills the next turn instead, with the error
+ *     arriving detached from the command that caused it. A failed probe leaves
+ *     the previous model in force and nothing on disk.
+ *  3. The write is reported, including when it fails. A switch that could not be
+ *     stored is still applied — it is what the captain asked for — but it is
+ *     announced as this-session-only rather than being left to look permanent.
+ *
+ * Ids are taken verbatim. There is no alias table and no friendly-name registry:
+ * either would be stale the day a new model ships, and would then reject an id
+ * that works.
+ *
+ * BARE, IT ALSO OPENS THE PICKER (where there is a screen for one): the report
+ * is printed exactly as before and a short curated list of models goes up in the
+ * panel, because making the captain type a Bedrock id from memory is the wrong
+ * primary surface for a choice with three real answers. A picked id then walks
+ * the SAME path a typed one does - probe, store, commit, in that order - so
+ * there is one way a model is set and one way it is persisted, not two.
+ */
+export async function runModelCommand(arg: string, deps: ModelSwitch): Promise<string[]> {
+  const { current, origin } = deps;
+  const wanted = arg.trim();
+
+  if (!wanted) {
+    const report = describeModel(current, origin);
+    // No picker to show (a piped session), or nothing a pick could change: an
+    // exported variable outranks a stored choice, so offering a list would be
+    // offering a choice that is refused the moment it is made. Report, as ever.
+    if (!deps.pick || origin.source === "env") return report;
+    const chosen = await deps.pick(MODEL_CHOICES, current);
+    // Cancelled: nothing probed, nothing written, nothing switched.
+    if (chosen === null) return report;
+    return [...report, ...(await switchModel(chosen, deps))];
+  }
+
+  if (!isPlausibleModelId(wanted)) {
+    return [
+      c.yellow(`usage: /model <bedrock model id>`),
+      c.dim(`  a bare id, e.g. ${DEFAULT_MODEL_ID}`),
+    ];
+  }
+
+  if (origin.source === "env") {
+    return [
+      c.yellow(`${MODEL_ID_KEY} is set in your environment (${origin.modelId}).`),
+      c.dim("  an exported variable outranks a stored choice, so nothing was changed."),
+      c.dim(`  unset ${MODEL_ID_KEY} to set a model per co-manager.`),
+    ];
+  }
+
+  return switchModel(wanted, deps);
+}
+
+/**
+ * Set the model to `wanted`: ask the API, store the choice, switch the provider,
+ * and say what happened at each step.
+ *
+ * ONE path, shared by the typed id and the picked one. A picker that wrote the
+ * `.env` itself, or skipped the probe because the list is curated, would be a
+ * second way for this co-manager's model to change - and the two would drift the
+ * first time either grew a rule.
+ */
+async function switchModel(wanted: string, deps: ModelSwitch): Promise<string[]> {
+  const { current } = deps;
+
+  // Already the model in force: skip the probe (it is answering turns already)
+  // and just pin it, so a changed default or a changed shared .env cannot move
+  // this instance later.
+  if (wanted === current) {
+    const out = [c.dim(`model: ${current} — already in force`)];
+    out.push(...(await store(deps, wanted)));
+    return out;
+  }
+
+  const verdict = await deps.probe(wanted);
+  if (!verdict.ok) {
+    return [
+      c.yellow(`${wanted} did not answer — staying on ${current}.`),
+      c.dim(`  ${verdict.error}`),
+    ];
+  }
+
+  const stored = await store(deps, wanted);
+  const note = deps.commit(wanted);
+  const out = [c.dim(`model: ${current} → ${wanted} (from the next turn)`)];
+  if (note) out.push(c.yellow(`  ${note}`));
+  return [...out, ...stored];
+}
+
+/** Persist the choice and say what happened, including when it didn't. */
+async function store(deps: ModelSwitch, modelId: string): Promise<string[]> {
+  try {
+    return [c.dim(`  stored for this co-manager in ${await deps.persist(modelId)}`)];
+  } catch (e) {
+    return [
+      c.yellow(`  this session only — the choice could not be stored: ${(e as Error).message}`),
+    ];
+  }
+}
+
+/** The bare `/model` report: what is in force, and what put it there. */
+function describeModel(current: string, origin: ModelOrigin): string[] {
+  const out = [c.dim(`model:  ${current}`), c.dim(`source: ${sourceLabel(origin)}`)];
+  for (const s of origin.shadowed) {
+    out.push(c.dim(`        shadowing ${s.modelId} in ${s.where}`));
+  }
+  // Only reachable when the two have been pulled apart — a store that failed, or
+  // a file edited by hand mid-session. Saying it plainly beats a report that is
+  // quietly about a different model than the next turn will use.
+  if (origin.modelId !== current) {
+    out.push(c.yellow(`        this session is on ${current}; a restart would use ${origin.modelId}`));
+  }
+  out.push(c.dim("switch it with /model <bedrock model id>"));
+  return out;
+}
+
+function sourceLabel(origin: ModelOrigin): string {
+  switch (origin.source) {
+    case "env":
+      return `${origin.where} — an exported variable outranks anything stored`;
+    case "instance":
+      return `this co-manager — ${origin.where}`;
+    default:
+      // A shared .env, or the built-in default: `where` already says which.
+      return origin.where;
+  }
 }
 
 type CommandResult = "ok" | "exit";
@@ -993,10 +2089,10 @@ async function handleCommand(state: SessionState, raw: string): Promise<CommandR
       }
       // A shortcut to record a decision explicitly. There is no confirmation
       // step — recording is silent and self-managed.
-      state.messages.push({
-        role: "user",
-        content: `Record this as a decision now with append_decision. Use the rationale already in our conversation; if some context is thin, record it anyway and note the open questions inline in the entry. Then refresh activeContext.md to reference the new decision id. Keep your spoken reply natural and brief, and do not narrate the memory write. Decision: ${arg}`,
-      });
+      pushUserTurn(
+        state,
+        `Record this as a decision now with memory_write (kind: decision). Use the rationale already in our conversation; if some context is thin, record it anyway and note the open questions inline in the entry. Then rewrite activeContext (memory_rewrite) to reference the new decision id. Keep your spoken reply natural and brief, and do not narrate the memory write. Decision: ${arg}`,
+      );
       await drive(state);
       return "ok";
     }
@@ -1030,22 +2126,77 @@ async function handleCommand(state: SessionState, raw: string): Promise<CommandR
       return "ok";
     }
 
+    case "cost": {
+      // The one place spend is ever visible. Nothing else in the session
+      // mentions it — that's the whole design (see cost.ts).
+      for (const l of formatCostReport({
+        ledger: state.costs,
+        modelId: state.model.modelId,
+        cacheTtl: CACHE_TTL,
+      })) {
+        io.appendBlock(l);
+      }
+      return "ok";
+    }
+
     case "effort": {
       // Session-scoped override of CO_EFFORT. Takes effect on the next turn;
       // nothing is written to disk, so a restart returns to the configured
       // default (set CO_EFFORT to make a change stick).
+      // The ladder is per-model: xhigh arrived with Opus 4.7, so on the 4.6
+      // generation it is a 400 on every subsequent turn rather than a level
+      // the model merely ignores. Offer and accept only what this model takes.
+      const levels = effortLevelsFor(state.model.modelId);
       const current = state.model.effort ?? "(unset)";
       if (!arg) {
-        io.appendBlock(c.dim(`effort: ${current}  (levels: ${EFFORT_LEVELS.join(", ")})`));
+        io.appendBlock(c.dim(`effort: ${current}  (levels: ${levels.join(", ")})`));
         return "ok";
       }
       const next = parseEffort(arg);
       if (!next) {
-        io.appendBlock(c.yellow(`usage: /effort [${EFFORT_LEVELS.join("|")}]`));
+        io.appendBlock(c.yellow(`usage: /effort [${levels.join("|")}]`));
+        return "ok";
+      }
+      if (!levels.includes(next)) {
+        io.appendBlock(
+          c.yellow(`${next} is not accepted by ${state.model.modelId} — levels: ${levels.join(", ")}`),
+        );
         return "ok";
       }
       state.model.setEffort(next);
       io.appendBlock(c.dim(`effort: ${current} → ${next} (this session)`));
+      return "ok";
+    }
+
+    case "model": {
+      // Unlike /effort, this one is DURABLE: the captain runs one co-manager per
+      // project and wants each on its own model without editing files. So the
+      // choice is written to the instance's own .env — per-instance, under
+      // CO_HOME, never in a repo and never a global default other instances would
+      // inherit. resolveModelOrigin is read fresh here rather than off the loaded
+      // config, so the report reflects a write this session just made.
+      const lines = await runModelCommand(arg, {
+        current: state.model.modelId,
+        origin: resolveModelOrigin({
+          instanceRoot: state.paths.root,
+          home: state.cfg.home,
+        }),
+        probe: (id) => state.model.probeModel(id),
+        persist: (id) => persistInstanceModel(state.paths.root, id),
+        // The picker is the Tui's, and only the Tui's: it is a panel view, and a
+        // piped session has no panel to put it in. Wired the way the landing
+        // gate is wired, for the same reason - the capability is narrowed to the
+        // one method, so nothing else of the screen is reachable from here.
+        ...(io instanceof Tui ? { pick: (choices, current) => io.openModelPicker(choices, current) } : {}),
+        commit: (id) => {
+          const before = state.model.effort;
+          const lowered = state.model.setModel(id);
+          return lowered
+            ? `effort ${before} → ${lowered}: ${id} does not accept ${before}`
+            : null;
+        },
+      });
+      for (const l of lines) io.appendBlock(l);
       return "ok";
     }
 
@@ -1075,11 +2226,10 @@ async function syncActiveContext(state: SessionState, force: boolean, quiet = fa
   if (!quiet) io.appendBlock(c.dim("\nsyncing activeContext.md…"));
 
   const before = state.effects.liveRewritten.has("activeContext.md");
-  state.messages.push({
-    role: "user",
-    content:
-      "Session sync: update .memory/activeContext.md so the next cold start orients" +
-      " correctly. Use rewrite_active_context. Reflect the current focus, decisions" +
+  pushUserTurn(
+    state,
+    "Session sync: update .memory/activeContext.md so the next cold start orients" +
+      " correctly. Use memory_rewrite (file: activeContext). Reflect the current focus, decisions" +
       " in flight, recent confirmed decisions (compressed, with ids), open questions," +
       " known risks, and next likely actions. Crucially, update the \"Recent" +
       " conversation\" section to summarise what we actually discussed this session -" +
@@ -1089,7 +2239,7 @@ async function syncActiveContext(state: SessionState, force: boolean, quiet = fa
       " letting older detail age out. Reply with a brief, natural one-line" +
       " acknowledgement, and do not narrate the memory write or say things like" +
       " saved, logged, or wrote to memory.",
-  });
+  );
   // On the exit distill (quiet), the model's acknowledgement is suppressed on
   // screen so `/exit` doesn't look like the co replied to a chat message; the
   // memory write still happens and the reply is still kept in the transcript.
@@ -1125,16 +2275,41 @@ async function endOfSessionGuard(state: SessionState): Promise<void> {
     return;
   }
 
-  // Distil the session into live state, quietly. This is the co-manager's own
-  // bookkeeping; it is never narrated to the captain.
-  await syncActiveContext(state, /*force*/ true, /*quiet*/ true);
+  // The save below is a model call: several seconds of a terminal that has
+  // already been told to quit. The line says why we're still here (at every
+  // visuals level); the ship, where it can sail, fills that wait and nothing
+  // else — it is started AFTER the label, stopped in a finally, and never
+  // waited on.
+  const visuals = visualsFor(io);
+  io.appendBlock("");
+  io.appendBlock(savingLabel(visuals));
+  const voyage = visuals.animate
+    ? io.playAnimation(
+        exitVoyage({
+          cols: process.stdout.columns || 80,
+          glyphs: visuals.glyphs,
+          color: visuals.color,
+        }),
+      )
+    : NO_ANIMATION;
 
-  // Keep the chatty logs from growing without bound. This is off the cold-start
-  // read path, so it never affects context size — it just keeps on-demand
-  // search fast. decisions.md is deliberately never auto-archived (see
-  // autoArchiveLargeLogs). Best-effort; failures never block exit. Silent, like
-  // the rest of memory maintenance.
-  await autoArchiveLargeLogs(state.paths);
+  try {
+    // Distil the session into live state, quietly. This is the co-manager's own
+    // bookkeeping; it is never narrated to the captain.
+    await syncActiveContext(state, /*force*/ true, /*quiet*/ true);
+
+    // Keep the chatty logs from growing without bound. This is off the cold-start
+    // read path, so it never affects context size — it just keeps on-demand
+    // search fast. decisions.md is deliberately never auto-archived (see
+    // autoArchiveLargeLogs). Best-effort; failures never block exit. Silent, like
+    // the rest of memory maintenance.
+    await autoArchiveLargeLogs(state.paths);
+  } finally {
+    // stop(), never settle(): the save is the point and the voyage is scenery
+    // over it. A ship still mid-crossing when the save lands is cut short — exit
+    // never waits on an animation, and never on the error path either.
+    voyage.stop();
+  }
 
   io.appendBlock(c.dim("bye."));
 }
@@ -1175,7 +2350,7 @@ function bannerText(name: string, cfg: Config, tui: boolean, linked: boolean): s
   if (tui) {
     lines.push(
       c.dim("scroll: wheel or PgUp/PgDn · ↑/↓ recalls your input · hold Option/Shift to select text"),
-      c.dim(linked ? "Ctrl-O opens the panel (merge queue + docs)" : "Ctrl-O opens the doc viewer"),
+      c.dim(linked ? "Ctrl-O opens the panel (merge queue + docs)" : "Ctrl-O opens the panel (docs)"),
     );
   }
   return lines.join("\n");
@@ -1300,4 +2475,12 @@ class PlainIO implements SessionIO {
   // No banner off the TTY: the armed order + command are printed inline by the
   // session loop instead, so a pipe/script sees them as ordinary output.
   setConfirmBanner(_lines: string[] | null): void {}
+
+  // Nothing animates on a pipe: there is no addressable screen, and a stream of
+  // redrawn frames would corrupt the deterministic output scripts and tests
+  // depend on. The caller's static line has already been printed either way —
+  // visualsFor() resolves PlainIO to `off`, so it printed the ASCII form.
+  playAnimation(_spec: AnimationSpec): AnimationHandle {
+    return NO_ANIMATION;
+  }
 }

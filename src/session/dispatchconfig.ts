@@ -168,7 +168,10 @@ function coerce(raw: unknown): DispatchConfig {
       );
       if (seq.length > 0) base.pane.directionSequence = seq;
     }
-    if (Number.isFinite(pane.cap) && Number(pane.cap) >= 1) base.pane.cap = Math.floor(Number(pane.cap));
+    // A `cap` written by an older build is deliberately read and dropped: crew
+    // panes are no longer capped (a dispatch that finds every pane busy splits
+    // another, always), so the value would be a limit nothing enforces. Leaving
+    // it in the file is harmless — it is simply not part of the config any more.
   }
 
   const anchor = o.anchor as Record<string, unknown> | undefined;

@@ -7,6 +7,7 @@ import path from "node:path";
  *
  *   <home>/
  *     instances/<name>/
+ *       .cost.json                   running token/cost meter, shown by /cost
  *       docs/                        user-facing documents (flat, starts empty)
  *         architecture.md, plan.md, ...  born with their workflow, via the doc tool
  *       .memory/                     hidden substrate the co-manager manages
@@ -70,6 +71,31 @@ export interface InstancePaths {
   dispatch: string;
   /** The per-instance dispatch config file (co link). */
   dispatchConfig: string;
+  /** Per-feature prose co authored and git cannot recover: the feature's intent
+   *  (its one-line description) and the PR title/body co wrote when it enqueued
+   *  the feature. Keyed by slug, read at startup so both survive a restart and a
+   *  re-processed head still opens its pull request with the message co wrote.
+   *  Lives beside the dispatch config — feature worktrees are dispatch state —
+   *  and is never written into the user's repo. */
+  featureStore: string;
+  /** The crew panes co owns: each pane's Ghostty id plus the tty and shell pid a
+   *  job taught it, and co's dispatch lease on it. Ghostty can only be asked
+   *  whether a terminal id still exists, so everything reuse needs to prove a
+   *  pane is idle is remembered here — beside the dispatch config, because a
+   *  crew pane is dispatch state. Never written into the user's repo. */
+  paneStore: string;
+  /** The co's own at-a-glance task table: the handful of live items it keeps in
+   *  live state, persisted so the Ctrl-O Home tab can render them rather than
+   *  waiting for the model to re-print the table into the chat. Sits beside the
+   *  feature store for the same reason it does — small, per-instance runtime
+   *  state the app reads at paint time — and is never written into the repo. */
+  taskTable: string;
+  /** The running token/cost meter for this instance (see cost.ts). Sits at the
+   *  instance root rather than in .memory/ or .dispatch/ because it is neither:
+   *  not the co-manager's substrate (the co never reads or writes it, and it is
+   *  not in the system prompt) and not dispatch state. It is the app's own
+   *  bookkeeping about the app, surfaced only by /cost. */
+  costLedger: string;
   /** Directory holding per-job capture files. */
   captures: string;
   /** Resolve a per-job capture file under .dispatch/captures/. */
@@ -103,6 +129,10 @@ export function instancePaths(home: string, name: string): InstancePaths {
     sessions,
     dispatch,
     dispatchConfig: path.join(dispatch, "config.json"),
+    featureStore: path.join(dispatch, "features.json"),
+    paneStore: path.join(dispatch, "panes.json"),
+    taskTable: path.join(dispatch, "tasks.json"),
+    costLedger: path.join(root, ".cost.json"),
     captures,
     captureFile: (jobId) => path.join(captures, `${jobId}.log`),
     liveFile: (f) => path.join(memory, f),

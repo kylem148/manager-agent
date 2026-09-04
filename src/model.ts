@@ -1,6 +1,8 @@
 import { AnthropicBedrock } from "@anthropic-ai/bedrock-sdk";
 import type Anthropic from "@anthropic-ai/sdk";
+import { clampEffort } from "./config.js";
 import type { Effort, ModelConfig } from "./config.js";
+import { emptyUsage, type TokenUsage } from "./cost.js";
 
 /**
  * Thin wrapper over the Anthropic Bedrock client. Responsibilities:
@@ -25,6 +27,18 @@ export interface ToolResult {
 
 export type ToolExecutor = (block: ToolUseBlock) => Promise<ToolResult>;
 
+/** Everything one assistant turn needs. */
+export interface TurnArgs {
+  system: string;
+  messages: MessageParam[];
+  tools: Tool[];
+  executor: ToolExecutor;
+  handlers?: StreamHandlers;
+  maxToolRounds?: number;
+  /** Run this turn at a different effort than the session default. */
+  effort?: Effort;
+}
+
 export interface StreamHandlers {
   /** Called for each chunk of visible answer text. */
   onText?: (delta: string) => void;
@@ -43,12 +57,15 @@ export interface StreamHandlers {
  * Cache breakpoints. Bedrock allows at most 4 per request, and (unlike the
  * first-party API) has no automatic caching, so every breakpoint is placed by
  * hand. Budget:
- *   1. the last tool definition — tools are static for the life of the binary,
- *      so this prefix survives across sessions, not just across turns;
- *   2. the end of the system prompt — stable for a whole session, since
- *      buildSystemPrompt runs once at startup and mid-session memory writes
- *      never rebuild it;
- *   3-4. two rolling anchors in the message history (see pickMessageBreakpoints).
+ *   1. the end of the system prompt — ONE entry covering the tool definitions
+ *      ahead of it AND the prompt text. Both are static for the life of the
+ *      binary (the prompt carries no live state since the 2026-07-30 overhaul;
+ *      per-instance state rides the startup injection in history), so this
+ *      prefix survives across sessions, not just across turns. Tools carry no
+ *      breakpoint of their own: caching them separately from a system prompt
+ *      that never changes without them bought a second entry for nothing.
+ *   2-3. two rolling anchors in the message history (see
+ *      pickMessageBreakpoints). The fourth slot is deliberately unspent.
  *
  * Verified working on the legacy bedrock-runtime path with a Bedrock bearer
  * token on 2026-07-20: a 3.7k-token prefix dropped input_tokens from 3832 to 79
@@ -57,8 +74,27 @@ export interface StreamHandlers {
  * and do not promise this path caches — so the CO_DEBUG_TIMING counters below
  * are the standing check, not a nicety. If cache_read_input_tokens goes to zero
  * and stays there, something upstream of the breakpoints started changing.
+ *
+ * TTL is one hour, not the five-minute default, and that is the single biggest
+ * cost lever in the whole program. A co-manager is a thinking partner: the
+ * captain reads an answer, thinks for ten minutes, then replies. Under the
+ * default TTL every one of those pauses expires the entry and the next turn
+ * re-writes the whole ~22k-token prefix at 1.25x instead of reading it at 0.1x
+ * — a 12.5x swing on the dominant input term, paid several times a session.
+ * The hour costs a 2x write premium instead of 1.25x, which pays for itself
+ * from the second read onward; only a strictly one-turn session is worse off.
+ *
+ * `ttl` is a first-party API field that this legacy Bedrock path does not
+ * document, so it was measured rather than assumed (2026-07-27): a unique
+ * prefix written under ttl "1h" returned cache_creation=2216/read=0, and the
+ * same prefix seven minutes later — well past the five-minute default expiry —
+ * returned cache_creation=0/read=2216. Survival past an hour was not measured;
+ * what mattered was proving the entry is not on the default clock. If a future
+ * SDK or endpoint change rejects the field, drop back to a bare `ephemeral`.
  */
-const CACHE_CONTROL = { type: "ephemeral" as const };
+export const CACHE_TTL = "1h" as const;
+
+const CACHE_CONTROL = { type: "ephemeral" as const, ttl: CACHE_TTL };
 
 /**
  * How many content blocks back the lagging message breakpoint sits. Each
@@ -75,39 +111,96 @@ function blockCount(m: MessageParam): number {
 }
 
 /**
- * Indices of the messages whose final content block should carry a breakpoint:
- * the newest message, plus one far enough back to stay inside the lookback
- * window. Returns at most two.
+ * Blocks that may carry `cache_control`, which is not all of them.
+ *
+ * A thinking block has no such field: it is signed by the model and replayed
+ * verbatim, and the API rejects the extra key outright rather than ignoring it
+ * — `400 messages.16.content.0.thinking.cache_control: Extra inputs are not
+ * permitted`. That is a hard failure of the whole turn, and it is reached with
+ * a history the captain cannot edit, so every later turn fails the same way.
+ * The type cast that used to sit on the marker below is exactly what let this
+ * compile; markBlock takes the narrowed type instead, so a block type the SDK
+ * says cannot carry a breakpoint is now a compile error rather than a 400.
+ */
+type BreakpointBlock = Exclude<
+  ContentBlockParam,
+  { type: "thinking" } | { type: "redacted_thinking" }
+>;
+
+function acceptsBreakpoint(b: ContentBlockParam): b is BreakpointBlock {
+  return b.type !== "thinking" && b.type !== "redacted_thinking";
+}
+
+/** True when this message has somewhere legal to put a breakpoint. */
+function canCarryBreakpoint(m: MessageParam): boolean {
+  return typeof m.content === "string" || m.content.some(acceptsBreakpoint);
+}
+
+/**
+ * The newest message at or before `from` that can carry a breakpoint, or null.
+ * An assistant turn that stopped inside its reasoning is nothing but a thinking
+ * block, so an anchor that lands on one slides back to the nearest message with
+ * a legal spot rather than being dropped — the anchor moves, the count doesn't.
+ */
+function anchorAtOrBefore(messages: MessageParam[], from: number): number | null {
+  for (let i = Math.min(from, messages.length - 1); i >= 0; i--) {
+    if (canCarryBreakpoint(messages[i]!)) return i;
+  }
+  return null;
+}
+
+/**
+ * Indices of the messages whose final cacheable content block should carry a
+ * breakpoint: the newest message, plus one far enough back to stay inside the
+ * lookback window. Returns at most two.
  */
 function pickMessageBreakpoints(messages: MessageParam[]): Set<number> {
   const marks = new Set<number>();
   if (messages.length === 0) return marks;
 
-  const newest = messages.length - 1;
+  const newest = anchorAtOrBefore(messages, messages.length - 1);
+  if (newest === null) return marks;
   marks.add(newest);
 
   let blocks = 0;
-  for (let i = newest; i >= 0; i--) {
+  for (let i = messages.length - 1; i >= 0; i--) {
     blocks += blockCount(messages[i]!);
     if (blocks >= LOOKBACK_BLOCK_BUDGET && i > 0) {
-      marks.add(i - 1);
+      // Strictly older than the newest anchor: two marks on one message is one
+      // breakpoint, and the lagging anchor exists to sit further back.
+      const lagging = newest === 0 ? null : anchorAtOrBefore(messages, Math.min(i - 1, newest - 1));
+      if (lagging !== null) marks.add(lagging);
       break;
     }
   }
   return marks;
 }
 
-/** A copy of `m` whose last content block carries a cache breakpoint. */
+/** A copy of `b` carrying a cache breakpoint. */
+function markBlock(b: BreakpointBlock): ContentBlockParam {
+  return { ...b, cache_control: CACHE_CONTROL };
+}
+
+/** A copy of `m` whose last cacheable content block carries a cache breakpoint. */
 function markMessage(m: MessageParam): MessageParam {
   // A string body has to become a block before it can carry cache_control.
   // Semantically identical to the API.
   if (typeof m.content === "string") {
     return { ...m, content: [{ type: "text", text: m.content, cache_control: CACHE_CONTROL }] };
   }
-  if (m.content.length === 0) return m;
-  const content = m.content.map((b, i) =>
-    i === m.content.length - 1 ? ({ ...b, cache_control: CACHE_CONTROL } as ContentBlockParam) : b,
-  );
+  // The last block the API will take one on: the final block of an ordinary
+  // message, and an earlier one when the tail of the message is thinking.
+  let at = -1;
+  for (let i = m.content.length - 1; i >= 0; i--) {
+    if (acceptsBreakpoint(m.content[i]!)) {
+      at = i;
+      break;
+    }
+  }
+  if (at === -1) return m;
+  // The guard is re-run rather than cast away: it is what narrows the block for
+  // markBlock, and narrowing is the whole point of the exercise.
+  const content = m.content.map((b, i) => (i === at && acceptsBreakpoint(b) ? markBlock(b) : b));
   return { ...m, content };
 }
 
@@ -122,21 +215,111 @@ function withMessageBreakpoints(messages: MessageParam[]): MessageParam[] {
   return messages.map((m, i) => (marks.has(i) ? markMessage(m) : m));
 }
 
-/** Tool definitions with a breakpoint on the last one, closing the tools prefix. */
-function withToolBreakpoint(tools: Tool[]): Tool[] {
-  if (tools.length === 0) return tools;
-  return tools.map((t, i) =>
-    i === tools.length - 1 ? ({ ...t, cache_control: CACHE_CONTROL } as Tool) : t,
-  );
-}
-
 function fmtMs(ms: number): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
+}
+
+/**
+ * Output cap on a cache-refresh probe. The reply is discarded, so this only has
+ * to be large enough that the request is legal and does not error — every token
+ * of it is waste, and adaptive thinking is on, so the model will almost always
+ * hit this cap rather than finish. That is fine and expected: at the Opus 5
+ * output rate this ceiling costs a tenth of a cent, against the dollars a
+ * rebuilt prefix costs.
+ */
+const CACHE_PROBE_MAX_TOKENS = 64;
+
+/**
+ * Output cap on the model-availability probe /model sends before switching.
+ * The reply is discarded — only whether the call was accepted matters — so this
+ * is as small as a legal request allows. Adaptive thinking will usually hit it
+ * rather than finish, which is fine and expected.
+ *
+ * Not metered. It is neither a turn nor a keep-alive, and at this cap it is a
+ * few tokens against a ledger that reports in cents; minting a third counter to
+ * account for it would cost more clarity in `/cost` than it could ever add.
+ */
+const MODEL_PROBE_MAX_TOKENS = 16;
+
+/**
+ * What the API actually said, for a failure the captain has to act on.
+ *
+ * The SDK's APIError already carries the status and the service's own body text
+ * in `message` ("404 {"message":"The provided model identifier is invalid."}"),
+ * so the job here is to NOT improve on it. A rewritten error is a guess about a
+ * failure we did not diagnose, and the whole value of this string is that it
+ * came from Bedrock rather than from us.
+ */
+export function apiErrorText(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  const text = raw.trim();
+  return text || String(e);
+}
+
+/**
+ * The history truncated to end on the last user-role message, or null if there
+ * isn't one.
+ *
+ * This is what makes a refresh free of side effects. The obvious probe — append
+ * a throwaway message and send that — writes a NEW cache entry for the appended
+ * bytes, and Opus 5 rejects a trailing assistant message outright, so the
+ * history cannot simply be replayed as it stands either. Cutting back to the
+ * last user turn sidesteps both: the prefix is byte-identical to one a real
+ * round already wrote, so the probe is a pure read that resets the clock on an
+ * entry the NEXT turn will actually want.
+ *
+ * Cutting from the end can only ever orphan a `tool_use` by removing the
+ * `tool_result` that answered it, never the reverse, and a completed turn always
+ * ends assistant-side — so the pairs left behind are intact.
+ */
+function throughLastUserTurn(messages: MessageParam[]): MessageParam[] | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.role === "user") return messages.slice(0, i + 1);
+  }
+  return null;
 }
 
 export class ModelProvider {
   private client: AnthropicBedrock;
   private cfg: ModelConfig;
+  /**
+   * Tokens billed since the last drain, summed across every round of every turn.
+   *
+   * Accumulated unconditionally — unlike the CO_DEBUG_TIMING counters, which
+   * report the same numbers as a diagnostic and are off by default. Spend
+   * happens whether or not anyone asked to watch it, so the meter always runs;
+   * `/cost` is the only thing that ever shows it (see cost.ts).
+   */
+  private pending: TokenUsage = emptyUsage();
+  /** Wall-clock spent inside runTurn since the last drain — the time the
+   *  captain actually waited, which is the other half of "what did this cost".
+   *  Measured for every turn, not just under CO_DEBUG_TIMING. */
+  private pendingMs = 0;
+  /**
+   * Model calls made since the last drain. A "turn" is one thing the captain
+   * asked for; a ROUND is one HTTP request to the model, and a turn that uses
+   * tools makes several. This is the multiplier on the whole prompt side of the
+   * bill: the entire prefix and the entire history are re-sent on every round,
+   * so cost-per-turn is rounds x (prefix + history), and a per-turn average
+   * cannot be read without knowing rounds. Counted unconditionally for the same
+   * reason the tokens are — the requests happened whether or not anyone watched.
+   */
+  private pendingRounds = 0;
+  /**
+   * Cache-write tokens billed on the FIRST round of each turn since the drain.
+   *
+   * This is the expiry meter, and it is the one number that decides whether a
+   * cache keep-alive is worth building. By the first round of turn N the prefix
+   * has already been written by turn N-1, so a warm cache should write almost
+   * nothing here — just the new user message. A large figure means the entry
+   * lapsed during the captain's thinking pause and the whole prefix was rebuilt
+   * at the 2x write rate, which is 20x what reading it would have cost.
+   *
+   * Deliberately first-round-only. Later rounds in a turn legitimately write the
+   * tool_use/tool_result blocks they just created, and folding those in would
+   * bury the signal under normal growth.
+   */
+  private pendingRebuild = 0;
 
   constructor(cfg: ModelConfig) {
     this.cfg = cfg;
@@ -154,8 +337,9 @@ export class ModelProvider {
     // while the Mantle endpoint 404s ("model does not exist") for the same key
     // and every id format — our account isn't entitled to Mantle. This mirrors
     // Claude Code's own working setup (CLAUDE_CODE_USE_BEDROCK=1, Mantle off).
-    // Verified end-to-end against the live key on 2026-07-16. Don't switch to
-    // Mantle without re-confirming entitlement, or Opus 4.8 will break.
+    // Verified end-to-end against the live key on 2026-07-16, and re-confirmed
+    // 2026-07-27 (runtime ✓ / Mantle 404 for the same id). Don't switch to
+    // Mantle without re-confirming entitlement, or the model will break.
     //
     // Re-confirmed 2026-07-20, this time including the id form Anthropic's docs
     // actually publish for Mantle (bare `anthropic.claude-opus-4-8`, no geo
@@ -168,6 +352,16 @@ export class ModelProvider {
     // Mantle "for full feature parity" without enumerating what legacy lacks —
     // so treat feature support here as empirical, not promised. Prompt caching
     // was measured working on this path the same day (see CACHE_CONTROL below).
+    //
+    // The same holds for the Sonnet line, checked on 2026-07-27 while costing
+    // out a cheaper default: `us.anthropic.claude-sonnet-4-6` and
+    // `us.anthropic.claude-sonnet-5` both answer on runtime and both reject the
+    // un-prefixed `anthropic.claude-sonnet-*` form for on-demand throughput.
+    // Adaptive thinking, tools, and prompt caching were all exercised together
+    // on Sonnet 4.6 here (cache_read 3477 on the second identical call), so the
+    // whole turn shape this file builds is known-good on the cheaper models if
+    // that trade is ever worth making — the one thing that is NOT is
+    // effort=xhigh, which 400s below Opus 4.7 (see effortLevelsFor).
     this.client = new AnthropicBedrock({
       awsRegion: cfg.region,
       ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
@@ -179,6 +373,37 @@ export class ModelProvider {
     return this.cfg.effort;
   }
 
+  /** The Bedrock model id every turn is sent to. Read by /effort and /status. */
+  get modelId(): string {
+    return this.cfg.modelId;
+  }
+
+  /**
+   * Take everything billed since the last call, plus the wall-clock it took,
+   * and reset the counters.
+   *
+   * Drain-and-reset rather than a running getter so the caller can fold each
+   * turn into the durable ledger exactly once, with no risk of double-counting.
+   * The session drains in a `finally`, so a turn that throws part-way still
+   * banks the rounds that already completed and were already billed. (Tokens
+   * spent on a round that threw mid-stream are lost to the meter — the SDK
+   * gives us no usage for a message that never finalized. The elapsed time is
+   * still counted: the captain waited for it either way.)
+   */
+  drainUsage(): { usage: TokenUsage; ms: number; rounds: number; rebuild: number } {
+    const drained = {
+      usage: this.pending,
+      ms: this.pendingMs,
+      rounds: this.pendingRounds,
+      rebuild: this.pendingRebuild,
+    };
+    this.pending = emptyUsage();
+    this.pendingMs = 0;
+    this.pendingRounds = 0;
+    this.pendingRebuild = 0;
+    return drained;
+  }
+
   /**
    * Change effort for the rest of the session (/effort). baseParams() is rebuilt
    * per turn, so the next turn picks this up; an in-flight turn is unaffected.
@@ -186,6 +411,68 @@ export class ModelProvider {
    */
   setEffort(effort: Effort): void {
     this.cfg.effort = effort;
+  }
+
+  /**
+   * Point every later turn at a different Bedrock model (/model).
+   *
+   * Same shape as setEffort and for the same reason: the request params are
+   * rebuilt per turn, so this takes effect from the NEXT turn and an in-flight
+   * one is untouched. The message history is deliberately kept — a model change
+   * is not a new conversation. The client is not rebuilt either: the model id is
+   * a per-request field, and region and credentials have not changed.
+   *
+   * Effort is re-clamped against the new model's ladder, because the levels are
+   * not the same on every model (xhigh arrived with Opus 4.7) and an unsupported
+   * one is a 400 on every subsequent turn rather than a soft degrade. Returns the
+   * effort it had to lower to, or null if nothing moved — the caller says so out
+   * loud, since a silent drop in effort is exactly the kind of thing a captain
+   * discovers three turns later.
+   *
+   * What this does NOT do is check that the model answers. Call probeModel first
+   * (as /model does): committing an unreachable id here would break the next turn
+   * instead of the command that set it.
+   */
+  setModel(modelId: string): Effort | null {
+    this.cfg.modelId = modelId;
+    const effort = this.cfg.effort;
+    if (!effort) return null;
+    const clamped = clampEffort(effort, modelId);
+    if (clamped === effort) return null;
+    this.cfg.effort = clamped;
+    return clamped;
+  }
+
+  /**
+   * Ask Bedrock whether it will answer to `modelId`, without committing to it.
+   *
+   * A model id is not checkable offline — there is no registry to consult that
+   * would not be stale the day a new model ships — so the only honest validation
+   * is the API's own answer, and the only place to hear it is before the switch.
+   * Without this, a typo'd or unentitled id sets fine and then kills the next
+   * turn, at which point the error arrives detached from the thing that caused it.
+   *
+   * The probe sends the same thinking and effort params a real turn would,
+   * effort clamped for the CANDIDATE model — a model that accepts the id but
+   * rejects the params fails every turn just as thoroughly, and that is a 400 on
+   * output_config, not on the model id. Tools and the system prompt are left off:
+   * they are the same bytes on any model, and this call is deliberately tiny.
+   *
+   * Never throws: the error is the return value, verbatim from the SDK, because
+   * surfacing what the API actually said is the entire point.
+   */
+  async probeModel(modelId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    try {
+      await this.client.messages.create({
+        model: modelId,
+        max_tokens: MODEL_PROBE_MAX_TOKENS,
+        messages: [{ role: "user", content: "Reply with the single word: ok" }],
+        ...this.baseParams(this.cfg.effort ? clampEffort(this.cfg.effort, modelId) : undefined),
+      });
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: apiErrorText(e) };
+    }
   }
 
   /**
@@ -221,25 +508,33 @@ export class ModelProvider {
    * Run one assistant turn to completion, resolving any tool calls via the
    * provided executor. Streams text deltas through handlers. Returns the full
    * final message and the (possibly extended) message history.
+   *
+   * A thin timing shim over the real loop: wall-clock is banked in a `finally`
+   * so a turn that throws still records the time the captain spent waiting for
+   * it. Keeping the shim separate is what lets the loop below keep its early
+   * returns instead of being wrapped in a try block.
    */
-  async runTurn(args: {
-    system: string;
-    messages: MessageParam[];
-    tools: Tool[];
-    executor: ToolExecutor;
-    handlers?: StreamHandlers;
-    maxToolRounds?: number;
-    /** Run this turn at a different effort than the session default. */
-    effort?: Effort;
-  }): Promise<{ messages: MessageParam[]; finalText: string }> {
+  async runTurn(args: TurnArgs): Promise<{ messages: MessageParam[]; finalText: string }> {
+    const startedAt = Date.now();
+    try {
+      return await this.runTurnInner(args);
+    } finally {
+      this.pendingMs += Date.now() - startedAt;
+    }
+  }
+
+  private async runTurnInner(
+    args: TurnArgs,
+  ): Promise<{ messages: MessageParam[]; finalText: string }> {
     const { system, tools, executor, handlers } = args;
     const messages = [...args.messages];
     const maxRounds = args.maxToolRounds ?? 12;
     const base = this.baseParams(args.effort);
     const timing = this.cfg.debugTiming ? handlers?.onTiming : undefined;
     // Built once per turn: neither the tool list nor the system prompt changes
-    // between rounds, and rebuilding them would churn the cached prefix.
-    const cachedTools = withToolBreakpoint(tools);
+    // between rounds, and rebuilding them would churn the cached prefix. The
+    // system breakpoint is the only prefix breakpoint - it covers the tools
+    // serialized ahead of it in the same entry.
     const cachedSystem: Anthropic.TextBlockParam[] = [
       { type: "text", text: system, cache_control: CACHE_CONTROL },
     ];
@@ -255,7 +550,7 @@ export class ModelProvider {
         max_tokens: this.cfg.maxTokens,
         system: cachedSystem,
         messages: withMessageBreakpoints(messages),
-        ...(cachedTools.length ? { tools: cachedTools } : {}),
+        ...(tools.length ? { tools } : {}),
         ...base,
       });
 
@@ -271,6 +566,23 @@ export class ModelProvider {
       }
 
       const message = await stream.finalMessage();
+
+      // Meter first, and unconditionally: everything below this line is either
+      // optional diagnostics or an early return, and the tokens are billed
+      // either way. Every field is read defensively — a counter is the least
+      // load-bearing thing in this file, and a missing usage block must cost an
+      // inaccurate /cost line, never the captain's turn.
+      const billed = message.usage;
+      this.pendingRounds += 1;
+      if (billed) {
+        this.pending.input += billed.input_tokens ?? 0;
+        this.pending.cacheWrite += billed.cache_creation_input_tokens ?? 0;
+        this.pending.cacheRead += billed.cache_read_input_tokens ?? 0;
+        this.pending.output += billed.output_tokens ?? 0;
+        // Only the opening round of the turn: see pendingRebuild. A big number
+        // here is a lapsed cache, not a big prompt.
+        if (round === 0) this.pendingRebuild += billed.cache_creation_input_tokens ?? 0;
+      }
 
       if (timing) {
         const u = message.usage;
@@ -322,6 +634,65 @@ export class ModelProvider {
     // Ran out of tool rounds; return whatever text we have.
     timing?.(`turn: ${fmtMs(Date.now() - turnStart)} — hit the ${maxRounds}-round cap`);
     return { messages, finalText };
+  }
+
+  /**
+   * Touch the cached prefix so its TTL restarts, instead of letting it lapse and
+   * paying to rebuild it.
+   *
+   * The economics are the whole justification and they are lopsided. A cache hit
+   * is billed at 0.1x base input; a 1-hour write is billed at 2x. So re-reading
+   * a prefix costs a TWENTIETH of re-writing the same bytes, and Bedrock resets
+   * the TTL on every successful hit — AWS's own guidance is explicit that a
+   * regularly-hit entry "will continue to be refreshed at no additional charge".
+   * A co-manager is a thinking partner, so the captain reads an answer and comes
+   * back twenty minutes later; without this, each of those pauses that outlives
+   * the TTL bills the entire prefix at the premium rate.
+   *
+   * Deliberately built to send a prefix byte-identical to a real round: same
+   * system text, same tool list, same breakpoints, same thinking and effort
+   * params. Any difference and it writes a fresh entry rather than hitting the
+   * one we are trying to keep alive, which would make it strictly worse than
+   * doing nothing. That is also why nothing here is "optimised" into a smaller
+   * request.
+   *
+   * Returns null when there is nothing to refresh (no user turn yet). Never
+   * throws: a probe is an optimisation, and a failed one must cost an unrefreshed
+   * cache, never the captain's session.
+   */
+  async refreshCache(args: {
+    system: string;
+    messages: MessageParam[];
+    tools: Tool[];
+  }): Promise<{ usage: TokenUsage; ms: number } | null> {
+    const replay = throughLastUserTurn(args.messages);
+    if (!replay) return null;
+
+    const startedAt = Date.now();
+    const usage = emptyUsage();
+    try {
+      const message = await this.client.messages.create({
+        model: this.cfg.modelId,
+        max_tokens: CACHE_PROBE_MAX_TOKENS,
+        system: [{ type: "text", text: args.system, cache_control: CACHE_CONTROL }],
+        messages: withMessageBreakpoints(replay),
+        ...(args.tools.length ? { tools: args.tools } : {}),
+        ...this.baseParams(),
+      });
+      const billed = message.usage;
+      if (billed) {
+        usage.input += billed.input_tokens ?? 0;
+        usage.cacheWrite += billed.cache_creation_input_tokens ?? 0;
+        usage.cacheRead += billed.cache_read_input_tokens ?? 0;
+        usage.output += billed.output_tokens ?? 0;
+      }
+    } catch {
+      // Swallowed on purpose. A refused or timed-out probe leaves the cache
+      // exactly as it was; surfacing it would put an error in front of the
+      // captain about work they never asked for.
+      return null;
+    }
+    return { usage, ms: Date.now() - startedAt };
   }
 
   /** A minimal non-streaming ping used by `co doctor` to test connectivity. */

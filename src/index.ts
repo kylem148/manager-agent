@@ -3,7 +3,7 @@ import * as readline from "node:readline";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { loadConfig } from "./config.js";
+import { applyInstanceOverrides, loadConfig } from "./config.js";
 import {
   createInstance,
   deleteInstance,
@@ -17,6 +17,7 @@ import { runDoctor } from "./cli/doctor.js";
 import { runModelsDoctor } from "./cli/modelsdoctor.js";
 import { runAuthBedrock } from "./cli/auth.js";
 import { runLink, runPaneAnchor } from "./cli/link.js";
+import { runCost } from "./cli/cost.js";
 import { c, line } from "./ui.js";
 import { restoreTerminal } from "./tui/tui.js";
 
@@ -24,6 +25,7 @@ import { restoreTerminal } from "./tui/tui.js";
  * CLI entry. Usage:
  *   co <name>            open (create-if-missing) the named co-manager
  *   co list              list instances
+ *   co cost              spend across every instance (in-session /cost is one)
  *   co create <name>     create an instance from the template
  *   co link <name>       register a repo + agent command for crew dispatch
  *   co pane <name>       designate the crew anchor pane (macOS + Ghostty)
@@ -106,6 +108,9 @@ async function main(): Promise<number> {
       return 1;
     }
 
+    case "cost":
+      return runCost(cfg);
+
     case "link":
       return runLink(cfg, argv[1]);
 
@@ -136,7 +141,10 @@ async function main(): Promise<number> {
         await createInstance(cfg.home, name);
       }
       const p = instancePaths(cfg.home, name);
-      await runSession(cfg, p);
+      // An instance may pin its own model (see applyInstanceOverrides), which is
+      // what makes a controlled A/B possible: one co on a cheaper tier, one on
+      // the control, and two separate ledgers to compare.
+      await runSession(applyInstanceOverrides(cfg, p.root), p);
       return 0;
     }
   }
@@ -250,6 +258,7 @@ function printUsage(): void {
   line(`  ${c.cyan("co list")}             list co-managers`);
   line(`  ${c.cyan("co create <name>")}    create a co-manager from the template`);
   line(`  ${c.cyan("co delete <name>")}    delete a co-manager (type the name to confirm; -y to force)`);
+  line(`  ${c.cyan("co cost")}             tokens, dollars and time across every co-manager`);
   line(`  ${c.cyan("co link <name>")}      register a repo + agent command so it can dispatch to the crew`);
   line(`  ${c.cyan("co pane <name>")}      designate the crew anchor pane (macOS + Ghostty)`);
   line(`  ${c.cyan("co auth bedrock")}     set the Bedrock bearer token in ~/co-managers/.env`);

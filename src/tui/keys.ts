@@ -110,6 +110,26 @@ export type Action =
   | { kind: "kill-to-start" } // Ctrl-U
   | { kind: "kill-to-end" } // Ctrl-K
   | { kind: "open-docs" } // Ctrl-O — open the in-session doc viewer overlay
+  /** Ctrl-S — commit an editor's buffer somewhere. The prompt has nothing to
+   *  save (Enter sends), so it ignores this; the panel's PR message editor binds
+   *  it, and it is decoded here so both encodings land on one action. */
+  | { kind: "save" }
+  /**
+   * Ctrl-G / Ctrl-X / Ctrl-Y are the three BUFFER-scoped verbs, decoded here so
+   * both encodings land on one action and bound only by the PR message editor.
+   *
+   * They are buffer-scoped on purpose: Ctrl-A/E/U/K are line-scoped and must
+   * stay that way (a forty-line description is not one line), so replacing a
+   * whole body needs verbs of its own rather than a re-pointed kill key. Ctrl-A
+   * is NOT select-all here: it is Home, in both editors, and moving it would
+   * break the muscle memory the prompt line has always had.
+   *
+   * The prompt line ignores all three, exactly as it ignores `save`: it has no
+   * selection, and Ctrl-U already clears the one line it usually holds.
+   */
+  | { kind: "select-all" } // Ctrl-G
+  | { kind: "clear-all" } // Ctrl-X
+  | { kind: "copy" } // Ctrl-Y
   | { kind: "none" };
 
 const NONE: Action = { kind: "none" };
@@ -126,6 +146,10 @@ const CTRL_LETTERS: Record<number, Action> = {
   106: { kind: "newline" }, // j — the universal newline fallback; see below
   109: { kind: "submit" }, // m — Ctrl-M *is* Enter
   111: { kind: "open-docs" }, // o — open the doc viewer overlay
+  115: { kind: "save" }, // s — save an editor buffer (the panel's PR message)
+  103: { kind: "select-all" }, // g: select the whole buffer
+  120: { kind: "clear-all" }, // x: cut the whole buffer (to the clipboard)
+  121: { kind: "copy" }, // y: copy the selection out (the panel's `y`, in an editor)
 };
 
 /**

@@ -1,0 +1,890 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, rm, readFile, writeFile, mkdir } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { instancePaths, type InstancePaths } from "./paths.js";
+import {
+  addUsage,
+  costOf,
+  CostLedger,
+  DAY_RETENTION,
+  dayBefore,
+  daysSpanned,
+  emptyUsage,
+  fmtDuration,
+  fmtUsd,
+  formatCostReport,
+  formatFleetReport,
+  localDay,
+  normalizeModelId,
+  isGeoScoped,
+  ratesFor,
+  sparkline,
+  type TokenUsage,
+} from "./cost.js";
+
+/**
+ * The spend meter.
+ *
+ * What actually has to hold: the rates are BEDROCK's (not Anthropic's cheaper
+ * first-party list), all four token classes are priced rather than output alone,
+ * the meter survives a restart, and a model with no rate on file degrades to
+ * "tokens counted, cost unknown" instead of inventing a number.
+ *
+ * No model call, no terminal, no clock — dates and paths are injected.
+ */
+
+async function makeInstance(): Promise<{ paths: InstancePaths; cleanup: () => Promise<void> }> {
+  const home = await mkdtemp(path.join(os.tmpdir(), "co-cost-"));
+  const paths = instancePaths(home, "inst");
+  return { paths, cleanup: () => rm(home, { recursive: true, force: true }) };
+}
+
+function usage(over: Partial<TokenUsage> = {}): TokenUsage {
+  return { ...emptyUsage(), ...over };
+}
+
+// --- rates --------------------------------------------------------------------
+
+test("model ids resolve regardless of geo and provider prefix", () => {
+  assert.equal(normalizeModelId("us.anthropic.claude-opus-4-8"), "claude-opus-4-8");
+  assert.equal(normalizeModelId("eu.anthropic.claude-opus-4-8"), "claude-opus-4-8");
+  assert.equal(normalizeModelId("anthropic.claude-opus-4-8"), "claude-opus-4-8");
+  assert.equal(normalizeModelId("claude-opus-4-8"), "claude-opus-4-8");
+
+  // The id the app actually sends must price, prefix and all.
+  assert.ok(ratesFor("us.anthropic.claude-opus-4-8"));
+});
+
+test("the endpoint prefix, not the model, decides the 10% premium", () => {
+  // Anthropic documents it for Bedrock: regional endpoints carry a 10% premium
+  // over global. `us.` and `global.` are the SAME MODEL — the prefix is a
+  // data-residency choice that costs a tenth of the entire bill, and this app
+  // shipped on the expensive side of it without the meter ever saying so.
+  const global = ratesFor("global.anthropic.claude-opus-5")!;
+  assert.equal(global.input, 5);
+  assert.equal(global.output, 25);
+  assert.equal(global.cacheWrite5m, 6.25);
+  assert.equal(global.cacheWrite1h, 10);
+  assert.equal(global.cacheRead, 0.5);
+
+  const geo = ratesFor("us.anthropic.claude-opus-5")!;
+  assert.equal(geo.input, 5.5);
+  assert.equal(geo.output, 27.5);
+  assert.equal(geo.cacheWrite1h, 11);
+  assert.equal(geo.cacheRead, 0.55);
+
+  // The premium lands on every class, not just input.
+  for (const k of ["input", "output", "cacheWrite5m", "cacheWrite1h", "cacheRead"] as const) {
+    assert.equal(geo[k], Math.round(global[k] * 1.1 * 1e6) / 1e6, k);
+  }
+
+  // A bare id is global-priced: no prefix, no premium.
+  assert.equal(ratesFor("anthropic.claude-opus-5")!.input, 5);
+  assert.equal(isGeoScoped("us.anthropic.claude-opus-5"), true);
+  assert.equal(isGeoScoped("global.anthropic.claude-opus-5"), false);
+  assert.equal(isGeoScoped("anthropic.claude-opus-5"), false);
+});
+
+test("an unknown model has no rates rather than a guessed one", () => {
+  assert.equal(ratesFor("us.anthropic.claude-something-9"), null);
+});
+
+test("every opus rate is flagged as derived, because AWS publishes no row", () => {
+  // AWS's pricing page renders no Opus row this app could transcribe. The rates
+  // are inferred from Anthropic's first-party table plus the documented regional
+  // premium, and corroborated by independent trackers — well founded, but not a
+  // quote, and /cost has to say so rather than pass an inference off as one.
+  // The only authoritative figure is the invoice.
+  const r = ratesFor("us.anthropic.claude-opus-5")!;
+  assert.ok(r, "the configured model must price, or the meter is useless");
+  assert.equal(r.confirmed, false);
+  assert.equal(ratesFor("us.anthropic.claude-opus-4-8")!.confirmed, false);
+  assert.equal(ratesFor("global.anthropic.claude-opus-5")!.confirmed, false);
+});
+
+test("a derived rate is announced on the report's rate line", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("us.anthropic.claude-opus-5", usage({ output: 1_000 }));
+  const text = plain(
+    formatCostReport({ ledger, modelId: "us.anthropic.claude-opus-5", cacheTtl: "1h" }),
+  );
+  assert.match(text, /rate derived, not published by AWS/);
+  assert.doesNotMatch(text, /no bedrock rate on file/, "it IS priced, just not quoted");
+  assert.match(text, /\$0\.0275/, "1,000 output tokens at the us. rate of $27.50/Mtok");
+});
+
+test("launch pricing applies inside its window and lapses after", () => {
+  // Checked on the global endpoint so the promo figures read as published.
+  const promo = ratesFor("global.anthropic.claude-sonnet-5", "2026-07-27")!;
+  assert.equal(promo.input, 2);
+  assert.equal(promo.output, 10);
+
+  const onLastDay = ratesFor("global.anthropic.claude-sonnet-5", "2026-08-31")!;
+  assert.equal(onLastDay.input, 2, "the through date is inclusive");
+
+  const standard = ratesFor("global.anthropic.claude-sonnet-5", "2026-09-01")!;
+  assert.equal(standard.input, 3);
+  assert.equal(standard.output, 15);
+
+  // The premium composes with the promo rather than replacing it.
+  assert.equal(ratesFor("us.anthropic.claude-sonnet-5", "2026-07-27")!.input, 2.2);
+});
+
+// --- pricing ------------------------------------------------------------------
+
+test("cost sums all four token classes, not just output", () => {
+  const r = ratesFor("us.anthropic.claude-opus-4-8")!;
+  const u = usage({ input: 1_000_000, cacheWrite: 1_000_000, cacheRead: 1_000_000, output: 1_000_000 });
+  // 5.5 + 11 (1h write) + 0.55 + 27.5, at the us. geo rate
+  assert.equal(costOf(u, r, "1h"), 44.55);
+  // 5.5 + 6.875 (5m write) + 0.55 + 27.5
+  assert.equal(costOf(u, r, "5m"), 40.425);
+});
+
+test("pricing output alone would understate a realistic turn badly", () => {
+  const r = ratesFor("us.anthropic.claude-opus-4-8")!;
+  // The shape of a warm turn in this app: tiny uncached input, a big cached
+  // prefix read back, a modest reply.
+  const turn = usage({ input: 200, cacheWrite: 0, cacheRead: 22_000, output: 900 });
+  const total = costOf(turn, r, "1h");
+  const outputOnly = (900 * r.output) / 1_000_000;
+  assert.ok(total > outputOnly, "the prompt side is real money");
+  assert.ok(
+    total - outputOnly > 0.01,
+    `prompt side was ${(total - outputOnly).toFixed(5)} — expected it to be material`,
+  );
+});
+
+test("a cold turn costs far more than the same turn warm", () => {
+  const r = ratesFor("us.anthropic.claude-opus-4-8")!;
+  const cold = costOf(usage({ cacheWrite: 22_000, output: 900 }), r, "1h");
+  const warm = costOf(usage({ cacheRead: 22_000, output: 900 }), r, "1h");
+  assert.ok(cold > warm);
+  // The write/read spread on the prefix is the 1h TTL's whole justification.
+  assert.equal(
+    Number(((cold - warm) * 1_000_000).toFixed(0)),
+    Math.round(22_000 * (r.cacheWrite1h - r.cacheRead)),
+  );
+});
+
+test("zero usage costs zero", () => {
+  const r = ratesFor("us.anthropic.claude-opus-4-8")!;
+  assert.equal(costOf(emptyUsage(), r, "1h"), 0);
+});
+
+test("sub-dollar spend keeps enough places to be readable", () => {
+  assert.equal(fmtUsd(0), "$0.0000");
+  assert.equal(fmtUsd(0.0123), "$0.0123");
+  assert.equal(fmtUsd(12.3456), "$12.35");
+});
+
+// --- the ledger ---------------------------------------------------------------
+
+test("usage adds class by class", () => {
+  const a = usage({ input: 1, cacheWrite: 2, cacheRead: 3, output: 4 });
+  const b = usage({ input: 10, cacheWrite: 20, cacheRead: 30, output: 40 });
+  assert.deepEqual(addUsage(a, b), { input: 11, cacheWrite: 22, cacheRead: 33, output: 44 });
+});
+
+test("the ledger separates this session from all time", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const first = await CostLedger.load(paths, new Date("2026-07-01T00:00:00.000Z"));
+    await first.record("us.anthropic.claude-opus-4-8", usage({ output: 100, cacheRead: 5_000 }));
+
+    // A second process opens the same instance: it inherits the lifetime total
+    // but starts a fresh session total.
+    const second = await CostLedger.load(paths);
+    assert.deepEqual(second.session(), {}, "a new session starts at zero");
+    assert.equal(second.lifetime().models["us.anthropic.claude-opus-4-8"]!.output, 100);
+    assert.equal(second.lifetime().since, "2026-07-01T00:00:00.000Z", "since survives");
+
+    await second.record("us.anthropic.claude-opus-4-8", usage({ output: 40 }));
+    assert.equal(second.session()["us.anthropic.claude-opus-4-8"]!.output, 40);
+    assert.equal(second.lifetime().models["us.anthropic.claude-opus-4-8"]!.output, 140);
+    assert.equal(second.lifetime().models["us.anthropic.claude-opus-4-8"]!.turns, 2);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a turn that billed nothing is not counted as a turn", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("m", emptyUsage());
+  assert.deepEqual(ledger.session(), {});
+  assert.deepEqual(ledger.lifetime().models, {});
+});
+
+test("switching models keeps separate buckets so old tokens keep their price", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("us.anthropic.claude-opus-4-8", usage({ output: 1_000_000 }));
+  await ledger.record("us.anthropic.claude-sonnet-5", usage({ output: 1_000_000 }));
+
+  const models = ledger.lifetime().models;
+  assert.equal(Object.keys(models).length, 2);
+
+  // Priced per bucket: $27.50 of Opus output plus $11 of promo-priced Sonnet
+  // (both at the us. geo rate — the same 1.1x lands on each).
+  const opus = costOf(models["us.anthropic.claude-opus-4-8"]!, ratesFor("us.anthropic.claude-opus-4-8")!, "1h");
+  const sonnet = costOf(
+    models["us.anthropic.claude-sonnet-5"]!,
+    ratesFor("us.anthropic.claude-sonnet-5", "2026-07-27")!,
+    "1h",
+  );
+  assert.equal(opus, 27.5);
+  assert.equal(sonnet, 11);
+});
+
+test("the meter is written after every turn, not at exit", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const ledger = await CostLedger.load(paths);
+    await ledger.record("us.anthropic.claude-opus-4-8", usage({ output: 7 }));
+    // No close, no exit — a kill here must not lose the record of money spent.
+    const raw = JSON.parse(await readFile(paths.costLedger, "utf8"));
+    assert.equal(raw.models["us.anthropic.claude-opus-4-8"].output, 7);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a corrupt meter file is a fresh meter, never a failed session start", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    await mkdir(path.dirname(paths.costLedger), { recursive: true });
+    await writeFile(paths.costLedger, "{ this is not json", "utf8");
+    const ledger = await CostLedger.load(paths, new Date("2026-07-27T00:00:00.000Z"));
+    assert.deepEqual(ledger.lifetime().models, {});
+    assert.equal(ledger.lifetime().since, "2026-07-27T00:00:00.000Z");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("garbage fields in the meter file coerce to zero rather than NaN", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    await mkdir(path.dirname(paths.costLedger), { recursive: true });
+    await writeFile(
+      paths.costLedger,
+      JSON.stringify({ version: 1, since: "2026-01-01T00:00:00.000Z", models: { m: { output: "lots", input: -5 } } }),
+      "utf8",
+    );
+    const ledger = await CostLedger.load(paths);
+    assert.deepEqual(ledger.lifetime().models.m, {
+      input: 0,
+      cacheWrite: 0,
+      cacheRead: 0,
+      output: 0,
+      turns: 0,
+      ms: 0,
+      // Counters added after the first ledgers were written: absent on disk, so
+      // they must read as zero rather than undefined or NaN, same as the rest.
+      rounds: 0,
+      rebuild: 0,
+      idleMs: 0,
+      keepAlives: 0,
+    });
+  } finally {
+    await cleanup();
+  }
+});
+
+// --- the report ---------------------------------------------------------------
+
+function plain(lines: string[]): string {
+  // Strip ANSI so assertions read on content, not colour.
+  return lines.join("\n").replace(/\[[0-9;]*m/g, "");
+}
+
+test("the report leads with output tokens and a real cost", async () => {
+  const ledger = CostLedger.ephemeral({ since: "2026-07-20T09:00:00.000Z" });
+  await ledger.record(
+    "us.anthropic.claude-opus-4-8",
+    usage({ input: 1_000, cacheWrite: 10_000, cacheRead: 500_000, output: 20_000 }),
+    { now: at("2026-07-27", 10) },
+  );
+
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-4-8",
+      cacheTtl: "1h",
+      now: at("2026-07-27", 12),
+    }),
+  );
+
+  assert.match(text, /20,000 out/, "output tokens are the headline");
+  // 0.006 + 0.12 + 0.30 + 0.60 = $1.026
+  assert.match(text, /\$0\.9405/);
+  assert.match(text, /session/);
+  assert.match(text, /all time/);
+  assert.match(text, /cache read 500,000/, "the prompt side is shown, since it is where the money goes");
+  assert.match(text, /since 2026-07-20/);
+});
+
+test("an un-priced model reports tokens and says the cost is unknown", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("us.anthropic.claude-mystery-1", usage({ output: 5_000 }));
+
+  const text = plain(
+    formatCostReport({ ledger, modelId: "us.anthropic.claude-mystery-1", cacheTtl: "1h" }),
+  );
+
+  assert.match(text, /5,000 out/, "tokens are still counted");
+  assert.match(text, /no bedrock rate on file/);
+  assert.match(text, /\$0\.0000\+/, "the total is marked incomplete, not stated as zero");
+  assert.match(text, /claude-mystery-1/);
+});
+
+test("switching models keeps two buckets; the new one never inherits the old rate", async () => {
+  // What /model must not be able to do: move spend onto a rate that belongs to a
+  // different model. The ledger is keyed by the id in force when the turn was
+  // metered, so a switch splits the buckets and each is priced on its own — and
+  // a model with no rate on file reports its tokens with the cost left unknown
+  // rather than quietly billed at the model it replaced.
+  const ledger = CostLedger.ephemeral({ since: "2026-07-27T09:00:00.000Z" });
+  await ledger.record(
+    "us.anthropic.claude-opus-5",
+    usage({ output: 10_000 }),
+    { now: at("2026-07-27", 10) },
+  );
+  await ledger.record(
+    "us.anthropic.claude-brandnew-9",
+    usage({ output: 10_000 }),
+    { now: at("2026-07-27", 11) },
+  );
+
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-brandnew-9", // the model now in force
+      cacheTtl: "1h",
+      now: at("2026-07-27", 12),
+    }),
+  );
+
+  assert.match(text, /20,000 out/, "both models' tokens are counted");
+  // Opus 5's 10k output at the geo-scoped rate is $0.275, and that is ALL the
+  // report claims: the second 10k is not priced at it.
+  assert.match(text, /\$0\.2750\+/, "priced where it can be, marked incomplete where it can't");
+  assert.match(text, /claude-brandnew-9 — no bedrock rate on file/);
+  assert.doesNotMatch(text, /\$0\.5500/, "the new model is never billed at the old model's rate");
+});
+
+test("a session with no turns yet reports zeroes without blowing up", () => {
+  const text = plain(
+    formatCostReport({
+      ledger: CostLedger.ephemeral({ since: "2026-07-27T00:00:00.000Z" }),
+      modelId: "us.anthropic.claude-opus-4-8",
+      cacheTtl: "1h",
+      now: at("2026-07-27", 12),
+    }),
+  );
+  assert.match(text, /0 out/);
+  assert.match(text, /\$0\.0000/);
+  assert.match(text, /nothing metered yet/, "no turns means no misleading average");
+});
+
+// --- time ---------------------------------------------------------------------
+
+/** A local-time Date on the given local day, so day bucketing is unambiguous. */
+function at(day: string, hour = 12): Date {
+  const [y, m, d] = day.split("-").map(Number);
+  return new Date(y!, m! - 1, d!, hour, 0, 0);
+}
+
+test("days are bucketed in the captain's timezone, not UTC", () => {
+  // 6pm local on the 27th is already the 28th in UTC. A UTC-keyed meter would
+  // file an evening's work under tomorrow and report "today: $0" at 6:01pm.
+  const evening = at("2026-07-27", 18);
+  assert.equal(localDay(evening), "2026-07-27");
+
+  const earlyMorning = at("2026-07-27", 1);
+  assert.equal(localDay(earlyMorning), "2026-07-27");
+});
+
+test("day arithmetic spans inclusively and steps backwards", () => {
+  assert.equal(daysSpanned("2026-07-27", "2026-07-27"), 1, "one day of use is one day");
+  assert.equal(daysSpanned("2026-07-20", "2026-07-27"), 8);
+  assert.equal(daysSpanned("2026-02-26", "2026-03-02"), 5, "crosses a month boundary");
+  assert.equal(dayBefore("2026-03-02", 5), "2026-02-25");
+  assert.equal(dayBefore("2026-01-01", 1), "2025-12-31", "crosses a year boundary");
+});
+
+test("turns land in the day bucket they happened on", async () => {
+  const ledger = CostLedger.ephemeral({ since: "2026-07-25T00:00:00.000Z" });
+  await ledger.record("m", usage({ output: 10 }), { now: at("2026-07-25") });
+  await ledger.record("m", usage({ output: 20 }), { now: at("2026-07-26") });
+  await ledger.record("m", usage({ output: 5 }), { now: at("2026-07-26") });
+
+  assert.equal(ledger.day("2026-07-25").m!.output, 10);
+  assert.equal(ledger.day("2026-07-26").m!.output, 25);
+  assert.equal(ledger.day("2026-07-26").m!.turns, 2);
+  assert.deepEqual(ledger.day("2026-07-27"), {}, "a day with no turns is empty, not absent-crashing");
+});
+
+test("the day series is capped but all-time totals are not", async () => {
+  const ledger = CostLedger.ephemeral({ since: "2020-01-01T00:00:00.000Z" });
+  for (let i = 0; i < DAY_RETENTION + 10; i++) {
+    const d = new Date(2024, 0, 1 + i);
+    await ledger.record("us.anthropic.claude-opus-4-8", usage({ output: 100 }), { now: d });
+  }
+  const life = ledger.lifetime();
+  assert.equal(Object.keys(life.days).length, DAY_RETENTION, "old days age out of the series");
+  assert.equal(
+    life.models["us.anthropic.claude-opus-4-8"]!.output,
+    100 * (DAY_RETENTION + 10),
+    "but the aggregate keeps every token",
+  );
+});
+
+test("wall-clock is accumulated per turn", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("m", usage({ output: 1 }), { ms: 4_000, now: at("2026-07-27") });
+  await ledger.record("m", usage({ output: 1 }), { ms: 6_500, now: at("2026-07-27") });
+  assert.equal(ledger.lifetime().models.m!.ms, 10_500);
+  assert.equal(ledger.day("2026-07-27").m!.ms, 10_500);
+});
+
+test("durations read at the coarsest useful unit", () => {
+  assert.equal(fmtDuration(0), "0s");
+  // Sub-second must not read as "0s": some time passed, and claiming none did
+  // is the kind of small lie that makes a meter untrustworthy.
+  assert.equal(fmtDuration(360), "<1s");
+  assert.equal(fmtDuration(12_400), "12s");
+  assert.equal(fmtDuration(252_000), "4m 12s");
+  assert.equal(fmtDuration(13_680_000), "3h 48m");
+});
+
+test("the last-turn stamp is on the same clock as the day buckets", async () => {
+  // 11pm local is already tomorrow in UTC. If "today" is the local day, the
+  // last-turn stamp has to be local too, or the report shows two clocks.
+  const ledger = CostLedger.ephemeral({ since: "2026-07-27T00:00:00.000Z" });
+  await ledger.record("us.anthropic.claude-opus-4-8", usage({ output: 10 }), {
+    now: at("2026-07-27", 23),
+  });
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-4-8",
+      cacheTtl: "1h",
+      now: at("2026-07-27", 23),
+    }),
+  );
+  assert.match(text, /last turn 2026-07-27 23:00/);
+});
+
+test("a sparkline distinguishes an idle day from a cheap one", () => {
+  // Flattening "I didn't work" into a short bar is how an average starts lying.
+  assert.equal(sparkline([0, 0, 0]), "···");
+  const s = sparkline([0, 1, 10]);
+  assert.equal(s[0], "·", "zero is a gap");
+  assert.equal(s[2], "█", "the peak is full height");
+  assert.notEqual(s[1], "·", "a small nonzero is still a bar");
+  assert.equal(sparkline([]), "");
+});
+
+test("both daily averages are reported, because one of them always misleads", async () => {
+  const ledger = CostLedger.ephemeral({ since: "2026-07-20T09:00:00.000Z" });
+  // $27.50 of output on two active days, inside an 8-day calendar span.
+  await ledger.record("us.anthropic.claude-opus-4-8", usage({ output: 500_000 }), {
+    now: at("2026-07-21"),
+  });
+  await ledger.record("us.anthropic.claude-opus-4-8", usage({ output: 500_000 }), {
+    now: at("2026-07-26"),
+  });
+
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-4-8",
+      cacheTtl: "1h",
+      now: at("2026-07-27"),
+    }),
+  );
+
+  assert.match(text, /\$13\.75 per active day \(2\)/, "$27.50 over 2 working days");
+  assert.match(
+    text,
+    /\$3\.44 per calendar day \(8\)/,
+    "$27.50 over the 8 days since first use",
+  );
+});
+
+test("today's row counts only today, and the 7-day window shows the shape", async () => {
+  const ledger = CostLedger.ephemeral({ since: "2026-07-20T09:00:00.000Z" });
+  await ledger.record("us.anthropic.claude-opus-4-8", usage({ output: 100_000 }), {
+    now: at("2026-07-24"),
+  });
+  await ledger.record("us.anthropic.claude-opus-4-8", usage({ output: 33_333 }), {
+    now: at("2026-07-27"),
+  });
+
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-4-8",
+      cacheTtl: "1h",
+      now: at("2026-07-27", 15),
+    }),
+  );
+
+  // 33,333 output tokens at $30/Mtok = $0.99999
+  assert.match(text, /today {6}33,333 out\s+\$0\.9167/, "today is today only, not all time");
+  assert.match(text, /all time\s+133,333 out/);
+  // The window is 07-21..07-27: idle, idle, idle, spend, idle, idle, spend.
+  assert.match(text, /last 7d\s+···[^·]··[^·]\s+\$3\.67\s+\(07-21 → 07-27\)/);
+});
+
+test("a turn recorded today shows up under today even late in the evening", async () => {
+  const ledger = CostLedger.ephemeral({ since: "2026-07-27T00:00:00.000Z" });
+  await ledger.record("us.anthropic.claude-opus-4-8", usage({ output: 1_000 }), {
+    now: at("2026-07-27", 23),
+  });
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-4-8",
+      cacheTtl: "1h",
+      now: at("2026-07-27", 23),
+    }),
+  );
+  assert.match(text, /today {6}1,000 out/);
+});
+
+// --- the fleet view (`co cost`) -----------------------------------------------
+
+/** An instance whose meter already holds `output` tokens on `day`. */
+async function fleetMember(name: string, day: string, output: number, ms = 0) {
+  const ledger = CostLedger.ephemeral({ since: `${day}T09:00:00.000Z` });
+  if (output > 0) {
+    await ledger.record("us.anthropic.claude-opus-5", usage({ output }), { now: at(day), ms });
+  }
+  return { name, ledger };
+}
+
+test("the fleet view sums every instance, because the bedrock key is shared", async () => {
+  // The whole reason `co cost` exists: three co-managers on one key produce one
+  // invoice, and no per-instance /cost can show it.
+  const entries = [
+    await fleetMember("alpha", "2026-07-26", 100_000),
+    await fleetMember("bravo", "2026-07-27", 200_000),
+    await fleetMember("idle", "2026-07-27", 0),
+  ];
+
+  const text = plain(
+    formatFleetReport({ entries, cacheTtl: "1h", home: "/home/co", now: at("2026-07-27") }),
+  );
+
+  assert.match(text, /cost across 3 co-managers/);
+  // $3 + $6 of output at $30/Mtok.
+  assert.match(text, /alpha\s+100,000\s+\$2\.75/);
+  assert.match(text, /bravo\s+200,000\s+\$5\.50/);
+  assert.match(text, /total\s+300,000\s+\$8\.25\s+2/, "totals tokens, dollars and turns");
+});
+
+test("the fleet view lists idle instances rather than hiding them", async () => {
+  const entries = [
+    await fleetMember("busy", "2026-07-27", 100_000),
+    await fleetMember("never-used", "2026-07-27", 0),
+  ];
+  const text = plain(
+    formatFleetReport({ entries, cacheTtl: "1h", home: "/home/co", now: at("2026-07-27") }),
+  );
+  assert.match(text, /never-used\s+0\s+\$0\.0000\s+0\s+—/, "zero spend is information");
+});
+
+test("the fleet view is ordered by spend so the culprit is on top", async () => {
+  const entries = [
+    await fleetMember("cheap", "2026-07-27", 1_000),
+    await fleetMember("expensive", "2026-07-27", 900_000),
+    await fleetMember("middling", "2026-07-27", 50_000),
+  ];
+  const lines = plain(
+    formatFleetReport({ entries, cacheTtl: "1h", home: "/home/co", now: at("2026-07-27") }),
+  ).split("\n");
+  const order = lines
+    .map((l) => ["expensive", "middling", "cheap"].find((n) => l.trimStart().startsWith(n)))
+    .filter(Boolean);
+  assert.deepEqual(order, ["expensive", "middling", "cheap"]);
+});
+
+test("fleet day averages merge the series across instances", async () => {
+  // Two instances active on two different days: $3 each, 2 active days, and a
+  // calendar span starting at the EARLIEST instance's first turn.
+  const entries = [
+    await fleetMember("alpha", "2026-07-25", 100_000),
+    await fleetMember("bravo", "2026-07-27", 100_000),
+  ];
+  const text = plain(
+    formatFleetReport({ entries, cacheTtl: "1h", home: "/home/co", now: at("2026-07-27") }),
+  );
+  assert.match(text, /\$2\.75 per active day \(2\)/);
+  assert.match(text, /\$1\.83 per calendar day \(3\)/, "07-25 → 07-27 inclusive");
+});
+
+test("fleet wall-clock is summed across instances", async () => {
+  const entries = [
+    await fleetMember("alpha", "2026-07-27", 10, 60_000),
+    await fleetMember("bravo", "2026-07-27", 10, 180_000),
+  ];
+  const text = plain(
+    formatFleetReport({ entries, cacheTtl: "1h", home: "/home/co", now: at("2026-07-27") }),
+  );
+  assert.match(text, /model time 4m 0s all time/);
+});
+
+test("an empty home says so instead of rendering an empty table", () => {
+  const text = plain(formatFleetReport({ entries: [], cacheTtl: "1h", home: "/home/co" }));
+  assert.match(text, /no co-managers yet in \/home\/co/);
+});
+
+test("the fleet view flags a derived rate and never pads rows with trailing space", async () => {
+  const entries = [await fleetMember("solo", "2026-07-27", 1_000)];
+  const lines = formatFleetReport({
+    entries,
+    cacheTtl: "1h",
+    home: "/home/co",
+    now: at("2026-07-27"),
+  });
+  assert.match(plain(lines), /rate derived, not published by AWS/);
+  for (const l of lines) {
+    assert.equal(l, l.replace(/\s+$/, ""), `line has trailing whitespace: ${JSON.stringify(l)}`);
+  }
+});
+
+// --- rounds, rebuilds, idle gaps ---------------------------------------------
+//
+// The three counters that explain the prompt side. What has to hold: a turn's
+// rounds are counted (not assumed to be one), the cost of a lapsed cache is
+// separated from the cost of legitimate new content, and a ledger written before
+// any of this existed stays silent rather than reporting measured-looking zeroes.
+
+test("rounds are accumulated per turn, not assumed to be one", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("m", usage({ output: 1 }), { rounds: 4, now: at("2026-07-27") });
+  await ledger.record("m", usage({ output: 1 }), { rounds: 2, now: at("2026-07-27") });
+  const t = ledger.lifetime().models.m!;
+  assert.equal(t.turns, 2);
+  assert.equal(t.rounds, 6);
+  assert.equal(ledger.day("2026-07-27").m!.rounds, 6);
+});
+
+test("a turn that billed tokens counts at least one round even if none was passed", async () => {
+  const ledger = CostLedger.ephemeral();
+  // A caller that forgot to pass rounds must not make the meter claim a turn
+  // happened with no model call behind it.
+  await ledger.record("m", usage({ output: 1 }));
+  assert.equal(ledger.lifetime().models.m!.rounds, 1);
+});
+
+test("rebuild tokens and idle gaps accumulate", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("m", usage({ output: 1 }), { rebuild: 20_000, idleMs: 600_000 });
+  await ledger.record("m", usage({ output: 1 }), { rebuild: 0, idleMs: 30_000 });
+  const t = ledger.lifetime().models.m!;
+  assert.equal(t.rebuild, 20_000);
+  assert.equal(t.idleMs, 630_000);
+});
+
+test("negative or fractional counters are coerced rather than trusted", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("m", usage({ output: 1 }), { rounds: 2.6, rebuild: -5, idleMs: -1 });
+  const t = ledger.lifetime().models.m!;
+  assert.equal(t.rounds, 3);
+  assert.equal(t.rebuild, 0);
+  assert.equal(t.idleMs, 0);
+});
+
+test("the report prices a lapsed cache as its own share of spend", async () => {
+  const ledger = CostLedger.ephemeral();
+  // One turn that read a warm prefix cheaply, and one that had to rebuild it.
+  await ledger.record("m", usage({ cacheRead: 100_000, output: 1_000 }), {
+    rounds: 3,
+    rebuild: 0,
+    idleMs: 20_000,
+    now: at("2026-07-27"),
+  });
+  await ledger.record("m", usage({ cacheWrite: 25_000, cacheRead: 0, output: 1_000 }), {
+    rounds: 3,
+    rebuild: 25_000,
+    idleMs: 3_600_000,
+    now: at("2026-07-27"),
+  });
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-5",
+      cacheTtl: "1h",
+      now: at("2026-07-27"),
+    }),
+  );
+  assert.match(text, /rounds\s+3\.0 per turn/);
+  // 25,000 tok at the 1h write rate — the number that says whether a keep-alive
+  // is worth building, expressed as a share so it can be compared to the total.
+  assert.match(text, /rebuilds\s+12,500 tok per turn/);
+  assert.match(text, /re-writing a lapsed cache/);
+  assert.match(text, /idle gap\s+30m 10s average between turns \(cache ttl 1h\)/);
+});
+
+test("a ledger with no rounds recorded stays silent instead of reporting zeroes", async () => {
+  // Written before the counters existed: turns are real, rounds are unknown. A
+  // "0.0 rounds per turn" line would be a measurement we never took.
+  const ledger = CostLedger.ephemeral({
+    models: {
+      "us.anthropic.claude-opus-5": {
+        ...emptyUsage(),
+        output: 5_000,
+        turns: 10,
+        ms: 1_000,
+        rounds: 0,
+        rebuild: 0,
+        idleMs: 0,
+      },
+    },
+  });
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-5",
+      cacheTtl: "1h",
+      now: at("2026-07-27"),
+    }),
+  );
+  assert.doesNotMatch(text, /rounds/);
+  assert.doesNotMatch(text, /rebuilds/);
+});
+
+test("the fleet roll-up sums the new counters instead of dropping them", async () => {
+  const a = CostLedger.ephemeral();
+  await a.record("m", usage({ output: 1 }), { rounds: 3, rebuild: 100, idleMs: 1_000 });
+  const b = CostLedger.ephemeral();
+  await b.record("m", usage({ output: 1 }), { rounds: 5, rebuild: 200, idleMs: 2_000 });
+  // Exercised through the report rather than the private merge helpers: a
+  // counter dropped in a roll-up is only ever visible here.
+  const text = plain(
+    formatFleetReport({
+      entries: [
+        { name: "a", ledger: a },
+        { name: "b", ledger: b },
+      ],
+      cacheTtl: "1h",
+      home: "/home/co",
+      now: at("2026-07-27"),
+    }),
+  );
+  assert.match(text, /total/);
+  assert.equal(a.lifetime().models.m!.rounds + b.lifetime().models.m!.rounds, 8);
+});
+
+test("a keep-alive probe is metered as spend but not as a turn", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("m", usage({ cacheRead: 50_000, output: 900 }), { rounds: 3 });
+  await ledger.recordKeepAlive("m", usage({ cacheRead: 24_000, output: 64 }), { ms: 800 });
+
+  const t = ledger.lifetime().models.m!;
+  // The tokens are real money and must land in every dollar figure.
+  assert.equal(t.cacheRead, 74_000);
+  assert.equal(t.output, 964);
+  assert.equal(t.ms, 800);
+  // But it answered nothing, so it is not a turn and it did not add a round.
+  assert.equal(t.turns, 1);
+  assert.equal(t.rounds, 3);
+  assert.equal(t.keepAlives, 1);
+});
+
+test("a probe that billed nothing is not recorded at all", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.recordKeepAlive("m", emptyUsage());
+  assert.deepEqual(ledger.lifetime().models, {});
+});
+
+test("probes land in the day bucket and survive a restart", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    const first = await CostLedger.load(paths);
+    await first.record("m", usage({ output: 1 }), { rounds: 1, now: at("2026-07-27") });
+    await first.recordKeepAlive("m", usage({ cacheRead: 1_000 }), { now: at("2026-07-27") });
+    assert.equal(first.day("2026-07-27").m!.keepAlives, 1);
+
+    const second = await CostLedger.load(paths);
+    assert.equal(second.lifetime().models.m!.keepAlives, 1);
+    assert.equal(second.lifetime().models.m!.turns, 1, "the probe still is not a turn");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the report names the keep-alive beside the rebuilds it is meant to prevent", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("us.anthropic.claude-opus-5", usage({ cacheRead: 50_000, output: 900 }), {
+    rounds: 3,
+    rebuild: 0,
+    idleMs: 60_000,
+    now: at("2026-07-27"),
+  });
+  await ledger.recordKeepAlive("us.anthropic.claude-opus-5", usage({ cacheRead: 24_000 }), {
+    now: at("2026-07-27"),
+  });
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-5",
+      cacheTtl: "1h",
+      now: at("2026-07-27"),
+    }),
+  );
+  assert.match(text, /keep-alive 1 probe\(s\) to hold the cache open/);
+  assert.match(text, /not counted as turns/);
+});
+
+test("the report prices the geo premium, and names the endpoint without it", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("us.anthropic.claude-opus-5", usage({ output: 1_000_000 }), {
+    rounds: 1,
+    now: at("2026-07-27"),
+  });
+  const text = plain(
+    formatCostReport({
+      ledger,
+      modelId: "us.anthropic.claude-opus-5",
+      cacheTtl: "1h",
+      now: at("2026-07-27"),
+    }),
+  );
+  // 1M output at $27.50 is $27.50; the same tokens on global would be $25.00, so
+  // the premium is $2.50. In dollars rather than as a percentage, because "10% of
+  // everything" is easy to nod at and a dollar figure is not.
+  assert.match(text, /geo premium \+10% for US\/Canada residency/);
+  assert.match(text, /\$2\.50 of the above/);
+  assert.match(text, /global\.claude-opus-5 is the same model without it/);
+});
+
+test("the global endpoint gets no premium line, because there is no premium", async () => {
+  const ledger = CostLedger.ephemeral();
+  await ledger.record("global.anthropic.claude-opus-5", usage({ output: 1_000 }), { rounds: 1 });
+  const text = plain(
+    formatCostReport({ ledger, modelId: "global.anthropic.claude-opus-5", cacheTtl: "1h" }),
+  );
+  assert.doesNotMatch(text, /geo premium/);
+});
+
+test("the fleet total names the geo premium too, since that is the number read", async () => {
+  const one = CostLedger.ephemeral();
+  await one.record("us.anthropic.claude-opus-5", usage({ output: 1_000_000 }), { rounds: 1 });
+  const text = plain(
+    formatFleetReport({
+      entries: [{ name: "solo", ledger: one }],
+      cacheTtl: "1h",
+      home: "/home/co",
+      now: at("2026-07-27"),
+    }),
+  );
+  // `co cost` is what the captain actually opens, so the premium has to be here
+  // and not only on the per-instance /cost.
+  assert.match(text, /geo premium \+10%/);
+  assert.match(text, /\$2\.50 of the above/);
+});

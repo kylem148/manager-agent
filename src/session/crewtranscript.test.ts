@@ -128,10 +128,60 @@ test("renderTranscriptForReview yields readable prose: prompt, crew text, tool o
   assert.ok(!out.includes("not json"), "unparseable fragments are skipped, not crashed on");
 });
 
-test("renderTranscriptForReview caps output keeping the tail", () => {
+test("renderTranscriptForReview bounds the run's context keeping its tail, and says so in bytes", () => {
   const lines = Array.from({ length: 500 }, (_, i) => assistantLine([{ type: "text", text: `step ${i} ` + "x".repeat(100) }]));
   const out = renderTranscriptForReview(lines.join("\n"), 2000);
-  assert.ok(out.length <= 2100, "capped near the limit");
-  assert.ok(out.startsWith("…[transcript truncated"), "announces truncation");
+  assert.ok(out.startsWith("…[co: the earlier part of this record was trimmed"), "announces the trim");
+  assert.match(out, /showing the last 2000 of \d{5} bytes of run context/, "names bytes shown vs captured");
   assert.ok(out.includes("step 499"), "keeps the end, where the conclusion lives");
+  assert.ok(!out.includes("step 0 "), "the oldest context is what goes");
+});
+
+/**
+ * The regression that matters: eleven consecutive dispatches delivered reports
+ * cut mid-sentence at the tail because every message was clipped to 2000
+ * characters, head first and silently. The crew's last spoken message is the
+ * completion report and is now exempt from every budget here.
+ */
+test("renderTranscriptForReview never cuts the crew's completion report", () => {
+  const report =
+    "## Root cause\n\n" +
+    Array.from({ length: 40 }, (_, i) => `Paragraph ${i}: ` + "the report says something that matters. ".repeat(6)).join("\n\n") +
+    "\n\n--- END OF REPORT ---";
+  assert.ok(report.length > 8000, "the fixture exceeds the old 2000-char per-message clip several times over");
+
+  const jsonl = [
+    userLine("Fix the thing and report."),
+    assistantLine([{ type: "text", text: "On it." }]),
+    assistantLine([{ type: "tool_use", name: "Bash", input: { command: "npm test" } }]),
+    assistantLine([{ type: "text", text: report }]),
+  ].join("\n");
+
+  const out = renderTranscriptForReview(jsonl, 16000);
+  assert.ok(out.includes(report), "the report arrives byte-for-byte whole");
+  assert.ok(out.endsWith("--- END OF REPORT ---"), "including its very last line");
+  assert.ok(!out.includes("bytes shown"), "and with no clip marker anywhere in it");
+});
+
+test("renderTranscriptForReview hands the report over whole even when the context budget is tiny", () => {
+  const report = "the whole conclusion of the run. ".repeat(200) + "\n--- END OF REPORT ---";
+  const noise = Array.from({ length: 50 }, (_, i) => assistantLine([{ type: "tool_use", name: "Bash", input: { command: `step ${i}` } }]));
+  const out = renderTranscriptForReview([userLine("go"), ...noise, assistantLine([{ type: "text", text: report }])].join("\n"), 200);
+  assert.ok(out.includes(report), "a budget smaller than the report does not touch the report");
+  assert.ok(out.endsWith("--- END OF REPORT ---"));
+  assert.ok(out.startsWith("…[co: the earlier part"), "the context around it is what the budget bounds");
+});
+
+test("renderTranscriptForReview announces a clipped tool result in bytes rather than cutting it silently", () => {
+  const build = "npm output line\n".repeat(500);
+  const jsonl = [
+    JSON.stringify({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", content: [{ type: "text", text: build }] }] },
+    }),
+    assistantLine([{ type: "text", text: "done" }]),
+  ].join("\n");
+  const out = renderTranscriptForReview(jsonl, 16000);
+  assert.match(out, /…\[co: 400 of \d{4} bytes shown\]/, "a trimmed build log names what it dropped");
+  assert.ok(out.endsWith("[crew] done"), "and the crew's own words still land last, untouched");
 });

@@ -1,8 +1,10 @@
 # dependencies
-node_modules/
+# no trailing slash: it matches a real directory and also any leftover symlink
+# an older build left behind in a worktree, which a dir-only pattern would miss
+node_modules
 
 # build output
-dist/
+dist
 *.tsbuildinfo
 
 # secrets — never commit

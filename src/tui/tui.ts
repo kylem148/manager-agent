@@ -22,6 +22,12 @@
  *    SSH). The terminal's modifier-key override (hold Option in iTerm2, Fn in
  *    Terminal.app, Shift elsewhere) still works as a fallback, and CO_MOUSE=off
  *    disables capture entirely.
+ *    The Ctrl-O panel gets the same treatment on its own body: a left-drag over
+ *    any panel view highlights and copies, so a paragraph of a doc, a PR link on
+ *    the queue tab or a chunk of a filed review all come out the same way. On
+ *    top of that a doc has `y`, which copies its RAW markdown rather than the
+ *    painted rows - the two answer different questions ("give me this bit of
+ *    what I'm looking at" vs "give me that document"), so both exist.
  *  - PgUp/PgDn/Ctrl-Home/Ctrl-End scroll from the keyboard; ↑/↓ navigate INPUT
  *    HISTORY (this is the behavior users expect and the old bug conflated).
  *  - SIGWINCH re-wraps and repaints. Every exit path restores the terminal.
@@ -32,7 +38,13 @@
 
 import { wrapText, wrapLine, visibleWidth, sliceVisibleText, highlightRange } from "./wrap.js";
 import { c, colorEnabled } from "../ui.js";
+// The one definition of the table's display order, shared with the task_table
+// tool and the system prompt's live-state block. It is a top-level leaf like
+// ../ui, so using it here does not make the Tui depend on the session layer.
+import { taskDisplayOrder } from "../taskorder.js";
+import { isConfirmVerb } from "../confirmverb.js";
 import { classifyToken, completeCommand } from "./commands.js";
+import { OCEAN_TICK_MS, oceanRows } from "./ocean.js";
 import { MarkdownRenderer, renderTable, type Rendered } from "./markdown.js";
 import {
   classify,
@@ -40,7 +52,22 @@ import {
   parseCsiU,
   parseModifyOtherKeys,
   type Action,
+  type KeyEvent,
 } from "./keys.js";
+import {
+  TextEditor,
+  inputRowStarts,
+  joinMessage,
+  layoutBuffer,
+  scrollToCursor,
+  type EditorLayout,
+} from "./editor.js";
+
+// The buffer/edit model is shared with the panel's PR message editor; it lives
+// in ./editor so both surfaces bind keys to ONE set of editing rules. Re-exported
+// because the input-layout tests (and any future caller) have always reached it
+// through this module.
+export { inputRowStarts };
 
 const ESC = "\x1b";
 const CSI = "\x1b[";
@@ -51,6 +78,26 @@ const CSI = "\x1b[";
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 
+/**
+ * How close together the two presses of esc-esc must land to read as one
+ * gesture. Exported so the tests can sit either side of it rather than
+ * hard-coding a number that would drift.
+ *
+ * It is a DEADLINE CHECKED ON THE SECOND PRESS, never a timer started by the
+ * first — that distinction is the whole design. A timer would have to hold the
+ * first ESC back to see what follows it, and since ESC is also the first byte of
+ * every arrow key, function key and mouse report, holding it would put a delay
+ * on the front of every one of those sequences (or, worse, swallow one that
+ * arrived split across two reads). Nothing here is deferred: a lone ESC is
+ * dispatched the instant it arrives, exactly as it always was, and the clock is
+ * only ever read to decide what a SECOND ESC means. So the window costs no
+ * latency anywhere, and cannot exist on the path of a sequence at all.
+ *
+ * 750ms is comfortably slower than a deliberate double-press and far faster than
+ * an ESC the captain pressed and then thought about.
+ */
+export const ESC_ESC_WINDOW_MS = 750;
+
 // The chip a collapsed multi-line paste leaves in the input buffer. It's plain
 // text (no ANSI) so the editor's cursor-index == visible-column math still
 // holds; (\d+) captures the paste id used to expand it back on submit.
@@ -59,6 +106,30 @@ const CHIP_PATTERN = String.raw`\[Pasted text #(\d+) \+\d+ lines\]`;
 function chipFor(id: number, lines: number): string {
   return `[Pasted text #${id} +${lines} lines]`;
 }
+
+/**
+ * One message the captain sent while a turn was in flight. `text` is what the
+ * session will receive — paste chips already expanded, exactly what submit()
+ * would have delivered — and `display` is the line as it was typed, chips
+ * intact, so un-queuing puts back on the line what was on screen.
+ */
+interface QueuedInput {
+  display: string;
+  text: string;
+}
+
+/**
+ * The one hint the queued-input block carries, and the whole of what it says
+ * about itself. Claude Code's wording, verbatim, because the key it names is the
+ * same key: what the captain reads here has to survive him alt-tabbing between
+ * the two terminals all day.
+ */
+const QUEUE_HINT = "Press up to edit queued messages";
+
+/** The prompt mark each queued message wears, so the block reads as input the
+ *  captain has already written rather than as anything the co is saying. Ours,
+ *  not Claude Code's `❯` — it is the mark on our own prompt label. */
+const QUEUE_MARK = "› ";
 
 function mouseEnabled(): boolean {
   return process.env.CO_MOUSE !== "off";
@@ -78,6 +149,156 @@ function enhancedKeysEnabled(): boolean {
   return process.env.CO_KEYS !== "off";
 }
 
+/**
+ * Fit `s` into `width` visible columns for a fixed-column layout: unchanged when
+ * it already fits, otherwise cut with an ellipsis so the eye can tell a
+ * truncated cell from a short one.
+ *
+ * `width` is an upper bound, not a target — the cut lands on a word boundary
+ * where there is one (a truncated intent reads as words, not as a syllable) and
+ * hard-splits a word too long to break, which is what a branch name or a handle
+ * always is. Callers that need the column filled pad afterwards.
+ *
+ * ANSI-aware in both directions — it measures visible width, never bytes, and it
+ * appends a reset when it cuts a styled string, because a colour opened before
+ * the cut and closed after it would otherwise bleed across the rest of the row.
+ */
+export function clipCell(s: string, width: number): string {
+  if (width <= 0) return "";
+  if (visibleWidth(s) <= width) return s;
+  const cut = sliceVisibleAnsi(s, width - 1);
+  return `${cut}…${s.includes(ESC) ? `${ESC}[0m` : ""}`;
+}
+
+/** The first `width` visible columns of `s`, ANSI escapes kept where they sit
+ *  (unlike sliceVisibleText, which strips them for the clipboard). */
+function sliceVisibleAnsi(s: string, width: number): string {
+  return wrapLine(s.replace(/\s+/g, " "), Math.max(1, width))[0] ?? "";
+}
+
+/** Pad `s` out to `width` VISIBLE columns. The counterpart of clipCell for a
+ *  fixed-column layout, and the reason String.padEnd is wrong for any cell that
+ *  might carry colour: padEnd counts escape bytes as characters.
+ *
+ *  Exported with clipCell because they are the whole of the Home tab's column
+ *  arithmetic and the only part of it a test can pin: `colorEnabled` is false
+ *  under a test runner, so a rendered frame there carries no escapes to get
+ *  wrong. These are tested with the escapes written in by hand. */
+export function pad(s: string, width: number): string {
+  return s + " ".repeat(Math.max(0, width - visibleWidth(s)));
+}
+
+/**
+ * Flow `text` after a fixed `lead`, wrapping at word boundaries into rows no
+ * wider than `width`, with every continuation row indented to the column the
+ * text started in — so a description too long for one line reads as more of the
+ * SAME row rather than as new rows of the list.
+ *
+ * This is the Home tab's answer to text that used to be clipped. Truncation
+ * removed the overflow and left the information unreadable, which was the actual
+ * complaint; nothing here is ever dropped.
+ *
+ * `text` is UNSTYLED and `style` colours each row after the wrap. That order
+ * matters: a wrap point consumes the space run it breaks on, and a closing SGR
+ * reset rides on the character after the text it closes — so wrapping an
+ * already-styled string can eat the reset and bleed the colour down the panel.
+ */
+export function flowRow(
+  lead: string,
+  text: string,
+  width: number,
+  style: (s: string) => string = (s) => s,
+): string[] {
+  const col = visibleWidth(lead);
+  const gap = " ".repeat(col);
+  return wrapLine(text, Math.max(1, width - col)).map(
+    (row, i) => (i === 0 ? lead : gap) + style(row),
+  );
+}
+
+/**
+ * Pack already-styled `tokens` onto rows no wider than `width`, after `lead` on
+ * the first row and `indent` columns in on every continuation row. The fallback
+ * for a fixed-column row whose columns alone outgrow the terminal (a long branch
+ * name on a narrow screen), where the alternative is the painter clipping it.
+ *
+ * A token is never split at a space, because a styled token is atomic: its
+ * closing reset would be dropped with the space run the wrap consumed. A token
+ * wider than a whole row is hard-split by visible column instead, which keeps
+ * every escape attached to the character it styles.
+ */
+export function packRow(lead: string, tokens: string[], width: number, indent: number): string[] {
+  const hang = " ".repeat(Math.max(0, Math.min(indent, Math.max(0, width - 1))));
+  const rows: string[] = [];
+  let cur = lead;
+  let curW = visibleWidth(lead);
+  let bare = true; // no token on this row yet, so no separating space is owed
+  for (const tok of tokens.filter((t) => t !== "")) {
+    const w = visibleWidth(tok);
+    if (!bare && curW + 1 + w > width) {
+      rows.push(cur.replace(/\s+$/, ""));
+      cur = hang;
+      curW = hang.length;
+      bare = true;
+    }
+    if (bare && curW + w > width) {
+      // Wider than the row it starts on. Split it at the narrower of the two
+      // prefixes so every piece fits under either of them.
+      const parts = wrapLine(tok, Math.max(1, width - Math.max(curW, hang.length)));
+      for (let p = 0; p < parts.length - 1; p++) rows.push((p === 0 ? cur : hang) + parts[p]!);
+      cur = (parts.length > 1 ? hang : cur) + parts[parts.length - 1]!;
+      curW = visibleWidth(cur);
+      bare = false;
+      continue;
+    }
+    cur += (bare ? "" : " ") + tok;
+    curW += (bare ? 0 : 1) + w;
+    bare = false;
+  }
+  rows.push(cur.replace(/\s+$/, ""));
+  return rows;
+}
+
+/**
+ * The visible window of a one-line input field `width` columns wide, plus where
+ * the caret sits inside it.
+ *
+ * A one-line field SCROLLS rather than wraps: the window is the tail ending at
+ * the caret, so typing past the right edge keeps what you are typing on screen
+ * instead of re-laying the row underneath you. Exported because it is pure
+ * arithmetic and the only part of the field a test can pin.
+ */
+export function fieldWindow(
+  text: string,
+  cursor: number,
+  width: number,
+): { shown: string; caret: number } {
+  const w = Math.max(1, width);
+  const from = cursor > w - 1 ? cursor - (w - 1) : 0;
+  return { shown: text.slice(from, from + w), caret: cursor - from };
+}
+
+/** The Home tab's task list: the status word in a fixed left column (sized to
+ *  the longest the contract allows — `building` and `enqueued` tie at eight),
+ *  then a gap, then the name. Fixed rather than content-sized because a column
+ *  that moves is a column you have to read instead of scan. */
+const TASK_STATUS_W = "building".length;
+const TASK_STATUS_GAP = "   ";
+
+/** The rows the task block opens with — a blank, the heading, a blank — and the
+ *  heading itself. Counted rather than written twice because the block's own row
+ *  offsets are recorded against the whole Home body, and because whether the
+ *  block fits the viewport is a question about these rows too. */
+const TASK_HEAD_ROWS = 3;
+function taskHead(heading: string): string[] {
+  return ["", "  " + c.dim(heading), ""];
+}
+
+/** Where a worktree's description hangs when it will not fit beside the columns:
+ *  in past the row's own two-space indent and its marker, so it reads as part of
+ *  the row above rather than as a row of its own. */
+const WORKTREE_HANG = 6;
+
 /** Count the lines in text, ignoring a single trailing newline. */
 function countLines(text: string): number {
   const parts = text.split("\n");
@@ -86,58 +307,58 @@ function countLines(text: string): number {
 }
 
 /**
- * Word-wrap the plain-text input buffer into visual rows no wider than `avail`
- * visible columns, returning the buffer offset at which each row starts
- * (`starts[0]` is always 0).
+ * The OSC 52 clipboard-write sequence for `text`: `ESC ] 52 ; c ; <base64> BEL`.
  *
- * The rows are *contiguous*: every character of `buf` belongs to exactly one
- * row and no boundary space is dropped. That is the whole trick — it lets the
- * editor word-wrap yet still map a `cursor` index to an exact (row, col) via
- * `starts`, which is why the editor used to hard-wrap by column instead. We
- * break after the last space that fits so words stay whole; the trailing space
- * rides along on the end of the row (invisible). A word longer than a full row
- * is hard-split at the column edge as a last resort so nothing overflows.
+ * Terminal-native, so it reaches the system clipboard locally AND through
+ * SSH/tmux (given passthrough) with no pbcopy/xclip and no runtime dependency.
  *
- * The buffer may contain literal newlines (Shift+Enter / Ctrl-J compose a
- * multi-line message), and each one ends its row unconditionally: the row after
- * it starts at the index just past the "\n", so the newline character itself is
- * the last character of the row it terminates. Callers slicing a row must strip
- * that trailing "\n" before painting it — see inputLayout. Tabs never reach the
- * buffer (Tab is a completion key) and every other char counts as one column,
- * matching the width assumptions the rest of the editor already makes.
+ * It is write-only and UNACKNOWLEDGED: nothing comes back, so a terminal with
+ * clipboard access switched off (Terminal.app has no OSC 52 at all; iTerm2 and
+ * Ghostty gate it behind a setting) drops it in silence and we cannot tell.
+ * That is why the callers confirm what they *sent* and name the caveat rather
+ * than claiming the clipboard changed.
  */
-export function inputRowStarts(buf: string, avail: number): number[] {
-  const width = Math.max(1, avail);
-  const starts = [0];
-  const n = buf.length;
-  let rowStart = 0;
-  while (rowStart <= n) {
-    // Wrap only up to the next hard break; the newline owns the row end.
-    const nl = buf.indexOf("\n", rowStart);
-    const lineEnd = nl === -1 ? n : nl;
+export function osc52(text: string): string {
+  return `${ESC}]52;c;${Buffer.from(text, "utf8").toString("base64")}\x07`;
+}
 
-    let cur = rowStart;
-    for (;;) {
-      let col = 0;
-      let lastBreak = -1; // buffer index just past the last space seen this row
-      let j = cur;
-      for (; j < lineEnd && col < width; j++) {
-        col++;
-        if (buf[j] === " ") lastBreak = j + 1;
-      }
-      if (j >= lineEnd) break; // the remainder fits on the current row
-      // Break after the last fitting space so the following word stays whole;
-      // if the row is one unbroken word, hard-split at the column edge (j).
-      const next = lastBreak > cur ? lastBreak : j;
-      starts.push(next);
-      cur = next;
-    }
+/**
+ * What a copy tells the captain. It names what was SENT, not what landed: OSC 52
+ * is unacknowledged, so the moment of the copy is the only place worth spending
+ * a footer on the one way it silently fails.
+ */
+export function copyReceipt(lines: number): string {
+  return `copied ${lines} line${lines === 1 ? "" : "s"} · if nothing pastes, allow clipboard access (OSC 52)`;
+}
 
-    if (nl === -1) break;
-    starts.push(nl + 1); // the row after the hard break (possibly empty)
-    rowStart = nl + 1;
-  }
-  return starts;
+/** A drag's two endpoints, in absolute row + 0-based visible column. */
+export interface SelectionRange {
+  anchorRow: number;
+  anchorCol: number;
+  focusRow: number;
+  focusCol: number;
+}
+
+/**
+ * Order a selection's endpoints top-to-bottom so highlight and copy don't care
+ * which direction the user dragged. `bottomCol` is exclusive (the column just
+ * past the last selected cell), so the cell the drag ended on is included.
+ *
+ * Shared by the transcript and the panel: two selection surfaces that disagreed
+ * about which end was the top would be two different bugs.
+ */
+export function normalizeSelection(sel: SelectionRange): {
+  top: number;
+  bottom: number;
+  topCol: number;
+  bottomCol: number;
+} {
+  const forward =
+    sel.focusRow > sel.anchorRow ||
+    (sel.focusRow === sel.anchorRow && sel.focusCol >= sel.anchorCol);
+  return forward
+    ? { top: sel.anchorRow, bottom: sel.focusRow, topCol: sel.anchorCol, bottomCol: sel.focusCol + 1 }
+    : { top: sel.focusRow, bottom: sel.anchorRow, topCol: sel.focusCol, bottomCol: sel.anchorCol + 1 };
 }
 
 /**
@@ -207,6 +428,34 @@ export interface DocSource {
   read(name: string): Promise<string>;
   /** Subscribe to doc-write events; returns an unsubscribe function. */
   subscribe(listener: (name: string) => void): () => void;
+  /**
+   * Write an edited doc back — the `e` editor's Ctrl-S, and the ONLY way this
+   * panel ever writes a file. Optional, exactly like the queue's
+   * `editPrMessage`: a source without it is read-only, and `e` on an open doc is
+   * refused with a stated reason rather than opening a popup that could not
+   * save. Same sandbox as `read`, so this can no more name a `.memory/` file
+   * than the list it came from could.
+   *
+   * `baseline` is the exact text the editor OPENED on. The implementation
+   * compares it against what is on disk at write time and refuses when they
+   * differ, so an edit the co-manager made while the popup was open is reported
+   * rather than overwritten.
+   */
+  write?(edit: { name: string; content: string; baseline: string }): Promise<DocSaveResult>;
+}
+
+/**
+ * What a panel-driven doc save did. Deliberately the same shape as
+ * PrMessageSaveResult: the popup that reports it is the same popup, so the two
+ * save paths hand back the same three things — did it land, one line for the
+ * panel, and (when it didn't) the reason to print over the intact buffer.
+ */
+export interface DocSaveResult {
+  saved: boolean;
+  /** One line for the panel to carry after the popup closes. */
+  summary: string;
+  /** Present when nothing was written: why. The popup stays open over it. */
+  error?: string;
 }
 
 /**
@@ -221,12 +470,17 @@ export interface QueuePanelEntry {
   /** 1-based landing position (1 is the head). */
   position: number;
   isHead: boolean;
-  status: "queued" | "head-processing" | "ready" | "blocked" | "resolving";
+  status: "queued" | "head-processing" | "awaiting-checks" | "ready" | "blocked" | "resolving";
   /** Commits awaiting merge on a ready head. */
   commitsReady?: number;
+  /** Present on a ready head whose PR reported no CI checks: mergeable, but
+   *  nothing verified it. Rendered, never swallowed. */
+  ungated?: boolean;
+  /** Present when awaiting-checks: how many checks are still running. */
+  checksPending?: number;
   /** Present when blocked: the human-readable reason. */
   blockedReason?: string;
-  /** Present when blocked: conflict vs red build+test. */
+  /** Present when blocked: conflict vs a red CI check. */
   blockedKind?: "conflict" | "failed";
   /** Resolver attempts spent so far on this head. */
   resolveAttempts?: number;
@@ -240,14 +494,268 @@ export interface QueuePanelView {
 }
 
 /**
+ * The head's inline body on the queue tab: what pressing [m] would land, or why
+ * there is no [m] (D-20260724-12). Structurally the session's QueueHeadDetail —
+ * declared here, like QueuePanelEntry, so the Tui never depends on the session
+ * layer.
+ */
+export type QueueHeadDetail =
+  | {
+      kind: "ready";
+      feature: string;
+      /** The integration branch the PR merges into (e.g. "dev"). */
+      target: string;
+      /** The per-job commits the merge preserves, oldest first. */
+      commits: string[];
+      /** What the PR's own CI checks said: the merge's evidence, including the
+       *  ungated case (no checks at all). */
+      checks?: PanelChecks;
+      /** The open pull request [m] merges — its message shown inline, so the
+       *  captain reads what will land where the key that lands it lives. The
+       *  patch itself is on GitHub (that is where they can comment on it). */
+      pr?: PanelPullRequest;
+    }
+  | {
+      kind: "awaiting";
+      feature: string;
+      target: string;
+      commits: string[];
+      /** The last read: which checks are still running. */
+      checks?: PanelChecks;
+      pr?: PanelPullRequest;
+    }
+  | {
+      kind: "blocked";
+      feature: string;
+      target: string;
+      blockedKind?: "conflict" | "failed";
+      reason: string;
+      /** conflict: the unmerged paths and git's own account of the failing step. */
+      conflictFiles?: string[];
+      detail?: string;
+      /** failed: the checks read, so the panel can name what went red and link
+       *  the run that says why. */
+      checks?: PanelChecks;
+      pr?: PanelPullRequest;
+      resolveAttempts?: number;
+      maxResolveAttempts?: number;
+    };
+
+/**
+ * The head's pull request as the panel paints it. Structurally the session's
+ * HeadPullRequest — declared here, like QueuePanelEntry, so the Tui never
+ * depends on the session layer.
+ *
+ * `title` + `prose` ARE the composed message the PR carries (D-20260727-10); the
+ * Tui never derives either. `prose` is the description with co's fenced evidence
+ * block already removed by the source, because those markers are HTML comments
+ * GitHub hides and a terminal would print, and what is inside them is the checks
+ * and commits this view already renders from `checks`/`commits`. A source that
+ * doesn't split falls back to the raw `body`, which is what the panel painted
+ * before there was anywhere to split it.
+ */
+export interface PanelPullRequest {
+  number: number;
+  url: string;
+  title: string;
+  body: string;
+  prose?: string;
+}
+
+/**
+ * What a panel-driven edit of the head PR's message did (D-20260727-15). The
+ * saved title and prose come back FROM the forge — the session re-reads the pull
+ * request after writing it — so the panel repaints from what GitHub stored
+ * rather than from the buffer the captain typed.
+ */
+export interface PrMessageSaveResult {
+  saved: boolean;
+  /** One line for the queue tab to carry after the popup closes. */
+  summary: string;
+  /** Present when nothing was written: why. The popup stays open over it. */
+  error?: string;
+}
+
+/** What a panel-driven merge did, for the flash line. Rejection of the promise
+ *  is handled too, so a thrown callback can't wedge the panel mid-merge. */
+export interface QueueMergeResult {
+  merged: boolean;
+  /** One line to flash on the separator when it settles. */
+  summary: string;
+  /** Present when nothing merged: why. */
+  error?: string;
+}
+
+/**
  * Backs the Ctrl-O panel's live merge-queue view. Read on demand at paint time
  * (the queue is an in-memory snapshot, so re-reading is cheap and always fresh),
  * so no subscription is needed: every tool turn and dispatch completion already
  * triggers a repaint, which re-reads the queue. Injected like DocSource so the
  * Tui never reaches into the engine.
+ *
+ * `headDetail` + `merge` are what make the queue tab PANEL-NATIVE: the tab shows
+ * the ready head's PR and checks inline and offers a live [m] that merges
+ * it directly through `merge`, with no co tool call anywhere in the loop and
+ * nothing blocked waiting on the keystroke. Both are optional so a bare list
+ * source (and every existing test that injects one) still works — without
+ * `merge` the tab is read-only and no [m] is ever offered.
  */
 export interface QueuePanelSource {
   view(): QueuePanelView;
+  /** The head's inline body, or null when the head has none (empty queue, or a
+   *  head still processing / being resolved). */
+  headDetail?(): QueueHeadDetail | null;
+  /**
+   * Merge the ready head. Called ONLY from the [m] keystroke over a head the
+   * source itself reports `ready`, at most once at a time (the panel holds a
+   * fire-once interlock while it is in flight). Resolves when the merge has
+   * landed AND the queue has advanced, so the next paint shows the new head.
+   */
+  merge?(): Promise<QueueMergeResult>;
+  /**
+   * Write a new title and description onto the head's pull request — the `e`
+   * editor's save (D-20260727-15). Called ONLY from Ctrl-S in that popup, at
+   * most once at a time (the popup locks while it is in flight).
+   *
+   * `body` is PROSE ONLY: the popup never loads co's fenced evidence block and
+   * never sends one, and the implementation splices the existing block back
+   * around this text. Saving merges nothing and changes no queue state.
+   * Absent (like `merge`) means the tab is read-only and `e` is refused.
+   *
+   * `prNumber` is the pull request the popup was OPENED on. It is a pin, not a
+   * lookup: if the head has moved on since (a resolver finished and re-prepared
+   * it), the save must fail rather than stamp one PR's message onto another.
+   */
+  editPrMessage?(message: {
+    title: string;
+    body: string;
+    prNumber: number;
+  }): Promise<PrMessageSaveResult>;
+}
+
+/** Where a tracked feature stands, in one word. Structurally the session's
+ *  FeatureActivity — declared here, like QueuePanelEntry, so the low-level Tui
+ *  never depends on the session layer. The queue spellings are shared with
+ *  QueuePanelEntry's statuses so the two tabs never disagree about a feature
+ *  that appears in both. */
+export type FeaturePanelStatus =
+  | "working"
+  | "idle"
+  | "queued"
+  | "processing"
+  | "ready"
+  | "blocked"
+  | "resolving"
+  | "provisioning"
+  | "failed"
+  | "removed";
+
+/**
+ * One tracked feature worktree, as the panel's Home tab shows it: what it is,
+ * what is happening to it, and which branch it lives on. Structurally a subset
+ * of the session's FeatureOverview.
+ */
+export interface FeaturePanelEntry {
+  /** The feature handle (its created name, or its slug after a restart rebuilt
+   *  the record from the worktree on disk). */
+  feature: string;
+  /** The feature's branch, always `co/feat-<slug>`. */
+  branch: string;
+  /** The stored one-line description, when the feature has one. A feature
+   *  created without an intent renders a placeholder instead. */
+  intent?: string;
+  status: FeaturePanelStatus;
+  /** Whether a crew agent is running or queued in the worktree — shown even when
+   *  the status chip is saying something else (a queue position, say). */
+  busy: boolean;
+  /** 1-based landing position, when the feature is in the merge queue. */
+  position?: number;
+  /** Present when blocked: conflict vs red build+test. */
+  blockedKind?: "conflict" | "failed";
+  /** Whether the worktree holds uncommitted changes, when that has been read.
+   *  UNDEFINED means nobody has looked — rendered as the plain state word, never
+   *  as clean, because "nothing to commit" is a claim and this would not be
+   *  evidence for it. Refreshed through the source's `refresh()`. */
+  dirty?: boolean;
+}
+
+/**
+ * Backs the Home tab's worktree list: EVERY tracked feature worktree, not just
+ * the ones queued to land. Read fresh at paint time like the queue and the
+ * inbox — the session derives it from in-memory state (registry records, jobs,
+ * the queue snapshot, the stored intents), so re-reading costs nothing and
+ * involves no git call, no filesystem read and no model call. Injected, so the
+ * Tui never reaches into the feature layer itself.
+ */
+export interface FeaturePanelSource {
+  /** Every tracked feature, in the order the tab lists them (the session sorts:
+   *  closest-to-landing first, then the rest alphabetically). */
+  list(): FeaturePanelEntry[];
+  /**
+   * Re-read whatever `list()` cannot derive for free — today the dirty flag,
+   * which costs one `git status` per worktree. Called when the captain opens or
+   * switches to the Home tab, NEVER on a paint, and the panel repaints when it
+   * resolves. Optional: a source without it simply reports no dirty state.
+   */
+  refresh?(): Promise<void>;
+}
+
+/** One row of the co's at-a-glance task table, as the Home tab paints it.
+ *  Structurally the session's TaskRow — declared here, like QueuePanelEntry, so
+ *  the low-level Tui never depends on the session layer. */
+export interface TaskPanelRow {
+  task: string;
+  /** Exactly four values, because the table is a "you are here" and not a
+   *  tracker: something is being built, it is built and handed to the merge
+   *  queue, it has landed and is waiting on the captain to test it, or it is
+   *  waiting its turn. The store coerces anything else to `queued`, so the
+   *  painter only ever sees these. */
+  status: "building" | "enqueued" | "testing" | "queued";
+}
+
+/** What `s` moves a row to, one press at a time: the cycle the work runs in.
+ *  Total over the four statuses, so the key can never compute a status the
+ *  store would refuse — see toggleSelectedTask for why it is a cycle at all. */
+const NEXT_TASK_STATUS: Record<TaskPanelRow["status"], TaskPanelRow["status"]> = {
+  queued: "building",
+  building: "enqueued",
+  enqueued: "testing",
+  testing: "queued",
+};
+
+/** Whether a task write landed, and what to say when it did not. A refusal is a
+ *  normal outcome here (a full table, a row that moved between the paint and the
+ *  keystroke), so it is a value and never an exception. */
+export interface TaskWriteResult {
+  ok: boolean;
+  message?: string;
+}
+
+/**
+ * Backs the Home tab's task table. Read fresh at paint time like every other
+ * panel source — it is an in-memory list behind a small JSON file, so re-reading
+ * is free and a table either writer changed mid-session shows on the next paint
+ * without a restart or a subscription.
+ *
+ * The four write hooks are the captain's own keys. They are OPTIONAL: a source
+ * without them is a table the tab paints and cannot edit (a degraded session),
+ * which the keys then say rather than doing nothing silently. Each names ONE row
+ * by its exact text, because the co writes the same table from its own tool and
+ * a row index goes stale between paints.
+ */
+export interface TaskPanelSource {
+  /** The table in STORED order. The tab paints it through taskDisplayOrder, so
+   *  a source hands over what it holds and never a pre-sorted copy. */
+  list(): TaskPanelRow[];
+  /** Append `task` as a new `queued` row. */
+  add?(task: string): Promise<TaskWriteResult>;
+  /** Move the row whose text is exactly `task` to `status`. */
+  setStatus?(task: string, status: TaskPanelRow["status"]): Promise<TaskWriteResult>;
+  /** Rewrite the text of the row that reads exactly `task` to `next`, keeping
+   *  its status and its place in the stored table. */
+  rename?(task: string, next: string): Promise<TaskWriteResult>;
+  /** Take the row whose text is exactly `task` out of the table. */
+  retire?(task: string): Promise<TaskWriteResult>;
 }
 
 /**
@@ -276,9 +784,37 @@ export interface LandingReview {
 /** A prepare outcome shaped for display. The session layer maps the landing
  *  engine's result onto this, so the Tui stays free of git types. */
 export type LandingPrepared =
-  | { kind: "green"; commits: string[]; diff: string }
+  | {
+      kind: "green";
+      commits: string[];
+      diff: string;
+      /** The pull request [m] would merge, when the prepare opened one. */
+      pr?: { number: number; url: string; title: string };
+    }
   | { kind: "conflict"; conflictFiles: string[]; detail: string }
-  | { kind: "failed"; exitCode: number; output: string };
+  | { kind: "failed"; reason: string; checks?: PanelChecks }
+  | { kind: "pending"; reason: string; checks?: PanelChecks };
+
+/**
+ * What a pull request's CI checks said, as the panel shows it. Structurally the
+ * session's ChecksSummary — declared here, like QueuePanelEntry, so the Tui never
+ * depends on the session layer. `ungated` is the one field that must never be
+ * rendered as an ordinary green: it means the PR reported NO checks at all, so
+ * nothing verified the merge but the captain.
+ */
+export interface PanelChecks {
+  verdict: "passed" | "failed" | "pending" | "none";
+  ungated: boolean;
+  requiredOnly: boolean;
+  total: number;
+  passed: number;
+  failed: number;
+  pending: number;
+  skipped: number;
+  runs: { name: string; bucket: string; link?: string }[];
+  ms: number;
+  timedOut?: boolean;
+}
 
 /** How a landing review ended: the human merged, declined, or dismissed a
  *  review whose merge attempt was refused. Only "merged" moved anything. */
@@ -357,10 +893,18 @@ function renderLandingBody(
     for (const l of p.detail.split("\n")) rows.push(...wrap("  " + c.dim(l)));
     return rows;
   }
-  if (p.kind === "failed") {
-    rows.push(...wrap("  " + c.red(`build+test failed on the rebased state (exit ${p.exitCode})`)));
+  if (p.kind === "failed" || p.kind === "pending") {
+    const head =
+      p.kind === "failed"
+        ? c.red(`the pull request's CI checks failed; there is nothing green to merge`)
+        : c.yellow(`the pull request's CI checks have not reported yet; there is nothing to merge yet`);
+    rows.push(...wrap("  " + head));
     rows.push("");
-    for (const l of p.output.split("\n")) rows.push(...wrap("  " + l));
+    rows.push(...wrap("  " + (p.kind === "failed" ? c.red(p.reason) : c.yellow(p.reason))));
+    if (p.checks) {
+      rows.push("");
+      for (const l of checkRunRows(p.checks)) rows.push(...wrap("  " + l));
+    }
     return rows;
   }
   const files = diffFileCount(p.diff);
@@ -368,6 +912,11 @@ function renderLandingBody(
     `${p.commits.length} commit${p.commits.length === 1 ? "" : "s"} · ` +
     `${files} file${files === 1 ? "" : "s"} changed`;
   rows.push(...wrap("  " + c.bold(summary)));
+  if (p.pr) {
+    // The merge is the PR's, so name it: [m] here presses `gh pr merge --merge`.
+    rows.push(...wrap("  " + c.cyan(`PR #${p.pr.number}`) + " " + p.pr.title));
+    rows.push(...wrap("  " + c.dim(p.pr.url)));
+  }
   rows.push("");
   if (p.commits.length === 0) {
     rows.push(...wrap("  " + c.yellow(`no commits beyond ${review.target}; nothing to land`)));
@@ -383,6 +932,185 @@ function renderLandingBody(
     rows.push(...wrap(c.dim(`── diff vs ${review.target} ──`)));
     rows.push("");
     for (const l of p.diff.split("\n")) rows.push(...wrap(colorDiffLine(l)));
+  }
+  return rows;
+}
+
+/**
+ * A checks result as one phrase — the line that replaced "build+test green" when
+ * the gate became GitHub's (D-20260727-1). The ungated case gets its OWN wording
+ * rather than a green one: "no CI checks" is not a pass, it is the absence of a
+ * gate, and the captain has to see the difference at a glance.
+ */
+function checksPhrase(checks: PanelChecks | undefined): string {
+  if (!checks) return "checks: not reported";
+  const scope = checks.requiredOnly ? "required check" : "check";
+  const plural = (n: number): string => (n === 1 ? scope : `${scope}s`);
+  switch (checks.verdict) {
+    case "none":
+      return "no CI checks on this pull request; nothing verified it but you";
+    case "passed":
+      return `checks green · ${checks.total} ${plural(checks.total)} passed${
+        checks.skipped > 0 ? ` (${checks.skipped} skipped)` : ""
+      }`;
+    case "failed":
+      return `checks RED · ${checks.failed} of ${checks.total} ${plural(checks.total)} failed`;
+    case "pending":
+      return `checks pending · ${checks.pending} of ${checks.total} ${plural(checks.total)} still running${
+        checks.timedOut ? " (co stopped waiting)" : ""
+      }`;
+  }
+}
+
+/** One row per check that is not simply passing, with its run link. What a
+ *  captain (or a resolver) needs in order to act, without leaving the panel. */
+function checkRunRows(checks: PanelChecks | undefined): string[] {
+  const rows: string[] = [];
+  for (const r of checks?.runs ?? []) {
+    if (r.bucket === "pass" || r.bucket === "skipping") continue;
+    const mark = r.bucket === "fail" || r.bucket === "cancel" ? c.red("✗") : c.yellow("…");
+    rows.push(`  ${mark} ${r.name}${r.link ? " " + c.dim(r.link) : ""}`);
+  }
+  return rows;
+}
+
+/**
+ * The queue head's inline body (D-20260724-12): everything the captain needs to
+ * decide the [m] that sits right there in the same view.
+ *
+ * A READY head renders the PULL REQUEST it would merge (D-20260724-13) in two
+ * blocks, deliberately separated:
+ *
+ *   1. THE EVIDENCE — the PR's number and URL and what its CI checks said. This
+ *      is the gate, so it leads and stays near the [m].
+ *   2. THE MESSAGE (D-20260727-10) — under its own rule: the PR's title, its
+ *      description prose, and the commits it carries. This is what the merge
+ *      ACCOMPLISHES, which is the other half of the decision and the half the
+ *      panel used to bury in a raw body dump.
+ *
+ * The message is rendered, not echoed: the prose goes through the same markdown
+ * renderer the transcript and the doc viewer use, so it reads on screen the way
+ * it reads on GitHub. The patch is still not repeated here — it lives at that
+ * URL, which is also where the captain edits the message or comments on it
+ * before pressing [m].
+ *
+ * An AWAITING head renders the same two blocks, with what it is still waiting on
+ * in place of a verdict — its PR exists and says what it will land, and the only
+ * missing thing is CI. A BLOCKED head renders why it cannot merge (and offers no
+ * [m] anywhere): the conflicted paths and git's account, or the checks that went
+ * red with links to their runs. Every line is wrapped, so nothing is clipped out
+ * of a merge decision.
+ *
+ * The one rendering rule that carries weight: a ready head whose PR reported NO
+ * checks is drawn in YELLOW as UNGATED, never in green. co had nothing to verify
+ * it with, and the captain's [m] is the only gate — that has to look different
+ * from a real green (D-20260727-1).
+ */
+export function renderQueueHeadDetail(detail: QueueHeadDetail, width: number): string[] {
+  const wrap = (s: string): string[] => (s === "" ? [""] : wrapLine(s, width));
+  const rows: string[] = [""];
+  rows.push(...wrap(c.dim(`── head · ${detail.feature} → ${detail.target} ──`)));
+  rows.push("");
+
+  if (detail.kind === "blocked") {
+    const kind =
+      detail.blockedKind === "conflict"
+        ? "rebase conflict"
+        : detail.blockedKind === "failed"
+          ? "failed CI checks"
+          : "not mergeable";
+    rows.push(...wrap("  " + c.red(c.bold(`BLOCKED (${kind})`)) + " " + c.dim("— no [m] on this head")));
+    rows.push(...wrap("  " + c.red(detail.reason)));
+    if (detail.conflictFiles && detail.conflictFiles.length > 0) {
+      rows.push("");
+      rows.push(...wrap("  conflicted paths:"));
+      for (const f of detail.conflictFiles) rows.push(...wrap("    " + c.red(f)));
+    }
+    if (detail.checks) {
+      rows.push("");
+      rows.push(...wrap("  " + c.dim(checksPhrase(detail.checks))));
+      for (const l of checkRunRows(detail.checks)) rows.push(...wrap("  " + l));
+      if (detail.pr) rows.push(...wrap("  " + c.dim(detail.pr.url)));
+    }
+    if (detail.detail) {
+      rows.push("");
+      for (const l of detail.detail.split("\n")) rows.push(...wrap("  " + c.dim(l)));
+    }
+    return rows;
+  }
+
+  const pr = detail.pr;
+  rows.push(
+    ...wrap(
+      "  " +
+        c.bold(pr ? `PR #${pr.number} → ${detail.target}` : `${detail.feature} → ${detail.target}`) +
+        c.dim(` · ${detail.commits.length} commit${detail.commits.length === 1 ? "" : "s"}`),
+    ),
+  );
+  if (pr) rows.push(...wrap("  " + c.dim(pr.url)));
+  if (detail.kind === "awaiting") {
+    rows.push(...wrap("  " + c.yellow("WAITING on CI") + " " + c.dim("— no [m] until the checks report")));
+    rows.push(...wrap("  " + c.yellow(checksPhrase(detail.checks))));
+    for (const l of checkRunRows(detail.checks)) rows.push(...wrap("  " + l));
+  } else if (detail.checks?.ungated) {
+    rows.push(...wrap("  " + c.yellow(c.bold("UNGATED")) + " " + c.yellow(checksPhrase(detail.checks))));
+    rows.push(...wrap("  " + c.dim("[m] merges it on your judgment alone — read the PR before you press it.")));
+  } else {
+    rows.push(...wrap("  " + c.green(checksPhrase(detail.checks))));
+  }
+  rows.push(...renderPrMessage(pr, detail.commits, detail.target, width));
+  return rows;
+}
+
+/**
+ * The pull request's own message, as the panel shows it back (D-20260727-10):
+ * the title, the description prose, and the commits it carries — under a rule of
+ * its own, so it never reads as more checks evidence.
+ *
+ * Nothing here is composed. The title and prose come off the PR (landing.ts
+ * composed them; the captain may have rewritten them since on GitHub), and the
+ * commit list is the same array the merge preserves. The prose is painted
+ * through renderMarkdownDoc — the renderer the transcript, the doc viewer and a
+ * filed review all use — so a description reads the same wherever it appears,
+ * and it is the prose ONLY: the source strips co's evidence fence, whose checks
+ * and commits are already drawn above and beside this.
+ */
+function renderPrMessage(
+  pr: PanelPullRequest | undefined,
+  commits: string[],
+  target: string,
+  width: number,
+): string[] {
+  const wrap = (s: string): string[] => (s === "" ? [""] : wrapLine(s, width));
+  const rows: string[] = [""];
+  // No PR (a source that carries none) means no message to show — the commits
+  // still are what would land, so they render on their own rather than under a
+  // rule announcing a pull request that isn't there.
+  if (pr) {
+    rows.push(...wrap(c.dim("── pull request ──")), "");
+    rows.push(...wrap("  " + c.bold(pr.title)));
+    const prose = (pr.prose ?? pr.body).trim();
+    if (prose === "") {
+      rows.push(...wrap("  " + c.dim("(no description)")));
+    } else {
+      rows.push("");
+      // Indented by the same two columns as everything else in this body; the
+      // renderer lays the prose out inside what that leaves.
+      for (const r of renderMarkdownDoc(prose, Math.max(20, width - 2))) {
+        rows.push(r === "" ? "" : "  " + r);
+      }
+    }
+    rows.push("");
+  }
+  if (commits.length === 0) {
+    rows.push(...wrap("  " + c.yellow(`no commits beyond ${target}; nothing to land`)));
+    return rows;
+  }
+  rows.push(...wrap("  " + c.dim(`commits (${commits.length})`)));
+  for (const cl of commits) {
+    const sp = cl.indexOf(" ");
+    const styled = sp === -1 ? c.dim(cl) : c.dim(cl.slice(0, sp)) + " " + cl.slice(sp + 1);
+    rows.push(...wrap("    " + styled));
   }
   return rows;
 }
@@ -418,7 +1146,88 @@ export interface TuiOptions {
    * one bound to the FeatureManager's queue when linked.
    */
   queue?: QueuePanelSource;
+  /**
+   * Backs the Home tab's worktree list (every tracked feature worktree). Omit
+   * off the feature flow (unlinked, or PlainIO) and Home says so where the list
+   * would be; session.ts supplies one bound to the FeatureManager when linked.
+   */
+  features?: FeaturePanelSource;
+  /**
+   * Backs the Home tab's task table. Omit and Home says the table is unavailable;
+   * session.ts always supplies one bound to the instance's task store, linked or
+   * not — the table is the co's own and needs no repo.
+   */
+  tasks?: TaskPanelSource;
+  /**
+   * Whether decoration the Tui starts BY ITSELF may move — today, the ocean at
+   * the foot of the Home tab.
+   *
+   * It is injected rather than read here for the same reason playAnimation makes
+   * no environment decision of its own: CO_VISUALS, NO_COLOR, reduced motion and
+   * the width floor are visuals.ts's call, and this file knows nothing about
+   * them. It is a predicate rather than a flag because every one of those inputs
+   * is live — a terminal narrowed mid-session, or a level read from the
+   * environment at the moment of use.
+   *
+   * Omit it and nothing moves. That is the right default for a Tui built without
+   * an opinion (every test harness, any future embedder): a scene that has not
+   * been told it may animate stays exactly as still as it was before.
+   */
+  scenery?: () => boolean;
+  /**
+   * Injectable monotonic-enough clock, for testing. Only esc-esc's window reads
+   * it (see ESC_ESC_WINDOW_MS), and a test that has to prove "two presses far
+   * apart are not one gesture" would otherwise have to sleep for real.
+   */
+  now?: () => number;
 }
+
+/**
+ * A bounded, ephemeral animation played in its own fixed-height region just
+ * above the input bar — the mechanism behind the dispatch flourish and the exit
+ * ship. The Tui owns WHEN it draws; visuals.ts owns WHAT it draws.
+ *
+ * `render` is called with the CURRENT width on every frame (and on every repaint
+ * in between), which is what makes the region resize-safe: a SIGWINCH mid-flight
+ * simply re-renders at the new width instead of leaving a torn frame. It must
+ * always return exactly `rows` rows, because the region's height is subtracted
+ * from the transcript viewport and a wobbling height would make the whole screen
+ * jump.
+ */
+export interface AnimationSpec {
+  /** Rows for frame `n` at `cols` columns. Must return exactly `rows` entries. */
+  render(frame: number, cols: number): string[];
+  /** Fixed height of the region, in screen rows. */
+  rows: number;
+  /** Total frames; the animation ends itself after the last one. Omit to run
+   *  until the caller stops it (used by the open-ended dispatch flourish). */
+  frames?: number;
+  /** Frame budget. ~10-12fps is the house speed: enough to read as motion,
+   *  cheap enough that it never competes with a repaint. */
+  intervalMs?: number;
+  /** Floor on how long the region stays up, honored by settle() only. Keeps a
+   *  flourish from flickering past when the work it covers finishes instantly. */
+  minDurationMs?: number;
+}
+
+/** A running animation. Every method is safe to call more than once. */
+export interface AnimationHandle {
+  /** False when nothing is animating (degraded context, or the Tui refused).
+   *  Callers use it to skip any wait they'd otherwise do for the animation. */
+  readonly animating: boolean;
+  /** End it now and clear the region. Use where a wait would delay real work. */
+  stop(): void;
+  /** End it, but not before `minDurationMs` has elapsed. Resolves once cleared;
+   *  resolves immediately when nothing is animating. */
+  settle(): Promise<void>;
+}
+
+/** The handle handed back when there is nothing to animate. */
+export const NO_ANIMATION: AnimationHandle = {
+  animating: false,
+  stop: () => {},
+  settle: () => Promise.resolve(),
+};
 
 /**
  * The interface the interactive session drives. The rich implementation is the
@@ -459,6 +1268,14 @@ export interface SessionIO {
    * plain non-TTY path this is a no-op — the banner is printed inline instead.
    */
   setConfirmBanner(lines: string[] | null): void;
+  /**
+   * Play a bounded animation in an ephemeral region above the input bar. Returns
+   * a live handle, or NO_ANIMATION when this IO can't animate (PlainIO always;
+   * the Tui while a stream is open, the panel is up, or the screen is too small)
+   * — so a caller never has to ask permission first, it just checks `animating`.
+   * Purely decorative: the caller always writes its own static line as well.
+   */
+  playAnimation(spec: AnimationSpec): AnimationHandle;
 }
 
 /**
@@ -487,12 +1304,37 @@ const BUSY_TICK_MS = 120;
 const PAINT_INTERVAL_MS = 16;
 
 /**
- * Single-key selectors for the doc list, in press order: digits first (the
- * obvious "press 3"), then letters for a longer list. No arrow key is ever
- * required — pressing the label beside a doc opens it. Doc-mode paging commands
- * (f/b/d/u/j/k/g/G) don't appear as list labels, so nothing collides.
+ * Default frame budget for the decorative visual region: ~11fps. Deliberately an
+ * order of magnitude slower than the repaint budget — the region is scenery
+ * played during an idle wait, and a full frame per tick is the cost. Anything
+ * faster buys no legibility on wave/ship motion and just competes with the work
+ * the animation is covering for.
  */
-const OVERLAY_LABELS = "123456789abcdefghijklmnopqrstuvwxyz";
+const VISUAL_TICK_MS = 90;
+
+/** Below this width the region can't hold a legible band and a branch label, so
+ *  the animation is refused and the caller's static line stands alone. */
+const VISUAL_MIN_COLS = 40;
+
+/** Screen rows that must survive OUTSIDE the region (transcript + rule + input)
+ *  for it to be worth drawing. A tall region on a short terminal would squeeze
+ *  the conversation to nothing, which is a worse trade than no animation. */
+const VISUAL_MIN_FREE_ROWS = 8;
+
+/**
+ * Single-key selectors for the doc list. No arrow key is ever required —
+ * pressing the label beside a row opens it. Paging commands (f/b/d/u/j/k/g/G)
+ * don't appear as list labels, so nothing collides.
+ *
+ * TWO keys are deliberately absent, on the same rule: a key the panel reserves
+ * GLOBALLY can never be a label, because a row wearing it could never be opened.
+ * `i` is the second spelling of Tab (D-20260724-9). The DIGITS are the tab bar's
+ * direct jumps — `1`..`3` land on a tab from any view — which is why this
+ * alphabet starts at `a` rather than at `1` as it once did. Dropping them keeps
+ * every row reachable (the list is 25 labels deep, and it says so when it
+ * outgrows them) instead of leaving dead labels a captain would press first.
+ */
+const OVERLAY_LABELS = "abcdefghjklmnopqrstuvwxyz";
 
 /**
  * The persistent Ctrl-O panel (D-20260723-25): the non-modal home for BOTH the
@@ -500,23 +1342,64 @@ const OVERLAY_LABELS = "123456789abcdefghijklmnopqrstuvwxyz";
  * does NOT auto-pop — the captain opens and closes it with Ctrl-O — and it hosts
  * the merge review in-place rather than through a separate modal surface.
  *
- * It has two tabs, switched with Tab, so the two key spaces never collide: the
- * `queue` tab (m/r/d act on the ready head's review), and the `docs` tab (1-9/a-z
- * open a doc). Opening a doc drops into a `doc` view; [d] on a ready head drops
- * into a `review` view (the full paged diff). Backspace/Esc walk back out.
+ * It has three home tabs, listed in a persistent bar across the top so the tabs
+ * that exist are visible without knowing they do, and switched three ways that
+ * never collide: Tab (or `i`) cycles, and `1`..`3` jump straight to one from any
+ * view. In order: `home` (the captain's task table over every tracked worktree —
+ * the table is editable, the worktree list is not), the `queue` tab ([m] merges
+ * the ready head, `e` edits its PR message, and the rest pages its inline body),
+ * and the `docs` tab (a-z open a doc). Opening a doc drops into a `doc` view. A
+ * pending feature_land review adds a fourth `review` tab for as long as it is
+ * pending. All the body views page identically. Backspace/Esc walk back out.
+ *
+ * HOME IS THE LANDING TAB and nothing on it acts on ONE keystroke: it merges
+ * nothing, and its own edits are gated behind either text the captain submitted
+ * (`a`) or a row he selected first (`x`, `s`). That is what lets it be the thing
+ * the panel opens on: the first screen of a panel that merges branches must not
+ * be one where a stray keypress can merge one — or delete a note.
+ *
+ * THE QUEUE TAB IS THE MERGE (D-20260724-12). A green head renders its own diff,
+ * commits and checks result right there and carries a live [m] that merges
+ * it — no co tool call, no gate, nothing waiting on the keystroke. The [m] is a
+ * STATE, not a prompt: it is present because the head is green, it stays present
+ * until pressed, and it disappears when the head changes. A blocked head renders
+ * why instead and offers no [m] at all.
  *
  * `docs` + its loading/error are kept on the panel (not per-view) so switching
- * tabs never reloads them; the live queue is read fresh from the QueuePanelSource
- * at paint time (cheap in-memory snapshot), so it needs no cached copy.
+ * tabs never reloads them. The queue is read fresh every paint, but its ROWS are
+ * memoized against a signature (queueSignature) because a ready head's inline
+ * diff is expensive to wrap and a paint can happen every frame.
  */
 type PanelView =
+  /** The landing page: the captain's task table, then every tracked feature
+   *  worktree with its state, branch and description. The table is his to edit
+   *  here (a/x/s); the worktree list only scrolls. */
+  | { kind: "home" }
   | { kind: "queue" }
   | { kind: "docs" }
   | { kind: "doc"; name: string; content: string; rows: string[]; scroll: number; error: string | null }
   /** The ready head's full paged diff, drilled into with [d] from the queue tab.
    *  Its rows/scroll live on `pendingReview` (mutated in place), so this carries
    *  no state of its own. */
-  | { kind: "review" };
+  | { kind: "review" }
+  /** The text editor, open over whichever view called it up (`e`): the head PR's
+   *  message over the queue tab, or an open doc over itself. Like `review` it
+   *  carries no state of its own — the buffer lives on `PanelState.popup` and is
+   *  mutated in place, so a resize (which re-lays every row) can never swap the
+   *  text under the captain's caret. */
+  | { kind: "popup" }
+  /** The model picker, open over whichever view was showing when `/model` was
+   *  typed. Like `popup` it carries no state of its own - the choices, the
+   *  cursor and the caller's promise live on `PanelState.picker`. */
+  | { kind: "picker" };
+
+/**
+ * The panel's home tabs: the kinds that appear in the bar and that a digit jumps
+ * to. `doc` and `popup` are SUB-VIEWS — they belong to a tab (docs, and whatever
+ * they opened over) rather than being one — so they are not in this union, and
+ * nothing that reasons about tabs has to carry a case for them.
+ */
+type PanelTab = "home" | "queue" | "docs" | "review";
 
 interface PanelState {
   view: PanelView;
@@ -524,7 +1407,241 @@ interface PanelState {
   docs: string[];
   docsLoading: boolean;
   docsError: string | null;
+  /** Scroll offset of the queue tab. The tab is scroll-bearing now: a ready
+   *  head's whole diff renders inline beneath the list (D-20260724-12). */
+  queueScroll: number;
+  /** Memoized queue rows and the signature they were built for. The tab is
+   *  re-rendered from its source every paint, and a paint can happen 60x a
+   *  second while the model streams underneath — re-wrapping a large diff that
+   *  often would be pure waste, so rows are rebuilt only when something they
+   *  depend on actually changed (see queueSignature). */
+  queueRows: string[];
+  queueSig: string;
+  /** Scroll offset of the Home tab. It is sized to fit typical content — a
+   *  handful of tasks over five or six worktrees — but the content is unbounded,
+   *  so unlike the docs list it pages rather than clipping. */
+  homeScroll: number;
+  /**
+   * The highlighted task row, held as its TEXT rather than its index, and null
+   * (no selection) whenever the panel opens.
+   *
+   * Text, for the same reason the tool addresses rows by text: the co edits this
+   * table from its own side, so an index taken at paint time can name a
+   * different row a moment later — and the key that acts on it is `x`. A
+   * selection whose text has left the table simply reads as no selection, which
+   * is inert, rather than as some other row.
+   */
+  taskSel: string | null;
+  /** The open task text field, or null. Non-null exactly while the captain is
+   *  typing a new row (`a`) or rewriting an existing one (`e`); it owns the
+   *  keyboard while it is. */
+  taskField: TaskFieldState | null;
+  /** What a task write had to say back — a refusal, mostly. Printed under the
+   *  table and cleared by the next Home key, like the popup's own message line. */
+  taskNotice: string | null;
+  /**
+   * The copy confirmation, shown in the footer in place of the key hints, or
+   * null. Sticky until the next panel key rather than timed out: it mirrors the
+   * transcript's finished selection, which stays highlighted as its own receipt
+   * until something dismisses it, and a copy is worth confirming for as long as
+   * the captain is still looking at what he copied.
+   */
+  copyNotice: string | null;
+  /**
+   * Mouse text selection over the panel body, in the SAME shape the transcript
+   * uses. `anchorRow`/`focusRow` are absolute indices into the current view's
+   * body rows (not screen rows), so the selection survives scrolling mid-drag;
+   * the columns are 0-based visible columns. `selecting` is true only during an
+   * active left-drag - the highlight persists after release as the visual half
+   * of the receipt, until a key or a fresh click clears it.
+   */
+  selection: SelectionRange | null;
+  selecting: boolean;
+  /** The body row painted at the top of the viewport in the last paintPanel:
+   *  the anchor for mapping a mouse (x, y) back to an absolute body row. */
+  lastStart: number;
+  /** The open PR message editor, or null. Non-null exactly while the view is
+   *  `popup`; kept on the panel rather than in the view so the buffer survives
+   *  a resize and a repaint by identity. */
+  popup: PopupState | null;
+  /** The open model picker, or null. Non-null exactly while the view is
+   *  `picker`, and kept here for the same reason the popup's buffer is: a
+   *  resize re-lays every row, and the cursor must not move with them. */
+  picker: PickerState | null;
 }
+
+/**
+ * The Home tab's one-line task text field (D-20260729-3): opened with `a` to add
+ * a row, or with `e` to rewrite the highlighted one, committed with Enter or
+ * Ctrl-S, cancelled with Esc.
+ *
+ * It exists because of the property that makes Home the tab the panel opens on:
+ * no single stray keystroke may change anything. So the keys that write TEXT
+ * open a field instead of acting, and nothing is written until the captain
+ * submits what he typed. While it is open it owns the keyboard — the panel's own
+ * digits (which jump tabs) and letters (which page) would otherwise eat the
+ * characters of a task name.
+ *
+ * ONE field serves both, because they are the same gesture on the same line of
+ * text and a second key-decoding layer is a second place for a binding to drift.
+ * `renaming` is the whole difference: null means the submitted text becomes a
+ * new row, and a row's exact current text means it replaces that row's wording.
+ *
+ * It runs on the shared TextEditor, so the line keys mean here what they mean in
+ * the prompt bar and the PR editor. The one difference is Enter, which commits:
+ * a task is one line, and the store folds any newline out of it anyway. Ctrl-S
+ * commits too, so the key that saves the PR editor's buffer saves this one.
+ */
+interface TaskFieldState {
+  /** The EXACT current text of the row being rewritten, or null when the field
+   *  is adding a new row. Text and not an index, for the same reason the
+   *  selection is text: the co edits the same table between paints. */
+  renaming: string | null;
+  editor: TextEditor;
+  /** A refusal from the store (a full table, a duplicate), shown under the field
+   *  with the typed text left intact so it can be edited rather than retyped. */
+  error: string | null;
+  /** Bracketed-paste state, kept here for the same reason the PR editor keeps
+   *  its own: while this field is open the panel's paste swallower never runs. */
+  pasting: boolean;
+  pasteBuf: string;
+}
+
+/**
+ * What the popup editor is writing to. The buffer, the keys, the paint and the
+ * whole save interlock are one mechanism (see PopupState); this is the only
+ * thing that differs between the two things it edits, and it is what the save
+ * dispatches on.
+ *
+ * `pr` is one buffer in `git commit` shape (line 1 the title, a blank line, then
+ * the description) holding the PROSE ONLY: co's fenced evidence block is split
+ * off before the buffer is filled and spliced back on by the save path, so the
+ * captain never sees those markers and cannot delete the block by editing around
+ * them.
+ *
+ * `doc` is a whole markdown file, verbatim — no split, no fence, nothing hidden.
+ * It can only ever name a doc the sandboxed DocSource already listed, which is
+ * what keeps the `.memory/` substrate as unreachable from this editor as it is
+ * from the list the name came from.
+ */
+type PopupTarget =
+  /** The pull request being edited — pinned, so a save can name it and a head
+   *  that changed underneath is visible rather than silently retargeted. */
+  | { kind: "pr"; prNumber: number; feature: string }
+  /** The doc being edited, plus the exact text the buffer opened on. The
+   *  baseline rides back to the write so a save can refuse rather than clobber a
+   *  file the co rewrote while the popup was up. */
+  | { kind: "doc"; name: string; baseline: string };
+
+/**
+ * The popup editor's live state (D-20260727-15): the buffer, its own scroll, and
+ * whatever it currently has to say back to the captain.
+ *
+ * ONE editor serves the PR message and a doc. The buffer model, every binding,
+ * the paste path, the drag-selection, the box and the save interlock are shared
+ * whole — `target` is the entire difference, and it is read in exactly three
+ * places (what the borders say, what Ctrl-S calls, and what a discard names). A
+ * second editing surface would be a second set of bindings to keep in step, and
+ * the captain would have to learn which one he was in.
+ */
+interface PopupState {
+  editor: TextEditor;
+  target: PopupTarget;
+  /**
+   * The view the popup opened OVER, restored when it closes and painted
+   * underneath it while it is up (the PR message keeps its head in sight; a doc
+   * keeps the document). Held here rather than left on `panel.view` because the
+   * view slot is what routes the keyboard, and the popup has to own that.
+   */
+  under: PanelView;
+  /** Top visual row of the popup's viewport. Kept in step with the caret by
+   *  scrollToCursor on every paint. */
+  scroll: number;
+  /** "saving": the write is in flight; every key is ignored until it settles,
+   *  the same fire-once interlock the queue merge uses. */
+  status: "editing" | "saving";
+  /** A refusal or a write failure, shown inside the popup with the buffer intact. */
+  error: string | null;
+  /** True once Esc has been pressed on a dirty buffer: the next Esc discards. */
+  escPending: boolean;
+  /**
+   * Bracketed-paste state, kept HERE rather than on the Tui: while the popup is
+   * open the panel branch of consume() runs first, so the prompt's paste
+   * machinery is never reached and the popup needs its own. `pasting` spans data
+   * events (a long description arrives in several) and the buffered content is
+   * inserted as ONE literal insert when the end marker lands, so a forty-line
+   * body can never be read as forty Enter presses.
+   */
+  pasting: boolean;
+  pasteBuf: string;
+  /** True only during an active left-drag inside the popup. The SELECTION lives
+   *  in the editor (as buffer offsets); this is just the gesture. */
+  dragging: boolean;
+  /** A copy receipt or a clear confirmation, shown on the popup's message line
+   *  until the next key. Same idea as the panel's copyNotice, scoped to the box. */
+  notice: string | null;
+}
+
+/** What the popup's top border says it is editing. */
+function popupLabel(target: PopupTarget): string {
+  return target.kind === "pr"
+    ? `edit PR #${target.prNumber} · ${target.feature}`
+    : `edit docs/${target.name}`;
+}
+
+/**
+ * One row of the model picker: the name a person uses for the model, and the
+ * Bedrock id that row sets.
+ *
+ * The list is handed IN. Nothing here asks Bedrock what exists, because Bedrock
+ * cannot answer the question this list has to answer - see MODEL_CHOICES in
+ * config.ts, which is the list itself and carries the reasoning.
+ */
+export interface ModelPickerEntry {
+  /** The friendly name on the row, e.g. "Opus 5". */
+  label: string;
+  /** The Bedrock model id this row sets, verbatim. */
+  id: string;
+}
+
+/**
+ * The open model picker: a short fixed list, a cursor, and the promise the
+ * caller is parked on until Enter or Esc.
+ *
+ * It is the popup's SIBLING, not a tab. Same box, same borders, same "open over
+ * the view underneath and put it back on the way out" rule - which is what lets
+ * `/model`, typed at the prompt, use the panel without becoming a permanent
+ * fixture of it. The selection is the Home tab's: arrows and j/k move a cursor
+ * that clamps at the ends, because a second movement rule on one screen is a
+ * second one to keep in step.
+ *
+ * The one thing it does that the editor does not is hold a caller's promise
+ * open, and that is why it owns the keyboard whole (see pickerInput).
+ */
+interface PickerState {
+  choices: readonly ModelPickerEntry[];
+  /** The highlighted row. Opens on the model in force, so Enter with no
+   *  movement re-pins what is already running rather than silently switching to
+   *  whatever happens to be first. */
+  index: number;
+  /** The id in force, marked on its row IN WORDS - the panel has to answer
+   *  "which one am I on" on a terminal with no colour. */
+  current: string;
+  /** The view the picker opened over, restored when it closes. Held here rather
+   *  than left on `panel.view` for the popup's reason: the view slot is what
+   *  routes the keyboard, and the picker has to own that. */
+  under: PanelView;
+  /** True when the picker opened the panel itself - the normal case, since
+   *  `/model` is typed at the prompt with the panel shut. Closing then shuts it
+   *  again, so the captain lands back where he typed rather than on a panel he
+   *  never asked for. */
+  opened: boolean;
+  /** Resolve openModelPicker's promise. Idempotent: first call wins. */
+  settle: (id: string | null) => void;
+}
+
+/** What the picker's top border says it is for. */
+const PICKER_LABEL = "set the model";
 
 /**
  * A merge review awaiting the captain's verdict, tracked INDEPENDENTLY of whether
@@ -565,8 +1682,13 @@ type OverlayInput =
   | {
       nav:
         | "escape"
+        /** Ctrl-O pressed while the panel is up: toggle it shut. */
+        | "close"
         | "back"
         | "tab"
+        /** Enter. Means something on exactly one view - the picker, where it
+         *  takes the highlighted model - and is inert on every other. */
+        | "enter"
         | "up"
         | "down"
         | "pageup"
@@ -613,6 +1735,19 @@ export class Tui implements SessionIO {
   private histIdx = -1; // -1 == editing a fresh line
   private draft = ""; // stashed in-progress line while browsing history
 
+  /**
+   * Messages the captain sent while nothing was reading input — i.e. while a
+   * turn was in flight. FIFO: Enter appends here instead of submitting, and the
+   * next question() takes the head, so the captain composes at the spinner
+   * instead of waiting on it. See enqueue() and releaseQueued().
+   *
+   * While a dispatch is armed the queue stays open but narrows: the only line it
+   * will release is a `confirm`, because the armed gate reads anything else as a
+   * cancellation. That is a correctness property, not politeness — see
+   * releaseQueued() for what it costs and why it is worth it.
+   */
+  private queued: QueuedInput[] = [];
+
   private header?: string;
   private active = false;
   private raw = false;
@@ -639,9 +1774,7 @@ export class Tui implements SessionIO {
   // click clears it. `lastPaintStart` is the transcript row shown at the top of
   // the viewport in the last paint(), the anchor for mapping mouse (x,y) back to
   // absolute coordinates.
-  private selection:
-    | { anchorRow: number; anchorCol: number; focusRow: number; focusCol: number }
-    | null = null;
+  private selection: SelectionRange | null = null;
   private selecting = false;
   private lastPaintStart = 0;
 
@@ -661,6 +1794,35 @@ export class Tui implements SessionIO {
   private busyFrame = 0;
   private busyTimer: ReturnType<typeof setInterval> | null = null;
 
+  // The decorative animation, and the ONE slow timer that drives it. There are
+  // two things it can drive and they are mutually exclusive by construction, so
+  // they share a timer, a frame counter and a teardown rather than running two
+  // schemes side by side:
+  //
+  //   region  a fixed-height band between the confirm banner and the busy line
+  //           (the dispatch flourish, the exit ship), carrying its own spec.
+  //   ocean   the sea at the foot of the panel's Home tab, which is drawn as
+  //           part of the tab body and so needs nothing but the frame number.
+  //
+  // They cannot overlap because the panel covers the whole screen: opening it
+  // ends any region animation, and playAnimation refuses outright while it is
+  // up. Like `busy` this is ephemeral — nothing here ever reaches the
+  // transcript, so the durable record of a dispatch or an exit is the static
+  // line the caller committed, identical at every visuals level.
+  private visual: { kind: "region"; spec: AnimationSpec } | { kind: "ocean" } | null = null;
+  // Not reset when an animation ends: the ocean's phase, so a stream that
+  // interrupts the tide (see appendStream) resumes it where it left off rather
+  // than snapping the swell back to still water. playAnimation zeroes it for the
+  // region, which does need to start from frame 0.
+  private visualFrame = 0;
+  private visualTimer: ReturnType<typeof setInterval> | null = null;
+  /** Resolvers waiting on the running animation to clear (settle/stop). */
+  private visualWaiters: Array<() => void> = [];
+  /** Wall-clock start of the running animation, for settle()'s minimum. */
+  private visualStartedAt = 0;
+  /** Whether self-started decoration may move at all (see TuiOptions.scenery). */
+  private readonly scenery: () => boolean;
+
   // Pending single-line resolver when awaiting input.
   private pendingResolve: ((line: string | null) => void) | null = null;
   private sigintCount = 0;
@@ -669,9 +1831,17 @@ export class Tui implements SessionIO {
   // interlock itself lives in the session loop, which decides what to do with
   // the typed line. Null when nothing is armed.
   private confirmBanner: string[] | null = null;
-  // Armed by a lone ESC; a second consecutive lone ESC clears the input line
-  // (matches Claude Code's esc-esc). Any other key disarms it.
+  // Armed by a lone ESC; a second consecutive lone ESC within ESC_ESC_WINDOW_MS
+  // CUTS the input line — the text goes to the clipboard and the line is
+  // cleared. Any other key disarms it, and so does letting the window lapse:
+  // `escArmedAt` is when the arming press landed, and the second press compares
+  // against it. Nothing is ever held back waiting to find out (see
+  // ESC_ESC_WINDOW_MS), so a lone ESC and every ESC-prefixed sequence are as
+  // fast as they were before the window existed.
   private escPending = false;
+  private escArmedAt = 0;
+  /** Injected clock; only the esc-esc window reads it. */
+  private readonly now: () => number;
 
   // The persistent Ctrl-O panel: the shared home for docs AND the live merge
   // queue. While `panel` is non-null it takes the whole screen and drives every
@@ -684,8 +1854,47 @@ export class Tui implements SessionIO {
   // tears down the live doc-refresh listener.
   private readonly docs?: DocSource;
   private readonly queue?: QueuePanelSource;
+  private readonly features?: FeaturePanelSource;
+  private readonly tasks?: TaskPanelSource;
+  /** Where each task row starts in the Home body, rebuilt every time the tab is
+   *  laid out. It is what lets a moved selection scroll itself into view without
+   *  the key handler having to reproduce the table's wrapping arithmetic. */
+  private readonly homeTaskStarts = new Map<string, number>();
+  /** Whether the LAST layout of a panel tab actually got a scene out of its
+   *  leftovers. Set by withOcean and read by syncOcean, so the tide follows what
+   *  was drawn rather than a second guess at whether it would fit. */
+  private oceanDrawn = false;
   private panel: PanelState | null = null;
   private unsubscribeDocs: (() => void) | null = null;
+  // The panel-native merge (D-20260724-12). `queueMerging` names the feature
+  // whose merge is in flight and is the fire-once interlock: while it is set,
+  // [m] is a no-op and the tab says what is happening instead of offering the
+  // key again. `queueMergeError` holds the last refusal so it banners in place
+  // rather than vanishing with a flash the captain may have missed. Neither is
+  // an "armed" state — there is nothing to settle, nothing waiting on a human,
+  // and no promise held open anywhere: the [m] is just a property of a ready
+  // head, present until pressed or until the head's state changes.
+  private queueMerging: string | null = null;
+  private queueMergeError: string | null = null;
+  // True while a bracketed paste is being swallowed on a panel tab (see
+  // consumeOverlay). The popup keeps its own paste state, on its own buffer.
+  private overlayPasting = false;
+  // What the PR message editor has to say on the queue tab after it closes: the
+  // save that landed, or the reason `e` had nothing to open. It banners at the
+  // top of the tab (like queueMergeError, and for the same reason: a flash on
+  // the separator is invisible while the panel owns the screen).
+  //
+  // `ok` is what it is worth, not just its colour, and it decides how long the
+  // line lives (see clearQueueEditReceipt). An ok line is a RECEIPT: the write
+  // already landed and the tab beneath it already shows the result, so it is
+  // worth exactly as long as the captain is still looking at the tab it landed
+  // on, and the next key retires it — the same life the panel's copy receipt
+  // has. A not-ok line is not a receipt: a refusal to open, or an edit
+  // discarded, is the only record of something that did NOT happen, so it
+  // stands until the next thing worth saying replaces it. A failed SAVE is
+  // neither — it never reaches this line at all, because the popup stays open
+  // over the captain's text and prints it there (see savePrMessage).
+  private queueEditNotice: { text: string; ok: boolean } | null = null;
   // A merge review awaiting the captain's [m]/[r]/[d], tracked apart from the
   // panel's open/closed state: openLandingReview sets it and flashes a hint (it
   // never force-opens the panel), and the captain opens the panel to act on it.
@@ -705,6 +1914,10 @@ export class Tui implements SessionIO {
     this.inp = opts.inp ?? process.stdin;
     this.docs = opts.docs;
     this.queue = opts.queue;
+    this.features = opts.features;
+    this.tasks = opts.tasks;
+    this.scenery = opts.scenery ?? ((): boolean => false);
+    this.now = opts.now ?? Date.now;
   }
 
   // --- lifecycle -------------------------------------------------------------
@@ -765,9 +1978,16 @@ export class Tui implements SessionIO {
       this.pendingReview.settle(this.pendingReview.status === "failed" ? "failed" : "rejected");
     }
     this.pendingReview = null;
+    // Same for an open model picker: `/model` is awaiting it, and a screen that
+    // has been torn down will never deliver a keystroke.
+    this.panel?.picker?.settle(null);
     this.panel = null;
     if (this.statusTimer) { clearTimeout(this.statusTimer); this.statusTimer = null; }
     if (this.busyTimer) { clearInterval(this.busyTimer); this.busyTimer = null; }
+    // A voyage still under way at teardown ends here: its timer is dropped and
+    // anything awaiting it is released, so an exit animation can never outlive
+    // the screen it was drawn on or hold the closing sequence up.
+    this.stopVisual();
     // Drop any queued frame: we're about to leave the alt screen, so painting
     // it would write into a buffer that's being torn down.
     if (this.paintTimer) { clearTimeout(this.paintTimer); this.paintTimer = null; }
@@ -819,14 +2039,60 @@ export class Tui implements SessionIO {
 
   /** Number of screen rows reserved for the input editor + separator. */
   private inputRows(): number {
-    // confirm banner (when armed) + busy line (when working) + separator +
-    // wrapped input text rows
-    return this.confirmRows() + this.busyRows() + 1 + this.inputTextRows();
+    // confirm banner (when armed) + visual region (while animating) + busy line
+    // (when working) + separator + queued-input block + wrapped input text rows
+    return (
+      this.confirmRows() +
+      this.visualRows() +
+      this.busyRows() +
+      1 +
+      this.queueRows() +
+      this.inputTextRows()
+    );
+  }
+
+  /**
+   * Rows the queued-input block occupies (0 when nothing is queued): one row per
+   * listed message, an elision row when more are waiting than fit, and the hint.
+   *
+   * Counted WITHOUT building the strings, because this runs on every layout
+   * question (and so on every streamed repaint), while queueLines() runs once per
+   * frame that actually paints the block.
+   */
+  private queueRows(): number {
+    const n = this.queued.length;
+    if (n === 0) return 0;
+    const shown = Math.min(n, this.queueShown());
+    return shown + (n > shown ? 1 : 0) + 1;
+  }
+
+  /**
+   * How many queued messages the block may list. The block is subtracted from
+   * the transcript viewport like every other region above the input, so an
+   * unbounded list would walk the input bar off the bottom of a short terminal —
+   * hence a ceiling of a third of the screen. On any real terminal that is a
+   * dozen or more messages, which is past the point where a queue is a queue.
+   *
+   * What the ceiling may NOT do is report itself as a number: the count is the
+   * one thing this block deliberately no longer shows. Overflow gets a single
+   * `…` row, and it elides the OLDEST — the newest message is the one ↑ recalls,
+   * so it is the one row that must always be on screen.
+   */
+  private queueShown(): number {
+    return Math.max(1, Math.floor(this.rows / 3));
   }
 
   /** Rows the armed-dispatch confirm banner occupies (0 when nothing armed). */
   private confirmRows(): number {
     return this.confirmBanner ? this.confirmBanner.length : 0;
+  }
+
+  /** Rows the decorative visual region occupies (0 when nothing is playing).
+   *  Fixed for the life of an animation, so the screen never jumps mid-flight.
+   *  The ocean costs nothing here: it is drawn inside the panel's own body, and
+   *  the panel is not on screen at the same time as the input bar. */
+  private visualRows(): number {
+    return this.visual?.kind === "region" ? this.visual.spec.rows : 0;
   }
 
   /**
@@ -858,42 +2124,14 @@ export class Tui implements SessionIO {
    * long line no longer splits words mid-word at the column edge; a word wider
    * than a row is still hard-split so nothing overflows. See inputRowStarts for
    * why contiguous rows keep the cursor index → (row, col) mapping exact.
+   *
+   * The wrapping itself lives in ./editor, shared with the panel's PR message
+   * editor: two editors on one screen must not disagree about where a line
+   * breaks or where the caret is inside it.
    */
-  private inputLayout(): {
-    segs: string[];
-    starts: number[];
-    cursorRow: number;
-    cursorCol: number;
-  } {
-    const promptW = visibleWidth(this.promptLabel);
-    const avail = Math.max(1, this.cols - promptW);
-    const starts = inputRowStarts(this.buf, avail);
-
-    const segs: string[] = [];
-    for (let r = 0; r < starts.length; r++) {
-      const raw = this.buf.slice(starts[r]!, starts[r + 1] ?? this.buf.length);
-      // A hard-broken row carries its terminating "\n" as its last character.
-      // Painting that would emit a real line break mid-frame, so drop it here;
-      // the index math above (and the cursor mapping below) still counts it.
-      segs.push(raw.endsWith("\n") ? raw.slice(0, -1) : raw);
-    }
-
-    // The cursor sits on the last row whose start offset is <= cursor; its
-    // column is the distance from that row's start.
-    let cursorRow = starts.length - 1;
-    while (cursorRow > 0 && starts[cursorRow]! > this.cursor) cursorRow--;
-    let cursorCol = this.cursor - starts[cursorRow]!;
-
-    // A cursor sitting exactly at the end of a row that fills the full width
-    // (a hard-split word, or a trailing space that wrapped) belongs at the
-    // start of a fresh row below it; add that row so the caret stays visible.
-    if (cursorCol >= avail) {
-      cursorRow++;
-      cursorCol = 0;
-      if (segs.length <= cursorRow) segs.push("");
-    }
-    if (segs.length === 0) segs.push("");
-    return { segs, starts, cursorRow, cursorCol };
+  private inputLayout(): EditorLayout {
+    const avail = Math.max(1, this.cols - visibleWidth(this.promptLabel));
+    return layoutBuffer(this.buf, this.cursor, avail);
   }
 
   /**
@@ -1006,6 +2244,15 @@ export class Tui implements SessionIO {
    * markdown; the open (partial) line is rendered live but non-committally.
    */
   appendStream(chunk: string, opts?: { markdown?: boolean }): void {
+    // Model tokens are landing: scenery yields immediately. playAnimation
+    // already refuses to start over an open stream; this is the other direction
+    // — a stream that starts while something is playing kills it — so the
+    // "never animate during streaming" rule holds no matter the ordering. It
+    // covers the panel's ocean too: the panel stays up while the model streams
+    // underneath it, and a tide repainting the screen against arriving tokens is
+    // exactly the competition this rule exists to prevent. syncOcean sees the
+    // open stream and leaves it stopped until the turn ends.
+    if (this.visual) this.stopVisual();
     if (this.open === null) this.open = "";
     this.openMarkdown = Boolean(opts?.markdown);
     const text = this.open + chunk;
@@ -1104,7 +2351,12 @@ export class Tui implements SessionIO {
     // The Ctrl-O panel owns the whole screen while open. The transcript
     // underneath keeps updating (streamed output still lands in the model);
     // closing the panel repaints it.
-    if (this.panel) { this.paintPanel(); return; }
+    //
+    // The tide is decided AFTER the frame, in both directions: what the panel
+    // just painted is what says whether there is a sea to animate, and painting
+    // the transcript at all means the panel is gone and the sea with it. Every
+    // route that closes the panel or leaves the tab ends in one of these two.
+    if (this.panel) { this.paintPanel(); this.syncOcean(); return; }
     // The input region height is dynamic (it grows as the buffer wraps), so the
     // transcript viewport height changes as the user types. Re-pin to the bottom
     // when following, so a growing input never leaves the transcript showing
@@ -1134,12 +2386,30 @@ export class Tui implements SessionIO {
       }
     }
 
+    // Visual region: the decorative band (dispatch waves, the exit ship). Its
+    // rows are re-rendered at the CURRENT width every frame, so a resize
+    // mid-animation re-lays it out instead of tearing; each row is clipped, so a
+    // generator that overshoots can never wrap into the row below and garble the
+    // frame. A generator that returns too few rows leaves blanks — the region's
+    // height is fixed at play time either way.
+    const visualRows = this.visualRows();
+    if (this.visual?.kind === "region") {
+      const art = this.visual.spec.render(this.visualFrame, this.cols);
+      for (let ar = 0; ar < visualRows; ar++) {
+        frame.push(
+          term.moveTo(vp + confirmRows + 1 + ar, 1) +
+            term.clearLine +
+            this.clip(art[ar] ?? "", this.cols),
+        );
+      }
+    }
+
     // Busy line: the spinner + chore, hard against the left margin on its own
     // row directly above the rule. Only painted while working.
     const busyRows = this.busyRows();
     if (busyRows) {
       frame.push(
-        term.moveTo(vp + confirmRows + 1, 1) +
+        term.moveTo(vp + confirmRows + visualRows + 1, 1) +
           term.clearLine +
           c.cyan(this.clip(this.busyText(), this.cols)),
       );
@@ -1151,14 +2421,24 @@ export class Tui implements SessionIO {
     const below = rowsAll.length - (start + vp);
     const scrollHint =
       this.atBottom || below <= 0 ? "" : `more below · ${below} line(s)`;
-    const sepRow = vp + confirmRows + busyRows + 1;
+    const sepRow = vp + confirmRows + visualRows + busyRows + 1;
     frame.push(term.moveTo(sepRow, 1) + term.clearLine + this.renderSeparator(scrollHint));
+
+    // Queued-input block: what the captain sent while a turn was in flight,
+    // waiting for the next read. It sits BELOW the rule, hard against the input
+    // bar, because it is input state — typed and not yet sent — rather than
+    // anything the co is saying. The block is what makes the queue visible at
+    // all, so its absence means the queue is empty.
+    const queueLines = this.queueLines();
+    for (let qr = 0; qr < queueLines.length; qr++) {
+      frame.push(term.moveTo(sepRow + 1 + qr, 1) + term.clearLine + queueLines[qr]!);
+    }
 
     // Input region: one or more wrapped rows below the separator. The prompt
     // label leads the first row; continuation rows hang-indent under it so the
     // text forms a clean block and the cursor column math is uniform.
     const view = this.inputView();
-    const firstRow = sepRow + 1;
+    const firstRow = sepRow + 1 + queueLines.length;
     for (let vr = 0; vr < view.rows.length; vr++) {
       frame.push(term.moveTo(firstRow + vr, 1) + term.clearLine + view.rows[vr]!);
     }
@@ -1169,6 +2449,64 @@ export class Tui implements SessionIO {
       term.moveTo(firstRow + view.cursorRow, promptW + 1 + view.cursorCol) + term.showCursor,
     );
     this.out.write(frame.join(""));
+    this.syncOcean(); // the panel is shut: the sea is not on screen
+  }
+
+  /**
+   * The queued-input block, in paint order. Exactly queueRows() rows.
+   *
+   * Claude Code's shape, read off its current behaviour on 2026-07-30
+   * (wmedia.es/en/tips/claude-code-queue-messages-while-working, which documents
+   * the `❯` mark, the absence of any count, and the hint's exact wording): every
+   * waiting message on its own row under a prompt mark, in the order they were
+   * typed, then one dim hint naming the key that edits them. No numbering and no
+   * total. A count answers "how many did I type", which the captain can see by
+   * looking; the rows answer "what did I type", which is the question a queue
+   * raises.
+   *
+   * Each row is composed as PLAIN text, clipped, and only then styled — the same
+   * order renderSeparator uses, and for the same reason: cutting an
+   * already-styled string can strand a colour open across the rest of the frame.
+   * A queued message can be multi-line, so its whitespace is flattened to single
+   * spaces; a literal newline painted here would tear the frame apart.
+   */
+  private queueLines(): string[] {
+    const n = this.queued.length;
+    if (n === 0) return [];
+    const shown = Math.min(n, this.queueShown());
+    const rows: string[] = [];
+    // Older-than-the-ceiling messages are elided ABOVE the list, which is where
+    // they are in time: the block still reads top-to-bottom in send order.
+    if (n > shown) rows.push(this.queueRow("  ", "…", c.dim));
+    for (const q of this.queued.slice(n - shown)) {
+      rows.push(this.queueMessageRow(q.display));
+    }
+    rows.push(this.queueRow("  ", QUEUE_HINT, c.dim));
+    return rows;
+  }
+
+  /**
+   * One queued message: the prompt mark in the prompt's own colour, the message
+   * itself dim. Two separately-closed styled spans rather than one wrapping
+   * both, so neither colour can be left open by the other's cut.
+   */
+  private queueMessageRow(display: string): string {
+    const lead = "  " + QUEUE_MARK;
+    const text = display.replace(/\s+/g, " ").trim();
+    return c.cyan(lead) + c.dim(clipCell(text, Math.max(1, this.cols - lead.length)));
+  }
+
+  /**
+   * One row of the queued-input block: a plain-ASCII lead of known width, the
+   * text clipped to whatever columns are left, and only then styled.
+   *
+   * The text is clipped rather than the finished row because clipCell folds
+   * whitespace runs when it cuts — clipping the whole row swallows the lead's
+   * indent, and a list whose long rows sit further left than its short ones reads
+   * as a broken frame.
+   */
+  private queueRow(lead: string, text: string, style: (s: string) => string): string {
+    return style(lead + clipCell(text, Math.max(1, this.cols - lead.length)));
   }
 
   /**
@@ -1244,39 +2582,18 @@ export class Tui implements SessionIO {
   private applySelection(line: string, absRow: number): string {
     const sel = this.selection;
     if (!sel) return line;
-    const { top, bottom, topCol, bottomCol } = this.normalizedSelection(sel);
+    const { top, bottom, topCol, bottomCol } = normalizeSelection(sel);
     if (absRow < top || absRow > bottom) return line;
     const from = absRow === top ? topCol : 0;
     const to = absRow === bottom ? bottomCol : Number.MAX_SAFE_INTEGER;
     return highlightRange(line, from, to);
   }
 
-  /**
-   * Order a selection's endpoints top-to-bottom so highlight/copy don't care
-   * which direction the user dragged. `bottomCol` is exclusive (the column just
-   * past the last selected cell).
-   */
-  private normalizedSelection(sel: NonNullable<Tui["selection"]>): {
-    top: number;
-    bottom: number;
-    topCol: number;
-    bottomCol: number;
-  } {
-    // bottomCol is exclusive, so the cell the drag ended on is included: +1
-    // past the ending cell's column.
-    const forward =
-      sel.focusRow > sel.anchorRow ||
-      (sel.focusRow === sel.anchorRow && sel.focusCol >= sel.anchorCol);
-    return forward
-      ? { top: sel.anchorRow, bottom: sel.focusRow, topCol: sel.anchorCol, bottomCol: sel.focusCol + 1 }
-      : { top: sel.focusRow, bottom: sel.anchorRow, topCol: sel.focusCol, bottomCol: sel.anchorCol + 1 };
-  }
-
   /** The plain text of the current selection, joined with newlines. */
   private selectionText(): string {
     const sel = this.selection;
     if (!sel) return "";
-    const { top, bottom, topCol, bottomCol } = this.normalizedSelection(sel);
+    const { top, bottom, topCol, bottomCol } = normalizeSelection(sel);
     const rowsAll = this.renderedRows();
     const out: string[] = [];
     for (let r = top; r <= bottom && r < rowsAll.length; r++) {
@@ -1348,6 +2665,146 @@ export class Tui implements SessionIO {
     this.paint();
   }
 
+  /**
+   * Play a bounded animation in the visual region (see AnimationSpec). Returns
+   * NO_ANIMATION — a live-looking handle that does nothing — whenever animating
+   * would be wrong, so the caller never has to branch before asking:
+   *
+   *  - a stream is OPEN: model tokens are landing right now, and scenery must
+   *    never compete with them for the frame. This is the structural half of the
+   *    "animate only during idle waits" rule; appendStream() is the other half
+   *    (it kills a running animation if output starts anyway).
+   *  - the Ctrl-O panel is up: it owns the whole screen, so the region isn't
+   *    painted at all and the timer would be pure waste.
+   *  - the screen is too small: the region is subtracted from the transcript
+   *    viewport, and eating the conversation to show scenery is a bad trade.
+   *
+   * The environment-level decision (CO_VISUALS, NO_COLOR, reduced motion…) is
+   * NOT made here — that is visuals.ts's resolveVisuals, which the caller
+   * consults to build the spec and its static fallback line. This method only
+   * guards what the Tui itself knows: its own state and its own dimensions.
+   */
+  playAnimation(spec: AnimationSpec): AnimationHandle {
+    if (
+      !this.active ||
+      this.open !== null ||
+      this.panel !== null ||
+      spec.rows <= 0 ||
+      this.cols < VISUAL_MIN_COLS ||
+      this.rows - spec.rows < VISUAL_MIN_FREE_ROWS
+    ) {
+      return NO_ANIMATION;
+    }
+    // There is one region: a second animation replaces the first (settling its
+    // waiters) rather than stacking two bands above the input bar.
+    this.stopVisual();
+
+    this.visual = { kind: "region", spec };
+    this.visualFrame = 0;
+    this.visualStartedAt = Date.now();
+    const total = spec.frames;
+    this.visualTimer = setInterval(
+      () => {
+        this.visualFrame++;
+        // A spec with a frame count ends itself — the ship finishes its voyage
+        // and the region clears without the caller doing anything.
+        if (total !== undefined && this.visualFrame >= total) {
+          this.stopVisual();
+          return;
+        }
+        this.paint();
+      },
+      Math.max(PAINT_INTERVAL_MS, spec.intervalMs ?? VISUAL_TICK_MS),
+    );
+    // Scenery never holds the event loop open (same rule as the busy spinner).
+    this.visualTimer.unref?.();
+    this.paint();
+
+    const mine = (): boolean => this.visual?.kind === "region" && this.visual.spec === spec;
+    const cleared = new Promise<void>((resolve) => this.visualWaiters.push(resolve));
+    return {
+      animating: true,
+      stop: () => {
+        if (mine()) this.stopVisual();
+      },
+      settle: async () => {
+        // Already gone (frames exhausted, replaced, or torn down): it had its
+        // time on screen, so there is nothing left to wait out.
+        if (!mine()) return cleared;
+        const remaining = (spec.minDurationMs ?? 0) - (Date.now() - this.visualStartedAt);
+        if (remaining > 0) await new Promise((r) => setTimeout(r, remaining));
+        if (mine()) this.stopVisual();
+        return cleared;
+      },
+    };
+  }
+
+  /**
+   * End whatever the decorative timer is driving — region or ocean — and release
+   * any waiters. Idempotent, and safe during teardown (it only repaints while
+   * active). `repaint` is false for callers that are already inside a paint, so
+   * clearing scenery mid-frame can't recurse into a second write of the same
+   * screen.
+   *
+   * visualFrame is deliberately NOT zeroed here; see the field.
+   */
+  private stopVisual(repaint = true): void {
+    if (this.visualTimer) {
+      clearInterval(this.visualTimer);
+      this.visualTimer = null;
+    }
+    const had = this.visual !== null;
+    this.visual = null;
+    const waiters = this.visualWaiters;
+    this.visualWaiters = [];
+    for (const w of waiters) w();
+    if (had && repaint && this.active) this.paint();
+  }
+
+  /**
+   * Start or stop the panel's tide, from the state the frame just painted.
+   * Called at the end of every paint, which makes this the ONE place the timer's
+   * life is decided — there is no start call sitting on a keybinding to be
+   * forgotten by the next route onto (or off) a tab.
+   *
+   * Every clause is a reason not to tick, and each is load-bearing:
+   *
+   *   the panel is shut — the sea is not on screen, and a timer repainting a
+   *     screen nobody can see is pure waste (the same judgement openPanel
+   *     already makes about the region).
+   *   the scene was not drawn — the content took the rows, the terminal is too
+   *     narrow for water, or an editor is up. Which TAB is showing is no longer
+   *     asked here: the scene rides under all of them now, so "was it drawn" is
+   *     the whole question and withOcean is the one place that answers it.
+   *   a stream is open — model tokens own the frame (see appendStream).
+   *   scenery may not move — CO_VISUALS, NO_COLOR, reduced motion, a pipe.
+   *
+   * Recovery is by the same route: the tab redraws for its own reasons after a
+   * turn ends or a resize widens the pane, and the tide starts again there.
+   */
+  private syncOcean(): void {
+    const running = this.visual?.kind === "ocean";
+    const wanted =
+      this.active &&
+      this.panel !== null &&
+      this.oceanDrawn &&
+      this.open === null &&
+      this.scenery();
+    if (wanted === running) return;
+    if (!wanted) {
+      this.stopVisual(false);
+      return;
+    }
+    this.stopVisual(false); // never two timers, whatever was running
+    this.visual = { kind: "ocean" };
+    this.visualTimer = setInterval(() => {
+      this.visualFrame++;
+      this.paint();
+    }, OCEAN_TICK_MS);
+    // Scenery never holds the event loop open (same rule as the busy spinner).
+    this.visualTimer.unref?.();
+  }
+
   /** Drop any active selection and repaint if it was showing. */
   private clearSelection(): void {
     if (!this.selection && !this.selecting) return;
@@ -1357,14 +2814,12 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * Copy `text` to the system clipboard via OSC 52. This is terminal-native, so
-   * it works through SSH/tmux (given passthrough) without shelling out to
-   * pbcopy/xclip. Empty selections are ignored.
+   * Copy `text` to the system clipboard via OSC 52 (see osc52 for the sequence
+   * and its silent-failure caveat). Empty selections are ignored.
    */
   private copyToClipboard(text: string): void {
     if (text === "") return;
-    const b64 = Buffer.from(text, "utf8").toString("base64");
-    this.out.write(`${ESC}]52;c;${b64}\x07`);
+    this.out.write(osc52(text));
   }
 
   /**
@@ -1434,10 +2889,119 @@ export class Tui implements SessionIO {
    * (Ctrl-D on an empty line) so the caller can treat it as a clean exit.
    */
   question(): Promise<string | null> {
+    // A turn just ended and the captain typed ahead: the head of the queue IS
+    // this read's answer, so the drain needs no separate pump. The session loop
+    // then handles it exactly as if it had just been typed — one turn per
+    // message, and the next question() takes the next one until the queue runs
+    // dry. Nothing is released while the dispatch gate is armed (see below).
+    const released = this.releaseQueued();
+    if (released !== null) return Promise.resolve(released);
+
     return new Promise((resolve) => {
       this.pendingResolve = resolve;
       this.paint();
     });
+  }
+
+  /**
+   * Whether a dispatch is armed and waiting on the captain's typed `confirm`.
+   *
+   * The banner IS the gate's presence: session.ts raises it in the one place it
+   * arms an order and clears it on both resolutions (fired, cancelled). Deriving
+   * the narrowing from what is on screen rather than from a second copy of the
+   * flag means the two can't drift apart, and it fails in the safe direction — a
+   * banner up for any reason lets nothing but a confirm out of the queue.
+   */
+  private gateArmed(): boolean {
+    return this.confirmBanner !== null;
+  }
+
+  /**
+   * Take a queued message as the answer to a fresh read, echoing it into the
+   * transcript the way a live submit does. Returns null when there is nothing
+   * this read may be given.
+   *
+   * Which message that is depends on the gate. Ordinarily it is the head: the
+   * queue is FIFO and every line in it is an ordinary turn.
+   *
+   * With a dispatch armed, the read is not asking for a turn — it is asking the
+   * captain to confirm or to cancel, and a line delivered into it that is not a
+   * confirm CANCELS the order. So the only line the queue may answer an armed
+   * gate with is a confirm verb, and it is taken from wherever it sits rather
+   * than only from the head: a captain who typed a note and then `confirm` while
+   * the co was still arming meant both, and the head is not the one the gate
+   * asked for. Everything else keeps its place and its order and goes out after
+   * the banner clears, which is the only fate available to it — delivering it
+   * here would kill the dispatch, and dropping it would lose a message.
+   *
+   * The queue therefore CANNOT cancel an armed order: the one line it will hand
+   * a gate is one the gate reads as a launch.
+   */
+  private releaseQueued(): string | null {
+    if (this.queued.length === 0) return null;
+    const at = this.gateArmed() ? this.queued.findIndex((q) => isConfirmVerb(q.text)) : 0;
+    if (at === -1) return null;
+    const next = this.queued.splice(at, 1)[0]!;
+    this.appendBlock("");
+    this.appendBlock(this.echoBlock(next.text));
+    this.scrollToBottom();
+    return next.text;
+  }
+
+  /**
+   * Enter with nothing reading input: park the line instead of dropping the
+   * keystroke on the floor. Everything a submit does to the line happens here
+   * too — chips expand, history remembers the typed form, the line clears — so
+   * the captain can immediately start the next message.
+   *
+   * A blank line queues nothing: an empty turn is a no-op at the session loop
+   * anyway, and a blank row in the block would just be a phantom.
+   */
+  private enqueue(): void {
+    const line = this.buf;
+    if (line.trim() === "") return;
+    this.queued.push({ display: line, text: this.expandChips(line) });
+    this.history.push(line);
+    this.buf = "";
+    this.cursor = 0;
+    this.histIdx = -1;
+    this.draft = "";
+    this.paint();
+  }
+
+  /**
+   * Take one queued message back: ↑ lifts the NEWEST onto the line, caret at the
+   * end, so it can be rephrased or simply left off the line and dropped. Un-queue
+   * rather than delete, because the reason to take a message back is almost
+   * always to rewrite it, and a key that silently ate a paragraph would be the
+   * wrong kind of cheap. The display form goes back (chip intact), so re-sending
+   * expands it again.
+   *
+   * Returns false when there is nothing queued, which is how ↑ falls through to
+   * input history. That is also the whole of the already-delivered guard
+   * (claude-code #66335, where the race put a message in the edit box AND sent
+   * it): this pops the live queue at the instant the key is pressed, and a
+   * message released to a read has already been spliced out of it, so there is
+   * no window in which ↑ can lift something that is on its way to the model.
+   */
+  private recallQueued(): boolean {
+    const last = this.queued.pop();
+    if (!last) return false;
+    this.buf = last.display;
+    this.cursor = this.buf.length;
+    this.histIdx = -1;
+    this.draft = "";
+    this.paint();
+    return true;
+  }
+
+  /** Clear the whole queue — esc-esc's meaning when there is no line to clear.
+   *  Receipted on the separator, the way every other ephemeral notice is, so the
+   *  block vanishing reads as something the captain did. */
+  private dropQueue(): void {
+    const n = this.queued.length;
+    this.queued = [];
+    this.setStatus(`queue cleared · ${n} dropped`);
   }
 
   /**
@@ -1513,13 +3077,38 @@ export class Tui implements SessionIO {
       .join("\n");
   }
 
-  /** Clear the input line and reset history browsing (esc-esc). */
+  /** Clear the input line and reset history browsing. */
   private clearInput(): void {
     this.buf = "";
     this.cursor = 0;
     this.histIdx = -1;
     this.draft = "";
     this.paint();
+  }
+
+  /**
+   * esc-esc's meaning when there is a line to lose: a CUT, not a wipe. The text
+   * goes to the system clipboard first (the same OSC 52 write the panel's
+   * drag-select, `y` and the popup's Ctrl-X all use), so a line the captain
+   * abandons is still a paste away rather than gone.
+   *
+   * It cuts the EXPANDED text, exactly as submit() sends the expanded text: a
+   * buffer holding a `[Pasted text #1 +43 lines]` chip has 43 lines in it as far
+   * as the captain is concerned, and a clipboard carrying the placeholder
+   * instead of the paste would be the one case where "recoverable" was a lie.
+   *
+   * An empty line writes NOTHING. OSC 52 with an empty payload is a real
+   * instruction to empty the clipboard, so a stray double-tap on a blank prompt
+   * would otherwise destroy whatever the captain had copied earlier — the one
+   * way this gesture could lose data instead of preserving it.
+   */
+  private cutInput(): void {
+    const text = this.expandChips(this.buf);
+    this.clearInput();
+    if (text === "") return;
+    this.copyToClipboard(text);
+    const n = countLines(text);
+    this.setStatus(`cut · ${n} line${n === 1 ? "" : "s"} on the clipboard`);
   }
 
   private handleData = (data: string): void => {
@@ -1551,9 +3140,11 @@ export class Tui implements SessionIO {
     // reports (ESC [ < ...) must not — they drive the selection itself.
     const isMouse = ch === ESC && data[i + 1] === "[" && data[i + 2] === "<";
     if (!isMouse && this.selection) this.clearSelection();
-    // esc-esc clears the input line. Arm on a lone ESC, fire on the next one.
-    // Any other key disarms, so clear by default and re-arm only below.
-    const wasEscPending = this.escPending;
+    // esc-esc cuts the input line. Arm on a lone ESC, fire on the next one if it
+    // lands inside the window. Any other key disarms, so clear by default and
+    // re-arm only below. The window is read HERE, off the byte that just
+    // arrived, and nowhere else: no timer, nothing deferred.
+    const wasEscPending = this.escPending && this.now() - this.escArmedAt <= ESC_ESC_WINDOW_MS;
     this.escPending = false;
 
     // Start of a bracketed paste. Checked before the generic CSI/ESC dispatch
@@ -1577,7 +3168,7 @@ export class Tui implements SessionIO {
     if (ch === ESC && data[i + 1] === "[") {
       return this.consumeCsi(data, i, wasEscPending);
     }
-    // Lone ESC: arm esc-esc; a second consecutive lone ESC clears the input.
+    // Lone ESC: arm esc-esc; a second consecutive lone ESC cuts the input.
     if (ch === ESC) {
       this.applyAction({ kind: "escape" }, wasEscPending);
       return 1;
@@ -1614,12 +3205,26 @@ export class Tui implements SessionIO {
         return;
 
       case "submit":
+        // With a read outstanding this sends, exactly as it always has. With
+        // none — a turn is in flight — it queues, and the next read takes it.
         if (this.pendingResolve) this.submit();
+        else this.enqueue();
         return;
 
       case "escape":
-        if (wasEscPending) this.clearInput();
-        else this.escPending = true;
+        if (!wasEscPending) {
+          // Arm (or RE-arm, when the previous arming has gone stale): this press
+          // becomes the first half of a gesture the next one may complete.
+          this.escPending = true;
+          this.escArmedAt = this.now();
+          return;
+        }
+        // esc-esc clears what has been typed and not sent. With an empty line
+        // that is the queue, so it clears that instead; with anything on the
+        // line it means exactly what it always meant — except that the line now
+        // goes to the clipboard on its way out (cutInput).
+        if (this.buf === "" && this.queued.length > 0) this.dropQueue();
+        else this.cutInput();
         return;
 
       case "interrupt": {
@@ -1643,6 +3248,11 @@ export class Tui implements SessionIO {
       }
 
       case "backspace": {
+        // Nothing before the caret: a no-op, including on an empty line with a
+        // queue behind it. Taking a queued message back used to live here too;
+        // it is ↑ alone now (see recallQueued). One recall key, not two — a
+        // second spelling of it is a second thing to keep true, and Backspace
+        // was the one nobody would guess from the block above the input.
         if (this.cursor === 0) return;
         // A chip is atomic: if the cursor sits just past (or within) one, remove
         // the whole chip rather than nibbling its closing bracket.
@@ -1690,6 +3300,20 @@ export class Tui implements SessionIO {
 
       case "open-docs":
         this.togglePanel();
+        return;
+
+      case "save":
+        // Ctrl-S belongs to the panel's PR message editor. The prompt has
+        // nothing to save — Enter sends — so it stays the no-op it always was.
+        return;
+
+      case "select-all":
+      case "clear-all":
+      case "copy":
+        // The three buffer-scoped verbs belong to the PR message editor too.
+        // The prompt line has no selection and no clipboard of its own, and
+        // these bytes did nothing here before the popup learned them, so they
+        // go on doing nothing, and the prompt's behaviour is unchanged.
         return;
 
       case "none":
@@ -1829,8 +3453,16 @@ export class Tui implements SessionIO {
         if (ev) this.applyAction(classify(ev), wasEscPending);
         return consumed;
       }
-      case "A": // Up → previous input row, else previous history
-        if (!this.moveCursorRow(-1)) this.historyPrev();
+      case "A":
+        // Up, in strict precedence: the row above inside a multi-line input
+        // first, THEN the newest queued message, then input history.
+        //
+        // The row comes first because a key that leaves the input the moment a
+        // message has two lines makes a multi-line message uneditable — the
+        // regression claude-code hit twice (#63191, #62922). moveCursorRow only
+        // declines at the top row, so recall and history are reachable exactly
+        // where they should be: the top of what is on the line.
+        if (!this.moveCursorRow(-1) && !this.recallQueued()) this.historyPrev();
         return consumed;
       case "B": // Down → next input row, else next history
         if (!this.moveCursorRow(1)) this.historyNext();
@@ -1991,17 +3623,24 @@ export class Tui implements SessionIO {
   // --- the Ctrl-O panel -------------------------------------------------------
   //
   // The persistent, non-modal home for the instance's user-facing docs AND the
-  // live merge queue (D-20260723-25). The captain opens/closes it with Ctrl-O;
-  // it never auto-pops. Two tabs (Tab switches): the QUEUE tab shows the ordered
-  // features and their state, with the ready head's review actioned in-place
-  // ([m] merge / [r] reject / [d] drill the full diff); the DOCS tab lists docs/
-  // (selectable by letter) and opens one rendered through the SAME markdown
-  // renderer the transcript uses, refreshing live when an agent writes it. The
-  // docs read only through the injected DocSource (the sandboxed doc tool — the
-  // `.memory/` substrate is never listed or reachable here); the queue reads a
-  // fresh in-memory snapshot from the QueuePanelSource at paint time. No step
-  // needs an arrow key: tab-switch is Tab, selection is a letter/number, paging
-  // is less-style (space/b, j/k, d/u, g/G).
+  // live merge queue (D-20260723-25). The captain opens/closes it with Ctrl-O
+  // (the same key both ways — see togglePanel and the "close" panel input); it
+  // never auto-pops. Four tabs, named in a bar across the top of every view and
+  // reachable three ways (Tab, `i`, or the digit the bar shows beside each): the
+  // HOME tab is the landing page — the captain's own task table (which he edits
+  // there, and the co edits through its tool) over EVERY tracked worktree,
+  // including the ones still being worked, which the queue never sees;
+  // the QUEUE tab shows the ordered features and their state, with the ready
+  // head's review actioned in-place ([m] merge / [e] edit its message / [d] drill
+  // the full diff); the DOCS tab lists docs/ (selectable by letter) and opens one
+  // rendered through the SAME markdown renderer the transcript uses, refreshing
+  // live when an agent writes it, and an open doc adds `y` to copy its raw
+  // markdown to the system clipboard. The docs read only through the injected
+  // DocSource (the sandboxed doc tool — the `.memory/` substrate is never listed
+  // or reachable here); the queue, the tasks and the worktrees read a fresh
+  // in-memory snapshot from their sources at paint time. No step needs an arrow
+  // key: tabs are Tab/1-3, selection is a letter, paging is less-style
+  // (space/b, j/k, d/u, g/G).
 
   /** Visible content rows in the panel: full screen minus header + footer. */
   private overlayViewport(): number {
@@ -2021,46 +3660,95 @@ export class Tui implements SessionIO {
   }
 
   /**
-   * Open the panel. With no DocSource, no queue AND no pending review there is
+   * Open the panel. With nothing wired at all and no pending review there is
    * nothing to show, so flash a hint instead (PlainIO/degraded never crashes on
-   * the keybind). Otherwise the opening view is: the pending review's diff when
-   * one is waiting (the captain almost certainly opened to act on it), else the
-   * QUEUE tab when a queue is wired (the merge flow is the reason the panel
-   * exists), else the DOCS tab. Subscribes to the doc write queue for live
-   * refresh and loads the doc list asynchronously.
+   * the keybind). Otherwise the opening view is: the pending feature_land review
+   * when one is waiting (that one IS a gate — it holds a caller open, so it wins
+   * the landing spot), else the FIRST tab in the bar, which is HOME whenever
+   * there is a Home to show. Home leads because it is the orientation view and
+   * because no single keystroke on it acts: the screen a keystroke lands on by
+   * default must not be one where a stray press can merge a branch. Subscribes to the doc
+   * write queue for live refresh and loads the doc list asynchronously.
+   *
+   * `force` skips the nothing-to-show refusal, for the one caller that brings
+   * its own content: the model picker stands a panel up whether or not this
+   * session wired a tab into one.
    */
-  private openPanel(): void {
-    if (!this.docs && !this.queue && !this.pendingReview) {
+  private openPanel(force = false): void {
+    if (!force && !this.docs && !this.queue && !this.features && !this.tasks && !this.pendingReview) {
       this.setStatus("panel unavailable");
       return;
     }
     if (this.panel) return;
     this.clearSelection();
     this.clearStatus();
+    // The panel takes the whole screen, so anything in the visual region is
+    // about to be invisible; end it rather than tick a timer nobody can see.
+    this.stopVisual();
     let view: PanelView;
     if (this.pendingReview) {
-      // Land where the captain can act: the queue tab (which shows the ready
-      // head + action bar) when a queue exists, else the review diff directly.
-      view = this.queue ? { kind: "queue" } : { kind: "review" };
-      if (this.queue) this.pendingReview.scroll = 0;
-      else {
-        this.pendingReview.rows = renderLandingBody(
-          this.pendingReview.review,
-          this.pendingReview.status,
-          this.pendingReview.error,
-          this.cols,
-        );
-        this.pendingReview.scroll = 0;
-      }
+      // A pending feature_land review lives on its OWN tab now: the queue tab's
+      // [m] belongs to the panel-native queue merge, so the two can never share
+      // a key space (D-20260724-12).
+      view = { kind: "review" };
+      this.pendingReview.rows = renderLandingBody(
+        this.pendingReview.review,
+        this.pendingReview.status,
+        this.pendingReview.error,
+        this.cols,
+      );
+      this.pendingReview.scroll = 0;
     } else {
-      view = this.queue ? { kind: "queue" } : { kind: "docs" };
+      view = this.homeView(this.panelTabs()[0] ?? "docs");
     }
-    this.panel = { view, docs: [], docsLoading: Boolean(this.docs), docsError: null };
+    this.panel = {
+      view,
+      docs: [],
+      docsLoading: Boolean(this.docs),
+      docsError: null,
+      queueScroll: 0,
+      queueRows: [],
+      queueSig: "",
+      homeScroll: 0,
+      // No selection when the panel opens: the tab it lands on is inert until
+      // the captain deliberately picks a row.
+      taskSel: null,
+      taskField: null,
+      taskNotice: null,
+      copyNotice: null,
+      selection: null,
+      selecting: false,
+      lastStart: 0,
+      popup: null,
+      picker: null,
+    };
     if (this.docs) {
       this.unsubscribeDocs = this.docs.subscribe((name) => this.onDocWrite(name));
       void this.loadList();
     }
+    if (view.kind === "home") this.refreshHome();
     this.paint();
+  }
+
+  /**
+   * Ask the feature source to re-read what it cannot derive for free (the dirty
+   * flag: one `git status` per worktree), and repaint when it lands. Called when
+   * Home is shown and nowhere else — a paint must never trigger I/O, and the one
+   * moment the answer matters is the moment the captain is looking at it.
+   *
+   * Fire-and-forget by design: the tab paints immediately from what the source
+   * already knows, and the dirty/clean refinement arrives a frame later. A source
+   * with no `refresh` (or one that rejects) simply leaves the rows as they are.
+   */
+  private refreshHome(): void {
+    const refresh = this.features?.refresh;
+    if (!refresh || !this.features) return;
+    void refresh.call(this.features).then(
+      () => {
+        if (this.panel) this.paint();
+      },
+      () => {},
+    );
   }
 
   /** Close the panel and repaint the transcript+editor beneath it, intact. A
@@ -2068,6 +3756,10 @@ export class Tui implements SessionIO {
    *  captain can reopen and act on it later. */
   private closePanel(): void {
     if (!this.panel) return;
+    // A picker still up when the panel goes settles as a cancel: it is holding a
+    // caller open, and no screen means no verdict. (closePicker clears it before
+    // it gets here on the ordinary route; this is for every other one.)
+    this.panel.picker?.settle(null);
     this.panel = null;
     this.clearStatus();
     if (this.unsubscribeDocs) {
@@ -2087,6 +3779,8 @@ export class Tui implements SessionIO {
         this.panel.docs = docs;
         this.panel.docsLoading = false;
         this.panel.docsError = null;
+        // The list just changed under any selection standing on it.
+        this.clearPanelSelection();
         this.paint();
       }
     } catch (e) {
@@ -2129,30 +3823,82 @@ export class Tui implements SessionIO {
     void this.loadList();
   }
 
-  /** The panel's home tabs, in order, given what's wired and pending: the queue
-   *  (when a queue source exists), docs (when a doc source exists), and a
-   *  standalone review (only when there's a pending review AND no queue to host
-   *  it — a feature_land review that isn't in the queue). Tab cycles these. */
-  private panelTabs(): PanelView["kind"][] {
-    const tabs: PanelView["kind"][] = [];
+  /** The panel's home tabs, IN BAR ORDER, given what's wired and pending: home
+   *  (when a task or feature source exists), the queue (when a queue source
+   *  exists), docs (when a doc source exists), and a feature_land review whenever
+   *  one is pending.
+   *
+   *  Home leads because it is the landing page and the one tab where no single
+   *  keystroke acts. The review gets its own tab even alongside the queue: the queue
+   *  tab's [m] is the panel-native queue merge, and two different merges must
+   *  never share one key (D-20260724-12). Tab cycles these; `1`..`3` (and `4`
+   *  when a review is pending) index straight into this list. */
+  private panelTabs(): PanelTab[] {
+    const tabs: PanelTab[] = [];
+    if (this.tasks || this.features) tabs.push("home");
     if (this.queue) tabs.push("queue");
     if (this.docs) tabs.push("docs");
-    if (this.pendingReview && !this.queue) tabs.push("review");
+    if (this.pendingReview) tabs.push("review");
     return tabs;
   }
 
-  /** Tab cycles the home tabs. From a doc sub-view it first pops back to the docs
-   *  tab. A no-op when there's only one tab. */
+  /** The one-word label each tab wears in the bar. */
+  private static readonly TAB_LABELS: Record<PanelTab, string> = {
+    home: "home",
+    queue: "queue",
+    docs: "docs",
+    review: "review",
+  };
+
+  /** A home tab's view state. */
+  private homeView(kind: PanelTab): PanelView {
+    switch (kind) {
+      case "home": return { kind: "home" };
+      case "queue": return { kind: "queue" };
+      case "docs": return { kind: "docs" };
+      case "review": return { kind: "review" };
+    }
+  }
+
+  /** Tab (or `i`, its panel-only twin) cycles the home tabs. From a sub-view (an
+   *  open doc) it first pops back to that sub-view's own tab. A no-op when
+   *  there's only one tab. */
   private switchTab(): void {
     if (!this.panel) return;
     const v = this.panel.view;
     if (v.kind === "doc") { this.panel.view = { kind: "docs" }; this.paint(); return; }
     const tabs = this.panelTabs();
     if (tabs.length < 2) return;
-    const cur = tabs.indexOf(v.kind);
-    const next = tabs[(cur + 1) % tabs.length]!;
-    this.panel.view = next === "review" ? { kind: "review" } : next === "docs" ? { kind: "docs" } : { kind: "queue" };
-    if (next === "review" && this.pendingReview) {
+    // A sub-view isn't in the bar and reads as -1, which starts the cycle at the
+    // first tab. (The popup never reaches here: it owns the keyboard, Tab
+    // included.)
+    const cur = tabs.indexOf(v.kind as PanelTab);
+    this.gotoTab(tabs[(cur + 1) % tabs.length]!);
+  }
+
+  /**
+   * `1`..`9`: jump straight to the nth tab in the bar, from ANY view — including
+   * out of an open doc, which is the whole point of a direct jump. A digit past
+   * the end of the bar is a no-op.
+   *
+   * The digits are reserved panel-wide, which is why the doc list is labelled
+   * from `a` (see OVERLAY_LABELS): a key that means "tab 2" everywhere cannot
+   * also mean "open the second doc" on one tab.
+   */
+  private jumpTab(index: number): void {
+    if (!this.panel) return;
+    const tab = this.panelTabs()[index];
+    if (!tab) return;
+    this.gotoTab(tab);
+  }
+
+  /** Land on a home tab: switch the view, run whatever that tab needs on arrival,
+   *  and repaint. The single path Tab, `i` and the number keys all take, so no
+   *  route onto a tab can skip its arrival work. */
+  private gotoTab(kind: PanelTab): void {
+    if (!this.panel) return;
+    this.panel.view = this.homeView(kind);
+    if (kind === "review" && this.pendingReview) {
       this.pendingReview.rows = renderLandingBody(
         this.pendingReview.review,
         this.pendingReview.status,
@@ -2160,10 +3906,13 @@ export class Tui implements SessionIO {
         this.cols,
       );
     }
+    // Home re-reads the worktrees' dirty state (a git call per worktree, so only
+    // ever on arrival).
+    if (kind === "home") this.refreshHome();
     this.paint();
     // Landing on docs re-lists so any writes that arrived while it was off screen
     // are picked up (onDocWrite skips the reload when docs aren't showing).
-    if (next === "docs") void this.loadList();
+    if (kind === "docs") void this.loadList();
   }
 
   /**
@@ -2190,9 +3939,15 @@ export class Tui implements SessionIO {
     try {
       const content = await this.docs.read(name);
       if (!this.panel || this.panel.view.kind !== "doc" || this.panel.view.name !== name) return; // moved on
+      const changed = this.panel.view.content !== content;
       const rows = renderMarkdownDoc(content, this.cols);
       const scroll = Math.min(this.panel.view.scroll, Math.max(0, rows.length - this.overlayViewport()));
       this.panel.view = { kind: "doc", name, content, rows, scroll, error: null };
+      // A receipt is only true of the text it was taken from, and a highlight
+      // only of the rows it was dragged over. This is the one refresh path no
+      // keystroke passes through (an agent rewrote the doc under the captain),
+      // so retire both here rather than let them vouch for content that moved.
+      if (changed) this.clearPanelSelection();
       this.paint();
     } catch {
       // Deleted out from under us: drop back to the list rather than show stale.
@@ -2200,12 +3955,27 @@ export class Tui implements SessionIO {
     }
   }
 
-  /** Re-lay the open doc or the drilled review body out at the current width
-   *  (resize). The queue/docs tabs re-render from source each paint, so only the
-   *  scroll-bearing views need reflowing. */
+  /** Re-lay the open doc or the pending review body out at the current width
+   *  (resize). The docs tab re-renders from source each paint; the queue tab
+   *  re-renders itself because its cache key carries the width. */
   private reflowPanel(): void {
     if (!this.panel) return;
-    const v = this.panel.view;
+    // A resize re-wraps every row, so a selection made at the old width points
+    // at text that has moved. Drop it rather than highlight the wrong cells.
+    this.clearPanelSelection();
+    const panel = this.panel;
+    // A doc sitting UNDER the popup is still painted, so it is re-laid too; the
+    // buffer above it needs nothing (its selection is buffer offsets, and its
+    // rows are laid out fresh on every paint).
+    const under = panel.popup?.under ?? panel.picker?.under;
+    if ((panel.view.kind === "popup" || panel.view.kind === "picker") && under?.kind === "doc") {
+      const rows = renderMarkdownDoc(under.content, this.cols);
+      const scroll = Math.min(under.scroll, Math.max(0, rows.length - this.overlayViewport()));
+      const held = panel.popup ?? panel.picker!;
+      held.under = { ...under, rows, scroll };
+      return;
+    }
+    const v = panel.view;
     if (v.kind === "doc") {
       const rows = renderMarkdownDoc(v.content, this.cols);
       const scroll = Math.min(v.scroll, Math.max(0, rows.length - this.overlayViewport()));
@@ -2218,10 +3988,26 @@ export class Tui implements SessionIO {
   }
 
   /** The scroll offset + row count of whichever scroll-bearing view is showing,
-   *  or null for the non-scrolling queue/docs tabs. */
+   *  or null for the non-scrolling docs list tab. */
   private scrollTarget(): { get(): number; set(n: number): void; rows: number } | null {
     if (!this.panel) return null;
     const v = this.panel.view;
+    if (v.kind === "queue") {
+      const panel = this.panel;
+      return {
+        get: () => panel.queueScroll,
+        set: (n) => { panel.queueScroll = n; },
+        rows: this.queueBody().length,
+      };
+    }
+    if (v.kind === "home") {
+      const panel = this.panel;
+      return {
+        get: () => panel.homeScroll,
+        set: (n) => { panel.homeScroll = n; },
+        rows: this.homeTabRows().length,
+      };
+    }
     if (v.kind === "doc") {
       return { get: () => v.scroll, set: (n) => { this.panel!.view = { ...v, scroll: n }; }, rows: v.rows.length };
     }
@@ -2254,6 +4040,36 @@ export class Tui implements SessionIO {
 
   /** Parse one key/sequence while the panel is open. Returns bytes consumed. */
   private consumeOverlay(data: string, i: number): number {
+    // The PR message editor takes the keyboard whole while it is open: it needs
+    // the EDITOR's decode table (where Ctrl-U kills to line start), not the
+    // panel's (where it pages up), so it is routed before any panel translation
+    // rather than through dispatchOverlay. It handles its own bracketed paste,
+    // into its buffer.
+    if (this.panel?.view.kind === "popup") return this.consumePopup(data, i);
+
+    // The Home tab's add-a-task field takes it whole for the same reason, and
+    // one more: the panel's digits jump tabs and its letters page, so a task
+    // called "1 fix the parser" is untypeable unless this is routed first.
+    if (this.panel?.taskField) return this.consumeTaskField(data, i);
+
+    // A bracketed paste on a panel TAB has nowhere to land, since no view out
+    // here is a text buffer, so it is swallowed whole rather than let its
+    // characters read as panel keys. That matters more than it sounds: `m` is
+    // the merge on the queue tab, and a pasted paragraph containing one would
+    // otherwise merge the head. (Reachable the moment pasting into the panel is
+    // a normal gesture, which the message editor makes it.)
+    if (this.overlayPasting) {
+      const end = data.indexOf(PASTE_END, i);
+      if (end === -1) return data.length - i; // still mid-paste; await the rest
+      this.overlayPasting = false;
+      return end - i + PASTE_END.length;
+    }
+    if (data.startsWith(PASTE_START, i)) {
+      this.overlayPasting = true;
+      return PASTE_START.length;
+    }
+    if (data.startsWith(PASTE_END, i)) return PASTE_END.length;
+
     const ch = data[i]!;
     if (ch === ESC && data[i + 1] === "[") return this.consumeOverlayCsi(data, i);
     // A lone ESC leaves. (Under the Kitty protocol Escape arrives as CSI 27 u,
@@ -2278,6 +4094,11 @@ export class Tui implements SessionIO {
     switch (code) {
       case 9:
         return { nav: "tab" }; // Tab switches tabs
+      case 13:
+      case 10:
+        return { nav: "enter" }; // Enter - the picker's select; inert elsewhere
+      case 15:
+        return { nav: "close" }; // Ctrl-O — the key that opened the panel closes it
       case 8:
       case 127:
         return { nav: "back" }; // Backspace
@@ -2290,17 +4111,16 @@ export class Tui implements SessionIO {
       case 21:
         return { nav: "halfup" }; // Ctrl-U
     }
-    return null; // Enter, other control bytes: nothing to do in the panel
+    return null; // other control bytes: nothing to do in the panel
   }
 
   private consumeOverlayCsi(data: string, i: number): number {
-    // Mouse: swallow, and let the wheel scroll a doc (a bonus; never required).
+    // Mouse (SGR 1006), same wire format the transcript decodes: the wheel
+    // scrolls the body, and a left-drag selects and copies out of it.
     if (data[i + 2] === "<") {
       const end = this.findMouseEnd(data, i + 3);
       if (end === -1) return data.length - i;
-      const b = Number.parseInt(data.slice(i + 3, end).split(";")[0] ?? "", 10);
-      if (b === 64) this.overlayScrollBy(-3);
-      else if (b === 65) this.overlayScrollBy(3);
+      this.handlePanelMouse(data.slice(i + 3, end), data[end] === "M");
       return end - i + 1;
     }
 
@@ -2314,20 +4134,7 @@ export class Tui implements SessionIO {
     switch (final) {
       case "u": {
         const ev = parseCsiU(params);
-        if (ev) {
-          if (ev.code === 27) this.dispatchOverlay({ nav: "escape" });
-          else if (ev.code === 9) this.dispatchOverlay({ nav: "tab" });
-          else {
-            // Fold a Kitty-encoded key back onto the legacy byte its raw form
-            // would have been, so Ctrl-F/B/D/U page identically either way.
-            const raw =
-              ev.mods.ctrl && ev.code >= 97 && ev.code <= 122
-                ? String.fromCharCode(ev.code - 96)
-                : String.fromCodePoint(ev.code);
-            const input = this.overlayByte(raw);
-            if (input) this.dispatchOverlay(input);
-          }
-        }
+        if (ev) this.dispatchOverlayKey(ev);
         return consumed;
       }
       case "A": this.dispatchOverlay({ nav: "up" }); return consumed;
@@ -2337,6 +4144,16 @@ export class Tui implements SessionIO {
       case "H": this.dispatchOverlay({ nav: "top" }); return consumed;
       case "F": this.dispatchOverlay({ nav: "bottom" }); return consumed;
       case "~": {
+        // xterm's modifyOtherKeys spelling of an ordinary key (`CSI 27;mods;code ~`),
+        // decoded here for the same reason the editor path decodes it: on a terminal
+        // running that mode Ctrl-O would otherwise open the panel and then be unable
+        // to close it. Plain CSI ~ keys (PgUp/PgDn/Home/End) parse as null and fall
+        // through untouched.
+        const other = parseModifyOtherKeys(params);
+        if (other) {
+          this.dispatchOverlayKey(other);
+          return consumed;
+        }
         const n = Number.parseInt(params, 10);
         if (n === 5) this.dispatchOverlay({ nav: "pageup" });
         else if (n === 6) this.dispatchOverlay({ nav: "pagedown" });
@@ -2349,30 +4166,601 @@ export class Tui implements SessionIO {
     }
   }
 
+  /**
+   * Route a key decoded from an enhanced protocol (Kitty CSI-u or xterm's
+   * modifyOtherKeys) into the panel. Everything but Escape/Tab is folded back
+   * onto the legacy byte its raw form would have been, so Ctrl-O closes and
+   * Ctrl-F/B/D/U page identically however the terminal spelled them.
+   */
+  private dispatchOverlayKey(ev: KeyEvent): void {
+    if (ev.code === 27) { this.dispatchOverlay({ nav: "escape" }); return; }
+    if (ev.code === 9) { this.dispatchOverlay({ nav: "tab" }); return; }
+    const raw =
+      ev.mods.ctrl && ev.code >= 97 && ev.code <= 122
+        ? String.fromCharCode(ev.code - 96)
+        : String.fromCodePoint(ev.code);
+    const input = this.overlayByte(raw);
+    if (input) this.dispatchOverlay(input);
+  }
+
   private dispatchOverlay(input: OverlayInput): void {
     if (!this.panel) return;
-    // Tab switches tabs from any view.
-    if ("nav" in input && input.nav === "tab") { this.switchTab(); return; }
+    // A standing selection and its receipt are dismissed by the next key,
+    // whatever it is, the way any real keystroke clears the transcript's
+    // copied-selection highlight. Cleared BEFORE routing so `y` re-sets the
+    // receipt on the way through and a repeat copy still reads as a fresh one.
+    // It also means every view change clears the selection for free: they are
+    // all key-driven, and a row index means something else on the next view.
+    this.clearPanelSelection();
+    // A landed save's receipt on the queue tab goes the same way, in the same
+    // breath and for the same reason. Cleared BEFORE routing so `e` sets a fresh
+    // one on the way through, and so the key that dismisses it still does its own
+    // job — dismissing is a side effect of the next keystroke, never a key of its
+    // own. HERE and not in clearPanelSelection, whose other callers are a doc
+    // refresh, a docs-list load and a resize: retiring the receipt on one of
+    // those would make it vanish with no keystroke behind it, which is the timed
+    // flash this is deliberately not.
+    this.clearQueueEditReceipt();
+    // Ctrl-O toggles the panel shut from any view — the same key that opened it.
+    // It takes each view's OWN escape exit rather than a second, divergent close
+    // path, so it inherits their rules (notably the review view's mid-merge
+    // lockout: a merge in flight can't be walked away from by any key).
+    //
+    // The one thing it does NOT inherit is an escape meaning that stops SHORT of
+    // that exit — see clearEscapeStops.
+    if ("nav" in input && input.nav === "close") this.clearEscapeStops();
+    const ev: OverlayInput = "nav" in input && input.nav === "close" ? { nav: "escape" } : input;
+    // The picker owns the keyboard whole while it is up - BEFORE the panel's own
+    // Tab and digits get a look. It is holding `/model` open, and a key that
+    // switched tabs would leave that caller waiting on a view nobody can act on.
+    // (It is routed here rather than in consumeOverlay, next to the editor's
+    // branch, because it wants exactly this decode table: the panel's, not the
+    // editor's.)
+    if (this.panel.view.kind === "picker") { this.pickerInput(ev); return; }
+    // Tab switches tabs from any view, and `i` is its second spelling
+    // (D-20260724-9). Both live HERE, on the panel's own input path, which is
+    // reached only while the panel owns the keyboard — a bare `i` typed at the
+    // input line never gets this far and stays the literal character it always
+    // was (see consume(): the panel branch is taken before any editor parsing).
+    if ("nav" in ev && ev.nav === "tab") { this.switchTab(); return; }
+    if ("ch" in ev && ev.ch === "i") { this.switchTab(); return; }
+    // The digits jump straight to a tab, from every view, for the same reason
+    // Tab lives here: they are the panel's own keys, reserved panel-wide, and no
+    // view may shadow them (which is why no list row is labelled with one).
+    if ("ch" in ev && ev.ch >= "1" && ev.ch <= "9") {
+      this.jumpTab(ev.ch.charCodeAt(0) - "1".charCodeAt(0));
+      return;
+    }
     switch (this.panel.view.kind) {
-      case "queue": this.queueTabInput(input); return;
-      case "docs": this.docsTabInput(input, this.panel); return;
-      case "doc": this.overlayDocInput(input); return;
-      case "review": this.reviewViewInput(input); return;
+      case "home": this.homeTabInput(ev); return;
+      case "queue": this.queueTabInput(ev); return;
+      case "docs": this.docsTabInput(ev, this.panel); return;
+      case "doc": this.overlayDocInput(ev); return;
+      case "review": this.reviewViewInput(ev); return;
     }
   }
 
-  /** The queue tab: [m]/[r]/[d] act on the ready head's review; Esc closes. */
+  /**
+   * The queue tab (D-20260724-12). [m] merges the ready head, directly — it is
+   * live whenever the head is green and it is simply absent otherwise, so there
+   * is no modal state to enter or leave. Everything else pages the body (the
+   * ready head's diff renders inline, so this tab scrolls like a doc), and
+   * Esc/Backspace/q close the panel.
+   *
+   * The paging surface is checked BEFORE the exits so `d`/`u` keep their
+   * less-style half-page meaning here, and [m] is checked first of all so a
+   * merge can never be shadowed by a paging key.
+   */
   private queueTabInput(input: OverlayInput): void {
+    if ("ch" in input && input.ch === "m") {
+      this.mergeReadyHead();
+      return;
+    }
+    // `e` edits the head PR's message (D-20260727-15). Checked beside [m] and
+    // before the paging surface for the same reason: an action key must never be
+    // shadowed by a scroll key. It writes a title and a body and nothing else —
+    // merging is still [m], and still a separate, deliberate keystroke.
+    if ("ch" in input && input.ch === "e") {
+      this.openPrEditor();
+      return;
+    }
     if ("nav" in input) {
+      if (this.overlayScrollInput(input)) return;
       if (input.nav === "escape" || input.nav === "back") this.closePanel();
-      return; // the queue list itself doesn't scroll (it fits; entries are terse)
+      return;
+    }
+    if (this.overlayScrollInput(input)) return;
+    if (input.ch === "q" || input.ch === "Q") this.closePanel();
+  }
+
+  /**
+   * The Home tab. It shows two blocks and now EDITS one of them: the task table
+   * is the captain's surface (D-20260729-3), so `a` adds a row, `e` rewrites the
+   * highlighted one's text, `x` retires it and `s` toggles its status. The
+   * worktree list underneath is still read-only — landing is the queue's [m],
+   * and creating, enqueuing and abandoning are the co's levers — and there is
+   * still no [m] here.
+   *
+   * The property that lets the panel OPEN on this tab is preserved deliberately:
+   * no single stray keystroke can change anything. `a` and `e` open a field and
+   * write nothing until text is submitted, and `e`/`x`/`s` are strict no-ops
+   * unless a row was deliberately selected first. Nothing is selected when the
+   * panel opens.
+   *
+   * The arrows and j/k move that selection instead of scrolling a line here,
+   * which is the one binding this tab repoints; every other paging key
+   * (space/f, b, d/u, g/G, PgUp/PgDn, the wheel) is untouched. `b` keeps its
+   * page-back meaning too, which is why the status toggle is `s` and not `b`.
+   */
+  private homeTabInput(input: OverlayInput): void {
+    // A notice describes something the LAST key did; this one supersedes it.
+    if (this.panel) this.panel.taskNotice = null;
+    if ("nav" in input) {
+      if (input.nav === "up" && this.moveTaskSelection(-1)) return;
+      if (input.nav === "down" && this.moveTaskSelection(1)) return;
+      // Esc's two meanings: drop the selection, then close. A Ctrl-O arriving
+      // here as an escape has already had the first one spent for it upstream
+      // (clearEscapeStops), so it falls straight through to the close below.
+      if (input.nav === "escape" && this.clearTaskSelection()) return;
+      if (this.overlayScrollInput(input)) return;
+      if (input.nav === "escape" || input.nav === "back") this.closePanel();
+      return;
     }
     switch (input.ch) {
-      case "q": case "Q": this.closePanel(); return;
-      case "m": this.approveLanding(); return;
-      case "r": this.rejectReview(); return;
-      case "d": this.drillReview(); return;
+      case "a": this.openTaskAdd(); return;
+      case "e": this.openTaskRename(); return;
+      case "x": this.retireSelectedTask(); return;
+      case "s": this.toggleSelectedTask(); return;
+      case "j": if (this.moveTaskSelection(1)) return; break;
+      case "k": if (this.moveTaskSelection(-1)) return; break;
     }
+    if (this.overlayScrollInput(input)) return;
+    if (input.ch === "q" || input.ch === "Q") this.closePanel();
+  }
+
+  /**
+   * Move the task selection by one row, and report whether there was one to
+   * move. With nothing selected, down takes the first row and up the last — a
+   * selection is not a mutation, so starting one costs nothing.
+   *
+   * Moves through the DISPLAYED order, not the stored one, so `j` always takes
+   * the row painted below this one. That is the whole reason the ordering is a
+   * shared function rather than something the painter does on its way out: a
+   * cursor that walked a different sequence from the eye would be unusable the
+   * first time a status toggle moved a row.
+   *
+   * False means "this tab has no task rows", and the caller falls through to the
+   * paging that key used to do, so a Home tab with an empty table still scrolls
+   * with j/k exactly as before.
+   */
+  private moveTaskSelection(delta: 1 | -1): boolean {
+    const panel = this.panel;
+    const rows = taskDisplayOrder(this.tasks?.list() ?? []);
+    if (!panel || rows.length === 0) return false;
+    const cur = panel.taskSel === null ? -1 : rows.findIndex((r) => r.task === panel.taskSel);
+    const next =
+      cur < 0
+        ? delta > 0 ? 0 : rows.length - 1
+        : Math.max(0, Math.min(rows.length - 1, cur + delta));
+    panel.taskSel = rows[next]!.task;
+    this.ensureTaskVisible();
+    this.paint();
+    return true;
+  }
+
+  /**
+   * Spend every escape meaning that stops SHORT of closing the panel, so the
+   * escape Ctrl-O folds into lands on the exit itself.
+   *
+   * Home is the only view that has one: its Esc drops the task selection first
+   * and closes on the press after, which is right for Esc — it steps back
+   * through what you did — and wrong for Ctrl-O, which is the way OUT and not a
+   * step back. Two presses to leave the surface the captain is in most is the
+   * friction this removes; one press now lands in the chat from any selection
+   * state, and Esc keeps both of its meanings exactly as they were.
+   *
+   * Silent, and no repaint: the close that follows immediately repaints the
+   * whole screen, and a frame showing an unselected Home would be a flicker of a
+   * state nobody asked to see. A no-op on every other view, which is what keeps
+   * this from being a second close path with rules of its own.
+   */
+  private clearEscapeStops(): void {
+    if (this.panel?.view.kind === "home") this.panel.taskSel = null;
+  }
+
+  /** Esc's first meaning on Home: drop the selection and leave the tab inert
+   *  again. False when there was none, and Esc then closes the panel as always. */
+  private clearTaskSelection(): boolean {
+    const panel = this.panel;
+    if (!panel || panel.taskSel === null) return false;
+    panel.taskSel = null;
+    this.paint();
+    return true;
+  }
+
+  /** Keep the selected row on screen after a move. The table sits at the top of
+   *  the body, so this usually scrolls to 0; it earns its keep on a short
+   *  terminal where the worktree list has been paged into view. */
+  private ensureTaskVisible(): void {
+    const panel = this.panel;
+    if (!panel || panel.taskSel === null) return;
+    const body = this.homeTabRows(); // rebuilds this.homeTaskStarts at this width
+    const at = this.homeTaskStarts.get(panel.taskSel);
+    if (at === undefined) return;
+    const vp = this.overlayViewport();
+    const max = Math.max(0, body.length - vp);
+    let start = Math.min(panel.homeScroll, max);
+    if (at < start) start = at;
+    else if (at > start + vp - 1) start = at - vp + 1;
+    panel.homeScroll = Math.max(0, Math.min(start, max));
+  }
+
+  /** The task the captain has highlighted, or null. Reads the LIVE table, so a
+   *  row the co retired between the paint and the keystroke is already gone and
+   *  the key that names it is a no-op rather than a write against nothing. */
+  private selectedTask(): TaskPanelRow | null {
+    const sel = this.panel?.taskSel;
+    if (!sel) return null;
+    return this.tasks?.list().find((r) => r.task === sel) ?? null;
+  }
+
+  /** `x`: retire the highlighted row. A NO-OP with nothing highlighted — that is
+   *  the rule that keeps one stray keypress from deleting anything.
+   *
+   *  The selection is dropped as it fires, so a second `x` cannot fall through
+   *  onto a neighbouring row and take that one too. */
+  private retireSelectedTask(): void {
+    const panel = this.panel;
+    const row = this.selectedTask();
+    if (!panel || !row) return;
+    const source = this.tasks;
+    if (!source?.retire) {
+      this.taskNotice("retiring a task isn't available in this session.");
+      return;
+    }
+    panel.taskSel = null;
+    this.runTaskWrite(source.retire(row.task));
+  }
+
+  /**
+   * `s`: advance the highlighted row to the next status. A no-op with nothing
+   * highlighted, like `x`. The selection stays, because the captain is often
+   * pressing it more than once and the row moves under them as it re-sorts.
+   *
+   * ONE KEY, CYCLING, rather than a key per status. `s` was a two-way toggle
+   * while there were two statuses, and every status since has reached it the
+   * same way — a key of its own for one of them would have made the odd one out
+   * of whichever the captain reaches for most, and Home's letters are nearly
+   * spent besides.
+   *
+   * The cycle runs the way the work does — queued -> building -> enqueued ->
+   * testing -> queued — so pressing `s` means "this moved on", which is the
+   * thing actually being recorded. Wrapping back to `queued` from `testing` is
+   * the way back for a row that failed its test; a row that PASSED leaves by
+   * `x`, because retiring is still what done means and no amount of pressing `s`
+   * reaches it.
+   */
+  private toggleSelectedTask(): void {
+    const row = this.selectedTask();
+    if (!row) return;
+    const source = this.tasks;
+    if (!source?.setStatus) {
+      this.taskNotice("changing a task's status isn't available in this session.");
+      return;
+    }
+    this.runTaskWrite(source.setStatus(row.task, NEXT_TASK_STATUS[row.status]));
+  }
+
+  /** Repaint at once (the store has already moved in memory), then print
+   *  whatever the write had to say when it settles. */
+  private runTaskWrite(write: Promise<TaskWriteResult>): void {
+    this.paint();
+    void write.then(
+      (res) => {
+        if (!res.ok) this.taskNotice(res.message ?? "the task table could not be written.");
+        else this.paint();
+      },
+      (e: unknown) => this.taskNotice(`the task table could not be written: ${String(e)}`),
+    );
+  }
+
+  private taskNotice(text: string): void {
+    if (!this.panel) return;
+    this.panel.taskNotice = text;
+    this.paint();
+  }
+
+  // --- the task text field (`a` adds, `e` rewrites) -----------------------------
+
+  /** `a`: open the one-line field on a blank line. Adding is the one thing that
+   *  needs no selection, so this is the tab's only key that works on an empty
+   *  table. */
+  private openTaskAdd(): void {
+    const panel = this.panel;
+    if (!panel) return;
+    if (!this.tasks?.add) {
+      this.taskNotice("adding a task isn't available in this session.");
+      return;
+    }
+    this.openTaskField(null, "");
+  }
+
+  /**
+   * `e`: open the same field on the highlighted row, prefilled with its text.
+   *
+   * A NO-OP with nothing highlighted, exactly like `x` and `s` — the rule that
+   * keeps one stray keystroke from changing the table is the reason Home can be
+   * the tab the panel opens on, and a key that grabbed the keyboard on an
+   * unselected table would break it as surely as one that wrote.
+   */
+  private openTaskRename(): void {
+    const row = this.selectedTask();
+    if (!row) return;
+    if (!this.tasks?.rename) {
+      this.taskNotice("renaming a task isn't available in this session.");
+      return;
+    }
+    this.openTaskField(row.task, row.task);
+  }
+
+  /** Open the field over `renaming` (null to add), prefilled with `text`. */
+  private openTaskField(renaming: string | null, text: string): void {
+    const panel = this.panel;
+    if (!panel) return;
+    const editor = new TextEditor(text);
+    // The caret opens at the start of the buffer (TextEditor's own rule, which
+    // is what a captain retitling a PR wants). Rewriting a task is usually a
+    // fix at the end of the line, so the caret goes there instead — and typing
+    // straight away appends rather than pushing the row's text along in front
+    // of it.
+    editor.end();
+    panel.taskField = { renaming, editor, error: null, pasting: false, pasteBuf: "" };
+    panel.taskNotice = null;
+    this.clearPanelSelection();
+    this.paint();
+  }
+
+  /** Leave the field, writing nothing. Esc's meaning here, and Ctrl-O's: the
+   *  panel stays open, because the field is what you asked to leave. A cancelled
+   *  rename leaves the row exactly as it was, selection included. */
+  private closeTaskField(): void {
+    const panel = this.panel;
+    if (!panel?.taskField) return;
+    // A cancel can land mid-paste; hand the rest to the tab's own swallower
+    // rather than let its bytes arrive as panel keys.
+    if (panel.taskField.pasting) this.overlayPasting = true;
+    panel.taskField = null;
+    this.paint();
+  }
+
+  /**
+   * Enter / Ctrl-S: commit what was typed. An empty field just closes — there is
+   * nothing to store, a blank row would render as a blank line, and a row whose
+   * text was cleared rather than replaced is untouched rather than erased.
+   *
+   * A refusal (a full table, a row that already reads the same) keeps the field
+   * open with the text intact, so it can be edited rather than retyped.
+   */
+  private submitTaskField(): void {
+    const panel = this.panel;
+    const state = panel?.taskField;
+    if (!panel || !state) return;
+    const text = state.editor.text.replace(/\s+/g, " ").trim();
+    if (text === "") {
+      this.closeTaskField();
+      return;
+    }
+    if (state.renaming !== null) this.commitTaskRename(state, state.renaming, text);
+    else this.commitTaskAdd(state, text);
+  }
+
+  /** The `a` half: append the typed row. Nothing is selected afterwards, refused
+   *  or not — the tab goes back to inert, and a fresh row the captain has not
+   *  picked is not a row `x` should be one keystroke from. */
+  private commitTaskAdd(state: TaskFieldState, text: string): void {
+    const add = this.tasks?.add;
+    if (!add || !this.tasks) {
+      state.error = "adding a task isn't available in this session.";
+      this.paint();
+      return;
+    }
+    void add.call(this.tasks, text).then(
+      (res) => {
+        if (this.panel?.taskField !== state) return; // cancelled while it was in flight
+        if (res.ok) this.panel.taskField = null;
+        else state.error = res.message ?? "the task could not be added.";
+        this.paint();
+      },
+      (e: unknown) => {
+        if (this.panel?.taskField !== state) return;
+        state.error = String(e);
+        this.paint();
+      },
+    );
+    this.paint();
+  }
+
+  /**
+   * The `e` half: rewrite `from`'s text to `to`, and carry the SELECTION across
+   * with it. The highlight is held as row text, so a rename that moved the store
+   * and not the selection would leave the captain marked on a row that no longer
+   * exists — which reconciles to no selection at all, and silently disarms the
+   * very next key he presses.
+   *
+   * Text he did not change is not written at all: the store would take it as a
+   * successful no-op, but there is no reason to spend a file write on it.
+   */
+  private commitTaskRename(state: TaskFieldState, from: string, to: string): void {
+    const panel = this.panel;
+    if (!panel) return;
+    if (to === from) {
+      this.closeTaskField();
+      return;
+    }
+    const rename = this.tasks?.rename;
+    if (!rename || !this.tasks) {
+      state.error = "renaming a task isn't available in this session.";
+      this.paint();
+      return;
+    }
+    const write = rename.call(this.tasks, from, to);
+    // Optimistic, so the row painted under the closing field is already the
+    // renamed one when the store moved synchronously; the settled result below
+    // is what actually decides, either way.
+    panel.taskSel = to;
+    void write.then(
+      (res) => {
+        const open = this.panel?.taskField === state;
+        if (res.ok) {
+          if (this.panel) this.panel.taskSel = to;
+          if (open) this.panel!.taskField = null;
+        } else {
+          if (this.panel) this.panel.taskSel = from;
+          if (open) state.error = res.message ?? "the task could not be renamed.";
+        }
+        this.paint();
+      },
+      (e: unknown) => {
+        if (this.panel) this.panel.taskSel = from;
+        if (this.panel?.taskField === state) state.error = String(e);
+        this.paint();
+      },
+    );
+    this.paint();
+  }
+
+  /** Parse one key/sequence while the add field owns the keyboard. The same
+   *  shapes consumePopup handles, decoded by the same table, minus everything a
+   *  one-line field has no use for. */
+  private consumeTaskField(data: string, i: number): number {
+    const state = this.panel?.taskField;
+    if (!state) return 1;
+
+    if (state.pasting) {
+      const end = data.indexOf(PASTE_END, i);
+      if (end === -1) {
+        state.pasteBuf += data.slice(i);
+        return data.length - i;
+      }
+      state.pasteBuf += data.slice(i, end);
+      const text = state.pasteBuf;
+      state.pasting = false;
+      state.pasteBuf = "";
+      // A task is ONE line, so a pasted block is folded rather than refused:
+      // paste a sentence out of the transcript and it becomes the row.
+      if (text !== "") {
+        state.error = null;
+        state.editor.insert(text.replace(/\s+/g, " "));
+        this.paint();
+      }
+      return end - i + PASTE_END.length;
+    }
+    if (data.startsWith(PASTE_START, i)) {
+      state.pasting = true;
+      state.pasteBuf = "";
+      return PASTE_START.length;
+    }
+    if (data.startsWith(PASTE_END, i)) return PASTE_END.length;
+
+    const ch = data[i]!;
+    if (ch === ESC && data[i + 1] === "[") return this.consumeTaskFieldCsi(data, i);
+    if (ch === ESC) {
+      this.closeTaskField();
+      return 1;
+    }
+    this.taskFieldAction(classifyByte(ch));
+    return 1;
+  }
+
+  /** The CSI half: the arrows and Home/End that move inside the line, plus both
+   *  enhanced protocols' spellings (Ghostty sends Enter and Escape as CSI-u, so
+   *  without this the field could neither be submitted nor left). A mouse report
+   *  is swallowed — the field is one line and has no selection of its own. */
+  private consumeTaskFieldCsi(data: string, i: number): number {
+    if (data[i + 2] === "<") {
+      const end = this.findMouseEnd(data, i + 3);
+      return end === -1 ? data.length - i : end - i + 1;
+    }
+    let j = i + 2;
+    while (j < data.length && !/[A-Za-z~]/.test(data[j]!)) j++;
+    if (j >= data.length) return data.length - i;
+    const final = data[j]!;
+    const params = data.slice(i + 2, j);
+    const consumed = j - i + 1;
+    const state = this.panel?.taskField;
+    if (!state) return consumed;
+
+    switch (final) {
+      case "u": {
+        const ev = parseCsiU(params);
+        if (ev) this.taskFieldAction(classify(ev));
+        return consumed;
+      }
+      case "C": this.taskFieldEdit(() => state.editor.right()); return consumed;
+      case "D": this.taskFieldEdit(() => state.editor.left()); return consumed;
+      case "H": this.taskFieldAction({ kind: "home" }); return consumed;
+      case "F": this.taskFieldAction({ kind: "end" }); return consumed;
+      case "~": {
+        const other = parseModifyOtherKeys(params);
+        if (other) {
+          this.taskFieldAction(classify(other));
+          return consumed;
+        }
+        const n = Number.parseInt(params, 10);
+        if (n === 3) this.taskFieldEdit(() => state.editor.deleteForward());
+        else if (n === 1 || n === 7) this.taskFieldAction({ kind: "home" });
+        else if (n === 4 || n === 8) this.taskFieldAction({ kind: "end" });
+        return consumed;
+      }
+      default:
+        return consumed;
+    }
+  }
+
+  /**
+   * Apply one decoded action to the field. The line keys mean exactly what they
+   * mean in the prompt bar; the differences are that Enter (and every other
+   * spelling of a newline, since a task has only one line) SUBMITS, and Ctrl-O
+   * leaves the field rather than closing the panel out from under it.
+   *
+   * Ctrl-S submits too. It is the key that commits the PR message editor's
+   * buffer, and the rename field is the same gesture on a smaller buffer — so
+   * the captain who learned one has the other. Enter keeps working here, because
+   * a one-line field that ignored Enter would be its own surprise.
+   *
+   * Everything else is deliberately swallowed. A key with no meaning in a text
+   * field must not fall through to the tab underneath, where `x` would retire a
+   * row the captain is only trying to type about.
+   */
+  private taskFieldAction(action: Action): void {
+    const state = this.panel?.taskField;
+    if (!state) return;
+    state.error = null;
+    switch (action.kind) {
+      case "insert": state.editor.insert(action.text); break;
+      case "backspace": state.editor.backspace(); break;
+      case "home": state.editor.home(); break;
+      case "end": state.editor.end(); break;
+      case "kill-to-start": state.editor.killToStart(); break;
+      case "kill-to-end": state.editor.killToEnd(); break;
+      // One line, so a newline is a submit rather than a compose.
+      case "submit":
+      case "newline":
+      case "save": this.submitTaskField(); return;
+      case "escape":
+      case "open-docs": this.closeTaskField(); return;
+      default: return; // no meaning here, and it must not reach the tab
+    }
+    this.paint();
+  }
+
+  /** One caret-only edit (the arrows, Delete), which no Action covers. */
+  private taskFieldEdit(fn: () => void): void {
+    const state = this.panel?.taskField;
+    if (!state) return;
+    state.error = null;
+    fn();
+    this.paint();
   }
 
   private docsTabInput(input: OverlayInput, panel: PanelState): void {
@@ -2393,8 +4781,218 @@ export class Tui implements SessionIO {
       this.overlayScrollInput(input);
       return;
     }
+    // `y` yanks the whole doc and `e` opens it in the editor. Both are checked
+    // before the paging surface so an action can never be shadowed by a scroll
+    // key, and both live here rather than in overlayScrollInput so the filed
+    // review body — which shares that paging surface — keeps the key space it
+    // already had. `e` is the same letter, the same popup and the same Ctrl-S as
+    // the queue tab's edit of a PR message, deliberately.
+    if (input.ch === "y") { this.copyDoc(); return; }
+    if (input.ch === "e") { this.openDocEditor(); return; }
     if (input.ch === "q") { this.closePanel(); return; }
     this.overlayScrollInput(input);
+  }
+
+  /**
+   * `y` on an open doc: copy it to the system clipboard via OSC 52.
+   *
+   * The RAW markdown, not the rows on screen. What the captain wants back is the
+   * document he authored - a command cheat-sheet he can paste somewhere useful -
+   * and the painted version is ANSI-styled and hard-wrapped to whatever width
+   * this terminal happens to be, which pastes as junk. `content` is verbatim
+   * what DocSource.read returned, so the clipboard gets the file.
+   *
+   * Nothing here touches mouse reporting, the Kitty flags or the alt screen: the
+   * copy is one escape sequence written mid-frame, which moves no cursor and
+   * disturbs no mode. It is the same mechanism the transcript's drag-selection
+   * already uses, so a doc copies exactly the way a selection does.
+   */
+  private copyDoc(): void {
+    if (!this.panel || this.panel.view.kind !== "doc") return;
+    const { content, error } = this.panel.view;
+    if (error !== null || content === "") {
+      this.panel.copyNotice = "nothing to copy";
+      this.paint();
+      return;
+    }
+    this.copyToClipboard(content);
+    this.panel.copyNotice = copyReceipt(countLines(content));
+    this.paint();
+  }
+
+  // --- selecting text inside the panel ----------------------------------------
+  //
+  // The panel owns the whole screen while it is up, and mouse reporting stays on
+  // underneath it, so the terminal will not do its own click-drag here. It gets
+  // the same treatment the transcript already gets: a left-drag highlights the
+  // cells in reverse video and, on release, copies the plain text through OSC 52.
+  //
+  // This works on EVERY panel view, not just a doc - the body is one surface, so
+  // a PR link on the queue tab or a paragraph of a filed review copies exactly
+  // the way a paragraph of a doc does. It is purely additive: no key binding
+  // moves, and a click with no drag copies nothing.
+  //
+  // What it yields is the RENDERED text, wrapped as painted, which is the whole
+  // point of a partial selection. `y` remains the way to take a doc away whole,
+  // in its raw markdown.
+
+  /**
+   * Handle an SGR mouse report while the panel is up. `body` is "b;x;y" (1-based
+   * screen coords); `press` is true for the M terminator (button-down/motion)
+   * and false for m (release). Bit layout as in handleMouse: low two bits are
+   * the button, 32 is motion, 64 is the wheel.
+   */
+  private handlePanelMouse(body: string, press: boolean): void {
+    // The picker owns the mouse as well as the keyboard while it is up: the view
+    // underneath is context, not a surface to scroll or drag a selection out of,
+    // and a wheel event that moved it would move it out from under the box.
+    if (this.panel?.picker) return;
+    const parts = body.split(";");
+    const b = Number.parseInt(parts[0] ?? "", 10);
+    const x = Number.parseInt(parts[1] ?? "", 10);
+    const y = Number.parseInt(parts[2] ?? "", 10);
+    if (Number.isNaN(b)) return;
+
+    if (b === 64) { this.overlayScrollBy(-3); return; }
+    if (b === 65) { this.overlayScrollBy(3); return; }
+
+    const button = b & 0b11;
+    const motion = (b & 32) !== 0;
+    if (button !== 0) return;
+
+    if (!motion && press) this.beginPanelSelection(x, y);
+    else if (motion && press) this.extendPanelSelection(x, y);
+    else if (!press) this.endPanelSelection();
+  }
+
+  /**
+   * Map a 1-based screen (x, y) to an absolute (row, col) in the current body.
+   *
+   * Screen row 1 is the header and the last row is the footer, so the body
+   * occupies rows 2..rows-1 and `y - 2` is the offset into the viewport. A drag
+   * that strays onto the header or the footer clamps into the body instead of
+   * being dropped, so running off the top or bottom edge still selects sensibly.
+   */
+  private panelMouseToCell(x: number, y: number): { row: number; col: number } | null {
+    const panel = this.panel;
+    if (!panel) return null;
+    const rowInView = Math.max(0, Math.min(this.overlayViewport() - 1, y - 2));
+    return { row: panel.lastStart + rowInView, col: Math.max(0, x - 1) };
+  }
+
+  private beginPanelSelection(x: number, y: number): void {
+    const panel = this.panel;
+    const cell = this.panelMouseToCell(x, y);
+    if (!panel || !cell) return;
+    // A fresh drag retires the previous copy's receipt: it described a selection
+    // that is about to stop existing.
+    panel.copyNotice = null;
+    panel.selecting = true;
+    panel.selection = {
+      anchorRow: cell.row,
+      anchorCol: cell.col,
+      focusRow: cell.row,
+      focusCol: cell.col,
+    };
+    this.paint();
+  }
+
+  private extendPanelSelection(x: number, y: number): void {
+    const panel = this.panel;
+    if (!panel?.selecting || !panel.selection) return;
+    const cell = this.panelMouseToCell(x, y);
+    if (!cell) return;
+    // Auto-scroll at the body's edges so a selection can span more than one
+    // screenful. The rows are absolute, so the anchor stays put as it scrolls.
+    if (y <= 2) this.overlayScrollBy(-1);
+    else if (y >= this.rows - 1) this.overlayScrollBy(1);
+    panel.selection.focusRow = cell.row;
+    panel.selection.focusCol = cell.col;
+    this.paint();
+  }
+
+  /**
+   * Left release: finalize. A bare click (press and release on the same cell)
+   * selected nothing, so it just dismisses any standing highlight rather than
+   * copying an empty string - which is also what makes a stray click on the
+   * queue tab harmless.
+   */
+  private endPanelSelection(): void {
+    const panel = this.panel;
+    if (!panel?.selecting) return;
+    panel.selecting = false;
+    const sel = panel.selection;
+    const dragged =
+      sel != null && (sel.anchorRow !== sel.focusRow || sel.anchorCol !== sel.focusCol);
+    const text = dragged ? this.panelSelectionText() : "";
+    if (text === "") {
+      panel.selection = null;
+      this.paint();
+      return;
+    }
+    this.copyToClipboard(text);
+    panel.copyNotice = copyReceipt(countLines(text));
+    this.paint();
+  }
+
+  /** The plain text of the panel's current selection, joined with newlines. */
+  private panelSelectionText(): string {
+    const sel = this.panel?.selection;
+    if (!sel) return "";
+    const { top, bottom, topCol, bottomCol } = normalizeSelection(sel);
+    const { body } = this.panelFrame();
+    const out: string[] = [];
+    // Clamped to the real body, so a drag that ran past the end doesn't tack
+    // phantom blank lines onto the clipboard.
+    for (let r = top; r <= bottom && r < body.length; r++) {
+      const from = r === top ? topCol : 0;
+      const to = r === bottom ? bottomCol : Number.MAX_SAFE_INTEGER;
+      out.push(sliceVisibleText(body[r] ?? "", from, to));
+    }
+    return out.join("\n");
+  }
+
+  /**
+   * Overlay the selection highlight onto the body row at absolute index
+   * `absRow`. Rows outside the selection come back untouched.
+   *
+   * An empty row inside the selection is painted as a single highlighted space.
+   * highlightRange returns a blank row unchanged (there is nothing to reverse),
+   * which in the transcript is invisible but in a doc would tear every selection
+   * spanning a paragraph break into stripes. The space is presentational only -
+   * the copy reads the original row, so a blank line stays blank.
+   */
+  private applyPanelSelection(line: string, absRow: number): string {
+    const sel = this.panel?.selection;
+    if (!sel) return line;
+    const { top, bottom, topCol, bottomCol } = normalizeSelection(sel);
+    if (absRow < top || absRow > bottom) return line;
+    const from = absRow === top ? topCol : 0;
+    const to = absRow === bottom ? bottomCol : Number.MAX_SAFE_INTEGER;
+    if (line === "" && absRow > top && absRow < bottom) return `${ESC}[7m ${ESC}[27m`;
+    return highlightRange(line, from, to);
+  }
+
+  /** Drop any panel selection and its receipt. Called wherever the rows beneath
+   *  a selection stop meaning what they meant when it was made. */
+  private clearPanelSelection(): void {
+    const panel = this.panel;
+    if (!panel) return;
+    if (!panel.selection && !panel.selecting && panel.copyNotice === null) return;
+    panel.selection = null;
+    panel.selecting = false;
+    panel.copyNotice = null;
+    this.paint();
+  }
+
+  /** Retire the queue tab's save receipt, the way clearPanelSelection retires a
+   *  copy one: same rule, same moment, one line each. Only an `ok` line is a
+   *  receipt — a refusal or a discarded edit is a standing message and is left
+   *  exactly where it is (see queueEditNotice). */
+  private clearQueueEditReceipt(): void {
+    if (!this.queueEditNotice?.ok) return;
+    this.queueEditNotice = null;
+    this.paint();
   }
 
   /** The drilled review view (full paged diff): m/r act, Backspace returns to the
@@ -2502,19 +5100,45 @@ export class Tui implements SessionIO {
     });
   }
 
-  /** [d] on a ready head: drill into the full paged diff. No-op without a
-   *  reviewable pending review. */
-  private drillReview(): void {
-    if (!this.panel || !this.pendingReview) return;
-    this.pendingReview.rows = renderLandingBody(
-      this.pendingReview.review,
-      this.pendingReview.status,
-      this.pendingReview.error,
-      this.cols,
-    );
-    this.pendingReview.scroll = 0;
-    this.panel.view = { kind: "review" };
+  /**
+   * The queue tab's [m] (D-20260724-12): merge the ready head, now. This is the
+   * whole happy path — no gate is opened, no promise is armed, no tool call is
+   * made, and nothing anywhere is parked waiting on this keystroke; the co is
+   * free the entire time and finds out only if the NEXT head comes back blocked.
+   *
+   * It is a strict no-op unless the source itself reports a ready head with
+   * commits: a blocked, processing or resolving head has no [m] at all, so a
+   * stray press does nothing. Fire-once while in flight (queueMerging), for the
+   * same reason the gate's [m] was: a double-tap must not mint two merges.
+   */
+  private mergeReadyHead(): void {
+    const merge = this.queue?.merge;
+    if (!this.queue || !merge || this.queueMerging) return;
+    const head = this.mergeableHead();
+    if (!head) return;
+
+    this.queueMerging = head.feature;
+    this.queueMergeError = null;
     this.paint();
+    const done = (): void => {
+      this.queueMerging = null;
+      // The body is a different head now (or gone): start it at the top rather
+      // than stranding the captain deep in the previous head's diff.
+      if (this.panel) this.panel.queueScroll = 0;
+    };
+    void merge.call(this.queue).then(
+      (res) => {
+        done();
+        if (!res.merged) this.queueMergeError = res.error ?? res.summary;
+        this.paint();
+        this.setStatus(res.summary);
+      },
+      (e: unknown) => {
+        done();
+        this.queueMergeError = e instanceof Error ? e.message : String(e);
+        this.paint();
+      },
+    );
   }
 
   /**
@@ -2565,72 +5189,1290 @@ export class Tui implements SessionIO {
     this.paint();
   }
 
-  /** After a review is settled (merged/rejected), leave the review view. Fall
-   *  back to the queue tab if a queue is wired (it now reflects the advance),
-   *  else the docs tab if docs exist, else close the panel — a review-only panel
-   *  (no queue, no docs, e.g. feature_land on PlainIO-adjacent flows) has nothing
-   *  left to show. */
+  /** After a feature_land review is settled (merged/rejected), leave its view.
+   *  Fall back to the first remaining home tab — the queue if one is wired, else
+   *  docs — and close the panel when nothing else is left to show (a review-only
+   *  panel). */
   private leaveSettledReview(): void {
     if (!this.panel) return;
-    if (this.panel.view.kind !== "review" && this.panel.view.kind !== "queue") return;
-    if (this.queue) this.panel.view = { kind: "queue" };
-    else if (this.docs) this.panel.view = { kind: "docs" };
+    if (this.panel.view.kind !== "review") return;
+    const next = this.panelTabs().find((t) => t !== "review");
+    if (next) this.panel.view = this.homeView(next);
     else this.closePanel();
   }
 
-  /** Paint the full-screen panel: header/tab bar, content viewport, footer. */
+  // --- the PR message editor (in-panel popup) ---------------------------------
+  //
+  // `e` on a queue head whose pull request exists opens a small popup over the
+  // tab holding that PR's own prose: line 1 the title, a blank line, then the
+  // description (D-20260727-15). Ctrl-S writes it to GitHub through the injected
+  // `editPrMessage`; Esc cancels, warning once when the buffer is dirty.
+  //
+  // Three properties are load-bearing:
+  //
+  //  - IT EDITS PROSE ONLY. co's fenced evidence block never enters the buffer
+  //    (the source hands the panel a body already split at the fence) and never
+  //    leaves it, so the captain cannot see, break or delete the block that the
+  //    harness regenerates on every head processing.
+  //  - IT IS THE SAME EDITOR AS THE PROMPT. The buffer model, the wrapping and
+  //    the cursor mapping are ./editor's, shared with the input bar; the keys
+  //    come off the same decode table. There are no modes to enter and nothing
+  //    new to learn — except that Enter inserts a newline here, because a
+  //    description is prose and there is nothing to send.
+  //  - SAVING NEVER MERGES. It writes a title and a body and nothing else: the
+  //    head's status, its checks, its `[m]` and the queue's order are exactly
+  //    where they were, and `[m]` remains a separate, deliberate keystroke.
+
+  /**
+   * The popup's geometry, derived from the screen every time it is needed rather
+   * than stored: a resize then re-lays it out instead of tearing (the same rule
+   * the animation region follows). `textRows` is the buffer viewport's height;
+   * the box also carries two borders and one message line.
+   *
+   * IT TAKES THE MAJORITY OF THE TERMINAL, because the job it exists for is
+   * replacing a whole description, and fourteen rows of a forty-line body is a
+   * keyhole. Both axes are a percentage of the screen with a floor and a ceiling:
+   *
+   *   width  90% of the columns, min 32, max 120 (never wider than cols - 2)
+   *   height 90% of the panel body (rows - 2), min 7, max 44 rows
+   *
+   * The floors keep it usable on a small terminal (the clamp to cols-2 / the body
+   * height wins over them, so the box never overflows a screen too small to hold
+   * its own minimum); the ceilings stop a full-screen terminal from producing a
+   * 200-column line length nobody can read a sentence across.
+   */
+  private popupBox(): { left: number; top: number; width: number; textRows: number } {
+    const width = Math.max(
+      1,
+      Math.min(this.cols - 2, Math.max(32, Math.min(120, Math.floor(this.cols * 0.9)))),
+    );
+    // The panel body is rows 2..rows-1; the box lives inside that, never over
+    // the tab bar or the footer.
+    const body = Math.max(1, this.rows - 2);
+    const height = Math.max(4, Math.min(body, Math.max(7, Math.min(44, Math.floor(body * 0.9)))));
+    const textRows = Math.max(1, height - 3);
+    const left = 1 + Math.max(0, Math.floor((this.cols - width) / 2));
+    const top = Math.max(2, Math.min(1 + Math.floor((this.rows - height) / 2), this.rows - height));
+    return { left, top, width, textRows };
+  }
+
+  /** Columns of buffer text inside the box (border + one space on each side). */
+  private popupWidth(): number {
+    return Math.max(1, this.popupBox().width - 4);
+  }
+
+  /**
+   * `e` on the queue tab: open the head PR's message in the popup.
+   *
+   * A strict no-op with a stated reason unless there is something to edit — a
+   * wired edit callback and a head that actually HAS a pull request. A head
+   * still processing, or one whose prepare never got as far as opening a PR, has
+   * no message to rewrite, and saying so beats a popup over nothing.
+   */
+  private openPrEditor(): void {
+    const panel = this.panel;
+    if (!panel) return;
+    const refuse = (text: string): void => {
+      this.queueEditNotice = { text, ok: false };
+      this.paint();
+    };
+    if (!this.queue?.editPrMessage) {
+      refuse("editing a pull request message isn't available in this session.");
+      return;
+    }
+    const detail = this.queue.headDetail?.() ?? null;
+    const pr = detail?.pr;
+    if (!detail || !pr) {
+      refuse("this head has no pull request yet — nothing to edit. One opens when the head is processed.");
+      return;
+    }
+    // `prose` is the body with co's evidence fence already split off by the
+    // source. A source that doesn't split falls back to the raw body, exactly as
+    // the painted message does.
+    const prose = (pr.prose ?? pr.body).trim();
+    this.openPopup(
+      { kind: "pr", prNumber: pr.number, feature: detail.feature },
+      joinMessage(pr.title, prose),
+      { kind: "queue" },
+    );
+    this.queueEditNotice = null;
+    this.paint();
+  }
+
+  /**
+   * `e` on an open doc: edit the document in the SAME popup, with the same keys.
+   *
+   * The buffer is the file's raw markdown — what `y` copies, not the painted
+   * rows — because that is what will be written back. The text it opened on is
+   * pinned as the baseline so the save can tell an edit the co made underneath
+   * from one it is safe to overwrite.
+   *
+   * Refused, with the reason on screen, when the doc surface cannot write (no
+   * `write` on the source) or when the view has no readable document under it —
+   * the same rule as the queue's `e`, which never opens a popup that could not
+   * save. `.memory/` never reaches this: the only name it can ever be handed is
+   * one the sandboxed DocSource listed.
+   */
+  private openDocEditor(): void {
+    const panel = this.panel;
+    if (!panel) return;
+    const refuse = (text: string): void => {
+      panel.copyNotice = text;
+      this.paint();
+    };
+    const view = panel.view;
+    if (view.kind !== "doc") return;
+    if (!this.docs?.write) {
+      refuse("editing docs isn't available in this session.");
+      return;
+    }
+    if (view.error !== null) {
+      refuse(`${view.name} could not be read, so there is nothing to edit.`);
+      return;
+    }
+    this.openPopup({ kind: "doc", name: view.name, baseline: view.content }, view.content, view);
+    this.paint();
+  }
+
+  /** Put the popup up over `under` with `text` in the buffer. The one place the
+   *  editor is entered, so neither target can drift into its own opening rules. */
+  private openPopup(target: PopupTarget, text: string, under: PanelView): void {
+    const panel = this.panel;
+    if (!panel) return;
+    panel.popup = {
+      editor: new TextEditor(text),
+      target,
+      under,
+      scroll: 0,
+      status: "editing",
+      error: null,
+      escPending: false,
+      pasting: false,
+      pasteBuf: "",
+      dragging: false,
+      notice: null,
+    };
+    panel.view = { kind: "popup" };
+    this.clearPanelSelection();
+  }
+
+  /** Leave the editor for the view underneath, optionally leaving a line behind
+   *  on it. Never called while a save is in flight. */
+  private closePopupEditor(notice?: { text: string; ok: boolean }): void {
+    const panel = this.panel;
+    if (!panel) return;
+    // A save can land mid-paste (the popup closes on success while the terminal
+    // is still feeding us the payload). Hand the paste over to the tab's own
+    // swallower rather than let its remaining bytes arrive as panel keys.
+    const state = panel.popup;
+    if (state?.pasting) this.overlayPasting = true;
+    const forDoc = state?.target.kind === "doc";
+    panel.popup = null;
+    if (panel.view.kind === "popup") panel.view = state?.under ?? { kind: "queue" };
+    // The line goes where the view it is about can show it: the queue tab has a
+    // banner of its own, and a doc has the footer's notice line — which is the
+    // same line a copy receipt lands on, and lives exactly as long.
+    if (notice) {
+      if (forDoc) panel.copyNotice = notice.text;
+      else this.queueEditNotice = notice;
+    }
+    this.paint();
+  }
+
+  /** Esc: cancel. A clean buffer leaves at once; a dirty one warns first and
+   *  discards on the second consecutive Esc, so a whole rewritten description is
+   *  never one stray keypress from gone. Nothing is written on either path, so a
+   *  discarded doc edit leaves the file exactly as it was. */
+  private escapePopupEditor(wasEscPending: boolean): void {
+    const state = this.panel?.popup;
+    if (!state) return;
+    if (state.editor.dirty && !wasEscPending) {
+      state.escPending = true;
+      this.paint();
+      return;
+    }
+    const what =
+      state.target.kind === "pr" ? `PR #${state.target.prNumber}` : state.target.name;
+    this.closePopupEditor(
+      state.editor.dirty ? { text: `discarded the unsaved edit to ${what}`, ok: false } : undefined,
+    );
+  }
+
+  /**
+   * Parse one key/sequence while the PR editor owns the keyboard. Mirrors the
+   * prompt's consume(): the same escape/CSI shapes, decoded by the same table,
+   * so every binding behaves identically in both editors.
+   */
+  private consumePopup(data: string, i: number): number {
+    const state = this.panel?.popup;
+    if (!state) return 1;
+    const saving = state.status === "saving";
+    const ch = data[i]!;
+
+    // Inside a bracketed paste every byte is opaque content, accumulated across
+    // as many data events as the paste spans, and never parsed as keys. This is
+    // the whole reason a multi-line description can be pasted at all: without it
+    // the embedded newlines arrive as Enter presses and the CSI sequences in a
+    // pasted diff arrive as arrow keys.
+    if (state.pasting) return this.consumePopupPaste(state, data, i);
+
+    // The start of one. Checked before the generic CSI dispatch because the
+    // marker itself begins with ESC [.
+    if (data.startsWith(PASTE_START, i)) {
+      state.pasting = true;
+      state.pasteBuf = "";
+      return PASTE_START.length;
+    }
+    // A stray end marker with no start (a paste that began before the popup
+    // opened): swallow it rather than type its bytes.
+    if (data.startsWith(PASTE_END, i)) return PASTE_END.length;
+
+    // Alt+Enter as an ESC prefix, checked before the generic ESC dispatch for
+    // the same reason the prompt checks it: otherwise it reads as a lone Escape.
+    if (ch === ESC && (data[i + 1] === "\r" || data[i + 1] === "\n")) {
+      if (!saving) this.popupAction({ kind: "newline" });
+      return 2;
+    }
+    if (ch === ESC && data[i + 1] === "[") return this.consumePopupCsi(data, i);
+    if (ch === ESC) {
+      if (!saving) this.popupAction({ kind: "escape" });
+      return 1;
+    }
+    if (!saving) this.popupAction(classifyByte(ch));
+    return 1;
+  }
+
+  /**
+   * Consume bytes while inside the popup's bracketed paste. Everything up to
+   * PASTE_END is content; a chunk that ends without the marker is buffered and
+   * we stay `pasting` for the next data event. Returns bytes consumed.
+   *
+   * The whole payload lands as ONE insert, so a 40-line body costs one repaint
+   * and one undo-able edit rather than 2,000 keystrokes' worth of both.
+   */
+  private consumePopupPaste(state: PopupState, data: string, i: number): number {
+    const end = data.indexOf(PASTE_END, i);
+    if (end === -1) {
+      state.pasteBuf += data.slice(i);
+      return data.length - i;
+    }
+    state.pasteBuf += data.slice(i, end);
+    const text = state.pasteBuf;
+    state.pasting = false;
+    state.pasteBuf = "";
+    // A save in flight swallows the paste rather than queueing it: the same
+    // fire-once interlock every other key obeys while gh is running.
+    if (state.status !== "saving" && text !== "") {
+      state.notice = null;
+      state.escPending = false;
+      // TextEditor.insert normalises CR/CRLF and strips the control bytes a
+      // paste can carry, and replaces the selection when there is one, so
+      // "select all, paste" swaps a description out in one gesture.
+      state.editor.insert(text);
+      this.paint();
+    }
+    return end - i + PASTE_END.length;
+  }
+
+  /** The CSI half of the editor's input: arrows, Home/End, Delete, the enhanced
+   *  protocols' spellings, and mouse reports, which belong to the EDITOR while
+   *  the popup is open (text selection), never to the panel underneath it. The
+   *  handoff is this one branch: the panel's own drag handler is unreachable
+   *  from here, and it resumes the moment the popup closes and the panel's input
+   *  path takes CSI again. */
+  private consumePopupCsi(data: string, i: number): number {
+    if (data[i + 2] === "<") {
+      const end = this.findMouseEnd(data, i + 3);
+      if (end === -1) return data.length - i;
+      this.handlePopupMouse(data.slice(i + 3, end), data[end] === "M");
+      return end - i + 1;
+    }
+    let j = i + 2;
+    while (j < data.length && !/[A-Za-z~]/.test(data[j]!)) j++;
+    if (j >= data.length) return data.length - i;
+    const final = data[j]!;
+    const params = data.slice(i + 2, j);
+    const consumed = j - i + 1;
+
+    const state = this.panel?.popup;
+    if (!state || state.status === "saving") return consumed;
+
+    switch (final) {
+      case "u": {
+        const ev = parseCsiU(params);
+        if (ev) this.popupAction(classify(ev));
+        return consumed;
+      }
+      case "A": this.popupMoveRow(-1); return consumed;
+      case "B": this.popupMoveRow(1); return consumed;
+      case "C": this.popupEdit(() => state.editor.right()); return consumed;
+      case "D": this.popupEdit(() => state.editor.left()); return consumed;
+      case "H": this.popupAction({ kind: "home" }); return consumed;
+      case "F": this.popupAction({ kind: "end" }); return consumed;
+      case "~": {
+        const other = parseModifyOtherKeys(params);
+        if (other) {
+          this.popupAction(classify(other));
+          return consumed;
+        }
+        const n = Number.parseInt(params, 10);
+        if (n === 3) this.popupEdit(() => state.editor.deleteForward());
+        else if (n === 5) this.popupPage(-1);
+        else if (n === 6) this.popupPage(1);
+        else if (n === 1 || n === 7) this.popupAction({ kind: "home" });
+        else if (n === 4 || n === 8) this.popupAction({ kind: "end" });
+        return consumed;
+      }
+      default:
+        return consumed;
+    }
+  }
+
+  /**
+   * Apply one decoded action to the buffer. Every binding the prompt has means
+   * the same thing here, with exactly two deliberate differences: Enter inserts
+   * a newline instead of sending (a description is prose, and Ctrl-S is the
+   * commit), and Ctrl-O leaves through this view's own exit rather than closing
+   * the panel out from under an unsaved buffer.
+   */
+  private popupAction(action: Action): void {
+    const state = this.panel?.popup;
+    if (!state || state.status === "saving") return;
+    const editor = state.editor;
+    // Only another Escape consumes the discard arming; every other key disarms.
+    const wasEscPending = state.escPending;
+    if (action.kind !== "escape" && action.kind !== "open-docs") state.escPending = false;
+    // A receipt describes a selection that the next key is about to change, so
+    // it is retired here, and re-set below by the keys that earn a new one.
+    state.notice = null;
+
+    switch (action.kind) {
+      case "insert":
+        editor.insert(action.text);
+        break;
+      // A bare Enter and every modified spelling of it do the same thing here.
+      case "newline":
+      case "submit":
+        editor.insert("\n");
+        break;
+      case "backspace":
+        editor.backspace();
+        break;
+      case "home":
+        editor.home();
+        break;
+      case "end":
+        editor.end();
+        break;
+      case "kill-to-start":
+        editor.killToStart();
+        break;
+      case "kill-to-end":
+        editor.killToEnd();
+        break;
+      // The three buffer-scoped verbs. Ctrl-A/E/U/K stay line-scoped, because a
+      // description is many lines and they mean what they mean everywhere else,
+      // so wholesale work gets keys of its own.
+      case "select-all":
+        editor.selectAll();
+        break;
+      case "clear-all": {
+        // A cut, not a wipe: what it removes goes to the clipboard first, so the
+        // one key that can empty a forty-line body never empties it into nothing.
+        const gone = editor.clearAll();
+        if (gone !== "") {
+          this.copyToClipboard(gone);
+          state.notice = `cleared · ${countLines(gone)} line${countLines(gone) === 1 ? "" : "s"} on the clipboard`;
+        }
+        break;
+      }
+      case "copy": {
+        // The selection, or the whole buffer when nothing is selected: the same
+        // "give me this bit" / "give me the lot" pair the doc view has.
+        const text = editor.selectedText() || editor.text;
+        if (text === "") break;
+        this.copyToClipboard(text);
+        state.notice = copyReceipt(countLines(text));
+        break;
+      }
+      case "save":
+        this.savePopup();
+        return;
+      case "escape":
+      case "open-docs":
+        this.escapePopupEditor(wasEscPending);
+        return;
+      // Tab, Ctrl-C and Ctrl-D have nothing to do in this buffer, and must not
+      // fall through to the panel's meanings for them (switch tab, quit).
+      case "tab":
+      case "interrupt":
+      case "eof":
+      case "none":
+        break;
+    }
+    this.paint();
+  }
+
+  // --- selecting text inside the popup -----------------------------------------
+  //
+  // The popup owns the mouse for as long as it is open (consumePopupCsi routes
+  // every report here, and the panel's own drag handler is not reachable from
+  // that path). A left-drag selects TEXT, not painted cells: the endpoints are
+  // buffer offsets, so the selection survives a re-wrap, and therefore a resize,
+  // where the panel's row/col selection has to be dropped. On release the
+  // selected text goes to the system clipboard through the same OSC 52 write the
+  // panel and the transcript use.
+
+  /**
+   * An SGR mouse report while the popup is open. Same wire format and bit layout
+   * as handleMouse: low two bits the button, 32 motion, 64 the wheel.
+   */
+  private handlePopupMouse(body: string, press: boolean): void {
+    const state = this.panel?.popup;
+    if (!state || state.status === "saving") return;
+    const parts = body.split(";");
+    const b = Number.parseInt(parts[0] ?? "", 10);
+    const x = Number.parseInt(parts[1] ?? "", 10);
+    const y = Number.parseInt(parts[2] ?? "", 10);
+    if (Number.isNaN(b)) return;
+
+    // The wheel scrolls by MOVING THE CARET, the way PgUp/PgDn already do here.
+    // The popup's scroll is derived from the caret on every paint (see
+    // popupFrame), so this keeps one invariant (the caret is always on screen
+    // and the hardware cursor is always where the text cursor is) instead of
+    // introducing a second, free-floating scroll that a keystroke would snap back.
+    if (b === 64) { this.popupScroll(-1, 3); return; }
+    if (b === 65) { this.popupScroll(1, 3); return; }
+
+    const button = b & 0b11;
+    const motion = (b & 32) !== 0;
+    if (button !== 0) return;
+
+    if (!motion && press) this.beginPopupSelection(x, y);
+    else if (motion && press) this.extendPopupSelection(x, y);
+    else if (!press) this.endPopupSelection();
+  }
+
+  /** Scroll by moving the caret `steps` visual rows, and repaint. */
+  private popupScroll(delta: 1 | -1, steps: number): void {
+    const state = this.panel?.popup;
+    if (!state || state.status === "saving") return;
+    state.escPending = false;
+    state.notice = null;
+    const width = this.popupWidth();
+    for (let n = 0; n < steps; n++) {
+      if (!state.editor.moveRow(delta, width)) break;
+    }
+    this.paint();
+  }
+
+  /**
+   * Map a 1-based screen (x, y) onto a visual (row, col) of the buffer.
+   *
+   * `inside` is false when the point is off the box's text area entirely, and a
+   * press there starts nothing. A DRAG that strays off the top or the bottom
+   * targets the row just outside the viewport instead, which pulls the scroll by
+   * one (the caret follows the drag, and the viewport follows the caret), so a
+   * selection can run past a screenful in either direction.
+   */
+  private popupCellAt(
+    state: PopupState,
+    x: number,
+    y: number,
+  ): { row: number; col: number; inside: boolean } {
+    const box = this.popupBox();
+    const firstRow = box.top + 1; // row 0 of the box is the top border
+    const firstCol = box.left + 2; // "│" + one space
+    const inner = Math.max(1, box.width - 4);
+    const col = Math.max(0, x - firstCol);
+    const inside =
+      y >= firstRow && y < firstRow + box.textRows && x >= firstCol && x < firstCol + inner;
+    let row: number;
+    if (y < firstRow) row = state.scroll - 1;
+    else if (y >= firstRow + box.textRows) row = state.scroll + box.textRows;
+    else row = state.scroll + (y - firstRow);
+    return { row: Math.max(0, row), col, inside };
+  }
+
+  /** Left press: anchor a selection at that character, and put the caret there.
+   *  A press outside the box's text area only dismisses a standing selection,
+   *  because a stray click on the queue underneath must not start one. */
+  private beginPopupSelection(x: number, y: number): void {
+    const state = this.panel?.popup;
+    if (!state || state.status === "saving") return;
+    const cell = this.popupCellAt(state, x, y);
+    state.notice = null;
+    state.escPending = false;
+    if (!cell.inside) {
+      state.editor.clearSelection();
+      state.dragging = false;
+      this.paint();
+      return;
+    }
+    state.dragging = true;
+    state.editor.anchorAt(state.editor.offsetAt(cell.row, cell.col, this.popupWidth()));
+    this.paint();
+  }
+
+  private extendPopupSelection(x: number, y: number): void {
+    const state = this.panel?.popup;
+    if (!state || !state.dragging || state.status === "saving") return;
+    const cell = this.popupCellAt(state, x, y);
+    state.editor.extendTo(state.editor.offsetAt(cell.row, cell.col, this.popupWidth()));
+    this.paint();
+  }
+
+  /** Left release: a drag that selected something copies it, the same way a drag
+   *  over the panel body does. A bare click selected nothing and copies nothing:
+   *  it just moved the caret, which is what a click in a text box is for. */
+  private endPopupSelection(): void {
+    const state = this.panel?.popup;
+    if (!state || !state.dragging) return;
+    state.dragging = false;
+    const text = state.editor.selectedText();
+    if (text === "") {
+      this.paint();
+      return;
+    }
+    this.copyToClipboard(text);
+    state.notice = copyReceipt(countLines(text));
+    this.paint();
+  }
+
+  /** Run a buffer mutation and repaint. The scroll follows on the next paint. */
+  private popupEdit(fn: () => void): void {
+    const state = this.panel?.popup;
+    if (!state || state.status === "saving") return;
+    state.escPending = false;
+    state.notice = null;
+    fn();
+    this.paint();
+  }
+
+  /** Up/Down: one visual row, clamped at both ends. There is no history here to
+   *  fall through to, since this buffer is the only thing the keys address. */
+  private popupMoveRow(delta: 1 | -1): void {
+    this.popupScroll(delta, 1);
+  }
+
+  /** PgUp/PgDn: a viewport of rows at a time, by the same clamped row move. */
+  private popupPage(delta: 1 | -1): void {
+    this.popupScroll(delta, this.popupBox().textRows);
+  }
+
+  /**
+   * Ctrl-S: write the buffer to wherever it came from. The one save key, routed
+   * on the target, so both writes get the same interlock and the same reporting.
+   */
+  private savePopup(): void {
+    const state = this.panel?.popup;
+    if (!state || state.status === "saving") return;
+    if (state.target.kind === "pr") this.savePrMessage(state, state.target);
+    else this.saveDoc(state, state.target);
+  }
+
+  /**
+   * Ctrl-S over a PR message: write the buffer to the pull request.
+   *
+   * Fire-once while in flight, like the queue merge. An empty title is refused
+   * HERE, before anything is sent, with the buffer left exactly as it is — gh
+   * would reject it anyway, and a refusal the captain can act on beats a stack
+   * trace from a subprocess. A failed save is the same: the popup stays open
+   * over the captain's text with the failure printed in it, so an edit is never
+   * silently dropped. Only a save that actually landed closes the popup, and
+   * what the tab paints afterwards is what the source read back from GitHub.
+   */
+  private savePrMessage(state: PopupState, target: { prNumber: number }): void {
+    const source = this.queue;
+    const save = source?.editPrMessage;
+    if (!source || !save) {
+      state.error = "editing a pull request message isn't available in this session.";
+      this.paint();
+      return;
+    }
+    const { title, body } = state.editor.message();
+    if (title === "") {
+      state.error = "line 1 is the title and it is empty — a pull request needs one. Nothing was sent.";
+      this.paint();
+      return;
+    }
+    this.runPopupSave(state, () => save.call(source, { title, body, prNumber: target.prNumber }));
+  }
+
+  /**
+   * Ctrl-S over a doc: write the buffer to the file.
+   *
+   * The whole buffer is the document — there is no title line here and no fence
+   * to splice — so the only thing refused before it is sent is an empty one. A
+   * doc emptied and saved would be indistinguishable from a doc the captain
+   * meant to keep, and Ctrl-X (which is how a buffer gets emptied by accident)
+   * is one keystroke away from Ctrl-S; deleting a document is the co's `doc`
+   * tool's job, deliberately and by name.
+   *
+   * The baseline pinned at open goes back with the text, so a file the co
+   * rewrote while the popup was up comes back as a refusal over the captain's
+   * intact buffer instead of being overwritten (see overwriteDocIfUnchanged).
+   */
+  private saveDoc(state: PopupState, target: { name: string; baseline: string }): void {
+    const source = this.docs;
+    const write = source?.write;
+    if (!source || !write) {
+      state.error = "editing docs isn't available in this session.";
+      this.paint();
+      return;
+    }
+    const content = state.editor.text;
+    if (content.trim() === "") {
+      state.error = `the buffer is empty — ${target.name} was left alone. Ask the co to delete a doc.`;
+      this.paint();
+      return;
+    }
+    this.runPopupSave(state, () =>
+      write.call(source, { name: target.name, content, baseline: target.baseline }),
+    );
+  }
+
+  /**
+   * Hold the popup locked while a save is in flight and settle it: a landed
+   * write closes over a receipt, and anything else — a refusal, a rejection —
+   * leaves the box open over the captain's text with the reason in it.
+   *
+   * Shared by both targets deliberately: the fire-once interlock and "a failed
+   * save never loses the buffer" are the properties that make the editor safe to
+   * put a file behind, and they must not be two implementations.
+   */
+  private runPopupSave(
+    state: PopupState,
+    send: () => Promise<{ saved: boolean; summary: string; error?: string }>,
+  ): void {
+    state.status = "saving";
+    state.error = null;
+    state.escPending = false;
+    this.paint();
+    void send().then(
+      (res) => {
+        if (this.panel?.popup !== state) return; // closed or replaced since
+        state.status = "editing";
+        if (res.saved) {
+          if (state.target.kind !== "doc") {
+            this.closePopupEditor({ text: res.summary, ok: true });
+            return;
+          }
+          // Repaint the document from DISK rather than from the buffer, the same
+          // way the queue tab repaints from what GitHub read back. The write
+          // queue's signal can't do it: it fires while the popup still owns the
+          // view, so onDocWrite has no open doc to refresh.
+          //
+          // The receipt is set AFTER that lands, because a refresh whose content
+          // moved retires the notice line — it exists to stop a receipt vouching
+          // for text that has since changed, and this is the one write where the
+          // change and the receipt are the same event.
+          this.closePopupEditor();
+          void this.refreshDoc().then(() => {
+            if (!this.panel) return;
+            this.panel.copyNotice = res.summary;
+            this.paint();
+          });
+          return;
+        }
+        state.error = res.error ?? res.summary;
+        this.paint();
+      },
+      (e: unknown) => {
+        if (this.panel?.popup !== state) return;
+        state.status = "editing";
+        state.error = e instanceof Error ? e.message : String(e);
+        this.paint();
+      },
+    );
+  }
+
+  /**
+   * The popup as painted rows, plus where the caret goes inside it (viewport
+   * coordinates: row 0 is the first text row).
+   *
+   * The viewport scroll is recomputed here from the caret rather than tracked by
+   * the key handlers, so every path that moves the caret — typing, arrows, a
+   * kill, a resize that re-wraps everything — keeps it on screen for free.
+   */
+  private popupFrame(state: PopupState): { rows: string[]; cursorRow: number; cursorCol: number } {
+    const { width, textRows } = this.popupBox();
+    const inner = Math.max(1, width - 4);
+    const layout = state.editor.layout(inner);
+    state.scroll = scrollToCursor(state.scroll, layout.cursorRow, textRows, layout.segs.length);
+
+    const pad = (s: string, w: number): string => s + " ".repeat(Math.max(0, w - visibleWidth(s)));
+    // The two borders carry the two things worth carrying: what is being edited,
+    // and how to leave.
+    const border = (label: string, open: string, close: string): string =>
+      this.boxBorder(label, open, close, width);
+    // The title line is the first BUFFER line, however many visual rows it takes
+    // — a PR message thing only. A doc's first line is ordinary markdown, and the
+    // renderer under the box, not the box, is what makes a heading look like one.
+    const isPr = state.target.kind === "pr";
+    const titleEnd = state.editor.text.indexOf("\n");
+    const sel = state.editor.selection;
+    const rows: string[] = [border(popupLabel(state.target), "┌", "┐")];
+    for (let r = 0; r < textRows; r++) {
+      const idx = state.scroll + r;
+      const seg = layout.segs[idx];
+      const start = layout.starts[idx];
+      const isTitle =
+        isPr && seg !== undefined && start !== undefined && (titleEnd === -1 || start < titleEnd);
+      let text = seg === undefined ? "" : isTitle ? c.bold(seg) : seg;
+      if (sel && seg !== undefined && start !== undefined) {
+        text = this.highlightSelectedRow(text, seg, start, layout.starts[idx + 1], sel);
+      }
+      rows.push(c.dim("│") + " " + pad(text, inner) + " " + c.dim("│"));
+    }
+    rows.push(c.dim("│") + " " + pad(this.popupMessage(state, inner), inner) + " " + c.dim("│"));
+    rows.push(border(this.popupKeys(state, width), "└", "┘"));
+    return { rows, cursorRow: layout.cursorRow - state.scroll, cursorCol: layout.cursorCol };
+  }
+
+  /**
+   * One titled border of a box drawn over the panel - the editor's and the
+   * picker's alike, so the two cannot drift into two different boxes.
+   *
+   * Built as plain text and dimmed whole, so a colour reset inside the label
+   * can't cancel the border's own styling, and the label is clipped to what is
+   * left after the corners rather than pushing the box wider.
+   */
+  private boxBorder(label: string, open: string, close: string, width: number): string {
+    const lead = "─ " + this.clip(label, Math.max(0, width - 6)) + " ";
+    const fill = Math.max(0, width - visibleWidth(lead) - 2);
+    return c.dim(open + lead + "─".repeat(fill) + close);
+  }
+
+  /**
+   * Paint the part of one visual row that falls inside the selection.
+   *
+   * The row's span is [start, next) in BUFFER offsets, which is what makes this
+   * width-agnostic: the same characters highlight at any wrapping. A row whose
+   * newline is inside the selection highlights to its end (and an empty row
+   * inside the selection gets one reversed space) so a multi-line selection
+   * reads as one block instead of tearing into stripes at every line break,
+   * the same rule applyPanelSelection follows, for the same reason.
+   */
+  private highlightSelectedRow(
+    painted: string,
+    seg: string,
+    start: number,
+    next: number | undefined,
+    sel: { start: number; end: number },
+  ): string {
+    const stop = next ?? start + seg.length;
+    if (sel.end <= start || sel.start > stop) return painted;
+    const from = Math.max(0, Math.min(seg.length, sel.start - start));
+    // A selection running past this row's end covers its line break too.
+    const to = sel.end >= stop && stop > start ? seg.length : Math.max(0, Math.min(seg.length, sel.end - start));
+    if (seg === "" && sel.start <= start && sel.end > start) return `${ESC}[7m ${ESC}[27m`;
+    if (to <= from) return painted;
+    return highlightRange(painted, from, to);
+  }
+
+  /**
+   * The keys on the popup's bottom border, in tiers: the widest run that fits.
+   * Save and cancel are never dropped (they are the two ways out); the wholesale
+   * verbs go before them, and the drag hint goes first, because the gesture is
+   * self-revealing where a key is not.
+   */
+  private popupKeys(state: PopupState, width: number): string {
+    if (state.status === "saving") return "saving…";
+    const room = Math.max(0, width - 6);
+    const tiers = [
+      "Ctrl-S save · Esc cancel · drag select · Ctrl-G all · Ctrl-X clear · Ctrl-Y copy",
+      "Ctrl-S save · Esc cancel · Ctrl-G all · Ctrl-X clear · Ctrl-Y copy",
+      "Ctrl-S save · Esc cancel · Ctrl-G all · Ctrl-X clear",
+      "Ctrl-S save · Esc cancel",
+    ];
+    return tiers.find((t) => t.length <= room) ?? tiers[tiers.length - 1]!;
+  }
+
+  /** The popup's one message line: what it needs to say, most urgent first. */
+  private popupMessage(state: PopupState, width: number): string {
+    const target = state.target;
+    if (state.status === "saving") {
+      const what = target.kind === "pr" ? `PR #${target.prNumber}` : target.name;
+      return c.cyan(this.clip(`writing ${what}…`, width));
+    }
+    if (state.escPending) {
+      return c.yellow(this.clip("unsaved changes — Esc again to discard them", width));
+    }
+    if (state.error) return c.red(this.clip(state.error, width));
+    // A copy/clear receipt outranks the dirty hint: it names something that just
+    // happened, and it is gone on the next key either way.
+    if (state.notice) {
+      const terse = state.notice.replace("if nothing pastes, allow", "allow");
+      return c.cyan(this.clip(visibleWidth(state.notice) <= width ? state.notice : terse, width));
+    }
+    if (state.editor.selection) {
+      const n = countLines(state.editor.selectedText());
+      return c.dim(this.clip(`${n} line${n === 1 ? "" : "s"} selected · Ctrl-Y copies · typing replaces`, width));
+    }
+    if (state.editor.dirty) {
+      const where = target.kind === "pr" ? "GitHub" : `docs/${target.name}`;
+      return c.dim(this.clip(`edited · Ctrl-S writes it to ${where}`, width));
+    }
+    return c.dim(
+      this.clip(
+        target.kind === "pr"
+          ? "line 1 is the title · Enter inserts a newline"
+          : "the whole file · Enter inserts a newline",
+        width,
+      ),
+    );
+  }
+
+  // --- the model picker (in-panel) ---------------------------------------------
+  //
+  // Bare `/model` opens this: a short fixed list of models, the one in force
+  // marked, arrows to move and Enter to set it. Typing a Bedrock id from memory
+  // is a fine escape hatch - `/model <id>` still takes any id verbatim, alias
+  // table and friendly-name registry deliberately absent - and a poor primary
+  // surface, which is the whole of why this exists.
+  //
+  // THE LIST IS HANDED IN, never discovered. No Bedrock call stands behind it and
+  // there is no useful one to make: ListFoundationModels returns every model in
+  // the region regardless of what this key may invoke, and
+  // GetFoundationModelAvailability has been seen answering AUTHORIZED for models
+  // that then 403. The probe `/model` already runs before it persists remains the
+  // only honest check, and it runs on a picked id exactly as on a typed one.
+  //
+  // Everything about the box is the editor's - geometry, borders, the rule that
+  // it opens over a view and puts it back. What differs is that it holds a
+  // caller's promise, so every exit settles exactly once and nothing on screen
+  // can leave it unsettled.
+
+  /**
+   * Show the picker and resolve to the chosen model id, or null when it is
+   * cancelled (Esc, Ctrl-O, the panel closing, teardown).
+   *
+   * Opens the panel if it is shut - `/model` is typed at the prompt, so it
+   * normally is - and shuts it again on the way out, so the captain lands back
+   * on the conversation he typed it from.
+   */
+  openModelPicker(choices: readonly ModelPickerEntry[], current: string): Promise<string | null> {
+    return new Promise((resolve) => {
+      // Nothing in the session runs two `/model`s at once, but never strand a
+      // caller: an unsettled promise hangs the loop that is awaiting it.
+      const prior = this.panel?.picker ?? null;
+      prior?.settle(null);
+      const opened = prior ? prior.opened : !this.panel;
+      if (!this.panel) this.openPanel(/*force*/ true);
+      const panel = this.panel;
+      // Only reachable if a panel could not be stood up at all. Answering null
+      // beats hanging: `/model` then just reports, as it does on PlainIO.
+      if (!panel) { resolve(null); return; }
+      let settled = false;
+      const at = choices.findIndex((ch) => ch.id === current);
+      panel.picker = {
+        choices,
+        // Nothing marked (a `current` off the list) starts at the top rather
+        // than nowhere - the cursor is how you move, not what is in force.
+        index: at >= 0 ? at : 0,
+        current,
+        under: prior && panel.view.kind === "picker" ? prior.under : panel.view,
+        opened,
+        settle: (id) => {
+          if (settled) return;
+          settled = true;
+          resolve(id);
+        },
+      };
+      panel.view = { kind: "picker" };
+      // A Home task field, if one were somehow open, takes the keyboard BEFORE
+      // the view does - and the picker would then be on screen with no key able
+      // to reach it, which is a hung session rather than a wrong pixel. It
+      // cannot happen from the session loop (the panel owns the keyboard while
+      // it is up, so `/model` is never typed underneath one), and closing it is
+      // one call.
+      this.closeTaskField();
+      this.clearPanelSelection();
+      this.paint();
+    });
+  }
+
+  /** Move the cursor one row, clamped at the ends - the Home tab's rule, so the
+   *  one selection idiom on this screen behaves the same wherever it turns up. */
+  private movePicker(delta: 1 | -1): void {
+    const st = this.panel?.picker;
+    if (!st || st.choices.length === 0) return;
+    const next = Math.max(0, Math.min(st.choices.length - 1, st.index + delta));
+    if (next === st.index) return;
+    st.index = next;
+    this.paint();
+  }
+
+  /**
+   * Leave the picker with a verdict: an id, or null for a cancel.
+   *
+   * The promise is settled LAST, after the screen is back, so the lines the
+   * caller prints in response land in a transcript the captain can already see
+   * rather than behind a panel that is still up.
+   */
+  private closePicker(id: string | null): void {
+    const panel = this.panel;
+    const st = panel?.picker;
+    if (!panel || !st) return;
+    panel.picker = null;
+    if (panel.view.kind === "picker") panel.view = st.under;
+    if (st.opened) this.closePanel();
+    else this.paint();
+    st.settle(id);
+  }
+
+  /**
+   * The picker's keys, and ONLY these: up/down (and j/k) move, Enter takes the
+   * highlighted model, Esc / Ctrl-O / Backspace cancel.
+   *
+   * Everything else is swallowed rather than falling through to the panel's own
+   * meanings. The picker is holding a caller open, so a digit that jumped to
+   * another tab - or a paging key that scrolled the view underneath - would
+   * leave `/model` waiting on a surface that is no longer on screen.
+   */
+  private pickerInput(input: OverlayInput): void {
+    const st = this.panel?.picker;
+    if (!st) return;
+    if ("nav" in input) {
+      switch (input.nav) {
+        case "up": this.movePicker(-1); return;
+        case "down": this.movePicker(1); return;
+        case "enter": this.closePicker(st.choices[st.index]?.id ?? null); return;
+        case "escape":
+        case "close":
+        case "back": this.closePicker(null); return;
+        default: return;
+      }
+    }
+    if (input.ch === "j") this.movePicker(1);
+    else if (input.ch === "k") this.movePicker(-1);
+  }
+
+  /**
+   * The rows, unstyled: a cursor, the name, the id it sets, and - on the model
+   * in force - a word saying so.
+   *
+   * The mark is a word and a glyph rather than a colour, because "which one am I
+   * on" must not be a question only a colour terminal can answer (the rule the
+   * tab bar follows). `withId` is the one tier: on a screen too narrow for the
+   * ids, the whole column goes rather than every id being cut off mid-string -
+   * these ids differ in their LAST few characters and share a twenty-character
+   * prefix, so a truncated one says strictly less than the name beside it.
+   */
+  private pickerRows(state: PickerState, withId: boolean): string[] {
+    const nameWidth = state.choices.reduce((n, ch) => Math.max(n, visibleWidth(ch.label)), 0);
+    return state.choices.map(
+      (ch, i) =>
+        (i === state.index ? "▸ " : "  ") +
+        pad(ch.label, nameWidth) +
+        (withId ? "  " + ch.id : "") +
+        (ch.id === state.current ? "  · in force" : ""),
+    );
+  }
+
+  /**
+   * The picker as painted rows, plus where its box sits.
+   *
+   * Sized to its CONTENT, unlike the editor's box: that one takes the majority
+   * of the screen because it is replacing a whole description, and a three-row
+   * list in a forty-four-row box is mostly emptiness. The clamps are the same
+   * idea though - never wider than the screen, and never so tall it paints over
+   * the footer, which is what the row window is for on a very short terminal.
+   */
+  private pickerFrame(state: PickerState): {
+    rows: string[];
+    box: { left: number; top: number; width: number };
+  } {
+    const keys = "↑↓ move · Enter select · Esc cancel";
+    // The box's own width: the widest row plus the border and one space of
+    // padding on each side, with the two border labels setting a floor of their
+    // own - a hint that is always clipped away is a hint nobody discovers. The
+    // ceiling is the screen (a box wider than the terminal is a torn frame) and
+    // 88 columns, so a full-screen terminal doesn't stretch three short rows
+    // across a metre of glass.
+    const avail = Math.max(1, Math.min(this.cols - 2, 88));
+    const width = (rows: string[]): number =>
+      Math.max(
+        1,
+        Math.min(
+          avail,
+          Math.max(
+            rows.reduce((n, t) => Math.max(n, visibleWidth(t)), 0) + 4,
+            visibleWidth(keys) + 6,
+            PICKER_LABEL.length + 6,
+          ),
+        ),
+      );
+    let texts = this.pickerRows(state, /*withId*/ true);
+    // Only drop the id column when the ids genuinely do not fit - never to make
+    // room for the borders' own hints, which is why this measures the rows.
+    if (texts.reduce((n, t) => Math.max(n, visibleWidth(t)), 0) + 4 > avail) {
+      texts = this.pickerRows(state, /*withId*/ false);
+    }
+    const boxWidth = width(texts);
+    const inner = Math.max(1, boxWidth - 4);
+    // Last resort on a terminal too narrow even for the names: a hard column cut,
+    // not the word wrap `clip` does - these rows are a laid-out table, and a
+    // wrapped one loses its indent and stops lining up.
+    const fit = (t: string): string =>
+      visibleWidth(t) <= inner ? t : sliceVisibleText(t, 0, Math.max(0, inner - 1)) + "…";
+
+    // The panel body is rows 2..rows-1; the box lives inside that, and on a
+    // screen too short for every row it windows rather than overflowing.
+    const room = Math.max(1, this.rows - 4);
+    const shown = Math.min(texts.length, room);
+    const start = Math.max(0, Math.min(state.index - shown + 1, texts.length - shown));
+    const height = shown + 2;
+    const left = 1 + Math.max(0, Math.floor((this.cols - boxWidth) / 2));
+    const top = Math.max(2, Math.min(1 + Math.floor((this.rows - height) / 2), this.rows - height));
+
+    const rows: string[] = [this.boxBorder(PICKER_LABEL, "┌", "┐", boxWidth)];
+    for (let r = 0; r < shown; r++) {
+      const i = start + r;
+      const text = fit(texts[i]!);
+      rows.push(c.dim("│") + " " + pad(i === state.index ? c.cyan(text) : text, inner) + " " + c.dim("│"));
+    }
+    rows.push(this.boxBorder(keys, "└", "┘", boxWidth));
+    return { rows, box: { left, top, width: boxWidth } };
+  }
+
+  /** Paint the full-screen panel: tab bar, content viewport, footer. */
+  /**
+   * What the panel is showing right now: which TAB the current view belongs to,
+   * the detail that names it when the view is a sub-view of that tab (an open
+   * doc's filename), the body rows, and the body row the viewport starts at.
+   *
+   * ONE source of truth for the view switch, read by the paint, the tab bar and
+   * the mouse-selection copy alike — so a drag can only ever copy the rows that
+   * were actually painted under it, and the bar can only ever highlight the tab
+   * the body came from. The queue body is fetched before its scroll is read
+   * because queueBody() clamps that scroll to the freshly-built row count.
+   */
+  private panelFrame(): {
+    tab: PanelTab;
+    suffix: string;
+    body: string[];
+    start: number;
+  } {
+    const panel = this.panel;
+    if (!panel) return { tab: "home", suffix: "", body: [], start: 0 };
+    const v = panel.view;
+    // The picker is the popup's sibling and gets the popup's treatment: the view
+    // it opened over stays painted underneath it, and the bar says what the box
+    // on top of it is for.
+    if (v.kind === "picker") {
+      const st = panel.picker;
+      const base = this.viewFrame(st?.under ?? { kind: "home" });
+      return st ? { ...base, suffix: PICKER_LABEL } : base;
+    }
+    if (v.kind !== "popup") return this.viewFrame(v);
+    // The editor is a POPUP over the view that called it up, not a view of its
+    // own: that view stays painted underneath (paintPanel overlays the box), so
+    // the captain never loses sight of the head — or the document — he is
+    // writing about. The bar names what is being edited in its place.
+    const state = panel.popup;
+    const base = this.viewFrame(state?.under ?? { kind: "queue" });
+    return state ? { ...base, suffix: popupLabel(state.target) } : base;
+  }
+
+  /** One view as a frame. Split out of panelFrame so the popup can ask for the
+   *  frame of the view it is sitting on top of.
+   *
+   *  Every body that reaches the screen goes through withOcean on its way, which
+   *  is what makes the scene the panel's rather than one tab's. It appends only
+   *  into rows the body did not want, so every scroll clamp below still reads a
+   *  count the content earned: a decorated body is exactly a viewport tall, so
+   *  its own max is zero and it cannot page. */
+  private viewFrame(v: PanelView): {
+    tab: PanelTab;
+    suffix: string;
+    body: string[];
+    start: number;
+  } {
+    const panel = this.panel;
+    if (!panel) return { tab: "home", suffix: "", body: [], start: 0 };
+    if (v.kind === "home") {
+      const body = this.withOcean("home", this.homeTabRows());
+      // A feature landing (or being abandoned) shortens the list; never strand
+      // the view past its end.
+      const max = Math.max(0, body.length - this.overlayViewport());
+      if (panel.homeScroll > max) panel.homeScroll = max;
+      return { tab: "home", suffix: "", body, start: panel.homeScroll };
+    }
+    if (v.kind === "queue") {
+      // queueBody() first: it clamps the scroll read on the next line, and it is
+      // the memoized rows that the scene is laid under rather than folded into,
+      // so the tide can roll on this tab without busting that memo.
+      const body = this.withOcean("queue", this.queueBody());
+      return { tab: "queue", suffix: "", body, start: panel.queueScroll };
+    }
+    if (v.kind === "docs") {
+      return { tab: "docs", suffix: "", body: this.withOcean("docs", this.docsTabRows(panel)), start: 0 };
+    }
+    if (v.kind === "doc") {
+      return { tab: "docs", suffix: v.name, body: this.withOcean("docs", v.rows), start: v.scroll };
+    }
+    if (v.kind === "popup") return { tab: "queue", suffix: "", body: [], start: 0 };
+    // Never reached in practice (panelFrame resolves a picker to the view it
+    // opened over), and here so the switch stays total.
+    if (v.kind === "picker") return { tab: "home", suffix: "", body: [], start: 0 };
+    const pr = this.pendingReview;
+    return {
+      tab: "review",
+      suffix: pr ? `${pr.review.feature} → ${pr.review.target}` : "",
+      body: this.withOcean("review", pr ? pr.rows : ["", "  " + c.dim("no review is pending.")]),
+      start: pr ? pr.scroll : 0,
+    };
+  }
+
   private paintPanel(): void {
     const panel = this.panel;
     if (!panel) return;
     const w = this.cols;
     const vp = this.overlayViewport();
-    const v = panel.view;
+    const { tab, suffix, body, start } = this.panelFrame();
+    panel.lastStart = start; // anchor for mapping mouse (x, y) → absolute body row
 
-    let title: string;
-    let body: string[];
-    let start = 0;
-    if (v.kind === "queue") {
-      title = "queue";
-      body = this.queueTabRows();
-    } else if (v.kind === "docs") {
-      title = "docs";
-      body = this.docsTabRows(panel);
-    } else if (v.kind === "doc") {
-      title = `docs · ${v.name}`;
-      body = v.rows;
-      start = v.scroll;
-    } else {
-      const pr = this.pendingReview;
-      title = pr ? `review · ${pr.review.feature} → ${pr.review.target}` : "review";
-      body = pr ? pr.rows : ["", "  " + c.dim("no review is pending.")];
-      start = pr ? pr.scroll : 0;
-    }
-
-    const frame: string[] = [term.moveTo(1, 1) + term.clearLine + this.overlayHeader(title)];
+    const frame: string[] = [term.moveTo(1, 1) + term.clearLine + this.overlayHeader(tab, suffix)];
     for (let r = 0; r < vp; r++) {
-      const lineText = body[start + r] ?? "";
+      const absRow = start + r;
+      const lineText = this.applyPanelSelection(body[absRow] ?? "", absRow);
       frame.push(term.moveTo(2 + r, 1) + term.clearLine + this.clip(lineText, w));
     }
     frame.push(term.moveTo(this.rows, 1) + term.clearLine + this.panelFooter(body.length, start, vp));
-    // The panel has no text cursor; hide the hardware caret while it's up.
-    frame.push(term.hideCursor);
+
+    // The PR message editor rides ON TOP of whatever the tab painted: its rows
+    // are laid over the middle of the body, so the head it is about stays
+    // visible around it. It is also the one panel view with a real text cursor,
+    // so the caret is placed and shown instead of hidden.
+    const edit = panel.view.kind === "popup" ? panel.popup : null;
+    const pick = panel.view.kind === "picker" ? panel.picker : null;
+    if (edit) {
+      const box = this.popupBox();
+      const { rows: boxRows, cursorRow, cursorCol } = this.popupFrame(edit);
+      for (let r = 0; r < boxRows.length; r++) {
+        frame.push(term.moveTo(box.top + r, box.left) + this.clip(boxRows[r]!, w));
+      }
+      frame.push(term.moveTo(box.top + 1 + cursorRow, box.left + 2 + cursorCol) + term.showCursor);
+    } else if (pick) {
+      // The picker rides on top the same way, and for the same reason: what was
+      // on screen when `/model` was typed stays there around it. It has no text
+      // cursor of its own - the ▸ is the cursor - so the caret stays hidden.
+      const { rows: boxRows, box } = this.pickerFrame(pick);
+      for (let r = 0; r < boxRows.length; r++) {
+        frame.push(term.moveTo(box.top + r, box.left) + this.clip(boxRows[r]!, w));
+      }
+      frame.push(term.hideCursor);
+    } else {
+      // Every other panel view has no text cursor; hide the hardware caret.
+      frame.push(term.hideCursor);
+    }
     this.out.write(frame.join(""));
   }
 
-  /** The tab bar as a header: the two tabs with the active one reversed, so the
-   *  captain sees both spaces and which is live. Sub-views (doc/review) get a
-   *  plain title instead. */
-  private overlayHeader(title: string): string {
+  /**
+   * The tab bar: every tab the panel has, numbered, across the top of every view.
+   *
+   * This is the panel's only discovery surface. Before it, the tabs existed but
+   * nothing on screen said so — the panel was usable by someone who already knew
+   * Tab cycled it, and by nobody else. So each tab is drawn with the digit that
+   * jumps to it (`2 queue`), and the ACTIVE one is drawn distinctly: cut out of
+   * the reversed bar (reversed-off, so it reads as the raised tab) with colour,
+   * and bracketed as `[2 queue]` when colour is off, because "which one am I on"
+   * must not be a thing only a colour terminal can answer.
+   *
+   * `suffix` names what a SUB-VIEW of the active tab is showing (an open doc's
+   * filename, a filed review's level, the PR the popup is editing) and rides
+   * inside the active tab's own segment — `[3 docs · plan.md]` — so the bar says
+   * where you are and what you are looking at in one line.
+   *
+   * It degrades in that order of value: the detail goes first, then the labels
+   * (leaving `1 2 3 4`, which still says how many tabs there are and which one
+   * you are on), and only a terminal too narrow even for that gets a clipped bar.
+   * A tab is never dropped from the list, because a tab you cannot see is a tab
+   * you do not know exists — which is the whole reason the bar is here.
+   */
+  private overlayHeader(active: PanelTab, suffix = ""): string {
     const w = this.cols;
-    const bar = this.clip(` ${title} `, w).padEnd(w, " ");
+    const tabs = this.panelTabs();
+    const activeTab = Tui.TAB_LABELS[active];
+    const segments = (detail: boolean, labels: boolean): string[] =>
+      tabs.map((t, i) => {
+        const label = labels ? `${i + 1} ${Tui.TAB_LABELS[t]}` : `${i + 1}`;
+        const on = Tui.TAB_LABELS[t] === activeTab;
+        const text = on && detail && suffix !== "" ? `${label} · ${suffix}` : label;
+        if (!colorEnabled) return on ? `[${text}]` : ` ${text} `;
+        // Inside a reversed bar, turning the reverse OFF is what makes a segment
+        // stand out — the active tab reads as a cut-out rather than as more of
+        // the same block.
+        return on ? `${ESC}[27m ${text} ${ESC}[7m` : ` ${text} `;
+      });
+    const width = (segs: string[]): number => segs.reduce((n, s) => n + visibleWidth(s), 0);
+    const tiers = [segments(true, true), segments(false, true), segments(false, false)];
+    const segs = tiers.find((t) => width(t) <= w) ?? tiers[tiers.length - 1]!;
+    const bar = this.clip(segs.join(""), w) + " ".repeat(Math.max(0, w - width(segs)));
     return colorEnabled ? `${ESC}[7m${bar}${ESC}[27m` : bar;
   }
 
   /**
+   * The queue tab's body, memoized. Rebuilt only when something it depends on
+   * changed — the queue snapshot, the head's detail, the merge state, or the
+   * width. Without this, streaming model output underneath would re-wrap a
+   * possibly-huge inline diff on every 60fps frame for no reason.
+   *
+   * Also clamps the tab's scroll to the fresh row count, so a body that shrank
+   * (the head merged and the next one is smaller) can't leave the view stranded
+   * past its end.
+   */
+  private queueBody(): string[] {
+    const panel = this.panel;
+    if (!panel) return this.queueTabRows();
+    const sig = this.queueSignature();
+    if (sig !== panel.queueSig) {
+      panel.queueRows = this.queueTabRows();
+      panel.queueSig = sig;
+    }
+    const max = Math.max(0, panel.queueRows.length - this.overlayViewport());
+    if (panel.queueScroll > max) panel.queueScroll = max;
+    return panel.queueRows;
+  }
+
+  /** A cheap identity for everything the queue tab renders from. The detail's
+   *  body is identified by its sizes rather than its content: a diff that
+   *  changed at all changed the head, which changes the rest of the key. */
+  private queueSignature(): string {
+    if (!this.queue) return "none";
+    const view = this.queue.view();
+    const d = this.queue.headDetail?.() ?? null;
+    const checksKey = (k: PanelChecks | undefined): string =>
+      k ? `${k.verdict}:${k.total}:${k.failed}:${k.pending}:${k.ungated ? "u" : ""}` : "-";
+    const detailKey = !d
+      ? "-"
+      : d.kind === "blocked"
+        ? `b:${d.feature}:${d.blockedKind ?? "-"}:${d.reason.length}:${(d.detail ?? "").length}:${checksKey(d.checks)}`
+        : `${d.kind === "ready" ? "r" : "w"}:${d.feature}:${d.commits.length}:${d.pr?.number ?? -1}:${
+            d.pr?.body.length ?? 0
+          }:${d.pr?.prose?.length ?? -1}:${checksKey(d.checks)}`;
+    const entries = view.entries
+      .map(
+        (e) =>
+          `${e.feature}/${e.status}/${e.commitsReady ?? ""}/${e.ungated ? "u" : ""}/${
+            e.checksPending ?? ""
+          }/${e.blockedKind ?? ""}/${e.resolveAttempts ?? ""}`,
+      )
+      .join(",");
+    return `${this.cols}|${this.queueMerging ?? ""}|${this.queueMergeError ?? ""}|${
+      this.queueEditNotice?.text ?? ""
+    }|${entries}|${detailKey}`;
+  }
+
+  /**
    * The live merge queue as rows: the head first with its state, then the rest in
-   * landing order. A ready head shows its commit count and the in-place action
-   * bar hint; a blocked head shows conflict-vs-red and the resolver hint; a
-   * resolving head shows the attempt. Read fresh from the QueuePanelSource.
+   * landing order, then the head's INLINE body — a ready head's commits, PR and
+   * checks evidence, or a blocked head's reason (D-20260724-12). Everything
+   * needed to decide the merge, in the same view as the key that performs it.
+   * Read fresh from the QueuePanelSource.
    */
   private queueTabRows(): string[] {
     if (!this.queue) {
@@ -2638,6 +6480,15 @@ export class Tui implements SessionIO {
     }
     const view = this.queue.view();
     const rows: string[] = [""];
+    if (this.queueMergeError) {
+      rows.push("  " + c.red(`merge failed: ${this.queueMergeError}`));
+      rows.push("");
+    }
+    if (this.queueEditNotice) {
+      const n = this.queueEditNotice;
+      rows.push("  " + (n.ok ? c.green(n.text) : c.yellow(n.text)));
+      rows.push("");
+    }
     if (view.size === 0) {
       rows.push("  " + c.dim("The merge queue is empty."));
       rows.push("  " + c.dim("Enqueue a finished feature (feature_enqueue) to line it up to land."));
@@ -2646,17 +6497,24 @@ export class Tui implements SessionIO {
     for (const e of view.entries) {
       rows.push(...this.queueEntryRows(e));
     }
-    // A ready head with a live pending review: name the actions right under it.
     // The head is position 1 (head-only invariant); derive it from entries so a
-    // source that leaves `head` unset still drives the hint.
-    const head = view.head ?? view.entries[0] ?? null;
-    if (head && head.isHead && head.status === "ready" && this.pendingReview?.status === "review") {
+    // source that leaves `head` unset still drives the affordance.
+    const detail = this.queue.headDetail?.() ?? null;
+    const mergeable = this.mergeableHead();
+    if (this.queueMerging) {
       rows.push("");
-      rows.push("  " + c.dim("this head is ready to merge — ") +
-        c.cyan("m") + c.dim(" merge · ") + c.cyan("r") + c.dim(" reject · ") + c.cyan("d") + c.dim(" drill the diff"));
-    } else if (head && head.isHead && head.status === "ready" && !this.pendingReview) {
+      rows.push("  " + c.cyan(`merging ${this.queueMerging}…`));
+    } else if (mergeable) {
       rows.push("");
-      rows.push("  " + c.dim("head is green; run feature_merge_head to open its review here."));
+      const what = mergeable.prNumber
+        ? ` to merge PR #${mergeable.prNumber}${mergeable.target ? ` into ${mergeable.target}` : ""}`
+        : mergeable.target
+          ? ` to merge it into ${mergeable.target}`
+          : " to merge it";
+      rows.push("  " + c.dim("this head is ready — press ") + c.cyan("m") + c.dim(what));
+    }
+    if (detail) {
+      rows.push(...renderQueueHeadDetail(detail, this.cols));
     }
     return rows;
   }
@@ -2672,6 +6530,18 @@ export class Tui implements SessionIO {
     if (e.isHead) {
       if (e.status === "ready" && e.commitsReady !== undefined) {
         rows.push("      " + c.dim(`${e.commitsReady} commit${e.commitsReady === 1 ? "" : "s"} ready to land`));
+        if (e.ungated) {
+          rows.push("      " + c.yellow("no CI checks on its PR — merging is your judgment, not a green"));
+        }
+      } else if (e.status === "awaiting-checks") {
+        rows.push(
+          "      " +
+            c.yellow(
+              e.checksPending
+                ? `waiting on ${e.checksPending} CI check${e.checksPending === 1 ? "" : "s"} on its pull request`
+                : "waiting on its pull request's CI checks",
+            ),
+        );
       } else if (e.status === "blocked" && e.blockedReason) {
         rows.push("      " + c.red(e.blockedReason));
         if (e.blockedKind) {
@@ -2680,8 +6550,8 @@ export class Tui implements SessionIO {
             "      " +
               c.dim(
                 spent > 0
-                  ? `resolver attempts: ${spent} — feature_resolve_head to try again, or fix by hand`
-                  : `feature_resolve_head dispatches a fresh agent to fix it in its worktree`,
+                  ? `resolver attempts: ${spent} — the co can send a fresh agent again, or fix by hand`
+                  : `the co can dispatch a fresh agent to fix it in its worktree (you confirm it)`,
               ),
           );
         }
@@ -2695,11 +6565,346 @@ export class Tui implements SessionIO {
   /** The coloured one-word state chip for a queue entry. */
   private queueStateLabel(e: QueuePanelEntry): string {
     switch (e.status) {
-      case "ready": return c.green("[ready]");
+      case "ready": return e.ungated ? c.yellow("[ready: ungated]") : c.green("[ready]");
       case "head-processing": return c.cyan("[processing]");
+      case "awaiting-checks": return c.yellow("[awaiting checks]");
       case "resolving": return c.yellow("[resolving]");
-      case "blocked": return c.red(`[blocked${e.blockedKind ? `: ${e.blockedKind === "conflict" ? "conflict" : "build+test"}` : ""}]`);
+      case "blocked": return c.red(`[blocked${e.blockedKind ? `: ${e.blockedKind === "conflict" ? "conflict" : "checks"}` : ""}]`);
       case "queued": return c.dim("[queued]");
+    }
+  }
+
+  /**
+   * The Home tab: the panel's landing page, in two blocks — the captain's
+   * at-a-glance task table, then every tracked feature worktree.
+   *
+   * The two answer the two questions the captain opens the panel with. The table
+   * is what we are doing (it used to exist only as prose the co re-printed into
+   * the chat; it is a stored, painted, and now EDITABLE thing). The worktree
+   * list is what is in flight — the view the queue tab cannot give, because the
+   * queue holds only what has been marked done and everything still being worked
+   * is invisible there.
+   *
+   * Both are read fresh from their sources, so a table rewritten or a feature
+   * created while the panel is open shows on the next paint — and rebuilt at the
+   * CURRENT width every paint, so a resize re-wraps everything here for free.
+   *
+   * Nothing on this tab is ever clipped. A worktree's description is the one
+   * thing on its row that says what the work is FOR, and cutting it with an
+   * ellipsis removed the overflow while leaving the information unreadable —
+   * which was the complaint. So text that outgrows its room wraps instead, and a
+   * long row costs a line or two rather than its meaning.
+   *
+   * The ocean underneath all of it is not this tab's any more — it belongs to
+   * the panel, and viewFrame lays it under every tab out of that tab's own
+   * leftovers (see withOcean). Home is simply the tab it reads best on.
+   */
+  private homeTabRows(): string[] {
+    return [...this.taskTableRows(), "", ...this.worktreeRows()];
+  }
+
+  /**
+   * Lay the ocean under a tab's body, in whatever rows that body did not use.
+   *
+   * The scene is the one purely decorative thing in the panel, so it is added
+   * LAST and out of the leftovers: oceanRows() is handed the rows the content
+   * did not take and can only ever return that many, which is what makes the art
+   * unable to cost a row of content anywhere. As a body grows the ship goes
+   * first, then the water, then there is simply no scene — and a body that
+   * already fills the viewport (or overflows it and pages) never sees one at
+   * all. No tab reserves a row, and no viewport shrinks to make room.
+   *
+   * It rides under EVERY tab, and under an open doc, because the panel is the
+   * room and not the page: leaving it on Home alone made the ship a decoration
+   * you walked away from. What it is dropped for is the editor and the picker —
+   * the two boxes that ride on top. There the body is scenery behind something
+   * being typed into, most of it is covered by the box anyway, and water rolling
+   * in the gap around a document you are rewriting is noise. `panel.view.kind`
+   * is what says so, and it says so even here, on the call the popup makes for
+   * the view UNDERNEATH it.
+   *
+   * The hull's windows are this panel's tabs, in bar order, with the one being
+   * painted lit. The bar is read fresh, so a tab that appears mid-session (the
+   * feature_land review) puts a window on the ship on its next paint.
+   *
+   * The sea moves, on a frame this only READS. It is a phase, not state: the row
+   * COUNT is a function of width and leftovers alone, so a tide running or
+   * stopped cannot change how much room the scene takes, and the scroll
+   * arithmetic that calls this for its own purposes gets the same answer at
+   * every frame. syncOcean decides whether the number ever changes, and reads
+   * `oceanDrawn` — set here, on the one path that draws — to know whether there
+   * is anything on screen worth ticking for.
+   */
+  private withOcean(tab: PanelTab, body: string[]): string[] {
+    const kind = this.panel?.view.kind;
+    if (kind === "popup" || kind === "picker") {
+      this.oceanDrawn = false;
+      return body;
+    }
+    const tabs = this.panelTabs();
+    const lit = tabs.indexOf(tab);
+    const scene = oceanRows(
+      this.cols,
+      this.overlayViewport() - body.length,
+      this.visualFrame,
+      tabs.length > 0 ? { count: tabs.length, lit } : undefined,
+    );
+    this.oceanDrawn = scene.length > 0;
+    return scene.length === 0 ? body : [...body, ...scene];
+  }
+
+  /**
+   * The task table: a spaced two-column list, status first, with the captain's
+   * selection marked and his text field sitting exactly where the row it is
+   * about to write will be — under the table for `a`, in the row's own place for
+   * `e`, so rewriting a task's wording never looks like moving it.
+   *
+   * Status leads and sits in a fixed column so the eye runs straight down it —
+   * "what is being built right now" is the question this block exists to answer,
+   * and it was buried on the right behind two content-sized columns before. The
+   * old `Type` column is gone: it never changed what the captain did next.
+   *
+   * Rows are painted most-active-first — `building`, `enqueued`, `testing`,
+   * then `queued` (D-20260729-5) — through the same shared helper the tool and
+   * the live-state block call, so the row actually being worked cannot sit below
+   * two rows waiting their turn, and the rows waiting on the captain's own test
+   * sit where they will be seen. The STORE is untouched by that: it keeps
+   * insertion order, this is a view.
+   *
+   * Building the rows is also where the selection is RECONCILED with the table:
+   * a selected row the co retired mid-session is simply no longer selected. The
+   * alternative — an index quietly sliding onto a neighbour — is the failure
+   * this whole two-writer design exists to avoid, and `x` is the key it would
+   * hand the wrong row to.
+   *
+   * THE TABLE IS UNBOUNDED, and the block paints every row of it. Home is one
+   * scrolling body — the panel clamps its viewport to the row count, pages it
+   * with space/b/d/u/g/G and the wheel, and the footer already counts what is
+   * below — so a table taller than the pane is the case that machinery exists
+   * for, not a new one. A display ceiling was the alternative and is worse here:
+   * the rows past it would still be selectable (the cursor walks the store, not
+   * the paint), so `x` would retire a row the captain could not see, and no
+   * amount of paging would bring it into view. What the ceiling WOULD have given
+   * is the honest bit, so the heading takes it instead: once the block outgrows
+   * the viewport it says how many rows there are, which is the question you only
+   * ask when you can no longer count them.
+   */
+  private taskTableRows(): string[] {
+    const panel = this.panel;
+    this.homeTaskStarts.clear();
+    if (!this.tasks) {
+      return [...taskHead("Tasks"), ...this.homeNote("The task table isn't available in this session.")];
+    }
+    const table = taskDisplayOrder(this.tasks.list());
+    if (panel && panel.taskSel !== null && !table.some((t) => t.task === panel.taskSel)) {
+      panel.taskSel = null;
+    }
+    const body = this.taskRowsOf(table);
+    // The count is the overflow indicator, and it appears on exactly the
+    // condition that makes it worth printing: the block, heading rows included,
+    // no longer fits the viewport, so "is that all of them?" has become a real
+    // question. Below that it would be furniture on a table you can see.
+    const heading = TASK_HEAD_ROWS + body.length > this.overlayViewport()
+      ? `Tasks (${table.length})`
+      : "Tasks";
+    return [...taskHead(heading), ...body];
+  }
+
+  /** The task rows themselves, without the heading. Every row start recorded
+   *  here is a row that really is painted, which is what `ensureTaskVisible`
+   *  scrolls to — and it is recorded against the whole Home body, so the
+   *  heading's own rows are counted back in. */
+  private taskRowsOf(table: TaskPanelRow[]): string[] {
+    const panel = this.panel;
+    const rows: string[] = [];
+    if (table.length === 0) {
+      rows.push(
+        ...this.homeNote("Nothing on the table."),
+        ...this.homeNote("Press `a` to put one on it — yours and the co's, on the same table."),
+      );
+    }
+    const field = panel?.taskField ?? null;
+    for (const t of table) {
+      // The row being rewritten hands its line to the field, keeping its own
+      // status word: the field IS that row for as long as it is open.
+      if (field && field.renaming === t.task) {
+        this.homeTaskStarts.set(t.task, TASK_HEAD_ROWS + rows.length);
+        rows.push(...this.taskFieldRows(field, this.taskStatusLabel(t.status)));
+        continue;
+      }
+      const selected = t.task === panel?.taskSel;
+      this.homeTaskStarts.set(t.task, TASK_HEAD_ROWS + rows.length);
+      // Padded by VISIBLE width, never by String.padEnd: the status carries
+      // colour, and padding the raw string would count the escape bytes as
+      // characters and collapse the column. The marker replaces the indent
+      // rather than shifting the row, so a selected row stays in its columns.
+      const lead =
+        (selected ? c.cyan("▸") + " " : "  ") +
+        pad(this.taskStatusLabel(t.status), TASK_STATUS_W) +
+        TASK_STATUS_GAP;
+      rows.push(...flowRow(lead, t.task, this.cols, selected ? c.cyan : undefined));
+    }
+    // An `a` field belongs under the table, where its row will land. So does a
+    // rename field whose row has left the table under it — the write will fail
+    // and say so, and painting nothing at all would look like a dropped key.
+    if (field && !table.some((t) => t.task === field.renaming)) {
+      rows.push(...this.taskFieldRows(field, c.dim("new")));
+    }
+    if (panel?.taskNotice) rows.push("", ...flowRow("  ", panel.taskNotice, this.cols, c.yellow));
+    return rows;
+  }
+
+  /**
+   * The task text field, painted as the row it is about to be: the same indent
+   * and the same name column, under `label` — `new` for a row being added, the
+   * row's own status word for one being rewritten.
+   *
+   * The caret is drawn in reverse video rather than placed as a hardware cursor.
+   * Every panel view but the PR popup hides the real caret, and a one-line field
+   * inside a scrolling body would have to be tracked back to a screen row to
+   * place one; a reversed cell says the same thing and cannot drift.
+   */
+  private taskFieldRows(state: TaskFieldState, label: string): string[] {
+    const lead = "  " + pad(label, TASK_STATUS_W) + TASK_STATUS_GAP;
+    const width = Math.max(8, this.cols - visibleWidth(lead) - 1);
+    const { shown, caret } = fieldWindow(state.editor.text, state.editor.cursor, width);
+    const rows = [lead + highlightRange(pad(shown, caret + 1), caret, caret + 1)];
+    if (state.error) rows.push(...flowRow("  ", state.error, this.cols, c.yellow));
+    return rows;
+  }
+
+  /** A task's status, coloured by the panel's existing convention rather than a
+   *  new one: the worktree chips already paint a live crew cyan, the merge
+   *  queue's own progress green, a thing needing the captain's eye yellow, and a
+   *  thing waiting its turn dim, and these four words mean the same four things.
+   *  Green for `enqueued` also keeps it distinct from the group under it at a
+   *  glance, which dim would not — `enqueued` and `queued` are adjacent and read
+   *  alike already. The colours come from the shared `c` helper, so NO_COLOR and
+   *  a non-TTY strip them here exactly as everywhere else and the column keeps
+   *  its width either way. */
+  private taskStatusLabel(status: TaskPanelRow["status"]): string {
+    if (status === "building") return c.cyan("building");
+    if (status === "enqueued") return c.green("enqueued");
+    if (status === "testing") return c.yellow("testing");
+    return c.dim("queued");
+  }
+
+  /** A line of explanation under a Home heading, wrapped rather than clipped. */
+  private homeNote(text: string): string[] {
+    return flowRow("  ", text, this.cols, c.dim);
+  }
+
+  /**
+   * Every tracked feature worktree: the handle, its state, its branch and its
+   * intent. The intent is the one thing git can't say about a branch — what it is
+   * FOR — read straight from the stored text. No model call is made to describe
+   * anything, at paint time or ever, and a feature that never got an intent says
+   * so rather than showing a blank.
+   */
+  private worktreeRows(): string[] {
+    const head: string[] = ["  " + c.dim("Worktrees"), ""];
+    if (!this.features) {
+      return [...head, ...this.homeNote("Feature worktrees aren't available in this session (not linked).")];
+    }
+    const entries = this.features.list();
+    if (entries.length === 0) {
+      return [
+        ...head,
+        ...this.homeNote("No feature worktrees yet."),
+        ...this.homeNote("Each feature the co creates gets its own branch and checkout, and shows up here."),
+      ];
+    }
+    // Columns as wide as their widest cell so the list reads DOWN — the states in
+    // one column, the branches in another — rather than as ragged prose. The caps
+    // bound the PADDING, not the text: a name or branch past its cap overflows
+    // its own column instead of being cut, so it costs that one row's alignment
+    // and never a character. Chips are measured by VISIBLE width: they carry
+    // colour, and padding the raw string would count the escapes.
+    const chips = entries.map((e) => {
+      const crew = e.busy && e.status !== "working" ? " " + c.cyan("[crew]") : "";
+      return this.featureStateLabel(e) + crew;
+    });
+    const nameW = Math.min(20, Math.max(...entries.map((e) => e.feature.length)));
+    const chipW = Math.min(22, Math.max(...chips.map((s) => visibleWidth(s))));
+    const branchW = Math.min(24, Math.max(...entries.map((e) => e.branch.length)));
+    const rows = [...head];
+    entries.forEach((e, idx) => {
+      rows.push(...this.worktreeLines(e, chips[idx]!, nameW, chipW, branchW));
+    });
+    return rows;
+  }
+
+  /**
+   * One worktree: marker, handle, state, branch, description.
+   *
+   * One line when the description fits beside the columns, which is the typical
+   * row and the reason six worktrees usually stay six rows. When it doesn't fit,
+   * the description drops underneath at a hanging indent and wraps to the FULL
+   * width — reading it across the panel beats reading it down a narrow gutter,
+   * and either way it is all there. The head keeps its own line in that case so
+   * the columns above and below it still line up; only a head that outgrows the
+   * terminal itself is packed across lines.
+   */
+  private worktreeLines(
+    e: FeaturePanelEntry,
+    chip: string,
+    nameW: number,
+    chipW: number,
+    branchW: number,
+  ): string[] {
+    // A marker on the two states that want the eye: one that can be merged right
+    // now, and one that is holding the queue up.
+    const marker = e.status === "ready" ? c.green("▸") : e.status === "blocked" ? c.red("▸") : " ";
+    const name = c.bold(e.feature);
+    const branch = c.dim(e.branch);
+    const head = `  ${marker} ${pad(name, nameW)}  ${pad(chip, chipW)}  ${pad(branch, branchW)}`;
+    // Folded to one logical line before it is wrapped: a row is a row, and a
+    // stored newline would otherwise punch through the panel's own layout.
+    const intent = e.intent?.replace(/\s+/g, " ").trim();
+    const text = intent ?? "no description — created without an intent";
+    const style = intent ? undefined : c.dim;
+    if (this.cols - visibleWidth(head) - 2 >= visibleWidth(text)) {
+      return [`${head}  ${style ? style(text) : text}`];
+    }
+    const rows =
+      visibleWidth(head) <= this.cols
+        ? [head.replace(/\s+$/, "")]
+        : packRow(`  ${marker} `, [name, chip, branch], this.cols, WORKTREE_HANG);
+    return [...rows, ...flowRow(" ".repeat(WORKTREE_HANG), text, this.cols, style)];
+  }
+
+  /** The coloured one-word state chip for a feature, mirroring the queue tab's
+   *  vocabulary for the states the two share.
+   *
+   *  `idle` is the one that resolves further, because "tracked, nothing running,
+   *  not enqueued" is not a state — it is the ABSENCE of the other states, and it
+   *  told the captain nothing. With the worktree's dirty flag read (see
+   *  FeaturePanelEntry.dirty) it becomes `clean` or `dirty`: whether there is
+   *  uncommitted work sitting in that checkout is the only question left about a
+   *  feature nothing else is happening to. Unread, it stays `idle` — never
+   *  `clean`, which would be a claim nobody checked.
+   *
+   *  The `[crew]` marker beside the chip (see worktreeRows) is separate: an
+   *  enqueued feature's queue state and a live agent are both worth seeing, so
+   *  neither hides the other. */
+  private featureStateLabel(e: FeaturePanelEntry): string {
+    switch (e.status) {
+      case "working": return c.cyan("[crew running]");
+      case "idle":
+        if (e.dirty === true) return c.yellow("[dirty]");
+        if (e.dirty === false) return c.dim("[clean]");
+        return c.dim("[idle]");
+      case "queued": return c.dim(`[queued${e.position === undefined ? "" : ` #${e.position}`}]`);
+      case "processing": return c.cyan("[processing]");
+      case "ready": return c.green("[ready to merge]");
+      case "resolving": return c.yellow("[resolving]");
+      case "blocked":
+        return c.red(
+          `[blocked${e.blockedKind ? `: ${e.blockedKind === "conflict" ? "conflict" : "build+test"}` : ""}]`,
+        );
+      case "provisioning": return c.dim("[provisioning]");
+      case "failed": return c.red("[provision failed]");
+      case "removed": return c.dim("[worktree gone]");
     }
   }
 
@@ -2736,46 +6941,166 @@ export class Tui implements SessionIO {
   private panelFooter(total: number, start: number, vp: number): string {
     const w = this.cols;
     const v = this.panel?.view;
-    const hasOther = (v?.kind === "queue" && this.docs) || (v?.kind === "docs" && this.queue);
-    const tabHint = hasOther ? "Tab switch · " : "";
+    // Home tabs offer the switch hint whenever there's somewhere to switch to.
+    // The bar across the top already shows the numbers, so the hint names the
+    // cycle key and points at them rather than spelling every digit out.
+    const onHomeTab = v?.kind === "home" || v?.kind === "queue" || v?.kind === "docs";
+    const tabHint = onHomeTab && this.panelTabs().length > 1 ? "Tab/1-9 tabs · " : "";
 
-    let left: string;
-    if (v?.kind === "review") {
-      left = " " + this.reviewActionBar() + " ";
-    } else if (v?.kind === "queue") {
-      const pr = this.pendingReview;
-      if (pr && pr.status === "review" && this.queueHeadReady()) {
-        left = " " + c.cyan("m") + c.dim(" merge · ") + c.cyan("r") + c.dim(" reject · ") +
-          c.cyan("d") + c.dim(" drill · ") + c.dim(`${tabHint}Esc close`) + " ";
-      } else if (pr && pr.status === "failed") {
-        left = " " + c.dim("merge failed — ") + c.cyan("r") + c.dim(" dismiss · ") +
-          c.cyan("d") + c.dim(" details · ") + c.dim(`${tabHint}Esc close`) + " ";
-      } else if (pr && pr.status === "merging") {
-        left = " " + c.cyan(`merging into ${pr.review.target}…`) + " ";
-      } else {
-        left = ` ${tabHint}Esc close `;
-      }
-    } else if (v?.kind === "docs") {
-      left = ` 1-9/a-z open · ${tabHint}Esc close `;
-    } else {
-      // doc view
-      left = " space/b page · j/k line · g/G ends · Backspace back · Esc close ";
-    }
-
+    // Built before the hints: the doc view sizes its hint run against whatever
+    // the indicator leaves, so the copy key isn't the thing that gets clipped.
     let right = "";
     if (total > vp) {
       const below = total - (start + vp);
       right = below > 0 ? `${below} more below ` : "end ";
     }
+
+    // A standing copy receipt speaks for every view, because a drag selects on
+    // every view. It yields to a merge in flight: "merging…" is the one thing on
+    // this line that must not be covered, and it lasts seconds at most.
+    const notice = this.panel?.copyNotice;
+    const merging = this.queueMerging !== null || this.pendingReview?.status === "merging";
+
+    let left: string;
+    if (notice && !merging) {
+      // The receipt takes the position indicator's room too when it needs it:
+      // the indicator is one keypress from coming back, whereas a half-printed
+      // "71 mo" is just debris. The caveat is the part that must survive a
+      // narrow terminal, so the lead-in is what shortens.
+      const terse = notice.replace("if nothing pastes, allow", "allow");
+      left = ` ${c.cyan(2 + visibleWidth(notice) <= w ? notice : terse)} `;
+      right = "";
+    } else if (v?.kind === "popup") {
+      // The popup carries its own keys on its bottom border; the footer names
+      // what is being written, so the two never disagree about which PR — or
+      // which file — it is.
+      const edit = this.panel?.popup;
+      const what =
+        edit === null || edit === undefined
+          ? ""
+          : edit.target.kind === "pr"
+            ? `PR #${edit.target.prNumber}`
+            : edit.target.name;
+      left = edit
+        ? " " +
+          (edit.status === "saving"
+            ? c.cyan(`writing ${what}…`)
+            : c.cyan("Ctrl-S") + c.dim(` save ${what} · `) + c.cyan("Esc") + c.dim(" cancel")) +
+          " "
+        : " ";
+    } else if (v?.kind === "picker") {
+      // The box carries the same two keys on its bottom border; the footer says
+      // what Enter will actually do, which is the part the border has no room
+      // to spell out.
+      left =
+        " " + c.cyan("Enter") + c.dim(" set the model · ") + c.cyan("Esc") + c.dim(" cancel, changing nothing") + " ";
+    } else if (v?.kind === "review") {
+      left = " " + this.reviewActionBar() + " ";
+    } else if (v?.kind === "queue") {
+      // The [m] hint is a plain function of the head's state — it appears when
+      // the head goes green and stays until it is pressed or the head changes.
+      // Nothing here is armed or awaited (D-20260724-12).
+      // `e` is advertised on the same rule as [m]: only where it would actually
+      // fire — a head that has a pull request, in a session wired to edit one.
+      const edit = this.editableHead();
+      const editHint = edit ? c.cyan("e") + c.dim(" edit message · ") : "";
+      if (this.queueMerging) {
+        left = " " + c.cyan(`merging ${this.queueMerging}…`) + " ";
+      } else if (this.mergeableHead()) {
+        const m = this.mergeableHead();
+        left = " " + c.cyan("m") + c.dim(`${m?.prNumber ? ` merge PR #${m.prNumber}` : " merge"} · `) +
+          editHint + c.dim(`space/b page · ${tabHint}Esc close`) + " ";
+      } else {
+        left = " " + editHint + c.dim("space/b page · " + tabHint + "Esc close") + " ";
+      }
+    } else if (v?.kind === "home") {
+      // The tab's keys are not discoverable anywhere else, so they live here, in
+      // tiers: the two that EDIT the table survive a narrow terminal, and paging
+      // and the tab hint go first, because both are advertised elsewhere (the
+      // bar shows the digits; space/b is the panel-wide idiom).
+      if (this.panel?.taskField) {
+        // The field names the key that COMMITS it, and the two openings commit
+        // different things: `a` writes a new row, `e` replaces one row's words.
+        const verb = this.panel.taskField.renaming === null ? " add the task · " : " rename the task · ";
+        left = ` ${c.cyan("Enter")}${c.dim(verb)}${c.cyan("Esc")}${c.dim(" cancel")} `;
+      } else {
+        const room = w - 2 - visibleWidth(right);
+        const tiers = [
+          `a add · e edit · j/k select · x retire · s status · space/b page · ${tabHint}Esc close`,
+          "a add · e edit · j/k select · x retire · s status · space/b page · Esc close",
+          "a add · e edit · j/k select · x retire · s status · Esc close",
+          "a add · e edit · x retire · s status · Esc close",
+          "a add · e edit · Esc close",
+        ];
+        left = ` ${c.dim(tiers.find((t) => t.length <= room) ?? tiers[tiers.length - 1]!)} `;
+      }
+    } else if (v?.kind === "docs") {
+      left = ` a-z open · ${tabHint}Esc close `;
+    } else if (v?.kind === "doc") {
+      // The ACTION keys on a doc lead and are coloured the way the queue tab
+      // leads with its [m]: `y` takes it away, `e` rewrites it. The run shortens
+      // to fit beside the position indicator rather than letting clip() eat its
+      // end: a hint that is always truncated away is a hint nobody discovers.
+      // The drag hint is first out, because the gesture is self-revealing where a
+      // key is not - you drag, the highlight appears, the receipt names what it
+      // took. `e` is advertised on the same rule the queue tab advertises its
+      // own: only where it would actually fire.
+      const editable = this.docs?.write !== undefined && v.error === null;
+      const lead = " " + c.cyan("y") + " copy" + (editable ? " · " + c.cyan("e") + " edit" : "");
+      const room = w - 2 - visibleWidth(right) - visibleWidth(lead);
+      const tiers = [
+        " · drag select · space/b page · j/k line · g/G ends · Backspace back · Esc close ",
+        " · space/b page · j/k line · g/G ends · Backspace back · Esc close ",
+        " · space/b page · Backspace back · Esc close ",
+        " · Esc close ",
+      ];
+      left = lead + (tiers.find((t) => t.length <= room) ?? tiers[tiers.length - 1]!);
+    } else {
+      // No view (the panel is closed): the shared paging surface, nothing of its own
+      left = " space/b page · j/k line · g/G ends · Backspace back · Esc close ";
+    }
+
     const fill = Math.max(0, w - visibleWidth(left) - visibleWidth(right));
     return this.clip(left + c.dim("─".repeat(fill)) + c.dim(right), w);
   }
 
-  /** Whether the head is the ready feature the pending review is for. */
-  private queueHeadReady(): boolean {
-    const view = this.queue?.view();
-    const head = view?.head ?? view?.entries[0] ?? null;
-    return Boolean(head && head.isHead && head.status === "ready");
+  /**
+   * Whether [m] is live right now, and on what. ONE predicate, used by the
+   * handler, the in-body hint and the footer alike, so the key can never be
+   * advertised somewhere it wouldn't fire (or fire where it isn't offered).
+   *
+   * Live means: the source reports a ready head, it exposes a merge, and — when
+   * it also exposes a head body — that body is a ready one with something to
+   * land. A source with no `headDetail` at all is trusted on its view, so a
+   * minimal list source still works; one that HAS a body must agree with it.
+   */
+  private mergeableHead(): { feature: string; target?: string; prNumber?: number } | null {
+    if (!this.queue?.merge) return null;
+    const view = this.queue.view();
+    const head = view.head ?? view.entries[0] ?? null;
+    if (!head || !head.isHead || head.status !== "ready") return null;
+    // No body source: trust the view, and say nothing about a target we were
+    // never told (the integration branch is the session's to name, not ours).
+    if (!this.queue.headDetail) return { feature: head.feature };
+    const detail = this.queue.headDetail();
+    if (!detail || detail.kind !== "ready" || detail.commits.length === 0) return null;
+    return {
+      feature: detail.feature,
+      target: detail.target,
+      ...(detail.pr ? { prNumber: detail.pr.number } : {}),
+    };
+  }
+
+  /**
+   * Whether `e` is live right now, and on which pull request. The twin of
+   * mergeableHead, and for the same reason: ONE predicate behind the key and the
+   * hint that advertises it, so the editor can never be offered over a head with
+   * no PR (or hidden on one that has one).
+   */
+  private editableHead(): { prNumber: number } | null {
+    if (!this.queue?.editPrMessage) return null;
+    const pr = this.queue.headDetail?.()?.pr;
+    return pr ? { prNumber: pr.number } : null;
   }
 
   /** The drilled review view's action bar: [m] armed only for a mergeable prepare
@@ -2793,7 +7118,8 @@ export class Tui implements SessionIO {
     const why =
       pr.status === "failed" ? "merge failed"
       : p.kind === "conflict" ? "conflict"
-      : p.kind === "failed" ? "build+test red"
+      : p.kind === "failed" ? "checks red"
+      : p.kind === "pending" ? "checks pending"
       : "nothing to land";
     return c.dim(`m disabled (${why}) · `) + c.cyan("r") +
       c.dim(" close · space/b page · Esc close");

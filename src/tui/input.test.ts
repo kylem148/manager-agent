@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Tui, inputRowStarts, type InStream, type OutStream } from "./tui.js";
+import {
+  ESC_ESC_WINDOW_MS,
+  Tui,
+  inputRowStarts,
+  type InStream,
+  type OutStream,
+} from "./tui.js";
 
 /**
  * End-to-end tests for the multi-line input box: raw bytes in one end, the
@@ -23,12 +29,17 @@ interface Harness {
   send(bytes: string): void;
   lastFrame(): string;
   allOutput(): string;
+  /** Move the injected clock forward, for the esc-esc window. */
+  advance(ms: number): void;
   stop(): void;
 }
 
 function harness(cols = 40, rows = 12): Harness {
   let listener: ((d: string) => void) | null = null;
   const writes: string[] = [];
+  // A clock the test drives: esc-esc's window is the only thing that reads it,
+  // and a real sleep is the one way to make that test flaky.
+  let clock = 1_000_000;
 
   const out: OutStream = { write: (s) => writes.push(s), columns: cols, rows };
   const inp: InStream = {
@@ -41,15 +52,30 @@ function harness(cols = 40, rows = 12): Harness {
     removeListener: () => (listener = null),
   };
 
-  const tui = new Tui({ promptLabel: PROMPT, out, inp });
+  const tui = new Tui({ promptLabel: PROMPT, out, inp, now: () => clock });
   tui.start();
   return {
     tui,
     send: (bytes) => listener?.(bytes),
     lastFrame: () => writes[writes.length - 1] ?? "",
     allOutput: () => writes.join(""),
+    advance: (ms) => {
+      clock += ms;
+    },
     stop: () => tui.stop(),
   };
+}
+
+/** The exact OSC 52 payload a clipboard write of `text` would carry. */
+function osc52For(text: string): string {
+  return `\x1b]52;c;${Buffer.from(text, "utf8").toString("base64")}\x07`;
+}
+
+/** Every OSC 52 write made so far, decoded back to the text it carried. */
+function clipboardWrites(h: Harness): string[] {
+  return [...h.allOutput().matchAll(/\x1b\]52;c;([^\x07]*)\x07/g)].map((m) =>
+    Buffer.from(m[1]!, "base64").toString("utf8"),
+  );
 }
 
 /** Type `bytes`, then press Enter, and return the message the session receives. */
@@ -92,14 +118,14 @@ test("plain Enter still submits", async () => {
   assert.equal(await submitAfter("hello"), "hello");
 });
 
-test("Enter with no pending read does not submit a phantom line", async () => {
+test("Enter with no pending read queues the line rather than dropping it", async () => {
   const h = harness();
-  h.send("stray\r"); // nobody is reading yet
+  h.send("stray\r"); // nobody is reading yet: this queues
   const answer = h.tui.question();
-  h.send(" text\r");
-  // The buffer survived the Enter that had no reader, and only the real Enter
-  // submitted — once.
-  assert.equal(await answer, "stray text");
+  // Delivered exactly once, whole, to the read that follows. It used to sit in
+  // the buffer waiting for a second Enter; it is now the answer to this read.
+  // The queue's own behaviour is pinned in queued.test.ts.
+  assert.equal(await answer, "stray");
   h.stop();
 });
 
@@ -239,6 +265,22 @@ test("Ctrl-U kills to the start of the current line only", async () => {
   h.stop();
 });
 
+test("the PR editor's buffer-scoped keys do nothing at all to the prompt line", async () => {
+  // Ctrl-G/X/Y are bound by the popup's editor. They were unbound bytes here
+  // before that, and they stay unbound: no text typed, no buffer cleared, no
+  // clipboard write. This is the guard on "the prompt line did not change".
+  const h = harness();
+  const answer = h.tui.question();
+  h.send("keep this line");
+  h.send("\x07"); // Ctrl-G
+  h.send("\x18"); // Ctrl-X
+  h.send("\x19"); // Ctrl-Y
+  assert.ok(!h.allOutput().includes("\x1b]52;"), "nothing was sent to the clipboard");
+  h.send("\r");
+  assert.equal(await answer, "keep this line", "the line is exactly what was typed");
+  h.stop();
+});
+
 test("Ctrl-K kills to the end of the current line only", async () => {
   const h = harness();
   const answer = h.tui.question();
@@ -269,6 +311,146 @@ test("esc-esc clears a multi-line buffer, in both escape encodings", async () =>
   h.send("\x1b[27u"); // the Kitty protocol's spelling of Escape
   h.send("fresh\r");
   assert.equal(await answer, "fresh");
+  // And it left the whole buffer, newline included, on the clipboard.
+  assert.deepEqual(clipboardWrites(h), ["gone\nalso gone"]);
+  h.stop();
+});
+
+// --- esc-esc is a CUT --------------------------------------------------------
+//
+// Driving real bytes through the real input path: the gesture must put the line
+// on the clipboard, the window must exclude two presses that aren't one gesture,
+// and neither may cost an ESC-prefixed sequence anything.
+
+test("esc-esc cuts the line: the exact text goes to the clipboard, the line goes", async () => {
+  const h = harness();
+  const answer = h.tui.question();
+  h.send("abandon this thought");
+  h.send("\x1b");
+  h.send("\x1b");
+
+  assert.deepEqual(clipboardWrites(h), ["abandon this thought"], "verbatim, one write");
+  assert.ok(
+    h.allOutput().includes(osc52For("abandon this thought")),
+    "the sequence on the wire is the OSC 52 write for exactly that text",
+  );
+  assert.match(h.lastFrame(), /cut · 1 line on the clipboard/, "receipted on the separator");
+  assert.equal(h.lastFrame().includes("abandon this thought"), false, "the line is gone");
+
+  // Typing after the cut starts from an empty line.
+  h.send("something else\r");
+  assert.equal(await answer, "something else");
+  h.stop();
+});
+
+test("esc-esc cuts the EXPANDED text of a collapsed paste, not the chip", async () => {
+  // The chip is a display placeholder; a clipboard carrying it back would be the
+  // one case where "recoverable by pasting" was untrue.
+  const h = harness();
+  h.tui.question();
+  h.send("\x1b[200~one\ntwo\x1b[201~");
+  assert.match(h.lastFrame(), /Pasted text #1 \+2 lines/);
+  h.send("\x1b\x1b");
+  assert.deepEqual(clipboardWrites(h), ["one\ntwo"]);
+  h.stop();
+});
+
+test("two Escs further apart than the window are not one gesture", async () => {
+  const h = harness();
+  const answer = h.tui.question();
+  h.send("keep this line");
+  h.send("\x1b");
+  h.advance(ESC_ESC_WINDOW_MS + 1);
+  h.send("\x1b");
+
+  assert.deepEqual(clipboardWrites(h), [], "nothing was sent to the clipboard");
+  assert.match(h.lastFrame(), /you > keep this line/, "and the line is untouched");
+
+  // The stale press re-armed rather than being spent, so the next one still cuts.
+  h.send("\x1b");
+  assert.deepEqual(clipboardWrites(h), ["keep this line"]);
+  h.send("second thoughts\r");
+  assert.equal(await answer, "second thoughts");
+  h.stop();
+});
+
+test("a press exactly on the window boundary still counts", () => {
+  const h = harness();
+  h.tui.question();
+  h.send("on the edge");
+  h.send("\x1b");
+  h.advance(ESC_ESC_WINDOW_MS);
+  h.send("\x1b");
+  assert.deepEqual(clipboardWrites(h), ["on the edge"]);
+  h.stop();
+});
+
+test("an ESC-prefixed sequence still parses as its key, armed or not", async () => {
+  const h = harness();
+  const first = h.tui.question();
+  h.send("remembered\r");
+  assert.equal(await first, "remembered");
+
+  const answer = h.tui.question();
+  h.send("ab");
+  h.send("\x1b"); // armed
+  h.send("\x1b[D"); // Left: an arrow, not the second half of a gesture
+  h.send("X");
+  assert.deepEqual(clipboardWrites(h), [], "an arrow key never cuts");
+
+  // The arrow disarmed it, so the ESC that opened it cannot pair with a later one.
+  h.send("\x1b");
+  h.send("\x1b[A"); // Up: history recall, still a key and not a cut
+  assert.deepEqual(clipboardWrites(h), []);
+  assert.match(h.lastFrame(), /you > remembered/, "the arrow did what arrows do");
+
+  h.send("\x1b");
+  h.send("\x1b"); // now a real gesture, on the recalled line
+  assert.deepEqual(clipboardWrites(h), ["remembered"]);
+  h.send("aXb\r");
+  assert.equal(await answer, "aXb");
+  h.stop();
+});
+
+test("nothing is deferred: a whole gesture and the next key land in one data event", () => {
+  // The proof that the window is a deadline and not a timer. If the first ESC
+  // were held back to see what followed it, this one read could not have already
+  // cut the line AND typed the next character by the time it returned — and that
+  // same hold would sit on the front of every arrow key.
+  const h = harness();
+  h.tui.question();
+  h.send("scratch");
+  h.send("\x1b\x1bX");
+  assert.deepEqual(clipboardWrites(h), ["scratch"]);
+  assert.match(h.lastFrame(), /you > X/);
+  h.stop();
+});
+
+test("esc-esc on an empty line writes nothing to the clipboard", () => {
+  const h = harness();
+  h.tui.question();
+  // Something worth keeping is put on the clipboard first...
+  h.send("worth keeping");
+  h.send("\x1b\x1b");
+  assert.deepEqual(clipboardWrites(h), ["worth keeping"]);
+
+  // ...and a stray double-tap on the now-empty prompt must not empty it. An
+  // OSC 52 write with an empty payload is a real "clear the clipboard".
+  h.send("\x1b\x1b");
+  h.send("\x1b\x1b");
+  assert.deepEqual(clipboardWrites(h), ["worth keeping"], "no second write at all");
+  h.stop();
+});
+
+test("a single Esc still does nothing on its own", async () => {
+  const h = harness();
+  const answer = h.tui.question();
+  h.send("untouched");
+  h.send("\x1b");
+  assert.deepEqual(clipboardWrites(h), []);
+  assert.match(h.lastFrame(), /you > untouched/);
+  h.send("\r");
+  assert.equal(await answer, "untouched", "and the line submits as typed");
   h.stop();
 });
 

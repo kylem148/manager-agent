@@ -11,12 +11,13 @@ import {
   deleteDoc,
   listDocs,
   overwriteDoc,
+  overwriteDocIfUnchanged,
   readDoc,
   readSurfacedDocs,
   strReplaceDoc,
 } from "./docs.js";
 import { makeExecutor, newSideEffects, toolDefinitions } from "../session/tools.js";
-import { buildSystemPrompt } from "../session/prompt.js";
+import { buildStartupInjection } from "../session/prompt.js";
 import { onWrite } from "./writequeue.js";
 import { rewriteLive, appendLog } from "./memory.js";
 import type { ResearchConfig } from "../config.js";
@@ -131,6 +132,61 @@ test("overwrite creates when the doc does not exist yet", async () => {
   }
 });
 
+test("a checked overwrite writes only while the file still holds what was read", async () => {
+  const { paths, cleanup } = await makeInstance();
+  try {
+    await createDoc(paths, "plan.md", "one\n");
+    const opened = await readDoc(paths, "plan.md");
+
+    const ok = await overwriteDocIfUnchanged(paths, "plan.md", "one\ntwo\n", opened);
+    assert.equal(ok.name, "plan.md");
+    assert.equal(await readDoc(paths, "plan.md"), "one\ntwo\n");
+
+    // The co rewrote it while the editor was open: the stale baseline is
+    // refused, and the co's version is still on disk afterwards.
+    await overwriteDoc(paths, "plan.md", "the co's rewrite\n");
+    const e = await expectDocError(
+      () => overwriteDocIfUnchanged(paths, "plan.md", "the captain's rewrite\n", opened),
+      "DOC_CHANGED",
+    );
+    assert.match(e.message, /changed on disk/);
+    assert.equal(await readDoc(paths, "plan.md"), "the co's rewrite\n");
+
+    // Deleted out from under the editor is the same answer: a save must not
+    // silently resurrect a document the co removed.
+    await deleteDoc(paths, "plan.md");
+    await expectDocError(
+      () => overwriteDocIfUnchanged(paths, "plan.md", "back from the dead\n", "the co's rewrite\n"),
+      "DOC_CHANGED",
+    );
+    await expectDocError(() => readDoc(paths, "plan.md"), "DOC_NOT_FOUND");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a checked overwrite announces itself on the write queue", async () => {
+  const { paths, cleanup } = await makeInstance();
+  const seen: string[] = [];
+  const off = onWrite((e) => seen.push(`${e.kind}:${e.name}`));
+  try {
+    await createDoc(paths, "plan.md", "one\n");
+    seen.length = 0;
+    await overwriteDocIfUnchanged(paths, "plan.md", "two\n", "one\n");
+    assert.deepEqual(seen, ["doc:plan.md"], "the viewer refreshes off exactly one signal");
+
+    seen.length = 0;
+    await expectDocError(
+      () => overwriteDocIfUnchanged(paths, "plan.md", "three\n", "stale\n"),
+      "DOC_CHANGED",
+    );
+    assert.deepEqual(seen, [], "a refused write signals nothing");
+  } finally {
+    off();
+    await cleanup();
+  }
+});
+
 test("the sandbox rejects every way out of docs/", async () => {
   const { paths, cleanup } = await makeInstance();
   try {
@@ -156,6 +212,12 @@ test("the sandbox rejects every way out of docs/", async () => {
       await expectDocError(() => overwriteDoc(paths, name, "x"), "INVALID_DOC_NAME");
       await expectDocError(() => deleteDoc(paths, name), "INVALID_DOC_NAME");
       await expectDocError(() => strReplaceDoc(paths, name, "a", "b"), "INVALID_DOC_NAME");
+      // The panel's editor writes through here, so it is held to the same
+      // sandbox as every other writer — `.memory/` included.
+      await expectDocError(
+        () => overwriteDocIfUnchanged(paths, name, "x", ""),
+        "INVALID_DOC_NAME",
+      );
     }
 
     // The substrate is untouched by all of that.
@@ -277,20 +339,22 @@ test("cold start surfaces architecture.md and plan.md when they exist", async ()
 
     const empty = await readSurfacedDocs(paths);
     assert.deepEqual(empty, [], "nothing to surface on a fresh instance");
-    const fresh = await buildSystemPrompt(paths, research);
+    const fresh = await buildStartupInjection(paths, research);
     assert.ok(!fresh.includes("docs/architecture.md"), "no phantom architecture.md");
 
     await createDoc(paths, "architecture.md", "# Arch\n\nthe hull and the rigging\n");
     await createDoc(paths, "plan.md", "# Plan\n\nthe course we are steering\n");
     await createDoc(paths, "scratch.md", "not surfaced at cold start\n");
 
-    const prompt = await buildSystemPrompt(paths, research);
-    assert.match(prompt, /### docs[/\\]architecture\.md/);
-    assert.match(prompt, /the hull and the rigging/);
-    assert.match(prompt, /### docs[/\\]plan\.md/);
-    assert.match(prompt, /the course we are steering/);
-    assert.ok(!prompt.includes("not surfaced at cold start"), "only the two privileged docs");
-    assert.match(prompt, /activeContext\.md/, "the substrate live state is still there");
+    // The privileged read lands in the startup injection (layer 3), not the
+    // static system prompt: docs are state, and state rides history.
+    const briefing = await buildStartupInjection(paths, research);
+    assert.match(briefing, /## docs[/\\]architecture\.md/);
+    assert.match(briefing, /the hull and the rigging/);
+    assert.match(briefing, /## docs[/\\]plan\.md/);
+    assert.match(briefing, /the course we are steering/);
+    assert.ok(!briefing.includes("not surfaced at cold start"), "only the two privileged docs");
+    assert.match(briefing, /activeContext\.md/, "the substrate live state is still there");
   } finally {
     await cleanup();
   }

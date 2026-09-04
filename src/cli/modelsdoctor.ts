@@ -172,22 +172,33 @@ function geoMismatch(id: string, region: string): boolean {
   return g !== null && g !== geoPrefix(region);
 }
 
-/** A small, current spread of Claude models on Bedrock, in inference-profile form. */
+/**
+ * A small, current spread of Claude models on Bedrock, in inference-profile
+ * form. Current-generation ids are undated (`claude-sonnet-4-6`); the 4.5
+ * generation and older still carry the dated `-YYYYMMDD-vN:0` suffix, which is
+ * why the shapes differ. Claude 3.x is deliberately absent: those models are
+ * retired first-party and this sweep exists to find a model worth running, not
+ * to inventory the account.
+ */
 function candidateModels(region: string): string[] {
   const g = geoPrefix(region);
   return [
     `${g}.anthropic.claude-opus-4-8`,
+    `${g}.anthropic.claude-sonnet-5`,
+    `${g}.anthropic.claude-sonnet-4-6`,
     `${g}.anthropic.claude-sonnet-4-5-20250929-v1:0`,
-    `${g}.anthropic.claude-3-7-sonnet-20250219-v1:0`,
-    `${g}.anthropic.claude-3-5-sonnet-20241022-v2:0`,
-    `${g}.anthropic.claude-3-5-haiku-20241022-v1:0`,
   ];
 }
 
-/** Rank working ids to recommend one: configured first, then newest/most-capable. */
+/**
+ * Rank working ids to recommend one: configured first, then newest/most-capable.
+ * Note this ranks on capability, not price — it answers "what can this account
+ * run", and the cheaper Sonnet rungs below Opus are a deliberate cost choice
+ * the operator makes in BEDROCK_MODEL_ID, not something to recommend away from.
+ */
 function recommend(configured: string, working: string[]): string | null {
   if (working.includes(configured)) return configured;
-  const order = ["opus-4-8", "sonnet-4-5", "3-7-sonnet", "3-5-sonnet", "haiku", "anthropic.claude"];
+  const order = ["opus-4-8", "sonnet-5", "sonnet-4-6", "sonnet-4-5", "anthropic.claude"];
   for (const needle of order) {
     const hit = working.find((id) => id.includes(needle));
     if (hit) return hit;

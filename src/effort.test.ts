@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseEffort, type ModelConfig } from "./config.js";
+import { clampEffort, effortLevelsFor, parseEffort, type ModelConfig } from "./config.js";
 import { ModelProvider } from "./model.js";
 
 /**
@@ -57,6 +57,38 @@ test("parseEffort rejects anything else", () => {
   assert.equal(parseEffort("bogus"), null);
   assert.equal(parseEffort(""), null);
   assert.equal(parseEffort(undefined), null);
+});
+
+test("the 4.6 generation is offered the ladder without xhigh", () => {
+  // Bedrock answers effort=xhigh on these with a 400, so the level must never
+  // reach the wire — see NO_XHIGH_MODELS in config.ts.
+  for (const id of ["us.anthropic.claude-sonnet-4-6", "us.anthropic.claude-opus-4-6"]) {
+    assert.deepEqual(effortLevelsFor(id), ["low", "medium", "high", "max"]);
+  }
+});
+
+test("models that take the full ladder keep xhigh", () => {
+  for (const id of [
+    "us.anthropic.claude-opus-4-8",
+    "us.anthropic.claude-sonnet-5",
+    "some.unknown.model", // unknown ids fail loudly at the API, not silently here
+  ]) {
+    assert.deepEqual(effortLevelsFor(id), ["low", "medium", "high", "xhigh", "max"]);
+  }
+});
+
+test("clampEffort degrades xhigh to high rather than up to max", () => {
+  // Rounding up would raise spend on every turn, which inverts the reason for
+  // moving to a cheaper model in the first place.
+  assert.equal(clampEffort("xhigh", "us.anthropic.claude-sonnet-4-6"), "high");
+});
+
+test("clampEffort leaves supported levels alone", () => {
+  const sonnet = "us.anthropic.claude-sonnet-4-6";
+  for (const level of ["low", "medium", "high", "max"] as const) {
+    assert.equal(clampEffort(level, sonnet), level);
+  }
+  assert.equal(clampEffort("xhigh", "us.anthropic.claude-opus-4-8"), "xhigh");
 });
 
 test("setEffort changes what the next turn sends", async () => {
